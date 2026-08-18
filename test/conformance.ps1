@@ -32,6 +32,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
+"  using: $(Split-Path $ctl -Leaf) from $(Split-Path $ctl -Parent)"
 
 # NOT back into $Spec: that parameter is typed [string], and PowerShell is case-insensitive, so
 # assigning the parsed object to $spec would silently ConvertTo-String it — $contract.steps then reads
