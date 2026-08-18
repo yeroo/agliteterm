@@ -1,1 +1,4 @@
 /bin
+/.native
+/installer/Output
+/installer/stage

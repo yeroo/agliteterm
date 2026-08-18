@@ -49,9 +49,12 @@ Start-Sleep -Seconds 7
 $p2.Refresh()
 Check 'starts with an unwritable profile' (-not $p2.HasExited) "exit 0x$('{0:X8}' -f $(if ($p2.HasExited) { $p2.ExitCode } else { 0 }))"
 if (-not $p2.HasExited) {
-    $ctl = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
-    $tree = (& $ctl tree --json --pipe "$pipe-nolog" 2>&1) -join ''
-    Check 'still serves the control pipe' ($tree -match '"ok":true')
+    . "$PSScriptRoot\ctl-path.ps1"
+    $ctl = Get-CtlPath
+    if ($ctl) {
+        $tree = (& $ctl tree --json --pipe "$pipe-nolog" 2>&1) -join ''
+        Check 'still serves the control pipe' ($tree -match '"ok":true')
+    } else { "  SKIP  still serves the control pipe (no agwintermctl)" }
     $p2.CloseMainWindow() | Out-Null
     Start-Sleep -Seconds 3
     if (-not $p2.HasExited) { Stop-Process -Id $p2.Id -Force }

@@ -16,7 +16,9 @@ $pipe  = 'logrst'
 $dir   = "$env:LOCALAPPDATA\agliteterm"
 $log   = "$dir\agliteterm-$pipe.log"
 $state = "$dir\sessions-$pipe.tsv"
-$ctl   = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
+. "$PSScriptRoot\ctl-path.ps1"
+$ctl   = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
 # The .bak and .tmp go too: since the save keeps a previous generation, leaving one behind means
 # run 1 is NOT a first run — it falls back to the last suite run's sessions and every count is off.
 Remove-Item $log, "$log.old", $state, "$state.bak", "$state.tmp" -ErrorAction SilentlyContinue

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The core dll + pty-host come from agwinterm releases, pinned by native/pinned.json, and the
+      # fetch REFUSES a release whose published abiVersion is not the one src/main.cpp requires.
+      # That check is the whole reason this step is separate: across two repositories an ABI drift
+      # would otherwise surface as a fatal refusal on a user's machine, a release cycle later.
+      - name: Fetch the pinned agwinterm core
+        shell: pwsh
+        run: ./tools/fetch-native.ps1
+
+      - name: Build agliteterm
+        # cl.exe with the ATL headers WTL needs; both are on windows-latest.
+        shell: pwsh
+        run: ./build.ps1
+
+      # The checks agwinterm's CI never ran — they drive the BUILT exe (lite has no C++ unit-test
+      # harness), so they only ever ran on a developer machine. Making them a merge gate is the
+      # point of having our own CI. They create real windows and real shells, so they are slower
+      # than a unit suite and get a generous timeout.
+      - name: Test (drives the built client)
+        shell: pwsh
+        timeout-minutes: 30
+        env:
+          AGWINTERMCTL: ${{ github.workspace }}\bin\agwintermctl.exe
+        run: ./test/run-all.ps1

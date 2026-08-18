@@ -1,0 +1,5 @@
+{
+  "repo": "yeroo/agwinterm",
+  "tag": "latest",
+  "note": "The agwinterm release whose agwinterm_core.dll + agwinterm-ptyhost.exe this client is built against. tools/fetch-native.ps1 refuses a release whose published abiVersion is not the one src/main.cpp requires. Pin an explicit tag (e.g. v0.17.4) to make a build reproducible; 'latest' tracks the newest release."
+}

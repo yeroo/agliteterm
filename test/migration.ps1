@@ -11,7 +11,9 @@ param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
-$ctl = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
+. "$PSScriptRoot\ctl-path.ps1"
+$ctl = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
 $fail = 0
 function Check([string]$n, $ok, [string]$d = '') {
     if ([bool]$ok) { "  PASS  $n" } else { $script:fail++; "  FAIL  $n$(if ($d) { " - $d" })" }

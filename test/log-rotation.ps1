@@ -13,7 +13,9 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 }
 
 $dir  = "$env:LOCALAPPDATA\agliteterm"
-$ctl  = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
+. "$PSScriptRoot\ctl-path.ps1"
+$ctl  = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
 
 "== log-rotation =="
 

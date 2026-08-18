@@ -24,7 +24,9 @@ $ErrorActionPreference = 'Stop'
 # Pinned rather than assumed: with the native-command mapping on, that poll throws on its first
 # iteration and every cell fails for a reason that has nothing to do with restore.
 $PSNativeCommandUseErrorActionPreference = $false
-$ctl = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
+. "$PSScriptRoot\ctl-path.ps1"
+$ctl = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
 

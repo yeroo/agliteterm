@@ -30,7 +30,9 @@ public class FF {
 $pipe = 'logfoc'
 $dir  = "$env:LOCALAPPDATA\agliteterm"
 $log  = "$dir\agliteterm-$pipe.log"
-$ctl  = "$env:LOCALAPPDATA\Programs\agwinterm\agwintermctl.exe"
+. "$PSScriptRoot\ctl-path.ps1"
+$ctl  = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
 Remove-Item $log, "$dir\sessions-$pipe.tsv" -ErrorAction SilentlyContinue
 
 "== log-focus-font =="
