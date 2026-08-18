@@ -7,13 +7,18 @@
 # Runs against a THROWAWAY %LOCALAPPDATA%. Migration is a whole-profile, once-ever adoption keyed on
 # "does agliteterm have any session state yet", so it cannot be exercised in a profile that already
 # has some — and pointing it at the real one would both fail and scribble on real state.
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # In CI a skip is a failure: a check that reports success while verifying nothing
+    # is worse than one that is absent.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $fail = 0
 function Check([string]$n, $ok, [string]$d = '') {
     if ([bool]$ok) { "  PASS  $n" } else { $script:fail++; "  FAIL  $n$(if ($d) { " - $d" })" }

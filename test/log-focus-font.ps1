@@ -2,7 +2,12 @@
 #
 # "I can't type after switching sessions" was only pinned because GetGUIThreadInfo could be run live
 # on the dev machine. These lines make the same story readable from a laptop's log file.
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # In CI a skip is a failure: a check that reports success while verifying nothing
+    # is worse than one that is absent.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $fail = 0
@@ -32,7 +37,7 @@ $dir  = "$env:LOCALAPPDATA\agliteterm"
 $log  = "$dir\agliteterm-$pipe.log"
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl  = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 Remove-Item $log, "$dir\sessions-$pipe.tsv" -ErrorAction SilentlyContinue
 
 "== log-focus-font =="

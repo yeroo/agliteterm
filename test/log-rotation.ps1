@@ -3,7 +3,12 @@
 # Rotation matters because the log is always on: it must not grow without bound on a machine that
 # runs lite for weeks. Per-instance files matter because multi-window lite is one process per window
 # — a shared file would interleave several writers' lines and be unreadable.
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # In CI a skip is a failure: a check that reports success while verifying nothing
+    # is worse than one that is absent.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $fail = 0
@@ -15,7 +20,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 $dir  = "$env:LOCALAPPDATA\agliteterm"
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl  = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 
 "== log-rotation =="
 

@@ -5,7 +5,11 @@
 #   - always a sandbox instance (--pipe <name>); never the default instance, which owns real state
 #   - never inject global input (keybd_event/SendInput) — it lands wherever focus happens to be
 #   - capture windows with PrintWindow, never CopyFromScreen, which grabs whatever overlaps
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # Accepted so run-all can pass it uniformly; this check has nothing that can skip.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $fail = 0

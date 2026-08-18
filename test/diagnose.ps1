@@ -1,5 +1,9 @@
 # lite diagnostics — Task 4 checks: --diagnose must be a safe, useful one-shot report.
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # Accepted so run-all can pass it uniformly; this check has nothing that can skip.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $fail = 0

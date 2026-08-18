@@ -3,7 +3,12 @@
 # The point of these lines is the work-laptop report "restore doesn't work at all", which was
 # unanswerable because a failed save and a failed rebuild look identical from outside. The log now
 # distinguishes them, and this check pins the wording so it can't silently regress.
-param([string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe")
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # In CI a skip is a failure: a check that reports success while verifying nothing
+    # is worse than one that is absent.
+    [switch]$Strict
+)
 
 $ErrorActionPreference = 'Stop'
 $fail = 0
@@ -18,7 +23,7 @@ $log   = "$dir\agliteterm-$pipe.log"
 $state = "$dir\sessions-$pipe.tsv"
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl   = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 # The .bak and .tmp go too: since the save keeps a previous generation, leaving one behind means
 # run 1 is NOT a first run — it falls back to the last suite run's sessions and every count is off.
 Remove-Item $log, "$log.old", $state, "$state.bak", "$state.tmp" -ErrorAction SilentlyContinue

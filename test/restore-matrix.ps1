@@ -15,6 +15,7 @@
 # every cell (and any lite window already open) talks to the same agwinterm-ptyhost.exe. Don't run
 # the suite with a real lite window open — the last instance out shuts the host down.
 param(
+    [switch]$Strict,
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
     [string]$Only = ''          # run a single cell by name
 )
@@ -26,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
 

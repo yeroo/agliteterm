@@ -14,7 +14,10 @@
 #   - never inject global input — every action goes through the control pipe
 param(
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
-    [string]$Spec = "$PSScriptRoot\control-api.json"
+    [string]$Spec = "$PSScriptRoot\control-api.json",
+    # CI passes -Strict: a suite that skips is reporting success while checking nothing,
+    # which is worse than not running it at all. Locally a skip is the right answer.
+    [switch]$Strict
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +31,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
-if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit 0 }
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 
 # NOT back into $Spec: that parameter is typed [string], and PowerShell is case-insensitive, so
 # assigning the parsed object to $spec would silently ConvertTo-String it — $contract.steps then reads
