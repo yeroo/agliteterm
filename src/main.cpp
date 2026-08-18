@@ -5737,7 +5737,9 @@ static std::string ctlDispatch(const std::string& line) {
                        "\",\"name\":\"" + jsonEscape(narrow(insts[i2].name)) +
                        "\",\"open\":true,\"active\":" + (insts[i2].hwnd == fg ? "true" : "false") + "}";
             }
-            return ctlOk("[" + out + "]");
+            // WRAPPED in an object, matching agwinterm: a bare array breaks every script that reads
+            // .result.windows, and "same control API" is the promise this product ships on.
+            return ctlOk("{\"windows\":[" + out + "]}");
         }
         if (cmd == "window.new") {
             std::wstring nm = widen(req.get("args.name"));
@@ -5799,6 +5801,50 @@ static std::string ctlDispatch(const std::string& line) {
             if (nm.empty()) return ctlErr("rename needs a name");
             SetWindowTextW(w->hwnd, (L"agliteterm \x2014 " + widen(nm)).c_str());
             return ctlOkStr("renamed");
+        }
+        if (cmd == "window.zoom") {
+            ShowWindow(w->hwnd, IsZoomed(w->hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+            return ctlOkStr(IsZoomed(w->hwnd) ? "maximized" : "restored");
+        }
+        if (cmd == "window.move" || cmd == "window.resize") {
+            RECT rc; GetWindowRect(w->hwnd, &rc);
+            int x = rc.left, y = rc.top, cw = rc.right - rc.left, chh = rc.bottom - rc.top;
+            std::string sx = req.get("args.x"), sy = req.get("args.y"), sw = req.get("args.w"), sh = req.get("args.h");
+            if (!sx.empty()) x = atoi(sx.c_str());
+            if (!sy.empty()) y = atoi(sy.c_str());
+            if (!sw.empty()) cw = atoi(sw.c_str());
+            if (!sh.empty()) chh = atoi(sh.c_str());
+            SetWindowPos(w->hwnd, nullptr, x, y, cw, chh, SWP_NOZORDER | SWP_NOACTIVATE);
+            return ctlOkStr("ok");
+        }
+        if (cmd == "window.state") {
+            // agwinterm answers this for any window because all its windows share one process. Here
+            // each window IS a process, so the UI flags of another instance are not ours to report —
+            // asking it on its own pipe is the honest answer, not this window's flags with its name.
+            if (w->hwnd != g_hwnd)
+                return ctlErr("window '" + narrow(w->name) + "' is a separate process; ask it on its "
+                              "own pipe (agwintermctl --pipe " + narrow(w->name) + " window state)");
+            RECT rc; GetWindowRect(w->hwnd, &rc);
+            const std::wstring& aws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size())
+                                    ? g_workspaces[g_activeWs] : g_workspaces[0];
+            Session* fs = focusedSession();
+            return ctlOk(std::string("{") +
+                         "\"sidebarVisible\":" + (g_showSidebar ? "true" : "false") +
+                         // Always false, and not a stub: this client has no fullscreen mode at all,
+                         // so the field is reported honestly rather than omitted from the contract.
+                         ",\"fullscreen\":false"
+                         ",\"maximized\":" + (IsZoomed(w->hwnd) ? "true" : "false") +
+                         ",\"quickTerminalVisible\":" + ((g_quickHwnd && IsWindowVisible(g_quickHwnd)) ? "true" : "false") +
+                         ",\"activeWorkspace\":\"" + jsonEscape(narrow(aws)) + "\"" +
+                         ",\"activeSession\":\"" + jsonEscape(fs ? narrow(fs->name) : std::string()) + "\"" +
+                         // Beyond the contract, and kept: the geometry is what a tiling script wants,
+                         // and extra fields are allowed.
+                         ",\"name\":\"" + jsonEscape(narrow(w->name)) + "\"" +
+                         ",\"x\":" + std::to_string(rc.left) + ",\"y\":" + std::to_string(rc.top) +
+                         ",\"w\":" + std::to_string(rc.right - rc.left) +
+                         ",\"h\":" + std::to_string(rc.bottom - rc.top) +
+                         ",\"minimized\":" + (IsIconic(w->hwnd) ? "true" : "false") +
+                         ",\"active\":" + (GetForegroundWindow() == w->hwnd ? "true" : "false") + "}");
         }
         if (cmd == "window.zoom") {
             ShowWindow(w->hwnd, IsZoomed(w->hwnd) ? SW_RESTORE : SW_MAXIMIZE);

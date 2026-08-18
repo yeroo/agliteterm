@@ -30,6 +30,14 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
+      # The control-API contract is canonical in agwinterm and mirrored here. Two copies of a promise
+      # drift silently — both suites keep passing against their own stale idea of it — so the copies
+      # are compared on every build. Skips with a warning when the canonical copy is unreachable
+      # rather than passing quietly.
+      - name: Check the contract against agwinterm
+        shell: pwsh
+        run: ./tools/check-contract.ps1
+
       # The checks agwinterm's CI never ran — they drive the BUILT exe (lite has no C++ unit-test
       # harness), so they only ever ran on a developer machine. Making them a merge gate is the
       # point of having our own CI. They create real windows and real shells, so they are slower
