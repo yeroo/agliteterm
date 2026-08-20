@@ -151,23 +151,14 @@ public class AgbfPack {
 }
 '@
 
-# Glyphs that are physically WIDER than the cell they claim. The renderer scales these to fit rather
-# than cropping them (which used to bisect symbols — U+23FA rendered as a half circle), but fitting is
-# a mitigation: a scaled glyph is a SMALLER glyph. The real fix is in fonts/generate.py, which should
-# not rasterize past the cell in the first place.
+# Glyphs must FIT the cells they claim. The renderer clips at the cell edge, so a record that
+# overruns arrives on screen cut in half — U+23FA used to render as a half circle.
 #
-# So these are a ratchet, not an assertion of health. The numbers below are today's known-bad state;
-# a regeneration that makes any of them worse fails here. Lower them as the packs improve.
-$overflowBudget = @{
-    'agwin-bitmap-14.agbf'          = 2671
-    'agwin-bitmap-16.agbf'          = 80
-    'agwin-bitmap-18.agbf'          = 82
-    'agwin-bitmap-20.agbf'          = 139
-    'agwin-bitmap-complete-14.agbf' = 17906
-    'agwin-bitmap-complete-16.agbf' = 7743
-    'agwin-bitmap-complete-18.agbf' = 7749
-    'agwin-bitmap-complete-20.agbf' = 7890
-}
+# This was a ratchet over a known-bad state (2671 overflowing records in bitmap-14 alone). The packs
+# were then regenerated with fonts/generate.py fitting each glyph at rasterization time, so the
+# budget is now ZERO and stays there: the generator asserts the same invariant, and this is the
+# check that catches a pack built by an older generator being committed by hand.
+$overflowBudget = 0
 
 $packs = @(
     @{ Name = 'agwin-bitmap-14.agbf';          Strike = 14; Complete = $false }
@@ -194,9 +185,7 @@ foreach ($p in $packs) {
         if ($r.W -eq 0) { continue }
         if (($r.Bx + $r.W) -gt ($r.CellW * $pack.CellW) -or $r.Bx -lt 0) { $over++ }
     }
-    $budget = $overflowBudget[$p.Name]
-    Check ("{0,-30} cell overflow <= {1}" -f $p.Name, $budget) ($over -le $budget) "$over glyphs overflow their cell"
-    if ($over -lt $budget) { "        (improved: $over, budget $budget - lower it)" }
+    Check ("{0,-30} every glyph fits its cell" -f $p.Name) ($over -eq $overflowBudget) "$over glyphs overflow"
 }
 
 if ($fail) { "agbf-packs: $fail FAILED"; exit 1 }
