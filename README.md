@@ -134,6 +134,26 @@ state
 Use `--pipe <instance> --diagnose` to ask about a named instance — it reports *that* instance's
 state file, which is the one its window restores from.
 
+## The other one: agwinterm
+
+**[agwinterm](https://github.com/yeroo/agwinterm)** is the full terminal this one is a sibling of —
+C#/.NET on Win32 + Direct2D, custom-drawn chrome, any TrueType font with ligatures, images and
+sixel, a dashboard, profiles, themes, and the complete control API. If your machine can afford it,
+take that one; agliteterm exists for the machines that cannot.
+
+Neither is a cut-down build of the other. They are separate programs that agreed on an interface,
+and the agreement is enforced rather than promised: `test/control-api.json` here mirrors the
+canonical contract in agwinterm, `tools/check-contract.ps1` compares them on every build, and both
+repositories run the same conformance steps in CI. It has already caught real drift in both
+directions.
+
+The emulator core and pty-host are agwinterm's, consumed here as ABI-pinned release artifacts — see
+[Building](#building).
+
+Both are by [Boris Kudriashov](https://github.com/yeroo), and both owe their design to
+**[umputun's agterm](https://github.com/umputun/agterm)**, the macOS terminal that treated AI coding
+agents as first-class citizens first. 💜
+
 ## Building
 
 Needs MSVC with the **VC++ ATL component** (WTL rides on the ATL headers):
