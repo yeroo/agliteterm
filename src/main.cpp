@@ -30,6 +30,7 @@
 #include <algorithm>    // std::stable_sort (command-palette ranking)
 #include <string>
 #include <vector>
+#include <deque>
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
 // Header-only over Win32: same window messages and the same native controls underneath, but with
@@ -135,6 +136,10 @@ static bool g_isDefaultInstance = true;
 // the state directory own fonts, colours, keybindings and saved sessions.
 // The diagnostics log is defined further down; migrateFromLegacy (just below) reports through it.
 static void logInfo(const char* fmt, ...);
+// fwd: the control-API event bus is defined with the rest of the control code, but the places
+// that have something to report (session created, status changed) come long before it.
+static void emitEvent(const char* type, const std::string& session = {}, const std::string& info = {});
+static std::string installAgentSkill();   // fwd: the Help menu offers it, the control API too
 static void logWarn(const char* fmt, ...);
 static const wchar_t* kProduct       = L"agliteterm";
 static const wchar_t* kRegKey        = L"Software\\agliteterm";
@@ -815,7 +820,7 @@ enum { IDM_NEW = 1, IDM_CLOSE = 2, IDM_SPLIT = 3, IDM_NEXT = 4, IDM_COPY = 5, ID
        IDM_QUICK = 120, IDM_SCRATCH = 121, IDM_REOPEN = 122,
        IDM_TG_SIDEBAR = 123, IDM_TG_TOOLBAR = 124, IDM_TG_STATUS = 125,
        IDM_FLAG = 126, IDM_FLAGVIEW = 127, IDM_ATTENTION = 128, IDM_FOCUSWS = 129, IDM_PALETTE = 130,
-       IDM_UPDATE = 131 };
+       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132 };
 #define IDM_MOVE_BASE 300   // "Move to workspace <w>" = IDM_MOVE_BASE + w
 enum { ID_TREE = 200, ID_TRAY = 201, ID_TOOLBAR = 202, ID_STATUS = 203 };
 
@@ -924,6 +929,7 @@ static const PalAction kPalActions[] = {
     { L"Keyboard…",           IDM_KEYBOARD,   -1,           -1 },
     { L"Properties…",         IDM_PROPERTIES, -1,           -1 },
     { L"Check for Updates",        IDM_UPDATE,     -1,           -1 },
+    { L"Install Agent Skill",      IDM_INSTALLSKILL, -1,         -1 },
     { L"Restart Everything",       IDM_RESTART,    -1,           -1 },
     { L"About agliteterm",         IDM_ABOUT,      -1,           -1 },
     { L"Exit",                     IDM_EXIT,       -1,           -1 },
@@ -1594,6 +1600,8 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr);
     EnterCriticalSection(&g_lock);
     g_sessions.push_back(s);
+    emitEvent("session", s->id, "created");
+    emitEvent("tree");
     g_userEmptied = false;   // the window has sessions again: a later empty list is transient, not deliberate
     LeaveCriticalSection(&g_lock);
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // add the session to the tree (UI thread)
@@ -1679,7 +1687,9 @@ static void closeSessionAt(int idx) {
     // popup's, which lives in its own window — so the pane indices can no longer answer this.
     const Session* splitShell = (g_pane[1] >= 0 && g_pane[1] < (int)g_sessions.size() && g_pane[1] != idx)
                                 ? g_sessions[g_pane[1]] : nullptr;
+    emitEvent("session", g_sessions[idx]->id, "closed");
     g_sessions.erase(g_sessions.begin() + idx);
+    emitEvent("tree");
     for (int p = 0; p < 2; p++) {
         if (g_pane[p] == idx) g_pane[p] = g_sessions.empty() ? -1 : max(0, idx - 1);
         else if (g_pane[p] > idx) g_pane[p]--;
@@ -3155,6 +3165,7 @@ static void sendUtf8(wchar_t wc) {
         Session* s = focusedSession();
         if (s && statusClass(s->status) == AGST_WORKING) {
             s->status = "idle";
+            emitEvent("status", s->id, "idle");
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         }
     }
@@ -3833,6 +3844,7 @@ static HMENU buildMenuBar() {
     AppendMenuW(view, MF_STRING | (g_showStatus ? MF_CHECKED : 0), IDM_TG_STATUS, L"Status &Bar");
     // Font selection lives in File -> Properties now (no separate View -> Font submenu).
     HMENU help = CreatePopupMenu();
+    AppendMenuW(help, MF_STRING, IDM_INSTALLSKILL, L"Install Agent &Skill…");
     AppendMenuW(help, MF_STRING, IDM_UPDATE, L"Check for &Updates…");
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About agliteterm");
     HMENU bar = CreateMenu();
@@ -5422,6 +5434,14 @@ public:
             case IDM_SHOW: showMainWindow(); break;
             case IDM_EXIT: DestroyWindow(); break;
             case IDM_UPDATE: updCheck(true); break;
+            case IDM_INSTALLSKILL: {
+                // Teaches Claude Code / Codex to drive THIS terminal. Explicit rather than
+                // automatic: it writes into the user's ~/.claude, which is not ours to touch
+                // on their behalf at startup.
+                std::string r = installAgentSkill();
+                ::MessageBoxW(g_hwnd, widen(r).c_str(), L"agliteterm", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
             case IDM_ABOUT: {
                 std::wstring about = L"agliteterm " + updVersion() +
                                      L"\nA lightweight native terminal over the Rust pty-host.";
@@ -5470,6 +5490,28 @@ static CMainFrame g_frame;
 // An ambiguous name resolves to NOTHING rather than to the first match: two panes can share a name,
 // and silently typing into the wrong terminal is worse than refusing. resolveTargetWhy() spells that
 // out for the caller instead of leaving them to guess.
+// ---- control-API event bus -------------------------------------------------------------------
+// A bounded, cursor-polled log of what happened: status changes, session lifecycle, tree edits.
+// An agent that can only read the screen has to poll and diff it to notice a command finished;
+// this lets it ask "what changed since cursor N" instead. Same shape as the full app, so one
+// script works against both.
+//
+// Emitted from the UI thread AND the reader threads; polled from the pipe thread. Hence its own
+// lock rather than g_lock, which is already held across emulator work when a status changes.
+struct CtlEvent { long long seq; std::string type, session, info; };
+static CRITICAL_SECTION g_evtLock;
+static std::deque<CtlEvent> g_evtLog;
+static long long g_evtSeq = 0;
+static bool g_evtReady = false;
+
+static void emitEvent(const char* type, const std::string& session, const std::string& info) {
+    if (!g_evtReady) return;             // before initControl(): nothing is polling yet
+    EnterCriticalSection(&g_evtLock);
+    g_evtLog.push_back({ ++g_evtSeq, type, session, info });
+    while (g_evtLog.size() > 1000) g_evtLog.pop_front();   // bounded history, oldest first
+    LeaveCriticalSection(&g_evtLock);
+}
+
 static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
     if (target.empty() || target == "active") return focusedSession();
     for (Session* s : g_sessions)
@@ -5491,9 +5533,13 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
     return nullptr;
 }
 
-static std::string dumpBufferText(Session* s) {
+// Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
+// scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
+// mark's outputLine..endLine can be handed straight in.
+static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) {
     FfiEmuInfo info{};
     std::string out;
+    int64_t abs = 0;
     EnterCriticalSection(&g_lock);
     emu_info(s->emu, &info);
     std::vector<FfiCell> row(info.cols);
@@ -5517,14 +5563,189 @@ static std::string dumpBufferText(Session* s) {
         out += line;
         out += '\n';
     };
-    for (uint32_t h = 0; h < info.historyCount; h++)
-        if (emu_copy_history_row(s->emu, h, row.data(), info.cols)) appendRow(row.data());
+    auto wanted = [&](int64_t line) { return from < 0 || (line >= from && line <= to); };
+    for (uint32_t h = 0; h < info.historyCount; h++, abs++)
+        if (wanted(abs) && emu_copy_history_row(s->emu, h, row.data(), info.cols)) appendRow(row.data());
     if (s->grid.size() >= (size_t)info.cols * info.rows)
-        for (uint32_t r = 0; r < info.rows; r++) appendRow(&s->grid[r * info.cols]);
+        for (uint32_t r = 0; r < info.rows; r++, abs++)
+            if (wanted(abs)) appendRow(&s->grid[r * info.cols]);
     LeaveCriticalSection(&g_lock);
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
     return out;
 }
+static std::string dumpBufferText(Session* s) { return dumpBufferRange(s, -1, -1); }
+
+// The output of the last COMPLETED command, delimited by the shell's FTCS (OSC 133) marks.
+// This is what an agent needs after asking a terminal to do something: not the whole screen,
+// and not a guess at which lines were the answer.
+//
+// It depends on the shell emitting 133;A/B/C/D. Without that there are no marks at all, and
+// saying so beats returning "" — which reads as "the command printed nothing".
+static std::string lastCommandOutput(Session* s, bool* haveMarks) {
+    FfiEmuInfo info{};
+    EnterCriticalSection(&g_lock);
+    emu_info(s->emu, &info);
+    std::vector<FfiMark> marks(info.markCount ? info.markCount : 1);
+    uint32_t nm = info.markCount ? emu_marks(s->emu, marks.data(), info.markCount) : 0;
+    LeaveCriticalSection(&g_lock);
+
+    const FfiMark* last = nullptr;
+    for (uint32_t k = 0; k < nm; k++)
+        if (marks[k].endLine >= 0) last = &marks[k];   // completed only: a running command has no end
+    *haveMarks = last != nullptr;
+    if (!last) return {};
+
+    // Output starts after the command's input row: 133;C when the shell emits it, else the line
+    // after 133;B, else after the prompt. Mirrors the full app so both answer the same question.
+    int64_t from = last->outputLine >= 0 ? last->outputLine
+                 : last->commandLine >= 0 ? last->commandLine + 1
+                 : last->promptLine + 1;
+    if (from > last->endLine - 1) return {};          // the command printed nothing
+    return dumpBufferRange(s, from, last->endLine - 1);
+}
+
+// ---- bundled agent skill --------------------------------------------------------------------
+// A SKILL.md that teaches Claude Code / Codex to drive THIS terminal. It documents only the verbs
+// agliteterm actually implements, and says plainly which of the full app's it does not.
+//
+// That restraint is the whole point. agwinterm's skill teaches events/output/search/command.run/
+// notify/install.*, and an agent following it against this client walked straight into
+// "unknown command '...' (lite subset)" — which reads as a broken terminal rather than a smaller
+// one. A skill that overpromises is worse than no skill.
+static const char* kSkillMarkdown = R"SKILL(---
+name: agliteterm
+description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, and poll for events - via the agwintermctl CLI or its control pipe.
+---
+
+# agliteterm
+
+agliteterm is a small native Windows terminal from the agwinterm family. It speaks the same
+control API as the full app, over the same `agwintermctl` CLI, with a smaller verb set.
+
+## Detect
+
+You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteterm`.
+
+- `AGWINTERM_SESSION_ID` - your session id, and the default target when you pass none
+- `AGWINTERM_PANE_ID` - same value; use it when you specifically mean the pane
+- `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
+
+The variables keep the `AGWINTERM_` prefix on purpose: the same hooks and scripts work in both
+products.
+
+## Targeting a session
+
+`--target` takes an id, an id prefix (4+ chars), or a session NAME. A name that matches more than
+one session is refused rather than guessed - ask `tree --json` and target an id instead.
+
+```
+agwintermctl session type "npm test" --target build      # by name
+agwintermctl tree --json                                 # ids, names, status, flags, unread
+```
+
+## Report your status - do this, it is the point
+
+The sidebar shows a per-session cue, so the user can see at a glance which agent needs them:
+
+```
+agwintermctl session status working     # busy
+agwintermctl session status blocked     # waiting for the user
+agwintermctl session status idle        # done
+```
+
+## Run something in a session
+
+One call creates the session, names it, and runs the command as its shell:
+
+```
+agwintermctl session new --name build --command "npm test" --cwd C:\src\app
+```
+
+For a session that already exists, type into it (`\n` is sent as Enter):
+
+```
+agwintermctl session type "npm test`n" --target build
+```
+
+## Find out what happened
+
+Two ways, and prefer the first:
+
+```
+agwintermctl events --since <cursor>            # what changed; the reply carries the new cursor
+agwintermctl session output --target build      # the last COMPLETED command's output
+agwintermctl session text --target build        # the whole buffer, when you need context
+```
+
+`events` is cursor-polled: start with `agwintermctl events` to get a cursor, then pass it as
+`--since`. Event types are `session` (info: created/closed), `status` (info: the new status), and
+`tree`. The reply always carries the current cursor, even when nothing happened, so a quiet
+terminal still moves you forward.
+
+`session output` needs FTCS shell integration (OSC 133) in the shell. Without it you get
+"no completed command marks" rather than a wrong answer - fall back to `session text`.
+
+## Sessions, workspaces, windows
+
+```
+agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay
+agwintermctl session copy|paste|type|text|output|status
+agwintermctl workspace new|rename|select|delete|collapse|expand|focus
+agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
+agwintermctl tree --json | ping | sidebar on|off|toggle | quick on|off|toggle
+```
+
+Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
+`window list` enumerates them.
+
+## What this terminal does NOT have
+
+Do not reach for these - they exist in the full agwinterm and will be refused here with
+"unknown command '<verb>' (lite subset)":
+
+`session search`, `session readonly`, `session bind`, `session restore`, `session background`,
+`command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
+`config get|set|list`, `profiles list|reload`, `theme list|set`, `omp list|set`, `image show|sixel`,
+`font`, `keymap reload`, `selection *`, `restore clear`, `install hooks|shell|cli`, `claude *`.
+
+For anything not listed as available, drive the shell directly with `session type` and read the
+result with `session output` or `session text`.
+)SKILL";
+
+// Written next to the other tools' skills so an agent self-discovers it. Copy-per-tool rather than
+// one shared file: each tool owns its own directory, and a missing tool is skipped rather than
+// created (installing into ~/.codex for someone who does not use Codex is litter).
+static std::string installAgentSkill() {
+    wchar_t home[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) return "cannot resolve %USERPROFILE%";
+    int written = 0;
+    std::string where, looked;
+    for (const wchar_t* tool : { L".claude", L".codex" }) {
+        std::wstring base = std::wstring(home) + L"\\" + tool;
+        if (!looked.empty()) looked += ", ";
+        looked += narrow(base);
+        if (GetFileAttributesW(base.c_str()) == INVALID_FILE_ATTRIBUTES) continue;   // tool not installed
+        std::wstring dir = base + L"\\skills";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"\\agliteterm";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::wstring file = dir + L"\\SKILL.md";
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        DWORD wr = 0;
+        bool ok = WriteFile(h, kSkillMarkdown, (DWORD)strlen(kSkillMarkdown), &wr, nullptr) && wr == strlen(kSkillMarkdown);
+        CloseHandle(h);
+        if (!ok) continue;
+        written++;
+        if (!where.empty()) where += ", ";
+        where += narrow(file);
+    }
+    // Name the paths that were checked. "Not found" without a path sends the reader looking in the
+    // wrong home directory, which is exactly what happened the first time this ran under a test.
+    if (!written) return "no agent tool directory found - looked in: " + looked;
+    return "installed the agliteterm skill to " + std::to_string(written) + " location(s): " + where;
+}
+
 
 static std::string ctlDispatch(const std::string& line) {
     JsonReq req;
@@ -5609,6 +5830,37 @@ static std::string ctlDispatch(const std::string& line) {
             ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size());
         return ctlOkStr("typed");
     }
+    if (cmd == "install.skill") return ctlOkStr(installAgentSkill());
+    if (cmd == "events") {
+        // Cursor-polled: pass the cursor from the previous reply as --since and get only what is
+        // new. The reply always carries the CURRENT cursor, even when the list is empty, so a
+        // caller that polls a quiet terminal still moves forward instead of re-reading history.
+        long long since = atoll(req.get("args.since").c_str());
+        int limit = atoi(req.get("args.limit").c_str());
+        std::string items;
+        long long cursor;
+        EnterCriticalSection(&g_evtLock);
+        cursor = g_evtSeq;
+        int n = 0;
+        for (const CtlEvent& e : g_evtLog) {
+            if (e.seq <= since) continue;
+            if (limit > 0 && n >= limit) break;
+            if (n++) items += ",";
+            items += "{\"seq\":" + std::to_string(e.seq) + ",\"type\":\"" + jsonEscape(e.type) + "\"";
+            if (!e.session.empty()) items += ",\"session\":\"" + jsonEscape(e.session) + "\"";
+            if (!e.info.empty()) items += ",\"info\":\"" + jsonEscape(e.info) + "\"";
+            items += "}";
+        }
+        LeaveCriticalSection(&g_evtLock);
+        return ctlOk("{\"cursor\":" + std::to_string(cursor) + ",\"events\":[" + items + "]}");
+    }
+    if (cmd == "session.output") {
+        if (!target) return ctlErr("session not found");
+        bool haveMarks = false;
+        std::string res = lastCommandOutput(target, &haveMarks);
+        if (!haveMarks) return ctlOkStr("no completed command marks (FTCS shell integration not active?)");
+        return ctlOkStr(res);
+    }
     if (cmd == "session.text") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         return ctlOkStr(dumpBufferText(target));
@@ -5618,6 +5870,7 @@ static std::string ctlDispatch(const std::string& line) {
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
         target->status = st;
+        emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label
         return ctlOkStr("status set");
@@ -6354,6 +6607,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     migrateFromLegacy();
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_reqLock);
+    InitializeCriticalSection(&g_evtLock);
+    g_evtReady = true;   // from here on, anything worth reporting goes into the event log
     loadCore();
 
     // Bundled fonts (process-private): Meslo Nerd (default TrueType), plus the optional bitmap fonts
