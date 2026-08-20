@@ -2524,14 +2524,40 @@ static void agbfPaintGrid(HDC mem, RECT pr, const FfiCell* view, const FfiEmuInf
                     bool color = (rec->flags & 16) != 0;        // emoji: BGRA rows, own colors
                     size_t stride = color ? (size_t)rec->w * 4 : onebit ? ((size_t)rec->w + 7) / 8 : rec->w;
                     int passes = (attrs & kAttrBold) && !color ? 2 : 1;   // synthetic bold: 1px overstrike
+                    // Some records are rasterized WIDER than the cell they claim: U+2714 is 17px in a
+                    // 10px cell, U+2B24 15px, U+23FA 12px. Clipping at the cell edge cut them in half —
+                    // a bisected symbol, which is what "strange glyphs rendered in half" looked like.
+                    // (agwin-bitmap-14 is the worst: 2671 of 3840 records run past their 8px cell.)
+                    //
+                    // So an oversized glyph is SCALED to fit rather than cropped. Only when it actually
+                    // overruns by a visible amount: a 1px overhang is invisible, and resampling a bitmap
+                    // font needlessly is exactly how a crisp pack starts looking mushy.
+                    int inkR = rec->bx + (int)rec->w;
+                    bool fit = inkR > cellPx + 1;
+                    int sw = rec->w, sh = rec->h, sbx = rec->bx, sby = rec->by;
+                    if (fit) {
+                        // Uniform scale, bottom-anchored so the glyph keeps sitting on its baseline,
+                        // then centred in the cell. Squashing one axis would turn a circle into an egg.
+                        sw = max(1, (int)rec->w * cellPx / inkR);
+                        sh = max(1, (int)rec->h * cellPx / inkR);
+                        sbx = (cellPx - sw) / 2;
+                        sby = rec->by + (int)rec->h - sh;
+                    }
                     for (int p = 0; p < passes; p++)
-                        for (int gy = 0; gy < rec->h; gy++) {
-                            int py = y0 + rec->by + gy;
+                        for (int dy = 0; dy < sh; dy++) {
+                            int py = y0 + sby + dy;
                             if (py < y0 || py >= y0 + ch) continue;
+                            // Nearest-neighbour back-mapping. Iterating DESTINATION pixels is what makes a
+                            // downscale work at all: walking the source would skip destination rows and
+                            // leave a comb pattern through the glyph.
+                            int gy = fit ? dy * (int)rec->h / sh : dy;
+                            if (gy < 0 || gy >= (int)rec->h) continue;
                             const uint8_t* src = g_agbfPack.atlas + rec->off + (size_t)gy * stride;
-                            for (int gx = 0; gx < rec->w; gx++) {
-                                int px = x0 + rec->bx + gx + p;
+                            for (int dx2 = 0; dx2 < sw; dx2++) {
+                                int px = x0 + sbx + dx2 + p;
                                 if (px < x0 || px >= x0 + cellPx) continue;
+                                int gx = fit ? dx2 * (int)rec->w / sw : dx2;
+                                if (gx < 0 || gx >= (int)rec->w) continue;
                                 uint32_t a = color ? src[gx * 4 + 3]
                                            : onebit ? ((src[gx >> 3] & (0x80u >> (gx & 7))) ? 255u : 0u)
                                            : src[gx];

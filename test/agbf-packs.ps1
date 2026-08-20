@@ -151,6 +151,24 @@ public class AgbfPack {
 }
 '@
 
+# Glyphs that are physically WIDER than the cell they claim. The renderer scales these to fit rather
+# than cropping them (which used to bisect symbols — U+23FA rendered as a half circle), but fitting is
+# a mitigation: a scaled glyph is a SMALLER glyph. The real fix is in fonts/generate.py, which should
+# not rasterize past the cell in the first place.
+#
+# So these are a ratchet, not an assertion of health. The numbers below are today's known-bad state;
+# a regeneration that makes any of them worse fails here. Lower them as the packs improve.
+$overflowBudget = @{
+    'agwin-bitmap-14.agbf'          = 2671
+    'agwin-bitmap-16.agbf'          = 80
+    'agwin-bitmap-18.agbf'          = 82
+    'agwin-bitmap-20.agbf'          = 139
+    'agwin-bitmap-complete-14.agbf' = 17906
+    'agwin-bitmap-complete-16.agbf' = 7743
+    'agwin-bitmap-complete-18.agbf' = 7749
+    'agwin-bitmap-complete-20.agbf' = 7890
+}
+
 $packs = @(
     @{ Name = 'agwin-bitmap-14.agbf';          Strike = 14; Complete = $false }
     @{ Name = 'agwin-bitmap-16.agbf';          Strike = 16; Complete = $false }
@@ -170,6 +188,15 @@ foreach ($p in $packs) {
     Check ("{0,-30} structure" -f $p.Name) ($null -eq $why) $why
     $why = $pack.CheckCoverage($p.Complete)
     Check ("{0,-30} coverage" -f $p.Name) ($null -eq $why) $why
+
+    $over = 0
+    foreach ($r in $pack.Recs) {
+        if ($r.W -eq 0) { continue }
+        if (($r.Bx + $r.W) -gt ($r.CellW * $pack.CellW) -or $r.Bx -lt 0) { $over++ }
+    }
+    $budget = $overflowBudget[$p.Name]
+    Check ("{0,-30} cell overflow <= {1}" -f $p.Name, $budget) ($over -le $budget) "$over glyphs overflow their cell"
+    if ($over -lt $budget) { "        (improved: $over, budget $budget - lower it)" }
 }
 
 if ($fail) { "agbf-packs: $fail FAILED"; exit 1 }
