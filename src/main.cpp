@@ -373,6 +373,8 @@ static bool g_haveTerminus = false, g_haveSpleen = false, g_haveUnscii = false, 
 static bool g_haveAgbf = false;     // agwin-bitmap-16.agbf found next to the exe
 static bool g_haveAgbfC = false;    // agwin-bitmap-complete-16.agbf found next to the exe
 static HFONT g_uiFont;          // shell UI font (Segoe UI) for the toolbar buttons
+static HFONT g_treeFont;        // sidebar font — the shell UI face at g_treeFontPt (0 = system size)
+static int   g_treeFontPt = 0;  // sidebar point size; 0 means "whatever the shell says", the default
 static bool g_customColors = false;   // Properties->Colors: override the terminal's default fg/bg
 static uint32_t g_defFg = 0xC0C0C0;   // packed 0xRRGGBB, legacy cmd.exe light gray on...
 static uint32_t g_defBg = 0x000000;   // ...black
@@ -1906,6 +1908,9 @@ static void loadColors() {   // Properties->Colors overrides (default fg/bg + on
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_dosPalette = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= TH_CLASSIC) g_themeMode = (int)v;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v >= 90 && v <= 900) g_sidebarW = v;
+    // 0 = follow the shell. The range is clamped rather than trusted: this is a font height, and a
+    // hand-edited 2000 would make the sidebar a single unreadable row.
+    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (v == 0 || (v >= 6 && v <= 24))) g_treeFontPt = (int)v;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowSidebar", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showSidebar = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showToolbar = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showStatus = v != 0;
@@ -1939,6 +1944,7 @@ static void saveColors() {
     v = g_dosPalette ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", REG_DWORD, &v, sizeof(v));
     v = (DWORD)g_themeMode;   RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", REG_DWORD, &v, sizeof(v));
     v = g_sidebarW; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", REG_DWORD, &v, sizeof(v));
+    v = (DWORD)g_treeFontPt; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", REG_DWORD, &v, sizeof(v));
     v = g_showSidebar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowSidebar", REG_DWORD, &v, sizeof(v));
     v = g_showToolbar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", REG_DWORD, &v, sizeof(v));
     v = g_showStatus ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", REG_DWORD, &v, sizeof(v));
@@ -3927,12 +3933,14 @@ static const COLORREF kConsolePalette[16] = {
     RGB(128,128,128),RGB(0,0,255),  RGB(0,255,0),   RGB(0,255,255),
     RGB(255,0,0),   RGB(255,0,255), RGB(255,255,0), RGB(255,255,255),
 };
-enum { PID_FONTLIST = 3001, PID_SIZECOMBO = 3002, PID_THEME = 3003, PID_USECOLORS = 3030, PID_TEXT = 3010, PID_BG = 3011, PID_APPLY = 3020, PID_DOSPAL = 3031 };
+enum { PID_FONTLIST = 3001, PID_SIZECOMBO = 3002, PID_THEME = 3003, PID_USECOLORS = 3030, PID_TEXT = 3010, PID_BG = 3011, PID_APPLY = 3020, PID_DOSPAL = 3031, PID_SIDEFONT = 3004 };
 static const int SW_X0 = 16, SW_Y = 186, SW = 20, SW_GAP = 22;   // swatch grid geometry (WM_PAINT + hit-test)
 static const wchar_t* kThemeNames[4] = { L"Auto (follow Windows)", L"Dark", L"Light", L"Classic" };
 // Working copies edited by the dialog; committed to the globals on OK/Apply.
 static int g_pFace, g_pSize, g_pTheme; static uint32_t g_pFg, g_pBg; static int g_pTarget; static bool g_pUse, g_pDos;
-static HFONT g_pPrev; static HWND g_pHwnd, g_pSizeCombo;
+static void applyTreeFont();   // fwd: propCommit applies the sidebar size, defined with the tree
+static HFONT g_pPrev; static HWND g_pHwnd, g_pSizeCombo, g_pSideFontCombo;
+static int g_pSidePt;   // pending sidebar point size (0 = follow the shell)
 
 // ---- owner-drawn dialog buttons ---------------------------------------------------------------
 // Roles are known by id; check/radio state lives in the working copies (the buttons are plain
@@ -4090,6 +4098,7 @@ static void fillSizeCombo(int sel) {   // sizes for the current face; disabled i
 static void propCommit() {
     pickFont(g_pFace, g_pSize);   // applies the font, persists face+size
     g_customColors = g_pUse; g_defFg = g_pFg; g_defBg = g_pBg; g_dosPalette = g_pDos;
+    if (g_pSidePt != g_treeFontPt) { g_treeFontPt = g_pSidePt; applyTreeFont(); relayout(); }
     if (g_pTheme != g_themeMode) {   // theme switch: re-skin everything live, incl. this open dialog
         g_themeMode = g_pTheme;
         applyTheme();
@@ -4107,6 +4116,12 @@ static LRESULT CALLBACK propDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             switch (LOWORD(w)) {
                 case PID_THEME:
                     if (HIWORD(w) == CBN_SELCHANGE) g_pTheme = (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
+                    break;
+                case PID_SIDEFONT:
+                    if (HIWORD(w) == CBN_SELCHANGE) {
+                        int i = (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
+                        g_pSidePt = (i <= 0) ? 0 : 8 + i - 1;   // item 0 is "System default"
+                    }
                     break;
                 case PID_FONTLIST:
                     if (HIWORD(w) == LBN_SELCHANGE) {
@@ -4231,6 +4246,19 @@ static void showPropertiesDialog() {
     SendMessageW(th, CB_SETCURSEL, g_pTheme, 0);
     SetWindowSubclass(th, comboProc, 1, 0);              // themed closed-field paint (v5 combo)
     SetWindowSubclass(g_pSizeCombo, comboProc, 1, 0);
+    // Sidebar text size. Separate from the terminal font on purpose: the terminal face is a raster
+    // pack that only exists at its strike sizes, while the sidebar is ordinary UI text that can be
+    // any size — and wanting a bigger session list is not wanting a bigger terminal.
+    mk(L"STATIC", L"Sidebar text:", 0, 16, 344, 80, 16, 0);
+    g_pSideFontCombo = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 100, 340, 156, 220, PID_SIDEFONT);
+    SendMessageW(g_pSideFontCombo, CB_ADDSTRING, 0, (LPARAM)L"System default");
+    for (int pt = 8; pt <= 20; pt++) {
+        wchar_t lbl[16]; wsprintfW(lbl, L"%d pt", pt);
+        SendMessageW(g_pSideFontCombo, CB_ADDSTRING, 0, (LPARAM)lbl);
+    }
+    g_pSidePt = g_treeFontPt;
+    SendMessageW(g_pSideFontCombo, CB_SETCURSEL, g_pSidePt ? (g_pSidePt - 8 + 1) : 0, 0);
+    SetWindowSubclass(g_pSideFontCombo, comboProc, 1, 0);
     mk(L"BUTTON", L"OK", BS_OWNERDRAW, 120, 408, 78, 26, IDOK);
     mk(L"BUTTON", L"Cancel", BS_OWNERDRAW, 204, 408, 78, 26, IDCANCEL);
     mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 288, 408, 78, 26, PID_APPLY);
@@ -4665,6 +4693,33 @@ static void endTreeDrag(bool drop, POINT treePt) {   // treePt in TREE-client co
 // Drag & drop lives in a tree subclass: comctl32's own TVN_BEGINDRAG detection proved unreliable
 // with TVS_EDITLABELS in play, so the press/threshold/move/drop loop is ours — the same
 // deterministic approach as the rest of this port. All coordinates are tree-client.
+// The sidebar font: the shell UI FACE at a chosen point size, never a stock object. The tree was
+// on DEFAULT_GUI_FONT, which is a bitmap face that ignores the user's shell font entirely and looks
+// nothing like the rest of the window. Size 0 keeps whatever the shell says, so the default still
+// tracks a system that has been set to large text.
+static void applyTreeFont() {
+    NONCLIENTMETRICSW ncm{ sizeof(ncm) };
+    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) return;
+    LOGFONTW lf = ncm.lfMessageFont;
+    if (g_treeFontPt > 0) {
+        HDC dc = GetDC(nullptr);
+        lf.lfHeight = -MulDiv(g_treeFontPt, GetDeviceCaps(dc, LOGPIXELSY), 72);
+        ReleaseDC(nullptr, dc);
+    }
+    // OUT_TT_PRECIS + CLEARTYPE: a TrueType face, antialiased — the point of not using the stock font.
+    lf.lfOutPrecision = OUT_TT_PRECIS;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    HFONT old = g_treeFont;
+    g_treeFont = CreateFontIndirectW(&lf);
+    if (g_tree && g_treeFont) {
+        SendMessageW(g_tree, WM_SETFONT, (WPARAM)g_treeFont, TRUE);
+        // The row height follows the font, and the tree only recomputes it on a real relayout.
+        TreeView_SetItemHeight(g_tree, -1);
+        InvalidateRect(g_tree, nullptr, TRUE);
+    }
+    if (old) DeleteObject(old);   // after the swap: deleting a font still selected paints nothing
+}
+
 static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR) {
     if (m == WM_NCDESTROY) RemoveWindowSubclass(h, treeProc, id);
     switch (m) {
@@ -4679,6 +4734,21 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
                 ::PostMessageW(g_hwnd, WM_APP_FOCUSTERM, 0, 0);
             } else {
                 logInfo("focus: sidebar keeps focus (inline rename in progress)");
+            }
+            break;
+        case WM_CHAR:
+            // A TreeView's type-ahead SELECTS A ROW, and in this sidebar selecting a row switches
+            // session. So a stray keystroke while the sidebar happens to hold focus does not merely
+            // go to the wrong place — it moves the user to a terminal they were not looking at, and
+            // the rest of what they type lands there. The WM_SETFOCUS bounce above cannot catch this
+            // on its own: it only fires when the tree RECEIVES focus, never when it already has it.
+            //
+            // So printable input is handed to the shell instead, which is what the person typing
+            // meant. Renaming is the one case that legitimately wants these keys.
+            if (!g_treeRenaming && !TreeView_GetEditControl(h)) {
+                ::PostMessageW(g_hwnd, WM_APP_FOCUSTERM, 0, 0);
+                ::PostMessageW(g_hwnd, WM_CHAR, w, l);
+                return 0;                       // swallowed: no type-ahead, no session switch
             }
             break;
         case WM_LBUTTONDOWN: {
@@ -4966,6 +5036,18 @@ public:
     }
     void OnRButtonDown(UINT, CPoint pt) {
         if (pt.x < sidebarSpan()) return;                        // sidebar/splitter: no paste
+        // Everything a LEFT click does about focus, a right click must do too. It did neither, and
+        // both omissions bite:
+        //   - no g_focus: in a split, right-clicking one pane pasted into the OTHER one, because
+        //     pasteClipboard() targets the focused pane rather than the pane under the cursor.
+        //   - no SetFocus: the keyboard stayed wherever it was. If that was the sidebar — and it can
+        //     be, since the bounce only fires when the tree RECEIVES focus, not when it already has
+        //     it — the next keystroke drove the TreeView's type-ahead instead of the shell, which
+        //     selects a different row and so silently SWITCHES SESSION. Pasting a command and typing
+        //     Enter then landed in a terminal the user was not looking at.
+        int pane, absRow, col;
+        if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) g_focus = pane;
+        SetFocus();                                              // before the early return below
         if (mouseReport(pt.x, pt.y, 2, true, false)) return;     // right-click to a mouse-aware app
         pasteClipboard();                                        // else right-click pastes
     }
@@ -5381,11 +5463,31 @@ static CMainFrame g_frame;
 
 
 // ---- control-API server (newline JSON, agwintermctl/skill-compatible subset) ----
-static Session* resolveTarget(const std::string& target) {
+// id (exact), then id prefix, then NAME. The name is what a human says and therefore what an agent
+// is told — "run it in the ralphex02 session" — and an id-only lookup made that the one phrasing
+// that could not work, while every other verb happily reported "session not found".
+//
+// An ambiguous name resolves to NOTHING rather than to the first match: two panes can share a name,
+// and silently typing into the wrong terminal is worse than refusing. resolveTargetWhy() spells that
+// out for the caller instead of leaving them to guess.
+static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
     if (target.empty() || target == "active") return focusedSession();
     for (Session* s : g_sessions)
-        if (s->id == target || (target.size() >= 4 && s->id.compare(0, target.size(), target) == 0))
-            return s;
+        if (s->id == target) return s;
+    for (Session* s : g_sessions)
+        if (target.size() >= 4 && s->id.compare(0, target.size(), target) == 0) return s;
+
+    std::wstring wanted = widen(target);
+    Session* hit = nullptr;
+    int matches = 0;
+    for (Session* s : g_sessions) {
+        if (s->hidden) continue;                       // quick/scratch/overlay are not addressable by name
+        if (lstrcmpiW(s->name.c_str(), wanted.c_str()) == 0) { hit = s; matches++; }
+    }
+    if (matches == 1) return hit;
+    if (matches > 1 && why)
+        *why = "'" + target + "' names " + std::to_string(matches) + " sessions — target one by id "
+               "(agwintermctl tree --json lists them)";
     return nullptr;
 }
 
@@ -5460,24 +5562,46 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOk("{\"workspaces\":[" + wss + "]}");
     }
     if (cmd == "session.new") {
+        // agwintermctl sends name/cwd/command and the full app honours all three; this dropped them
+        // on the floor and handed back a session called "<pipe>-<n>". An agent asked to "run X in the
+        // build session" then cannot find what it just made — not by the name it chose, and not in
+        // the tree — which looks like the control API is broken rather than one argument ignored.
+        std::string name = req.get("args.name");
+        std::string cwd  = req.get("args.cwd");
+        std::string command = req.get("args.command");
         int cols, rows;
         paneGridSize(g_focus, &cols, &rows);
-        Session* s = newSession(cols, rows);
+
+        // --command runs it as the session's shell, which is the whole point: the caller wants the
+        // command RUNNING, not typed into a prompt that may not be ready to receive it yet.
+        std::vector<std::string> cargs;
+        const char* app = nullptr;
+        if (!command.empty()) {
+            app = "powershell.exe";
+            cargs.push_back("-NoExit");     // keep the pane alive after it finishes, like the full app
+            cargs.push_back("-Command");
+            cargs.push_back(command);
+        }
+        Session* s = newSession(cols, rows, app, cargs.empty() ? nullptr : &cargs,
+                                cwd.empty() ? nullptr : cwd.c_str());
         if (!s) return ctlErr("create failed");
+        // tsvField: the name reaches the state file, where a tab or newline would forge a record.
+        if (!name.empty()) s->name = widen(tsvField(name));
         g_pane[g_focus] = (int)g_sessions.size() - 1;
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr(s->id);
     }
-    Session* target = resolveTarget(req.get("target"));
+    std::string targetWhy;
+    Session* target = resolveTarget(req.get("target"), &targetWhy);
     if (cmd == "session.select") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         for (int i2 = 0; i2 < (int)g_sessions.size(); i2++)
             if (g_sessions[i2] == target) g_pane[g_focus] = i2;
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr("selected");
     }
     if (cmd == "session.type") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string text = req.get("args.text");
         // \n → \r (keystroke semantics, like the main app's session.type)
         for (char& ch : text) if (ch == '\n') ch = '\r';
@@ -5486,11 +5610,11 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("typed");
     }
     if (cmd == "session.text") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         return ctlOkStr(dumpBufferText(target));
     }
     if (cmd == "session.status") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
         target->status = st;
@@ -5499,7 +5623,7 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("status set");
     }
     if (cmd == "session.close") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         // Close the session that was ASKED for, by index. The old form pointed the focused pane at it
         // and called closeFocused(), which with the split pane focused reroutes into toggleSplit() —
         // so it killed the repointed target through the unsplit path, ORPHANING the hidden split
@@ -5556,13 +5680,13 @@ static std::string ctlDispatch(const std::string& line) {
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
             return ctlOkStr("cleared");
         }
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         target->flagged = wantOn(op, target->flagged);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr(target->flagged ? "flagged" : "unflagged");
     }
     if (cmd == "session.seen") {   // clear the unread badge
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         EnterCriticalSection(&g_lock);
         target->seenDone = completedMarks(target);
         target->unread = 0;
@@ -5571,7 +5695,7 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("seen");
     }
     if (cmd == "session.rename") {
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string nm = req.get("args.name");
         if (nm.empty()) return ctlErr("rename needs a name");
         target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
@@ -5579,7 +5703,7 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("renamed");
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         int cols, rows; paneGridSize(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
@@ -5603,7 +5727,7 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("ok");
     }
     if (cmd == "session.move") {   // workspace <sel> = relocate; dir up|down = reorder within its workspace
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         int from = idxOf(target);
         std::string wsSel = req.get("args.workspace");
         if (!wsSel.empty()) {
@@ -5622,12 +5746,12 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("unchanged");   // already at the edge
     }
     if (cmd == "session.copy") {   // the selection's text (the selection belongs to one session)
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         if (!g_sel.isFor(target)) return ctlOkStr("");
         return ctlOkStr(selectionText());
     }
     if (cmd == "session.paste") {   // paste text (or the clipboard) into the target
-        if (!target) return ctlErr("session not found");
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string text = req.get("args.text");
         if (text.empty() && OpenClipboard(nullptr)) {   // no text -> clipboard contents
             if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
@@ -6308,7 +6432,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                           WS_EX_CLIENTEDGE, (UINT)ID_TREE);
     g_tree = g_frame.m_tree;   // the rest of the file talks to the raw handle
     SetWindowSubclass(g_tree, treeProc, 1, 0);   // session drag & drop (own drag-detect loop)
-    SendMessageW(g_tree, WM_SETFONT, (WPARAM)(HFONT)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    applyTreeFont();   // shell UI face at the saved size, not the stock bitmap font
     { LOGFONTW lf{}; GetObjectW((HFONT)GetStockObject(DEFAULT_GUI_FONT), sizeof(lf), &lf); lf.lfItalic = TRUE; g_treeItalic = CreateFontIndirectW(&lf); }   // "working" rows
 
     // Native status bar (msctls_statusbar32) — a real standard control, docks itself at the bottom.
@@ -6344,6 +6468,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     NONCLIENTMETRICSW ncm{ sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
+    applyTreeFont();
 
     // System-tray icon (right-click for a menu incl. Restart / Exit; double-click restores).
     g_nid.cbSize = sizeof g_nid;
