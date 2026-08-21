@@ -1,7 +1,26 @@
+<div align="center">
+
+<img src="docs/agliteterm-icon.png" width="96" alt="agliteterm icon" />
+
 # agliteterm
 
-**A tiny native Windows terminal.** Part of the [agwinterm](https://github.com/yeroo/agwinterm)
-family: same Rust emulator core, same pty-host, same control API — a fraction of the footprint.
+**A tiny native Windows terminal for AI coding agents.**
+
+Part of the [agwinterm](https://github.com/yeroo/agwinterm) family: same Rust emulator core, same
+pty-host, same control API — a fraction of the footprint. One small C++ exe, **no .NET runtime**,
+real native Win32 controls.
+
+[![CI](https://github.com/yeroo/agliteterm/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/agliteterm/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yeroo/agliteterm/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/agliteterm)
+[![Release](https://img.shields.io/github/v/release/yeroo/agliteterm?sort=semver)](https://github.com/yeroo/agliteterm/releases)
+[![Downloads](https://img.shields.io/github/downloads/yeroo/agliteterm/total.svg)](https://github.com/yeroo/agliteterm/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+<img src="docs/img/screenshot.png" width="820" alt="agliteterm running Claude Code, with the working session marked in the sidebar" />
+
+</div>
+
+---
 
 > **Was `agwinterm-lite`.** An existing agwinterm-lite install is handed over by its own updater
 > (agwinterm 0.17.4 points at this feed). agliteterm installs **alongside** rather than replacing it
@@ -26,9 +45,11 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   GNU Unifont bitmap fonts) — face and size are chosen once in Properties; there is deliberately
   **no zoom**, because a raster face only exists at the strike sizes its pack ships,
   MS-DOS/EGA palette, cmd.exe-style Properties dialog, fully rebindable keys (all unbound by
-  default — keystrokes belong to your shell).
+  default — keystrokes belong to your shell). The **sidebar text size** is set separately
+  (*Properties → Sidebar text*), because wanting a bigger session list is not wanting a
+  bigger terminal.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  38 verbs covering sessions, workspaces, windows, and the tree (`agwintermctl --pipe
+  41 verbs covering sessions, workspaces, windows, and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
@@ -133,6 +154,26 @@ state
 
 Use `--pipe <instance> --diagnose` to ask about a named instance — it reports *that* instance's
 state file, which is the one its window restores from.
+
+## The other one: agwinterm
+
+**[agwinterm](https://github.com/yeroo/agwinterm)** is the full terminal this one is a sibling of —
+C#/.NET on Win32 + Direct2D, custom-drawn chrome, any TrueType font with ligatures, images and
+sixel, a dashboard, profiles, themes, and the complete control API. If your machine can afford it,
+take that one; agliteterm exists for the machines that cannot.
+
+Neither is a cut-down build of the other. They are separate programs that agreed on an interface,
+and the agreement is enforced rather than promised: `test/control-api.json` here mirrors the
+canonical contract in agwinterm, `tools/check-contract.ps1` compares them on every build, and both
+repositories run the same conformance steps in CI. It has already caught real drift in both
+directions.
+
+The emulator core and pty-host are agwinterm's, consumed here as ABI-pinned release artifacts — see
+[Building](#building).
+
+Both are by [Boris Kudriashov](https://github.com/yeroo), and both owe their design to
+**[umputun's agterm](https://github.com/umputun/agterm)**, the macOS terminal that treated AI coding
+agents as first-class citizens first. 💜
 
 ## Building
 
