@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+# Pinned at the last submitted version; packaging/winget/publish.ps1 rewrites the version, the
+# installer URL and its SHA-256 from the actual release asset before submitting.
+PackageIdentifier: yeroo.agliteterm
+PackageVersion: 0.17.9
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

@@ -10,6 +10,11 @@ on:
   push:
     tags: [ 'v*' ]
   workflow_dispatch:
+    inputs:
+      publish_packages:
+        description: 'Submit to winget + Chocolatey even if this is not a checkpoint version'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,17 +46,128 @@ jobs:
         shell: pwsh
         run: ./installer/build.ps1
 
+      # The same payload without an installer around it. Two audiences: a machine that cannot run
+      # an installer at all, and Chocolatey — which runs ELEVATED, so packaging a per-user setup
+      # would install agliteterm into the administrator's profile instead of the user's.
+      - name: Build portable zip
+        shell: pwsh
+        run: ./installer/build-portable.ps1
+
       # Free, certless supply-chain signing: a Sigstore-backed attestation binding the artifact to
       # this commit + workflow. Verify with:  gh attestation verify <file> --repo yeroo/agliteterm
       # (Doesn't remove SmartScreen — that needs Authenticode.)
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: installer/Output/agliteterm-setup-*.exe
+          subject-path: |
+            installer/Output/agliteterm-setup-*.exe
+            installer/Output/agliteterm-portable-*.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: installer/Output/agliteterm-setup-*.exe
+          files: |
+            installer/Output/agliteterm-setup-*.exe
+            installer/Output/agliteterm-portable-*.zip
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: true    # a missing artifact is a broken release, not a warning
+
+  # ---- checkpoint releases ----------------------------------------------------------------------
+  # winget and Chocolatey are HUMAN-MODERATED. Every submission costs a reviewer a slot in a queue,
+  # and this project releases far faster than those queues drain. agwinterm learned this the hard
+  # way: versions stacked up behind each other, and Chocolatey answers 403 to a new version while
+  # the previous one is still unreviewed.
+  #
+  # So only CHECKPOINT versions are submitted: a patch number that is a multiple of 9 (x.y.9,
+  # x.y.18, x.y.27...). Everything between them is a GitHub release, which the in-app updater
+  # consumes perfectly well.
+  #
+  # The gaps are the point. If .8 does not feel like something to put in front of a reviewer, go
+  # straight to .10 and let the next checkpoint be .18. The rule never forces a submission; it only
+  # ever decides whether one is allowed. To submit anything else — a security fix, or a x.y.0 that
+  # opens a new line — run this workflow manually with publish_packages: true.
+  gate:
+    needs: installer
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - id: check
+        shell: bash
+        run: |
+          if [ "${{ inputs.publish_packages }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::manual override - submitting to winget + Chocolatey"
+            exit 0
+          fi
+          ref="${{ github.ref_name }}"
+          case "$ref" in
+            v*) ver="${ref#v}" ;;
+            *)  echo "publish=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::not a tag - no package submission"
+                exit 0 ;;
+          esac
+          patch="${ver##*.}"
+          # A non-numeric patch (a prerelease like 0.17.9-rc1) is never a checkpoint: package
+          # managers should see finished versions, and "-rc1" would fail the arithmetic anyway.
+          if ! [[ "$patch" =~ ^[0-9]+$ ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$ver is a prerelease - no package submission"
+            exit 0
+          fi
+          if [ "$patch" -gt 0 ] && [ $((patch % 9)) -eq 0 ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$ver is a checkpoint release - submitting to winget + Chocolatey"
+          else
+            next=$(( (patch / 9 + 1) * 9 ))
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$ver is not a checkpoint (next is ${ver%.*}.$next) - GitHub release only"
+          fi
+
+  # Opens the version-bump PR to microsoft/winget-pkgs. A job here rather than a `release:`
+  # workflow because releases published with GITHUB_TOKEN do not trigger other workflows.
+  # Needs WINGET_TOKEN — a classic PAT with public_repo scope, used to fork winget-pkgs and open
+  # the PR; skips with a warning if unset.
+  winget:
+    needs: [installer, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: windows-latest
+    # Best-effort: agliteterm's FIRST submission has to clear moderation before any later one can
+    # follow, so this can legitimately fail early on — never fail the whole release for it.
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submit manifests to winget-pkgs
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) { Write-Warning 'WINGET_TOKEN secret not set - skipping winget publish'; exit 0 }
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          ./packaging/winget/publish.ps1 -Version $version -Token $env:WINGET_TOKEN -Repository '${{ github.repository }}'
+
+  # Packs and pushes the Chocolatey package to the community feed. Every version then goes through
+  # moderation (automated validation + a VM install test + human review). Needs CHOCO_API_KEY from
+  # the community.chocolatey.org account; skips with a warning if unset.
+  chocolatey:
+    needs: [installer, gate]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: windows-latest
+    # Best-effort for the same reason as winget: Chocolatey rejects new versions of a package whose
+    # first version is still in moderation (403).
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pack and push to Chocolatey
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if (-not $env:CHOCO_API_KEY) { Write-Warning 'CHOCO_API_KEY secret not set - skipping chocolatey publish'; exit 0 }
+          # Shared with choco-push.yml (the repush-a-moderated-version path) so the two cannot drift.
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          ./packaging/chocolatey/publish.ps1 -Version $version -ApiKey $env:CHOCO_API_KEY -Repository '${{ github.repository }}'
