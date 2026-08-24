@@ -102,6 +102,22 @@ if (-not $clipOk) { "  NOTE  this machine has no usable clipboard - clipboard as
 
 $root = Join-Path $env:TEMP ("clip-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $root -Force | Out-Null
+$dsrPs1 = Join-Path $root 'dsr.ps1'
+@'
+$e = [char]27
+[Console]::Write("$e[6n")
+$r = @()
+$sw = [Diagnostics.Stopwatch]::StartNew()
+while ($sw.ElapsedMilliseconds -lt 2000 -and $r.Count -eq 0) {
+    while ([Console]::KeyAvailable) { $r += [int][char][Console]::ReadKey($true).KeyChar }
+    Start-Sleep -Milliseconds 50
+}
+Write-Host "DSR=<$($r -join ',')>"
+'@ | Set-Content $dsrPs1 -Encoding UTF8
+$markerPs1 = Join-Path $root 'marker.ps1'
+@'
+1..40 | ForEach-Object { Write-Host 'COPY-ME-MARKER' }
+'@ | Set-Content $markerPs1 -Encoding UTF8
 $savedClip = try { Get-Clipboard -Raw } catch { '' }   # the machine's clipboard is the user's, not ours
 $p = $null
 
@@ -142,18 +158,22 @@ try {
     # --- a query gets its answer ----------------------------------------------------------------
     # DSR cursor-position, read back from stdin inside the session. Undrained, the reply was never
     # sent at all and a program that waits for one waits forever.
-    $q = '$e=[char]27; [Console]::Write("$e[6n"); Start-Sleep -m 400; $r=@(); while([Console]::KeyAvailable){$r+=[int][char][Console]::ReadKey($true).KeyChar}; Write-Host "DSR=<$($r -join `",`")>"'
-    Ctl @('session', 'type', "$q`r") | Out-Null
-    Start-Sleep 4
+    #
+    # Run it from a FILE. A long single-line probe full of quotes and backticks is the documented
+    # way to lose a command in transit through `session type` - on a CI runner this one was echoed
+    # onto the command line and never executed at all.
+    Ctl @('session', 'type', "& '$dsrPs1'`r") | Out-Null
+    Start-Sleep 6
     $t = Screen
     # 27,91 = ESC [ ; 82 = 'R'. A drained reply reads 27,91,<row>,59,<col>,82.
     Check 'a DSR query is answered' ($t -match 'DSR=<27,91[\d,]*,82>') "screen tail: $($t.Substring([Math]::Max(0, $t.Length - 200)))"
 
     # --- Ctrl+C with a selection copies ---------------------------------------------------------
-    Ctl @('session', 'type', "Write-Host 'COPY-ME-MARKER'`r") | Out-Null
-    Start-Sleep 2
-    # Select the whole visible area: the marker's row depends on the font cell height and the
-    # chrome above it, and a check that computes that is testing its own arithmetic.
+    # FILL the screen with the marker rather than printing it once: any rectangle inside the
+    # terminal then contains it, so the check cannot fail on the cell height, the prompt, or how
+    # much the runner's shell had already scrolled.
+    Ctl @('session', 'type', "& '$markerPs1'`r") | Out-Null
+    Start-Sleep 3
     [ClipIn]::Drag($h, 200, 80, 960, 555)
     Start-Sleep 1
     if ($clipOk) {
