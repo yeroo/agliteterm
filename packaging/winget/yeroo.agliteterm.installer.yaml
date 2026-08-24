@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: yeroo.agliteterm
+PackageVersion: 0.17.9
+MinimumOSVersion: 10.0.17763.0
+InstallerType: inno
+# agliteterm installs per-user, under %LOCALAPPDATA%\Programs\agliteterm, and needs no admin.
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+# Inno registers its uninstall entry as {AppId}_is1; naming it here is how winget recognises an
+# already-installed copy as THIS package rather than an unrelated app with a similar name.
+AppsAndFeaturesEntries:
+  - DisplayName: agliteterm
+    Publisher: Boris Kudriashov
+    ProductCode: '{E0ACBA4E-AAD3-4689-9234-66D3CD207A6A}_is1'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/yeroo/agliteterm/releases/download/v0.17.9/agliteterm-setup-0.17.9.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.6.0

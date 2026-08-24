@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>agliteterm</id>
+    <version>0.17.9</version>
+    <packageSourceUrl>https://github.com/yeroo/agliteterm/tree/main/packaging/chocolatey</packageSourceUrl>
+    <owners>yeroo</owners>
+    <title>agliteterm</title>
+    <authors>Boris Kudriashov</authors>
+    <projectUrl>https://github.com/yeroo/agliteterm</projectUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/yeroo/agliteterm@v0.17.9/docs/agliteterm-icon.png</iconUrl>
+    <copyright>Copyright (c) 2026 Boris Kudriashov</copyright>
+    <licenseUrl>https://github.com/yeroo/agliteterm/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/yeroo/agliteterm</projectSourceUrl>
+    <docsUrl>https://github.com/yeroo/agliteterm#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/yeroo/agliteterm/issues</bugTrackerUrl>
+    <tags>agliteterm terminal ai agent console conpty win32 portable lightweight</tags>
+    <summary>A tiny native Windows terminal for AI coding agents</summary>
+    <description>
+agliteterm is a minimal Windows terminal for old or low-RAM machines: one small C++ exe
+(Win32/WTL, **no .NET runtime**) over the same Rust emulator core and pty-host as
+[agwinterm](https://github.com/yeroo/agwinterm), with real native controls instead of
+custom-drawn chrome.
+
+- **Agent workflow**: workspaces and sessions with per-session agent status (bold = blocked,
+  italic = working), an attention bell that jumps to the next blocked session, flagged sessions,
+  unread badges, sidebar drag and drop.
+- **Scriptable**: the same newline-JSON control pipe as agwinterm, speaking the `agwintermctl`
+  dialect — 41 verbs across sessions, workspaces, windows and the tree. Shells get the same
+  `AGWINTERM_*` environment, so hooks and the agent skill work in both. A shared conformance suite
+  runs in **both** repositories' CI, so "same control API" is enforced rather than asserted.
+- **Classic Windows**: menu bar, toolbar, TreeView sidebar, status bar; Dark / Light / Classic /
+  Auto themes; bundled bitmap fonts (Cozette, Tamzen, Terminus, Spleen, UNSCII, GNU Unifont);
+  MS-DOS/EGA palette; a cmd.exe-style Properties dialog.
+- **Explains itself**: an always-on log of its own decisions, and `agliteterm --diagnose` for a
+  one-shot report.
+
+If your machine can afford it, take agwinterm instead — it is the fuller terminal. agliteterm
+exists for the machines that cannot.
+
+This package installs the **portable** build from the official GitHub release (the setup is a
+per-user installer, which does not belong in an elevated package manager). The binaries are
+unsigned but carry a Sigstore build-provenance attestation
+(`gh attestation verify &lt;file&gt; --repo yeroo/agliteterm`).
+    </description>
+    <releaseNotes>https://github.com/yeroo/agliteterm/releases/tag/v0.17.9</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

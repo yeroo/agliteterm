@@ -71,10 +71,24 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
 
 ## Install
 
-Grab **`agliteterm-setup-<version>.exe`** from
+```powershell
+winget install yeroo.agliteterm
+choco install agliteterm
+```
+
+Or grab **`agliteterm-setup-<version>.exe`** from
 [Releases](https://github.com/yeroo/agliteterm/releases) — per-user, no admin. It self-updates from
 that feed (*Help → Check for Updates*), verifying the SHA-256 the release API publishes for the
 asset before applying anything.
+
+**No installer at all**: `agliteterm-portable-<version>-win-x64.zip` is the same payload unzipped
+where you like. Settings still live in `%LOCALAPPDATA%\agliteterm`, so a portable copy and an
+installed one share their sessions. (This is what the Chocolatey package installs — the setup is
+per-user and Chocolatey runs elevated, which would put agliteterm in the administrator's profile.)
+
+Package-manager versions are deliberately sparser than releases: winget and Chocolatey are
+human-moderated, so only **checkpoint** versions (`x.y.9`, `x.y.18`, ...) are submitted. Everything
+between them ships here and through the in-app updater.
 
 Every release carries a [Sigstore build-provenance attestation](https://github.com/yeroo/agliteterm/attestations):
 
