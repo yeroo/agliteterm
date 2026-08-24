@@ -93,6 +93,10 @@ static bool (*emu_copy_grid)(void*, FfiCell*, uint32_t);
 static bool (*emu_copy_history_row)(void*, uint32_t, FfiCell*, uint32_t);
 static uint32_t (*emu_marks)(void*, FfiMark*, uint32_t);
 static uint8_t* (*emu_get_text)(void*, uint32_t, uint32_t*);   // 0 title, 1 cwd (OSC 7), 2 modes
+// Side effects the emulator QUEUED rather than performed: OSC 52 clipboard writes, the replies
+// it owes a program that asked the terminal a question, notifications, BEL. None of it happens
+// until the host drains them (see runHostActions).
+static uint8_t* (*emu_take_host_actions)(void*, uint32_t*);
 static void (*core_free_buf)(uint8_t*, uint32_t);
 
 static constexpr uint32_t kRequiredAbi = 15;
@@ -850,6 +854,9 @@ static int tbImageOf(int cmdId) {
 #define WM_APP_OVERLAY     (WM_APP + 5)   // control thread -> UI thread: open an overlay (creates a window)
 #define WM_APP_UPDATE      (WM_APP + 6)   // self-update worker -> UI thread (balloon / message / apply)
 #define WM_APP_FOCUSTERM   (WM_APP + 7)   // "give the terminal keyboard focus back", posted (see OnNotify)
+#define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
+enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
+struct NotifyMsg { std::wstring title, body; };
 static std::string g_pendingOverlayCmd; static int g_pendingOverlaySize;
 static HICON g_appIcon;         // big (taskbar / alt-tab)
 static HICON g_appIconSm;       // small (title bar / tray)
@@ -886,6 +893,12 @@ struct Sel {
     }
 };
 static Sel g_sel;
+// Main-app parity (TerminalConfig.RightClickPaste / .CopyOnCtrlC, both on by default). No UI:
+// they are the behaviour nearly everyone wants, and the registry is the escape hatch for the
+// rest - HKCU\Software\agliteterm, DWORD 0 to turn either off.
+static bool g_rightClickPaste = true;
+static bool g_copyOnCtrlC = true;
+static bool g_rbtnForwarded = false;   // did the app get the button-2 PRESS? then it gets the release
 
 // ---- command palette: type-to-filter overlay over every action -------------------------------
 // One entry per action lite has (menu commands, keyboard-only actions, theme switches). Executed
@@ -1163,8 +1176,9 @@ static void loadCore() {
     emu_copy_history_row = (decltype(emu_copy_history_row))GetProcAddress(m, "agwcore_emu_copy_history_row");
     emu_marks = (decltype(emu_marks))GetProcAddress(m, "agwcore_emu_marks");
     emu_get_text = (decltype(emu_get_text))GetProcAddress(m, "agwcore_emu_get_text");
+    emu_take_host_actions = (decltype(emu_take_host_actions))GetProcAddress(m, "agwcore_emu_take_host_actions");
     core_free_buf = (decltype(core_free_buf))GetProcAddress(m, "agwcore_free_buf");
-    if (!core_abi || !emu_new || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !core_free_buf)
+    if (!core_abi || !emu_new || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !emu_take_host_actions || !core_free_buf)
         fatal(L"agwinterm_core.dll: exports missing");
     // Name BOTH numbers. The old message hardcoded "need v15", so it went stale on every bump and
     // never said what the dll actually reported — the one fact you need when the exe and the core
@@ -1363,14 +1377,79 @@ static int completedMarks(Session* s) {
     return done;
 }
 
+// ---- host actions ---------------------------------------------------------------------------
+// The emulator performs no side effects of its own: it QUEUES them and the host drains them after
+// each feed. lite never drained, and the cost was larger than it looks. OSC 52 clipboard writes
+// were dropped, so a program that copies through the terminal (Claude Code does) put nothing on
+// the clipboard - and every REPLY the terminal owed a program went unsent, because a query answer
+// is a host action too. To the program that asked, the terminal simply never answered.
+//
+// Wire format from agwcore_emu_take_host_actions: u32 count, then per action a u8 tag and its
+// payload; strings are u32 length + UTF-8 bytes.
+static std::wstring widen(const std::string& s);   // fwd (the drain sits above the utf helpers)
+static bool haStr(const uint8_t* p, uint32_t len, uint32_t& off, std::string& out) {
+    uint32_t n;
+    if (off + 4 > len) return false;
+    memcpy(&n, p + off, 4);
+    off += 4;
+    if (n > len || off + n > len) return false;
+    out.assign((const char*)p + off, n);
+    off += n;
+    return true;
+}
+// Call with g_lock RELEASED: a reply goes straight back down the pty, and everything else is
+// posted to the UI thread, which owns the clipboard and the tray icon.
+static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
+    if (!buf || len < 4) return;
+    uint32_t count;
+    memcpy(&count, buf, 4);
+    uint32_t off = 4;
+    for (uint32_t i = 0; i < count && off < len; i++) {
+        uint8_t tag = buf[off++];
+        std::string a, b;
+        switch (tag) {
+            case 1:   // Notify(title, body): OSC 9 / OSC 777
+                if (!haStr(buf, len, off, a) || !haStr(buf, len, off, b)) return;
+                PostMessageW(g_hwnd, WM_APP_HOSTACT, HA_NOTIFY, (LPARAM)new NotifyMsg{ widen(a), widen(b) });
+                break;
+            case 2:   // Progress(state, value): OSC 9;4 taskbar progress, which lite does not draw
+                if (off + 8 > len) return;
+                off += 8;
+                break;
+            case 3:   // Clipboard(text): an OSC 52 write, already base64-decoded by the core
+                if (!haStr(buf, len, off, a)) return;
+                PostMessageW(g_hwnd, WM_APP_HOSTACT, HA_CLIP, (LPARAM)new std::string(a));
+                break;
+            case 4:   // Respond(reply): the answer to a query - back down the pty, from this thread
+                if (!haStr(buf, len, off, a)) return;
+                if (s->data != INVALID_HANDLE_VALUE && !a.empty())
+                    ovIo(s->data, true, a.data(), nullptr, (DWORD)a.size());
+                break;
+            case 5:   // Unhandled(kind, detail): the VT tap. lite's log is the equivalent of
+                      // AGWINTERM_VT_LOG - "app misbehaves here but works elsewhere" starts here.
+                if (!haStr(buf, len, off, a) || !haStr(buf, len, off, b)) return;
+                logInfo("vt unhandled %s: %s", a.c_str(), b.c_str());
+                break;
+            case 6:   // Bell
+                PostMessageW(g_hwnd, WM_APP_HOSTACT, HA_BELL, 0);
+                break;
+            default:
+                return;   // an unknown tag makes the rest of the buffer unparseable - stop
+        }
+    }
+}
+
 static DWORD WINAPI readerThread(void* param) {
     Session* s = (Session*)param;
     std::vector<uint8_t> buf(64 * 1024);
     DWORD n;
     while ((n = ovIo(s->data, false, nullptr, buf.data(), (DWORD)buf.size())) > 0) {
         bool bump = false;
+        uint32_t haLen = 0;
+        uint8_t* ha = nullptr;
         EnterCriticalSection(&g_lock);
         emu_feed(s->emu, buf.data(), n);
+        ha = emu_take_host_actions(s->emu, &haLen);   // taken under the lock, RUN outside it
         // Unread: commands that FINISHED while the session wasn't on screen (noise-free — prompt
         // repaints don't move the completed count). Visible panes track instead of accumulating.
         if (!s->hidden) {
@@ -1382,6 +1461,7 @@ static DWORD WINAPI readerThread(void* param) {
             else { int u = done > s->seenDone ? done - s->seenDone : 0; if (u != s->unread) { s->unread = u; bump = true; } }
         }
         LeaveCriticalSection(&g_lock);
+        if (ha) { runHostActions(s, ha, haLen); core_free_buf(ha, haLen); }
         InvalidateRect(windowForSession(s), nullptr, FALSE);
         if (bump) PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // repaint the badge
     }
@@ -1925,6 +2005,8 @@ static void loadColors() {   // Properties->Colors overrides (default fg/bg + on
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showToolbar = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showStatus = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"FlagView", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_flagView = v != 0;
+    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"RightClickPaste", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_rightClickPaste = v != 0;
+    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"CopyOnCtrlC", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_copyOnCtrlC = v != 0;
 }
 static void loadKeys() {   // configurable key bindings; absent = unbound (0)
     // One seeded default: Ctrl+Shift+P opens the command palette (parity with the full app).
@@ -3119,8 +3201,9 @@ static std::string selectionText() {
     return out;
 }
 
-static void copySelection() {
-    std::string utf8 = selectionText();
+// Put UTF-8 text on the clipboard. UI thread only (the clipboard is per-thread-owned): a host
+// action arriving on a reader thread is posted across rather than setting it there.
+static void setClipboardUtf8(const std::string& utf8) {
     if (utf8.empty() || !OpenClipboard(g_hwnd)) return;
     EmptyClipboard();
     int wn = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), nullptr, 0);
@@ -3134,6 +3217,8 @@ static void copySelection() {
     }
     CloseClipboard();
 }
+
+static void copySelection() { setClipboardUtf8(selectionText()); }
 
 // ---- input ----
 static void sendBytes(const char* bytes, int len) {
@@ -3598,6 +3683,15 @@ static bool handleKeyDown(WPARAM vk) {
         BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
         WORD combo = MAKEWORD((BYTE)vk, mods);
         if (mods) for (int a = 0; a < KB_COUNT; a++) if (g_keys[a] == combo) { runKbAction(a); return true; }
+    }
+
+    // Ctrl+C with a selection COPIES; with nothing selected it falls straight through and the shell
+    // still gets its ^C. That ordering is the whole point - the interrupt is never taken away, you
+    // only get the copy when there is something to copy. Ctrl+Shift+C copies unconditionally, so
+    // there is a chord that never interrupts. (Main-app parity: Program.Input.cs, CopyOnCtrlC.)
+    if (vk == 'C' && ctrlDown() && !altDown()) {
+        if (shiftDown()) { copySelection(); return true; }
+        if (g_copyOnCtrlC && g_sel.has()) { copySelection(); return true; }
     }
 
     // Terminal special keys, encoded with xterm modifiers (mod = 1 + shift + 2*alt + 4*ctrl) so
@@ -4924,6 +5018,7 @@ public:
         MESSAGE_HANDLER(WM_APP_OVERLAY, OnOverlay)
         MESSAGE_HANDLER(WM_APP_UPDATE, OnAppUpdate)
         MESSAGE_HANDLER(WM_APP_FOCUSTERM, OnFocusTerm)
+        MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -5086,10 +5181,22 @@ public:
         int pane, absRow, col;
         if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) g_focus = pane;
         SetFocus();                                              // before the early return below
-        if (mouseReport(pt.x, pt.y, 2, true, false)) return;     // right-click to a mouse-aware app
-        pasteClipboard();                                        // else right-click pastes
+        // Paste WINS over the app's mouse reporting (main-app parity, Program.WndProc.cs). It used
+        // to lose, and that made right-click paste dead exactly where it is wanted most: a TUI like
+        // Claude Code holds mouse mode on for its entire run, so every right-click went to the app
+        // as a button-2 report - which it ignores - and nothing was ever pasted. An app that really
+        // needs the right button still gets it with RightClickPaste off.
+        if (g_rightClickPaste) { pasteClipboard(); return; }
+        if (mouseReport(pt.x, pt.y, 2, true, false)) { g_rbtnForwarded = true; return; }
+        pasteClipboard();
     }
-    void OnRButtonUp(UINT, CPoint pt) { mouseReport(pt.x, pt.y, 2, false, false); }
+    // Only report the release if the press was reported: a paste must not leak an orphan button-2
+    // release into an app that never saw the press.
+    void OnRButtonUp(UINT, CPoint pt) {
+        if (!g_rbtnForwarded) return;
+        g_rbtnForwarded = false;
+        mouseReport(pt.x, pt.y, 2, false, false);
+    }
 
     // ---- caret blink + focus cue ----
     // Only the caret cell needs repainting, so invalidate that instead of the whole client: on the
@@ -5199,6 +5306,28 @@ public:
         std::string cmd; int sz;
         EnterCriticalSection(&g_lock); cmd = g_pendingOverlayCmd; sz = g_pendingOverlaySize; LeaveCriticalSection(&g_lock);
         openOverlay(cmd, sz);
+        return 0;
+    }
+    // A host action the reader thread drained (see runHostActions): the clipboard and the tray
+    // icon both belong to this thread, so it does that half of the work.
+    LRESULT OnHostAction(UINT, WPARAM wp, LPARAM lp, BOOL&) {
+        if (wp == HA_CLIP) {                       // OSC 52: the program wrote the clipboard
+            std::string* t = (std::string*)lp;
+            setClipboardUtf8(*t);
+            delete t;
+        } else if (wp == HA_NOTIFY) {              // OSC 9 / OSC 777
+            NotifyMsg* n = (NotifyMsg*)lp;
+            g_nid.uFlags |= NIF_INFO;
+            wcscpy_s(g_nid.szInfoTitle, n->title.empty() ? L"agliteterm" : n->title.c_str());
+            wcscpy_s(g_nid.szInfo, n->body.c_str());
+            g_nid.dwInfoFlags = NIIF_INFO;
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            g_nid.uFlags &= ~NIF_INFO;
+            delete n;
+        } else if (wp == HA_BELL) {                // BEL: beep, and flash only when unattended
+            MessageBeep(MB_OK);
+            if (GetForegroundWindow() != m_hWnd) FlashWindow(TRUE);
+        }
         return 0;
     }
     LRESULT OnAppUpdate(UINT, WPARAM wp, LPARAM lp, BOOL&) {   // self-update worker -> UI thread

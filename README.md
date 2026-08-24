@@ -48,6 +48,13 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   default — keystrokes belong to your shell). The **sidebar text size** is set separately
   (*Properties → Sidebar text*), because wanting a bigger session list is not wanting a
   bigger terminal.
+- **Clipboard**: select with the mouse and it is copied on release; **Ctrl+C copies a selection**
+  and otherwise still interrupts the shell (Ctrl+Shift+C always copies); **right-click pastes**
+  even while a full-screen app is grabbing the mouse — a TUI like Claude Code holds mouse mode on
+  for its whole run, which is exactly when pasting matters. A program can drive the clipboard
+  itself with **OSC 52**, and terminal queries get answered. Both bindings are on by default; the
+  registry escape hatch is `RightClickPaste` / `CopyOnCtrlC` (DWORD `0`) under
+  `HKCU\Software\agliteterm`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
   41 verbs covering sessions, workspaces, windows, and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work.

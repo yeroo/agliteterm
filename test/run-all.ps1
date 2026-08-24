@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $failed = @()
-foreach ($t in 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'agbf-packs') {
+foreach ($t in 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs') {
     $script = Join-Path $PSScriptRoot "$t.ps1"
     if (-not (Test-Path $script)) { continue }
     # Each child sets $ErrorActionPreference = 'Stop', so it can die before reaching its own exit
