@@ -63,7 +63,7 @@ CAppModule _Module;
 #include "proto/pb_decode.h"
 #include "control.h"
 
-// ---- agwinterm-core C ABI (ABI v15) ----
+// ---- agwinterm-core C ABI (ABI v16) ----
 struct FfiCell {
     int32_t rune;
     uint32_t fg, bg, attrs, width;
@@ -99,7 +99,9 @@ static uint8_t* (*emu_get_text)(void*, uint32_t, uint32_t*);   // 0 title, 1 cwd
 static uint8_t* (*emu_take_host_actions)(void*, uint32_t*);
 static void (*core_free_buf)(uint8_t*, uint32_t);
 
-static constexpr uint32_t kRequiredAbi = 15;
+// v16 added agwcore_emu_set_scrollback. lite does not call it yet, but the core handshake is an
+// EXACT match, so the pin has to move with the core it is built against.
+static constexpr uint32_t kRequiredAbi = 16;
 static constexpr uint32_t kAttrBold = 1, kAttrItalic = 2, kAttrUnderline = 4,
                           kAttrInverse = 8, kAttrDim = 16, kAttrStrike = 32;
 static constexpr uint32_t kProtocolVersion = 2;
@@ -318,6 +320,13 @@ struct Session {
     bool failed = false;
     std::vector<FfiCell> grid;  // paint snapshot buffer
     std::vector<FfiCell> hrow;
+    // Scrollback eviction, counted so a SELECTION can survive it. Buffer-absolute rows renumber
+    // when the core drops the oldest history lines, and a selection that ignores that silently
+    // covers different text than the one highlighted — you would paste something you never
+    // selected. The reader thread maintains these under g_lock; nothing else writes them.
+    int64_t lastGen = 0;        // scrollGeneration last seen (one per line pushed into history)
+    int64_t lastHist = 0;       // historyCount last seen; scrolled-but-not-kept == evicted
+    int64_t evicted = 0;        // total lines dropped off the front of this session's history
 };
 
 // Agent status classification for the sidebar: BLOCKED = agent needs you (bold name),
@@ -863,6 +872,14 @@ static HICON g_appIconSm;       // small (title bar / tray)
 static NOTIFYICONDATAW g_nid{};
 static int g_cw = 8, g_ch = 16;
 static CRITICAL_SECTION g_lock; // guards every session's emu + the session list shape
+// Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
+// already holds it) is safe.
+struct LockG {
+    LockG() { EnterCriticalSection(&g_lock); }
+    ~LockG() { LeaveCriticalSection(&g_lock); }
+    LockG(const LockG&) = delete;
+    LockG& operator=(const LockG&) = delete;
+};
 static HANDLE g_control = INVALID_HANDLE_VALUE;
 static std::vector<Session*> g_sessions;
 static std::vector<std::wstring> g_workspaces = { L"workspace 1" };  // session "folders" (groups)
@@ -884,7 +901,14 @@ struct Sel {
     bool active = false;            // a drag is in progress
     int aRow = 0, aCol = 0;         // anchor (buffer-absolute row, column)
     int bRow = 0, bCol = 0;         // current end
+    int64_t epoch = 0;              // the session's evicted-line count when these rows were taken
+    bool alt = false;               // was the ALT screen showing? it is a different buffer entirely
     bool has() const { return pane >= 0 && sess && (aRow != bRow || aCol != bCol); }
+    // Bound = the rows and the epoch mean something, even while the drag is still degenerate
+    // (mouse-down, before the pointer has left the anchor cell). The reconciler must use THIS:
+    // skipping a degenerate selection leaves the anchor in the old numbering while the first
+    // extended end is written in the new one, and the next reconcile then shifts that fresh end too.
+    bool bound() const { return pane >= 0 && sess; }
     bool isFor(const void* s) const { return has() && sess == s; }
     void clear() { *this = Sel{}; }
     void norm(int& r0, int& c0, int& r1, int& c1) const {
@@ -893,6 +917,7 @@ struct Sel {
     }
 };
 static Sel g_sel;
+static void syncSelection();   // fwd: the paint path uses it above the definition
 // Main-app parity (TerminalConfig.RightClickPaste / .CopyOnCtrlC, both on by default). No UI:
 // they are the behaviour nearly everyone wants, and the registry is the escape hatch for the
 // rest - HKCU\Software\agliteterm, DWORD 0 to turn either off.
@@ -1450,6 +1475,23 @@ static DWORD WINAPI readerThread(void* param) {
         EnterCriticalSection(&g_lock);
         emu_feed(s->emu, buf.data(), n);
         ha = emu_take_host_actions(s->emu, &haLen);   // taken under the lock, RUN outside it
+        // Count what fell off the front of history. scrollGeneration ticks once per line PUSHED
+        // into history (main screen only — the alt screen never pushes), so anything that scrolled
+        // without growing history was evicted at the far end. Only a counter is updated here; the
+        // selection is reconciled against it in syncSelection. g_sel is shared state — the control
+        // thread answers session.copy — so EVERY access to it is under g_lock, this one included.
+        {
+            FfiEmuInfo si{};
+            if (emu_info(s->emu, &si)) {
+                int64_t scrolled = si.scrollGeneration - s->lastGen;
+                if (scrolled > 0) {
+                    int64_t ev = scrolled - ((int64_t)si.historyCount - s->lastHist);
+                    if (ev > 0) s->evicted += ev;
+                }
+                s->lastGen = si.scrollGeneration;
+                s->lastHist = (int64_t)si.historyCount;
+            }
+        }
         // Unread: commands that FINISHED while the session wasn't on screen (noise-free — prompt
         // repaints don't move the completed count). Visible panes track instead of accumulating.
         if (!s->hidden) {
@@ -1740,7 +1782,7 @@ static void scanHostSessions() {
 }
 
 static void killSession(Session* s) {
-    if (g_sel.sess == s) g_sel.clear();   // the selection is keyed by session: don't outlive it
+    { LockG lk; if (g_sel.sess == s) g_sel.clear(); }   // keyed by session: don't outlive it
     if (s->id.empty()) return;            // restore placeholder: nothing on the host to kill
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -2947,6 +2989,7 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
 afterGridPaint:;
 
     // Selection highlight (invert the selected span, buffer-absolute rows mapped into the view).
+    syncSelection();   // the rows may have been renumbered by eviction since the last paint
     if (g_sel.isFor(s) && g_sel.pane == pane) {
         int r0, c0, r1, c1;
         g_sel.norm(r0, c0, r1, c1);
@@ -3156,8 +3199,38 @@ static bool hitTest(int x, int y, int* pane, int* absRow, int* col) {
     return false;
 }
 
+// Bring the selection's buffer-absolute rows up to date with any scrollback eviction since it was
+// made, and drop it if its own lines are the ones that went.
+//
+// The reader thread only ever increments the counter; the selection is written here. But "here" is
+// not always the UI thread — the control server answers `session.copy` on its own thread — so the
+// whole read-modify-write runs under g_lock, the same lock the counter is written under. The lock
+// is recursive, so callers that already hold it (the paint path) are fine.
+static void syncSelection() {
+    LockG lk;   // the WHOLE read-modify-write, including the reads that decide to clear
+    if (!g_sel.bound()) return;
+    Session* s = (Session*)g_sel.sess;
+    if (!s) { g_sel.clear(); return; }
+    // The alt screen is a different buffer: an index into one names unrelated text in the other, so
+    // a selection cannot cross the boundary in either direction. (A full-screen app switching in is
+    // the common case — the highlight would otherwise sit on top of its UI and copy that.)
+    FfiEmuInfo ai{};
+    bool gotInfo = s->emu && emu_info(s->emu, &ai);
+    if (gotInfo && (ai.isAltScreen != 0) != g_sel.alt) { g_sel.clear(); return; }
+    int64_t ev = s->evicted - g_sel.epoch;
+    if (ev <= 0) return;
+    g_sel.epoch = s->evicted;
+    if ((int64_t)min(g_sel.aRow, g_sel.bRow) < ev) { g_sel.clear(); return; }   // its text is gone
+    g_sel.aRow -= (int)ev;
+    g_sel.bRow -= (int)ev;
+}
+
 // Extract the selected text (buffer-absolute rows), trailing spaces trimmed per line.
 static std::string selectionText() {
+    // One hold across reconcile AND extraction: released in between, a reader feed could evict
+    // another line and the text would come from a different buffer than the rows were checked against.
+    LockG lk;
+    syncSelection();
     if (!g_sel.has()) return "";
     Session* s = (Session*)g_sel.sess;   // the session the selection was made in, not whatever the pane shows now
     int r0, c0, r1, c1;
@@ -3691,7 +3764,11 @@ static bool handleKeyDown(WPARAM vk) {
     // there is a chord that never interrupts. (Main-app parity: Program.Input.cs, CopyOnCtrlC.)
     if (vk == 'C' && ctrlDown() && !altDown()) {
         if (shiftDown()) { copySelection(); return true; }
-        if (g_copyOnCtrlC && g_sel.has()) { copySelection(); return true; }
+        // Reconcile and test as one: an evicted selection must fall through to the interrupt rather
+        // than swallow it, and the answer must not change between the two.
+        bool live;
+        { LockG lk; syncSelection(); live = g_sel.has(); }
+        if (g_copyOnCtrlC && live) { copySelection(); return true; }
     }
 
     // Terminal special keys, encoded with xterm modifiers (mod = 1 + shift + 2*alt + 4*ctrl) so
@@ -4348,7 +4425,7 @@ static void showPropertiesDialog() {
     g_pTheme = g_themeMode;
     if (g_pPrev) DeleteObject(g_pPrev);
     g_pPrev = makePreviewFontSel();
-    const int W = 396, H = 490;   // grew for the Theme row (was 452)
+    const int W = 396, H = 518;   // grew for the Theme row (452 -> 490), then the Sidebar row
     RECT pw; GetWindowRect(g_hwnd, &pw);
     g_pHwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"AgwintermLiteProps", L"agliteterm — Properties",
                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,   // erase-on-repaint won't flicker the controls
@@ -4372,8 +4449,8 @@ static void showPropertiesDialog() {
     mk(L"BUTTON", L"MS-DOS palette (EGA)", BS_OWNERDRAW, 194, 134, 180, 18, PID_DOSPAL);
     mk(L"BUTTON", L"Screen &Text", WS_GROUP | BS_OWNERDRAW, 28, 158, 110, 18, PID_TEXT);
     mk(L"BUTTON", L"Screen &Background", BS_OWNERDRAW, 150, 158, 150, 18, PID_BG);
-    mk(L"STATIC", L"Theme:", 0, 16, 372, 56, 16, 0);
-    HWND th = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 76, 368, 180, 140, PID_THEME);
+    mk(L"STATIC", L"Theme:", 0, 16, 400, 56, 16, 0);
+    HWND th = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 76, 396, 180, 140, PID_THEME);
     for (const wchar_t* n : kThemeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, g_pTheme, 0);
     SetWindowSubclass(th, comboProc, 1, 0);              // themed closed-field paint (v5 combo)
@@ -4381,8 +4458,10 @@ static void showPropertiesDialog() {
     // Sidebar text size. Separate from the terminal font on purpose: the terminal face is a raster
     // pack that only exists at its strike sizes, while the sidebar is ordinary UI text that can be
     // any size — and wanting a bigger session list is not wanting a bigger terminal.
-    mk(L"STATIC", L"Sidebar text:", 0, 16, 344, 80, 16, 0);
-    g_pSideFontCombo = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 100, 340, 156, 220, PID_SIDEFONT);
+    // BELOW the preview box, which ends at SW_Y + 170 = 356. Placed at 340 it drew straight over
+    // the sample text - the one control in this dialog whose position is not free.
+    mk(L"STATIC", L"Sidebar text:", 0, 16, 372, 80, 16, 0);
+    g_pSideFontCombo = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 100, 368, 156, 220, PID_SIDEFONT);
     SendMessageW(g_pSideFontCombo, CB_ADDSTRING, 0, (LPARAM)L"System default");
     for (int pt = 8; pt <= 20; pt++) {
         wchar_t lbl[16]; wsprintfW(lbl, L"%d pt", pt);
@@ -4391,9 +4470,9 @@ static void showPropertiesDialog() {
     g_pSidePt = g_treeFontPt;
     SendMessageW(g_pSideFontCombo, CB_SETCURSEL, g_pSidePt ? (g_pSidePt - 8 + 1) : 0, 0);
     SetWindowSubclass(g_pSideFontCombo, comboProc, 1, 0);
-    mk(L"BUTTON", L"OK", BS_OWNERDRAW, 120, 408, 78, 26, IDOK);
-    mk(L"BUTTON", L"Cancel", BS_OWNERDRAW, 204, 408, 78, 26, IDCANCEL);
-    mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 288, 408, 78, 26, PID_APPLY);
+    mk(L"BUTTON", L"OK", BS_OWNERDRAW, 120, 436, 78, 26, IDOK);
+    mk(L"BUTTON", L"Cancel", BS_OWNERDRAW, 204, 436, 78, 26, IDCANCEL);
+    mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 288, 436, 78, 26, PID_APPLY);
     themeDialog(g_pHwnd);   // dark title bar + DarkMode styles when the dark theme is active
     EnableWindow(g_hwnd, FALSE);
     ShowWindow(g_pHwnd, SW_SHOW);
@@ -4841,8 +4920,14 @@ static void applyTreeFont() {
     // OUT_TT_PRECIS + CLEARTYPE: a TrueType face, antialiased — the point of not using the stock font.
     lf.lfOutPrecision = OUT_TT_PRECIS;
     lf.lfQuality = CLEARTYPE_QUALITY;
-    HFONT old = g_treeFont;
+    HFONT old = g_treeFont, oldItalic = g_treeItalic;
     g_treeFont = CreateFontIndirectW(&lf);
+    // The "working" rows are the SAME face, italic. Built here rather than once at startup: it used
+    // to come from DEFAULT_GUI_FONT and never move, so changing the sidebar size left every agent
+    // that was busy rendered in the old font at the old size, next to rows that had resized.
+    LOGFONTW it = lf;
+    it.lfItalic = TRUE;
+    g_treeItalic = CreateFontIndirectW(&it);
     if (g_tree && g_treeFont) {
         SendMessageW(g_tree, WM_SETFONT, (WPARAM)g_treeFont, TRUE);
         // The row height follows the font, and the tree only recomputes it on a real relayout.
@@ -4850,6 +4935,7 @@ static void applyTreeFont() {
         InvalidateRect(g_tree, nullptr, TRUE);
     }
     if (old) DeleteObject(old);   // after the swap: deleting a font still selected paints nothing
+    if (oldItalic) DeleteObject(oldItalic);
 }
 
 static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR) {
@@ -5128,12 +5214,21 @@ public:
         }
         // The sidebar is the native tree child, so clicks here are always in the terminal area.
         int pane, absRow, col;
+        // One hold for the hit-test, the alt-screen flag and the eviction count: absRow is derived
+        // from historyCount, and if the reader evicts between reading the row and reading the count
+        // the two describe different buffers — permanently, since nothing later can detect it.
+        LockG lk;
         if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) {
             g_focus = pane;
             if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
             int si = g_pane[pane];                              // begin drag-select, bound to THIS session
-            g_sel = { pane, si >= 0 && si < (int)g_sessions.size() ? (void*)g_sessions[si] : nullptr,
-                      true, absRow, col, absRow, col };
+            Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? g_sessions[si] : nullptr;
+            FfiEmuInfo ai{};
+            bool alt = false;
+            if (ss && ss->emu && emu_info(ss->emu, &ai)) alt = ai.isAltScreen != 0;
+            g_sel = { pane, (void*)ss, true, absRow, col, absRow, col,
+                      ss ? ss->evicted : 0,                     // rows are relative to THIS eviction count
+                      alt };                                    // ...and to THIS buffer
             SetCapture();
             Invalidate(FALSE);
         }
@@ -5152,7 +5247,15 @@ public:
         }
         if (g_sel.active && (nFlags & MK_LBUTTON)) {
             int pane, absRow, col;
+            // Held across hit-test, reconcile and store, for the same reason as mouse-down: an
+            // eviction landing between any two of them puts the ends in different numberings.
+            LockG lk;
             if (hitTest(pt.x, pt.y, &pane, &absRow, &col) && pane == g_sel.pane) {
+                // Reconcile BEFORE writing: absRow is in today's numbering while the anchor may
+                // still be in the numbering from when the drag started, and storing the two
+                // together would leave the next reconcile shifting this fresh end as well.
+                syncSelection();
+                if (!g_sel.bound()) return;   // it was dropped under us
                 g_sel.bRow = absRow; g_sel.bCol = col;
                 Invalidate(FALSE);
             }
@@ -5161,10 +5264,18 @@ public:
     void OnLButtonUp(UINT, CPoint pt) {
         if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveColors(); return; }   // persist the new width
         if (mouseReport(pt.x, pt.y, 0, false, false)) return;
-        if (g_sel.active) {
-            g_sel.active = false;
-            ReleaseCapture();
-            if (g_sel.has()) copySelection();   // auto-copy on release (terminal convention)
+        {
+            // ReleaseCapture unconditionally: syncSelection can DROP the selection mid-drag (its
+            // rows evicted, or the app switched to the alt screen), which clears `active` — and the
+            // mouse then stayed captured with no drag in progress.
+            bool wasDragging;
+            {
+                LockG lk;
+                wasDragging = g_sel.active;
+                g_sel.active = false;
+            }
+            if (GetCapture() == m_hWnd) ReleaseCapture();
+            if (wasDragging && g_sel.has()) copySelection();   // auto-copy on release (convention)
         }
     }
     void OnRButtonDown(UINT, CPoint pt) {
@@ -6843,7 +6954,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_tree = g_frame.m_tree;   // the rest of the file talks to the raw handle
     SetWindowSubclass(g_tree, treeProc, 1, 0);   // session drag & drop (own drag-detect loop)
     applyTreeFont();   // shell UI face at the saved size, not the stock bitmap font
-    { LOGFONTW lf{}; GetObjectW((HFONT)GetStockObject(DEFAULT_GUI_FONT), sizeof(lf), &lf); lf.lfItalic = TRUE; g_treeItalic = CreateFontIndirectW(&lf); }   // "working" rows
+    // g_treeItalic is built by applyTreeFont() alongside g_treeFont, so it tracks the sidebar size.
 
     // Native status bar (msctls_statusbar32) — a real standard control, docks itself at the bottom.
     RECT zr{ 0, 0, 0, 0 };
