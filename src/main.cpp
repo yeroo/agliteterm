@@ -6233,8 +6233,36 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr(s->id);
     }
     if (cmd == "session.split") {   // op: on|off|toggle over the window's second pane
+        // Returns the split pane's SESSION ID, because a pane an agent cannot address is a pane it
+        // cannot use. The split shell is hidden — it never appears in the tree and has no name — so
+        // the id handed back here is the only way to reach it. Without it, `session type` with no
+        // --target falls back to $AGWINTERM_SESSION_ID, which for an agent running INSIDE a session
+        // is its own pane: the launch command lands in the agent's own prompt instead of the pane
+        // that was just opened.
+        //
+        // Created here rather than by posting IDM_SPLIT, for the same reason session.new does it
+        // here: a posted message is asynchronous and there would be nothing to return.
         bool cur = g_pane[1] >= 0;
-        if (wantOn(req.get("args.op"), cur) != cur) PostMessageW(g_hwnd, WM_COMMAND, IDM_SPLIT, 0);
+        bool want = wantOn(req.get("args.op"), cur);
+        if (want && !cur) {
+            int c, r;
+            paneGridSize(1, &c, &r);        // approximate; syncPaneSizes fixes both below
+            Session* s = newSession(c, r);
+            if (!s) return ctlErr("split failed");
+            s->hidden = true;               // a split shell, not a tree session
+            g_pane[1] = (int)g_sessions.size() - 1;
+            // Focus deliberately NOT moved: the menu split is a human asking to type over there,
+            // but an API split is an agent opening a pane beside a user who is still typing.
+            syncPaneSizes();
+            PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return ctlOkStr(s->id);
+        }
+        if (!want && cur) { PostMessageW(g_hwnd, WM_COMMAND, IDM_SPLIT, 0); return ctlOkStr("ok"); }
+        // Already in the requested state — still hand back the id, so a caller that does not know
+        // whether it split gets something addressable either way.
+        if (cur && g_pane[1] >= 0 && g_pane[1] < (int)g_sessions.size())
+            return ctlOkStr(g_sessions[g_pane[1]]->id);
         return ctlOkStr("ok");
     }
     if (cmd == "session.scratch" || cmd == "quick") {   // op on|off|toggle (window creation -> UI thread)
