@@ -3,7 +3,7 @@
 ; Built via installer\build.ps1 (stages to stage\ then runs ISCC on this file).
 
 #define AppName    "agliteterm"
-#define AppVersion "0.17.10"
+#define AppVersion "0.17.11"
 #define AppExe     "agliteterm.exe"
 #define AppPublisher "Boris Kudriashov"
 
