@@ -5892,7 +5892,9 @@ control API as the full app, over the same `agwintermctl` CLI, with a smaller ve
 
 You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteterm`.
 
-- `AGWINTERM_SESSION_ID` - your session id, and the default target when you pass none
+- `AGWINTERM_SESSION_ID` - your session id, and the default target when you pass none. Read
+  that twice: a command with no `--target` goes to YOUR OWN pane. Pass `--target` whenever you
+  mean a different one, or you will type into your own prompt
 - `AGWINTERM_PANE_ID` - same value; use it when you specifically mean the pane
 - `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
 
@@ -5926,6 +5928,20 @@ One call creates the session, names it, and runs the command as its shell:
 ```
 agwintermctl session new --name build --command "npm test" --cwd C:\src\app
 ```
+
+## A second pane, beside you
+
+`session split` opens the window's right-hand pane and RETURNS ITS SESSION ID. That id is the only
+handle it has: the split shell is hidden, so it appears in no tree listing and has no name.
+
+```
+id=$(agwintermctl session split)
+agwintermctl session type "ralphex docs/plans/my-plan.md\n" --target $id
+```
+
+Keep the id if you want to read that pane later (`session text --target $id`). Closing the split
+kills the shell. For something durable and visible instead, make a NAMED session - it shows in the
+sidebar and can be addressed by name - it simply will not sit side by side.
 
 For a session that already exists, type into it (`\n` is sent as Enter):
 
