@@ -3291,7 +3291,21 @@ static void setClipboardUtf8(const std::string& utf8) {
     CloseClipboard();
 }
 
-static void copySelection() { setClipboardUtf8(selectionText()); }
+// Copy the selection; false when there was nothing to copy.
+//
+// A LIVE selection can still hold no text - a full-screen app repaints and blanks the cells under
+// it. selectionText joins its rows with CRLF whether or not a row contributed a character, so a
+// blanked six-row selection is ten characters of pure separator. Deciding by emptiness of the
+// STRING reads that as a successful copy: the clipboard is overwritten with newlines and, worse,
+// Ctrl+C is consumed, so the interrupt the user actually wanted never reaches the app. Decide on
+// content instead. (agwinterm hit exactly this in its own fix and corrected it in 0.17.7 -
+// Program.Input.cs CopySelection.)
+static bool copySelection() {
+    std::string t = selectionText();
+    if (t.find_first_not_of("\r\n ") == std::string::npos) return false;
+    setClipboardUtf8(t);
+    return true;
+}
 
 // ---- input ----
 static void sendBytes(const char* bytes, int len) {
@@ -3768,7 +3782,9 @@ static bool handleKeyDown(WPARAM vk) {
         // than swallow it, and the answer must not change between the two.
         bool live;
         { LockG lk; syncSelection(); live = g_sel.has(); }
-        if (g_copyOnCtrlC && live) { copySelection(); return true; }
+        // ...and only CONSUME the key if something was actually copied, so a selection over cells
+        // a TUI has blanked falls through to the interrupt instead of swallowing it.
+        if (g_copyOnCtrlC && live && copySelection()) return true;
     }
 
     // Terminal special keys, encoded with xterm modifiers (mod = 1 + shift + 2*alt + 4*ctrl) so
@@ -4148,7 +4164,8 @@ static const wchar_t* kThemeNames[4] = { L"Auto (follow Windows)", L"Dark", L"Li
 // Working copies edited by the dialog; committed to the globals on OK/Apply.
 static int g_pFace, g_pSize, g_pTheme; static uint32_t g_pFg, g_pBg; static int g_pTarget; static bool g_pUse, g_pDos;
 static void applyTreeFont();   // fwd: propCommit applies the sidebar size, defined with the tree
-static HFONT g_pPrev; static HWND g_pHwnd, g_pSizeCombo, g_pSideFontCombo;
+static HFONT g_pPrev; static HWND g_pHwnd, g_pSizeCombo, g_pSideFontCombo;
+
 static int g_pSidePt;   // pending sidebar point size (0 = follow the shell)
 
 // ---- owner-drawn dialog buttons ---------------------------------------------------------------
