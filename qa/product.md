@@ -73,6 +73,14 @@ Cases must not assume the main app's behaviour. As of 0.17.11:
   hands back its id, which is the only handle on it. The full app models panes inside a session
   instead. Behaviour matches: the split belongs to its session either way.
 - **No mark mode, no Select All, no drag-autoscroll.** Those cases exist only in agwinterm's `qa/`.
+- **No `selection.*` control verbs.** agwinterm has `selection.all/clear/copy/finalize`; lite
+  implements none of them. `session.copy` (the selection's text) is there and is what these cases
+  read. A step that calls `selection clear` here does nothing and reports an error nobody reads — do
+  not reach for it; clear a selection with a single click instead.
+- **No `selection.*` control verbs.** agwinterm has `selection.all/clear/copy/finalize`; lite
+  implements none of them. `session.copy` (the selection's text) is there and is what these cases
+  read. A step that calls `selection clear` here does nothing and reports an error nobody reads — do
+  not reach for it; clear a selection with a single click instead.
 - **Scrollback is not configurable** — lite does not call `agwcore_emu_set_scrollback` yet, so there
   is no `scrollback-lines = 0` case here.
 - **The alt screen scrolls back into main-screen history.** `paintPane` composes the history tail
