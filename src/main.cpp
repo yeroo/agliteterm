@@ -301,6 +301,11 @@ struct Session {
     std::string status = "idle";   // control-API agent status (sidebar dot)
     std::wstring name;             // custom name (rename); empty = "session N"
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
+    // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
+    // session, not to the window: switching sessions shows that session's split (or no split), the
+    // way panes work in the full app. Held by id rather than index because g_sessions shifts under
+    // every close. Only a visible session owns one; the shell it names is hidden.
+    std::string splitId;
     bool flagged = false;          // user-flagged (working set); amber pennant in the tree, persisted
     int seenDone = 0;              // completed-command (FTCS) count when the session was last visible
     int unread = 0;                // commands finished while NOT visible — red count pill in the tree
@@ -1553,6 +1558,55 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
 // won't start" shape this branch exists to remove. Check before every copy.
 static bool fitsField(const char* s, size_t cap) { return s && strlen(s) < cap; }
 
+// ---- per-session split ----
+//
+// g_pane[1] used to be pure window state: it kept whatever shell it had while g_pane[0] changed
+// under it, so switching sessions left the previous session's right-hand terminal on screen beside
+// the new one. The split is a property of the SESSION now; these two keep the window agreeing with
+// it.
+
+static int indexOfSessionId(const std::string& id) {
+    if (id.empty()) return -1;
+    for (int i = 0; i < (int)g_sessions.size(); i++) if (g_sessions[i]->id == id) return i;
+    return -1;
+}
+
+static int indexOfSession(const Session* s) {
+    for (int i = 0; i < (int)g_sessions.size(); i++) if (g_sessions[i] == s) return i;
+    return -1;
+}
+
+/// Point pane 1 at the primary session's own split shell, or at nothing. A link whose shell has died
+/// (the user typed exit in it) is cleared here rather than left dangling.
+///
+/// PURE: it touches pane state only. closeSessionAt needs that — it runs this while holding g_lock
+/// and before it has decided whether the user deliberately emptied the window, and a resize from
+/// here would let a save land ahead of that decision and overwrite the state the guard exists to
+/// protect. (It did: two restore-matrix cells caught it.)
+static void resolveSplitForPrimary() {
+    int p0 = g_pane[0];
+    Session* prim = (p0 >= 0 && p0 < (int)g_sessions.size()) ? g_sessions[p0] : nullptr;
+    int comp = prim ? indexOfSessionId(prim->splitId) : -1;
+    if (prim && !prim->splitId.empty() && comp < 0) prim->splitId.clear();
+    g_pane[1] = comp;
+    if (g_pane[1] < 0 && g_focus != 0) g_focus = 0;   // nothing to focus on the right any more
+}
+
+/// The same, then lay the panes out. Call after ANY change to g_pane[0] — that is what makes the
+/// split follow the session.
+static void syncSplitToPrimary() {
+    resolveSplitForPrimary();
+    syncPaneSizes();
+}
+
+/// Show a session in the main pane, bringing its own split with it.
+static void selectPrimary(int idx) {
+    if (idx < 0 || idx >= (int)g_sessions.size()) return;
+    g_pane[0] = idx;
+    g_focus = 0;
+    syncSplitToPrimary();
+}
+
 static Session* newSession(int cols, int rows, const char* app = nullptr,
                            const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr) {
     char idbuf[64];
@@ -1797,6 +1851,21 @@ static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for
 static void closeSessionAt(int idx) {
     if (idx < 0 || idx >= (int)g_sessions.size()) return;
     Session* cs = g_sessions[idx];
+    // A split shell exists only to be one session's right-hand pane, so it dies with that session -
+    // otherwise closing the owner would strand a running shell nothing can reach: it is hidden, so
+    // it is in no tree and no sidebar. One level of recursion only; a split owns no split of its own.
+    if (!cs->splitId.empty()) {
+        int ci = indexOfSessionId(cs->splitId);
+        cs->splitId.clear();
+        if (ci >= 0 && ci != idx) {
+            closeSessionAt(ci);
+            idx = indexOfSession(cs);          // the erase above may have shifted us
+            if (idx < 0) return;
+        }
+    }
+    // ...and the other direction: a split shell that dies on its own (the user typed exit in it)
+    // must not leave its owner pointing at nothing.
+    for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
     if (!cs->hidden) {   // remember the launch spec so it can be reopened (skip transient split/popup shells)
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
         g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args });
@@ -1817,14 +1886,19 @@ static void closeSessionAt(int idx) {
         else if (g_pane[p] > idx) g_pane[p]--;
     }
     if (g_sessions.empty()) g_pane[1] = -1;   // unsplit when the last pane dies
+    resolveSplitForPrimary();                // pane 1 follows whichever session pane 0 now shows
     // "Emptied" means NOTHING IS LEFT ON SCREEN IN THIS WINDOW, which is neither the raw session
     // count nor the save's count. The save writes only non-hidden sessions, so a quick/scratch popup
     // (its own window) keeps g_sessions non-empty while the save sees zero — judged by the raw vector
     // the guard would refuse that save and the sessions the user just closed would be read straight
     // back out of the untouched file on the next launch. A split shell is hidden too, but it is
     // right there in pane 1: the window is not empty, so this is not the one save allowed to write a
-    // zero-session file (and to drop the .bak). Unsplit as well and nothing writes the empty either —
-    // deliberately, because "throw away every saved session" should take an unambiguous gesture.
+    // zero-session file (and to drop the .bak).
+    //
+    // Since a split BELONGS to its session (it closes with it), a split shell should no longer be
+    // able to outlive the session it was opened from — so the splitShell clause below is now a
+    // belt-and-braces guard rather than the live case it was written for. It stays because the cost
+    // is one pointer compare and the failure it prevents is overwriting good state.
     bool anyVisible = false;
     for (const Session* vs : g_sessions) if (!vs->hidden || vs == splitShell) { anyVisible = true; break; }
     bool allGone = g_sessions.empty();
@@ -1852,7 +1926,7 @@ static void reopenClosed() {
     int c, r; paneGridSize(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
-    if (s) { s->name = sp.name; g_pane[g_focus] = (int)g_sessions.size() - 1; syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (s) { s->name = sp.name; selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 static void toggleSplit();   // fwd
 static void closeFocused() {
@@ -1864,13 +1938,21 @@ static void closeFocused() {
 // output) — but marked hidden, so it is NOT a sidebar/tree session (agterm: a split isn't a new
 // session). Unsplitting removes that shell.
 static void toggleSplit() {
+    int p0 = g_pane[0];
+    Session* prim = (p0 >= 0 && p0 < (int)g_sessions.size()) ? g_sessions[p0] : nullptr;
+    if (!prim) return;                               // nothing to attach a split to
     if (g_pane[1] < 0) {
         int c, r; paneGridSize(g_focus, &c, &r);   // approximate; syncPaneSizes resizes both after
         Session* s = newSession(c, r);
-        if (s) { s->hidden = true; g_pane[1] = (int)g_sessions.size() - 1; g_focus = 1; }
+        if (s) {
+            s->hidden = true;
+            prim->splitId = s->id;                   // the split belongs to THIS session
+            g_pane[1] = (int)g_sessions.size() - 1; g_focus = 1;
+        }
     } else {
         int sp = g_pane[1];
         g_pane[1] = -1; g_focus = 0;
+        prim->splitId.clear();
         if (sp >= 0 && sp < (int)g_sessions.size()) {   // remove the hidden split shell
             killSession(g_sessions[sp]);
             EnterCriticalSection(&g_lock);
@@ -1891,7 +1973,7 @@ static void cycleSession(int dir) {
     int i = g_pane[0];
     for (int k = 0; k < n; k++) {
         i = (i + dir + n) % n;
-        if (i >= 0 && i < n && !g_sessions[i]->hidden) { g_pane[0] = i; g_focus = 0; break; }
+        if (i >= 0 && i < n && !g_sessions[i]->hidden) { selectPrimary(i); break; }
     }
     syncPaneSizes();
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
@@ -2271,6 +2353,7 @@ static void saveSessionState() {
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
     std::string idLine;
+    std::vector<const Session*> savedOrder;   // S-line order, so a split can name its owner by position
     int saved = 0;
     for (const Session* s : g_sessions) {
         if (s->hidden) continue;
@@ -2285,7 +2368,26 @@ static void saveSessionState() {
         out += "\n";
         if (s->flagged) flagLine += "\t" + std::to_string(saved);
         idLine += "\t" + s->id;
+        savedOrder.push_back(s);
         saved++;
+    }
+    // ...then each saved session's split shell, named by its owner's POSITION among the S lines.
+    // Written after them so a reader that stops at an unknown line type still gets every session,
+    // and a build that does not know P ignores it and restores without the split.
+    std::string splitLines;
+    const std::string tab(1, (char)9);       // the field separator, spelled without an escape
+    for (size_t oi = 0; oi < savedOrder.size(); oi++) {
+        const Session* owner = savedOrder[oi];
+        if (owner->splitId.empty()) continue;
+        const Session* sh = nullptr;
+        for (const Session* c : g_sessions) if (c->id == owner->splitId) { sh = c; break; }
+        if (!sh) continue;                               // its shell is gone; nothing to restore
+        std::string scw = sessionLiveCwd(sh);
+        if (scw.size() >= sizeof agwinterm_ptyhost_Create::cwd) scw.clear();
+        splitLines += "P" + tab + std::to_string(oi) + tab + tsvField(sh->app)
+                    + tab + tsvField(scw.empty() ? sh->cwd : scw);
+        for (const auto& a : sh->args) splitLines += tab + tsvField(a);
+        splitLines += "\n";
     }
     // Read under the lock, with the session list it describes: the flag is written from the
     // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
@@ -2294,6 +2396,7 @@ static void saveSessionState() {
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
+    out += splitLines;                       // P lines: each session's own right-hand shell
     out += "A\t" + std::to_string(g_activeWs) + "\n";
 
     // Anything that rebuilds the tree while the session list is momentarily empty used to rewrite the
@@ -3714,7 +3817,7 @@ static void palChar(wchar_t wc) {   // printable input -> query (both frame + po
 
 static void runKbAction(int a) {
     switch (a) {
-        case KB_NEW: { int c, r; paneGridSize(g_focus, &c, &r); Session* s = newSession(c, r); if (s) { g_pane[g_focus] = (int)g_sessions.size() - 1; InvalidateRect(g_hwnd, nullptr, FALSE); } break; }
+        case KB_NEW: { int c, r; paneGridSize(g_focus, &c, &r); Session* s = newSession(c, r); if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); } break; }
         case KB_NEWWS: SendMessageW(g_hwnd, WM_COMMAND, IDM_NEWWS, 0); break;
         case KB_CLOSE: closeFocused(); break;
         case KB_SPLIT: toggleSplit(); break;
@@ -3991,7 +4094,7 @@ static void showTreeContextMenu() {
                 g_activeWs = cws;
                 int c, r; paneGridSize(g_focus, &c, &r);
                 Session* s = newSession(c, r);
-                if (s) { g_pane[g_focus] = (int)g_sessions.size() - 1; syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+                if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
             }
             break;
         case IDM_RENAME:
@@ -4147,7 +4250,7 @@ static void newSessionDialog(const char* cwd) {
     if (i < 0 || i >= (int)profs.size()) return;
     int c, r; paneGridSize(g_focus, &c, &r);
     Session* s = newSession(c, r, profs[i].app.c_str(), &profs[i].args, cwd);
-    if (s) { g_pane[g_focus] = (int)g_sessions.size() - 1; syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 
 // ---- Properties dialog (cmd.exe-style: font + colors, live preview) ----
@@ -5051,7 +5154,7 @@ static void nextBlocked() {
         int i = (start + k) % n;
         Session* s = g_sessions[i];
         if (s->hidden || s->exited || statusClass(s->status) != AGST_BLOCKED) continue;
-        g_pane[0] = i; g_focus = 0;
+        selectPrimary(i);
         g_activeWs = s->ws;
         if (g_focusWs >= 0) g_focusWs = s->ws;   // focus follows the jump (the row must be visible)
         syncPaneSizes();
@@ -5618,7 +5721,7 @@ public:
             if (p >= 0) {                                   // session node -> show it in the MAIN pane
                 int i = (int)p;
                 if (i < (int)g_sessions.size()) {
-                    g_pane[0] = i; g_focus = 0;             // tree drives the main pane, not the split shell
+                    selectPrimary(i);                      // tree drives the main pane, not the split shell
                     g_activeWs = g_sessions[i]->ws;         // new sessions follow the selected one's workspace
                     syncPaneSizes();
                     Invalidate(FALSE);
@@ -5946,10 +6049,24 @@ One call creates the session, names it, and runs the command as its shell:
 agwintermctl session new --name build --command "npm test" --cwd C:\src\app
 ```
 
+**Say which workspace, or you get whichever one is active** - and the active one moves every time a
+session is selected, so a run of sessions created without it scatters across whatever the user was
+clicking. The id is the index `tree` reports:
+
+```
+agwintermctl session new --name build --workspace 1
+agwintermctl session new --name build --workspace-name review [--create-workspace]
+```
+
+A workspace that does not exist is refused, not silently swapped for the active one.
+
 ## A second pane, beside you
 
-`session split` opens the window's right-hand pane and RETURNS ITS SESSION ID. That id is the only
-handle it has: the split shell is hidden, so it appears in no tree listing and has no name.
+`session split` opens the CURRENT SESSION's right-hand pane and RETURNS ITS SESSION ID. That id is
+the only handle it has: the split shell is hidden, so it appears in no tree listing and has no name.
+
+The split belongs to that session: switch to another session and the right pane shows that one's
+split, or none at all. It closes with its owner.
 
 ```
 id=$(agwintermctl session split)
@@ -6089,6 +6206,35 @@ static std::string ctlDispatch(const std::string& line) {
         std::string name = req.get("args.name");
         std::string cwd  = req.get("args.cwd");
         std::string command = req.get("args.command");
+
+        // Which workspace to create into. Without this the session landed in whatever workspace was
+        // active, and the active one moves every time a session is selected - so an agent creating
+        // several sessions scattered them wherever the user had last clicked. Same arguments and the
+        // same precedence as the full app (Program.ControlHost.cs NewSession): an explicit id wins,
+        // then a name, and --create-workspace makes a missing one rather than falling back.
+        //
+        // lite's workspace "id" is its index, which is what `tree` publishes.
+        int wantWs = -1;
+        std::string wsArg = req.get("args.workspace");
+        std::string wsName = req.get("args.workspace-name");
+        std::string wsCreate = req.get("args.create-workspace");
+        if (!wsArg.empty()) {
+            bool digits = wsArg.find_first_not_of("0123456789") == std::string::npos;
+            int n = digits ? atoi(wsArg.c_str()) : -1;
+            if (n >= 0 && n < (int)g_workspaces.size()) wantWs = n;
+            else return ctlErr("no workspace '" + wsArg + "' (ids are the indices `tree` reports)");
+        } else if (!wsName.empty()) {
+            std::wstring want = widen(wsName);
+            for (int w = 0; w < (int)g_workspaces.size(); w++)
+                if (_wcsicmp(g_workspaces[w].c_str(), want.c_str()) == 0) { wantWs = w; break; }
+            if (wantWs < 0) {
+                if (wsCreate != "true" && wsCreate != "1")
+                    return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
+                g_workspaces.push_back(want);
+                wantWs = (int)g_workspaces.size() - 1;
+            }
+        }
+
         int cols, rows;
         paneGridSize(g_focus, &cols, &rows);
 
@@ -6107,7 +6253,8 @@ static std::string ctlDispatch(const std::string& line) {
         if (!s) return ctlErr("create failed");
         // tsvField: the name reaches the state file, where a tab or newline would forge a record.
         if (!name.empty()) s->name = widen(tsvField(name));
-        g_pane[g_focus] = (int)g_sessions.size() - 1;
+        if (wantWs >= 0) s->ws = wantWs;   // newSession() defaults to the active workspace
+        selectPrimary((int)g_sessions.size() - 1);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr(s->id);
     }
@@ -6116,7 +6263,11 @@ static std::string ctlDispatch(const std::string& line) {
     if (cmd == "session.select") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         for (int i2 = 0; i2 < (int)g_sessions.size(); i2++)
-            if (g_sessions[i2] == target) g_pane[g_focus] = i2;
+            if (g_sessions[i2] == target) selectPrimary(i2);   // brings that session's own split
+        // The sidebar highlight never followed an API select (pre-existing): the tree is rebuilt on
+        // WM_APP_REFRESHTREE and nothing posted it here, so the previous session stayed highlighted
+        // while a different one was on screen. Worth more now that selecting also changes the layout.
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr("selected");
     }
@@ -6218,7 +6369,7 @@ static std::string ctlDispatch(const std::string& line) {
         return -1;
     };
     auto selectIdx = [&](int i2) {   // the tree-click effects, control-thread safe
-        g_pane[0] = i2; g_focus = 0; g_activeWs = g_sessions[i2]->ws;
+        selectPrimary(i2); g_activeWs = g_sessions[i2]->ws;
         syncPaneSizes();
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -6275,6 +6426,9 @@ static std::string ctlDispatch(const std::string& line) {
         //
         // Created here rather than by posting IDM_SPLIT, for the same reason session.new does it
         // here: a posted message is asynchronous and there would be nothing to return.
+        int p0 = g_pane[0];
+        Session* prim = (p0 >= 0 && p0 < (int)g_sessions.size()) ? g_sessions[p0] : nullptr;
+        if (!prim) return ctlErr("no session to split");
         bool cur = g_pane[1] >= 0;
         bool want = wantOn(req.get("args.op"), cur);
         if (want && !cur) {
@@ -6283,6 +6437,8 @@ static std::string ctlDispatch(const std::string& line) {
             Session* s = newSession(c, r);
             if (!s) return ctlErr("split failed");
             s->hidden = true;               // a split shell, not a tree session
+            prim->splitId = s->id;          // ...and it belongs to the session being split, so it
+                                            // travels with it when the user switches away and back
             g_pane[1] = (int)g_sessions.size() - 1;
             // Focus deliberately NOT moved: the menu split is a human asking to type over there,
             // but an API split is an agent opening a pane beside a user who is still typing.
@@ -6623,9 +6779,15 @@ static DWORD WINAPI ctlServerThreadFor(void* arg) {
 // One parsed state file. `opened` separates "no file" from "a file that says nothing useful" — the
 // two used to look identical from outside, which is half of why the field report was unanswerable.
 struct RestoreSpec { int ws; std::string name, app, cwd; std::vector<std::string> args; bool flagged = false; };
+// A split shell, and which S line owns it. It has no name and no workspace of its own - it is one
+// session's right-hand pane, so it is restored only if that session was.
+struct SplitSpec { int owner = -1; RestoreSpec spec; };
+
 struct ParsedState {
     std::vector<std::wstring> wss;
     std::vector<RestoreSpec> specs;
+    std::vector<SplitSpec> splits;       // from P lines; empty for any file written before 0.17.13
+    int sLines = 0;                      // RAW S lines seen, valid or not - see the P-line guard
     std::vector<std::string> savedIds;   // from the D line; empty for a pre-0.17.3 file
     int activeWs = 0, focusWs = -1;
     int version = 0;                     // from the V header; 0 = there wasn't one
@@ -6659,10 +6821,17 @@ static ParsedState parseStateFile(const std::wstring& path) {
         // log can say so; unknown line types are ignored by the same principle.
         if (ff[0].size() >= 2 && ff[0][0] == 'V' && isdigit((unsigned char)ff[0][1])) ps.version = atoi(ff[0].c_str() + 1);
         else if (ff[0] == "W" && ff.size() >= 2) ps.wss.push_back(widen(ff[1]));
-        else if (ff[0] == "S" && ff.size() >= 5) {
-            RestoreSpec sp; sp.ws = atoi(ff[1].c_str()); sp.name = ff[2]; sp.app = ff[3]; sp.cwd = ff[4];
-            for (size_t k = 5; k < ff.size(); k++) sp.args.push_back(ff[k]);
-            ps.specs.push_back(sp);
+        else if (ff[0] == "S") {
+            ps.sLines++;                 // counted even when malformed: the P guard below needs it
+            if (ff.size() >= 5) {
+                RestoreSpec sp; sp.ws = atoi(ff[1].c_str()); sp.name = ff[2]; sp.app = ff[3]; sp.cwd = ff[4];
+                for (size_t k = 5; k < ff.size(); k++) sp.args.push_back(ff[k]);
+                ps.specs.push_back(sp);
+            }
+        } else if (ff[0] == "P" && ff.size() >= 4) {   // a session's split shell: owner, app, cwd, args
+            SplitSpec sp; sp.owner = atoi(ff[1].c_str()); sp.spec.app = ff[2]; sp.spec.cwd = ff[3];
+            for (size_t k = 4; k < ff.size(); k++) sp.spec.args.push_back(ff[k]);
+            ps.splits.push_back(sp);
         } else if (ff[0] == "F") {   // flagged indices, in S-line order
             for (size_t k = 1; k < ff.size(); k++) {
                 int fi = atoi(ff[k].c_str());
@@ -6679,6 +6848,14 @@ static ParsedState parseStateFile(const std::wstring& path) {
     // name/app/cwd, and save that wrong pairing back. Damaged files are exactly what the .bak
     // fallback exists to read, so refuse the ids rather than misapply them; the specs still restore,
     // just as fresh sessions.
+    // P lines name their owner by POSITION among the S lines, so a dropped S line slides every
+    // later owner index onto the wrong session - and a split would then open beside a session that
+    // never had one. Same reasoning as the D line below: refuse the splits, keep the sessions.
+    if (!ps.splits.empty() && ps.sLines != (int)ps.specs.size()) {
+        logWarn("state: %d session line(s) but %zu parsed - refusing %zu split line(s) rather than "
+                "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.splits.size());
+        ps.splits.clear();
+    }
     if (!ps.savedIds.empty() && ps.savedIds.size() != ps.specs.size()) {
         logWarn("state: %zu saved id(s) for %zu session line(s) — the file is inconsistent, so live "
                 "sessions will not be adopted from it", ps.savedIds.size(), ps.specs.size());
@@ -6785,6 +6962,7 @@ static bool restoreSessions() {
     if (!wss.empty()) g_workspaces = wss;
     int cols, rows; paneGridSize(0, &cols, &rows);
     int firstIdx = -1, built = 0, adopted = 0, dead = 0;
+    std::vector<Session*> bySpec;   // spec index -> the session it produced (null if it could not start)
 
     // Sessions the host still holds (read at startup by scanHostSessions, which also reserved their
     // ids). lite was killed rather than closed if this is non-empty: the pty-host outlives the UI by
@@ -6837,6 +7015,7 @@ static bool restoreSessions() {
             s->name = widen(sp.name); s->flagged = sp.flagged;
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;
             built++;
+            bySpec.push_back(s);
         } else {
             // A spec that won't start used to be invisible AND gone: the session didn't come back and
             // the next save rewrote the file without it. Keep it as a dead entry and name it in the log.
@@ -6844,8 +7023,27 @@ static bool restoreSessions() {
                     sp.name.c_str(), sp.app.c_str(), sp.cwd.c_str());
             failedSpecSession(sp, cols, rows);
             dead++;
+            bySpec.push_back(nullptr);   // keep spec positions aligned for the P lines
         }
     }
+    // Each session gets its own split shell back. A P line names its owner by position, and the
+    // parser has already refused the whole set if the S lines it counts on did not all parse.
+    // The shell is created fresh rather than adopted: only the S lines carry host ids (the D line),
+    // so a killed lite leaves the old split shells to the reap, as it always did.
+    int splitsBuilt = 0;
+    for (const auto& sp : ps.splits) {
+        if (sp.owner < 0 || sp.owner >= (int)bySpec.size() || !bySpec[sp.owner]) continue;
+        Session* sh = newSession(cols, rows, sp.spec.app.empty() ? nullptr : sp.spec.app.c_str(),
+                                 sp.spec.args.empty() ? nullptr : &sp.spec.args,
+                                 sp.spec.cwd.empty() ? nullptr : sp.spec.cwd.c_str());
+        if (!sh) { logWarn("restore: a split shell FAILED to start (app=%s cwd=%s) - its session comes back without it",
+                           sp.spec.app.c_str(), sp.spec.cwd.c_str()); continue; }
+        sh->hidden = true;                       // a split shell, not a tree session
+        bySpec[sp.owner]->splitId = sh->id;
+        splitsBuilt++;
+    }
+    if (!ps.splits.empty())
+        logInfo("restore: %d of %zu split shell(s) rebuilt", splitsBuilt, ps.splits.size());
     g_restoring = false;
     logInfo("restore: %d of %zu session(s) built (%d adopted live from the pty-host, %d kept as dead)",
             built, specs.size(), adopted, dead);
@@ -6857,7 +7055,8 @@ static bool restoreSessions() {
         if (dead) refreshTree();
         return false;
     }
-    g_pane[0] = firstIdx; g_pane[1] = -1; g_focus = 0;
+    g_pane[0] = firstIdx; g_focus = 0;
+    resolveSplitForPrimary();   // ...and the restored session shows its own split, if it had one
     g_activeWs = (activeWs >= 0 && activeWs < (int)g_workspaces.size()) ? activeWs : 0;
     g_focusWs = (focusWs >= 0 && focusWs < (int)g_workspaces.size()) ? focusWs : -1;
     syncPaneSizes();
@@ -7086,7 +7285,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         // better than a message box that throws them away. Judged by `restored` alone this killed
         // exactly the launch it was built to explain.
         if (!s && g_sessions.empty()) fatal(L"could not create the first session");
-        if (s) { g_pane[0] = (int)g_sessions.size() - 1; g_focus = 0; syncPaneSizes(); }
+        if (s) { selectPrimary((int)g_sessions.size() - 1); }
         refreshTree();
     }
     static std::wstring ctlName = g_argPipe.empty() ? std::wstring(kAppId) : g_argPipe;
