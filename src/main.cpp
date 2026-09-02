@@ -6060,6 +6060,16 @@ agwintermctl session new --name build --workspace-name review [--create-workspac
 
 A workspace that does not exist is refused, not silently swapped for the active one.
 
+## Typing, and the two verbs that are not the same thing
+
+`session type` sends keystrokes to the shell. A newline is Enter; every other control byte is
+REFUSED rather than stripped, because a NUL truncates your command while its Return still fires.
+Pass `--allow-control` when you mean one (an escape sequence for a TUI, a lone ^C).
+
+`session write` does NOT reach the shell. It injects bytes into the terminal's display, so it paints
+a pane without any program having printed anything — useful for a banner or a marker, and no use at
+all for sending keys.
+
 ## A second pane, beside you
 
 `session split` opens the CURRENT SESSION's right-hand pane and RETURNS ITS SESSION ID. That id is
@@ -6104,7 +6114,7 @@ terminal still moves you forward.
 ## Sessions, workspaces, windows
 
 ```
-agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay
+agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
 agwintermctl session copy|paste|type|text|output|status
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
@@ -6276,9 +6286,40 @@ static std::string ctlDispatch(const std::string& line) {
         std::string text = req.get("args.text");
         // \n → \r (keystroke semantics, like the main app's session.type)
         for (char& ch : text) if (ch == '\n') ch = '\r';
+        // Every other control byte is REFUSED, not stripped. agterm hardened this in v0.25.0 after
+        // a NUL truncated an injection while the call still answered ok - and because the text and
+        // its Return are separate keystrokes, the shortened line got its Return and ran. Stripping
+        // produces that same shortened line. TAB stays: completion is typing. A caller that MEANS
+        // the byte passes allow-control. (NOT session.write: that injects into the emulator and
+        // never reaches the shell, here as in the full app.)
+        std::string allowCtl = req.get("args.allow-control");
+        if (allowCtl != "true" && allowCtl != "1") {
+            for (size_t bi = 0; bi < text.size(); bi++) {
+                unsigned char uc = (unsigned char)text[bi];
+                if ((uc >= ' ' && uc != 0x7f) || uc == '\r' || uc == '\t') continue;
+                char emsg[176];
+                sprintf_s(emsg, "session.type refuses control byte 0x%02X at index %u "
+                                "(CR, LF and TAB are fine) - pass --allow-control if you mean it",
+                          uc, (unsigned)bi);
+                return ctlErr(emsg);
+            }
+        }
         if (target->data != INVALID_HANDLE_VALUE)
             ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size());
         return ctlOkStr("typed");
+    }
+    if (cmd == "session.write") {
+        // Feed bytes into the EMULATOR only - display injection, never the shell. Same meaning as
+        // the full app (ISession.Inject): useful for painting into a pane, and useless as a way to
+        // send keystrokes, which is exactly why session.type refuses control bytes instead of
+        // pointing here.
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        std::string bytes = req.get("args.text");
+        EnterCriticalSection(&g_lock);
+        if (target->emu) emu_feed(target->emu, (const uint8_t*)bytes.data(), (uint32_t)bytes.size());
+        LeaveCriticalSection(&g_lock);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return ctlOkStr("written");
     }
     if (cmd == "install.skill") return ctlOkStr(installAgentSkill());
     if (cmd == "events") {
