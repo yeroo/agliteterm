@@ -10,6 +10,13 @@ Part of the [agwinterm](https://github.com/yeroo/agwinterm) family: same Rust em
 pty-host, same control API — a fraction of the footprint. One small C++ exe, **no .NET runtime**,
 real native Win32 controls.
 
+**Feature parity with agwinterm is the goal, not a cut-down build.** What is still missing (and the
+few places this one is ahead) is tracked in
+[agwinterm/docs/lite-parity.md](https://github.com/yeroo/agwinterm/blob/main/docs/lite-parity.md),
+kept there because the control-API contract is canonical in that repo. Both products' standing
+against umputun's agterm is in
+[agterm-parity.md](https://github.com/yeroo/agwinterm/blob/main/docs/agterm-parity.md).
+
 [![CI](https://github.com/yeroo/agliteterm/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/agliteterm/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yeroo/agliteterm/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/agliteterm)
 [![Release](https://img.shields.io/github/v/release/yeroo/agliteterm?sort=semver)](https://github.com/yeroo/agliteterm/releases)
@@ -223,7 +230,8 @@ To build against a core you are changing:
 
 ```powershell
 ./build.ps1 -NativeDir C:\srcgwinterm
-ative	argetelease
+ative	arget
+elease
 ```
 
 ## Tests
