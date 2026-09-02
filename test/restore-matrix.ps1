@@ -528,10 +528,15 @@ if (-not $Only -or $Only -eq 'restart-cmdline') {
 # --- a good state file must never be replaced by an empty or truncated one ----------------------
 # The save is atomic (tmp + rename) and keeps one .bak generation; restore falls back to the .bak.
 
-# The transient-empty save, driven for real. Split shells are hidden and deliberately not persisted,
-# so with a split open, closing the only VISIBLE session leaves lite running with zero persistable
-# sessions. That save used to write a 0-session file over a good one — and with CREATE_ALWAYS there
-# was nothing left to fall back to.
+# A split now BELONGS to its session (0.17.13), so closing that session closes its split too and the
+# window really is empty — the same shape as closing the last session, and it must write the empty
+# rather than resurrect anything.
+#
+# This cell used to assert the opposite, because a split used to be window state that outlived the
+# session it was opened beside: it was the one vehicle for a TRANSIENT empty (nothing persistable
+# left, but a hidden shell still on screen), and the guard had to skip that save. That state is now
+# unreachable by construction, and this cell records the new invariant instead: no orphan shell, no
+# resurrected session.
 if (-not $Only -or $Only -eq 'zero-guard') {
     $inst = 'rm-zero-guard'
     Reset-Cell $inst
@@ -547,7 +552,7 @@ if (-not $Only -or $Only -eq 'zero-guard') {
         & $ctl session close $id --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 3
         $kept = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -match 'keep-me')
-        $skipped = Log-Has $inst 'save SKIPPED'
+        $wrote = Log-Has $inst 'save ok: 0 session'
         Stop-Lite $p; $p = $null
         $p2 = Start-Lite $inst
         Start-Sleep -Seconds 2
@@ -555,13 +560,15 @@ if (-not $Only -or $Only -eq 'zero-guard') {
         Stop-Lite $p2; $p2 = $null
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2 }
-    if (-not $err -and $kept -and $skipped -and $after -match 'keep-me') {
-        "  PASS  {0,-22} [{1}]" -f 'zero-guard', $after
+    # The empty is written, the closed session does not come back, and nothing is left holding the
+    # window open — if the split had outlived its owner, the empty save would not have happened.
+    if (-not $err -and $wrote -and -not $kept -and $after -notmatch 'keep-me') {
+        "  PASS  {0,-22} (a split closes with its session)" -f 'split-with-session'
     } else {
-        $script:failed += 'zero-guard'
-        "  FAIL  zero-guard"
+        $script:failed += 'split-with-session'
+        "  FAIL  split-with-session"
         if ($err) { "        error:  $err" }
-        "        state kept the session: $kept ; log said SKIPPED: $skipped"
+        "        empty save happened: $wrote ; state still has the session: $kept"
         "        after:  [$after]"
         "        log:    $(Restore-Verdict $inst)"
     }
@@ -606,33 +613,34 @@ if (-not $Only -or $Only -eq 'closed-last') {
     }
 }
 
-# The guard must survive being used. Closing the last session marks the empty as DELIBERATE, and
-# driven over the control pipe the window does not actually go away (DestroyWindow is a no-op off the
-# UI thread) — so a window keeps running with that mark set. If it is a one-way latch rather than a
-# statement about one save, every later transient empty is waved straight through and the good file
-# is overwritten with a zero-session one, which is exactly what 'zero-guard' exists to prevent.
+# The deliberate-empty mark must not LATCH, in either direction. Closing the last session sets it,
+# and driven over the control pipe the window does not actually go away (DestroyWindow is a no-op off
+# the UI thread), so a window keeps running with it set. Stuck on, a later save of real sessions is
+# judged against a stale "the user emptied this" and the file it writes cannot be trusted; stuck off,
+# a later empty is never written and closed sessions come back.
 if (-not $Only -or $Only -eq 'guard-after-empty') {
     $inst = 'rm-guard-after-empty'
     Reset-Cell $inst
-    $err = ''; $kept = $false; $skipped = $false; $after = ''
+    $err = ''; $savedAfterEmpty = $false; $secondEmpty = $false; $after = ''
     $p = $null; $p2 = $null
     try {
         $p = Start-Lite $inst
         & $ctl session close (LastSessionId $inst) --pipe $inst 2>&1 | Out-Null   # window is now empty
         Start-Sleep -Seconds 3
         if (-not (Log-Has $inst 'save ok: 0 session')) { throw 'the window never reached the deliberate-empty save' }
-        # Re-fill it, then drive a TRANSIENT empty exactly as zero-guard does.
+        # Not stuck ON: a real session created after that empty must still be saved normally.
         & $ctl session new --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 2
         $id = LastSessionId $inst
         & $ctl session rename kept-after-empty --target $id --pipe $inst 2>&1 | Out-Null
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
+        $savedAfterEmpty = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -match 'kept-after-empty')
+        # Not stuck OFF: emptying it again (the session takes its split with it) must be written.
         & $ctl session split on --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 2
         & $ctl session close $id --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 3
-        $kept = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -match 'kept-after-empty')
-        $skipped = Log-Has $inst 'save SKIPPED'
+        $secondEmpty = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -notmatch 'kept-after-empty')
         Stop-Lite $p; $p = $null
         $p2 = Start-Lite $inst
         Start-Sleep -Seconds 2
@@ -640,13 +648,13 @@ if (-not $Only -or $Only -eq 'guard-after-empty') {
         Stop-Lite $p2; $p2 = $null
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2 }
-    if (-not $err -and $kept -and $skipped -and $after -match 'kept-after-empty') {
-        "  PASS  {0,-22} [{1}]" -f 'guard-after-empty', $after
+    if (-not $err -and $savedAfterEmpty -and $secondEmpty -and $after -notmatch 'kept-after-empty') {
+        "  PASS  {0,-22} (the deliberate-empty mark does not latch)" -f 'guard-after-empty'
     } else {
         $script:failed += 'guard-after-empty'
         "  FAIL  guard-after-empty"
         if ($err) { "        error:  $err" }
-        "        state kept the session: $kept ; log said SKIPPED: $skipped"
+        "        saved after the empty: $savedAfterEmpty ; second empty written: $secondEmpty"
         "        after: [$after]"
         "        log:   $(Restore-Verdict $inst)"
     }
