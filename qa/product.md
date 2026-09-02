@@ -69,6 +69,9 @@ can go green having driven nothing; it happened while writing agwinterm's copy o
 
 Cases must not assume the main app's behaviour. As of 0.17.11:
 
+- **A split is a hidden session, not a pane object.** It has no tree row and no name; `session split`
+  hands back its id, which is the only handle on it. The full app models panes inside a session
+  instead. Behaviour matches: the split belongs to its session either way.
 - **No mark mode, no Select All, no drag-autoscroll.** Those cases exist only in agwinterm's `qa/`.
 - **Scrollback is not configurable** — lite does not call `agwcore_emu_set_scrollback` yet, so there
   is no `scrollback-lines = 0` case here.
@@ -83,7 +86,8 @@ Cases must not assume the main app's behaviour. As of 0.17.11:
 
 ## What is here, and what is still a script
 
-`qa/selection.md` holds the selection cases. **Clipboard and host actions stay in
+`qa/selection.md` holds the selection cases and `qa/panes.md` the split-pane ones (a split belongs
+to its session, closes with it, and comes back with it after a restart). **Clipboard and host actions stay in
 `test/clipboard.ps1`** — OSC 52 writes, query replies, right-click paste while a TUI holds the mouse
 — because CI runs `test/run-all.ps1 -Strict` and those checks would lose their only automated home
 until the markdown cases have a CI story. Port them when that exists, not before: coverage that runs
