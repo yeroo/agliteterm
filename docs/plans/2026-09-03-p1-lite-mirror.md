@@ -110,22 +110,27 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 ## Implementation Steps
 
 ### Task 1: `surface.cursor`
-- [ ] add `surface.cursor` to `ctlDispatch` beside the other resolved-target verbs: refuse with
+- [x] add `surface.cursor` to `ctlDispatch` beside the other resolved-target verbs: refuse with
       `targetWhy` when the target does not resolve; otherwise read `FfiEmuInfo` under `g_lock` and
       answer `ctlOk(std::to_string(info.cursorCol))` — the **column only**, a bare JSON integer
-- [ ] a pane whose child has exited still reports its caret (a dead child does not un-address the
+- [x] a pane whose child has exited still reports its caret (a dead child does not un-address the
       pane, and a caller deciding whether to type must get a number, not an error); a session that
       is gone from the tree is refused. Pin both
-- [ ] comment on the verb: why column-only (agterm's shape, shared with agwinterm), why row is not
+- [x] comment on the verb: why column-only (agterm's shape, shared with agwinterm), why row is not
       reported, and that the target resolves exactly as `session text` / `session type` do
-- [ ] `test/control-read.ps1` (new, listed in `run-all.ps1`): a fresh pane reports the prompt's
+- [x] `test/control-read.ps1` (new, listed in `run-all.ps1`): a fresh pane reports the prompt's
       column and **not** `0` mistaken for "no answer"; type text without Enter and the column moves
       by that many cells; an unknown target returns `ok:false`; the reply is a JSON **number**
       (`[int]` after `ConvertFrom-Json`, not a string); a pane whose shell has exited still answers
-- [ ] a case for the deferred wrap: after printing into the last column the answer equals the pane
+- [x] a case for the deferred wrap: after printing into the last column the answer equals the pane
       width, so callers must not use it as an index without clamping — assert the value, document
       the caveat where the verb is documented
-- [ ] build + run `test/control-read.ps1` — must pass before task 2
+- [x] build + run `test/control-read.ps1` — must pass before task 2
+- ⚠️ the published agwinterm release (v0.17.8, 2026-09-02) predates #221, so the fetched
+      `bin\agwintermctl.exe` has no `surface cursor`. `test/control-read.ps1` detects that and
+      SKIPs (fails under `-Strict`); locally run it with `$env:AGWINTERMCTL` pointing at a
+      post-#221 build. It goes green in CI when agwinterm cuts its next release — the same
+      merge gate as `check-contract`, not a bug to work around
 
 ### Task 2: `statusChangedAt`
 - [ ] add `long long statusChangedAt` (epoch seconds) to `struct Session`, initialised at

@@ -1,0 +1,172 @@
+# Control API — the read-only trio (P1-lite): `surface.cursor` first; `statusChangedAt` and the
+# truthful `ping` join it in the same plan.
+#
+# Every case here checks that the NUMBER IS RIGHT, not merely well-shaped. A cursor column that is
+# always 0 passes a shape test and breaks the caller in exactly the way the verb exists to prevent:
+# an agent asks "is that composer empty before I type into it", and the caret column is its answer.
+# Shape is pinned as well (test/conformance.ps1 does the cross-product half), because the
+# bare-integer reply is the contract agwinterm and agterm share.
+#
+# Driven through the REAL agwintermctl against a sandbox instance, under test/ui-lib.ps1's rules:
+# --pipe <name>, a throwaway %LOCALAPPDATA%, nothing injected globally. `surface cursor` reached the
+# CLI in agwinterm #221; an older client refuses the verb locally, before any pipe is opened, and
+# this check says so and skips (fails under -Strict) rather than reporting the app broken.
+param(
+    [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
+    # CI passes -Strict: a suite that skips is reporting success while checking nothing.
+    [switch]$Strict
+)
+
+$ErrorActionPreference = 'Stop'
+$fail = 0
+function Check([string]$name, [bool]$ok, [string]$detail = '') {
+    if ($ok) { "  PASS  $name" }
+    else { $script:fail++; "  FAIL  $name$(if ($detail) { " — $detail" })" }
+}
+
+"== control-read =="
+
+. "$PSScriptRoot\ui-lib.ps1"
+$ctl = Get-CtlPath
+if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
+$exe = Resolve-Lite $Exe
+if (-not $exe) { "  SKIP  no build at $Exe"; exit ($Strict ? 1 : 0) }
+"  using: $ctl"
+# The client refuses a verb it does not know on its own side, so this probe never needs a pipe.
+$probe = (& $ctl surface cursor --pipe 'ctlread-probe' --json 2>&1) -join ''
+if ($probe -match "unknown command 'surface cursor'") {
+    "  SKIP  this agwintermctl predates agwinterm #221 and has no 'surface cursor' - set AGWINTERMCTL to a newer build"
+    exit ($Strict ? 1 : 0)
+}
+
+$s = $null
+function Tree { (ConvertFrom-Json (Send-Ctl $s @('tree'))).result }
+function Nodes { Tree | ForEach-Object workspaces | ForEach-Object sessions }
+function Node([string]$id) { Nodes | Where-Object { $_.id -eq $id } }
+function CursorRaw([string]$t) { Send-Ctl $s @('surface', 'cursor', '--target', $t) }
+# Through the parser, and as a number: an [int] cast on a string "7" would also give 7, which is
+# exactly the wrong thing to hide, so the type is asserted separately below and never coerced here.
+function Col([string]$t) {
+    $r = ConvertFrom-Json (CursorRaw $t)
+    if (-not $r.ok) { throw "surface cursor --target $t refused: $($r.error)" }
+    return $r.result
+}
+function IsInteger($v) { ($v -is [long] -or $v -is [int]) -and $v -isnot [string] }
+function Text([string]$t) { [string](Get-PaneText $s $t) }
+function LastLine([string]$t) {
+    $lines = @((Text $t) -split "`n" | Where-Object { $_.Trim() -ne '' })
+    if ($lines.Count) { return $lines[-1] } else { return '' }
+}
+# A column caught mid-repaint is a race in the check, not a bug in the verb: wait for the shell's
+# prompt to be on screen before reading anything. "On screen" is judged by the screen SETTLING,
+# not by what the prompt looks like — the sandbox runs the machine's real profile, and a prompt
+# theme that ends in '#' on its own line is as valid as 'PS ...>'.
+function Wait-Prompt([string]$t) {
+    $prev = ''; $same = 0
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 500
+        $now = (Text $t).Trim()
+        if ($now -ne '' -and $now -eq $prev) { if (++$same -ge 3) { return $true } } else { $same = 0 }
+        $prev = $now
+    }
+    return $false
+}
+function NewSession([string]$name) { [string](ConvertFrom-Json (Send-Ctl $s @('session', 'new', '--name', $name))).result }
+
+try {
+    $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe 'ctlread'
+    $sid = [string](Nodes | Select-Object -First 1).id
+    if (-not $sid) { throw 'the sandbox has no session' }
+    Check 'the first session reaches a prompt' (Wait-Prompt $sid) "screen: $(Text $sid)"
+
+    # --- the reply is a bare JSON integer -------------------------------------------------------
+    $raw = CursorRaw $sid
+    $r = ConvertFrom-Json $raw
+    Check 'surface cursor answers ok' ([bool]$r.ok) "raw: $raw"
+    # {"ok":true,"result":7} — no {"col":7}, no "7". The exact wire form both products emit.
+    Check 'the wire form is {"ok":true,"result":<int>}' ($raw -match '^\{"ok":true,"result":\d+\}$') "raw: $raw"
+    Check 'the result parses as a number, not a string' (IsInteger $r.result) "result is $($r.result.GetType().Name)"
+
+    # --- the number is the prompt's width, not 0 mistaken for "no answer" -----------------------
+    $c0 = Col $sid
+    Check 'a fresh pane reports the prompt column, not 0' ($c0 -gt 0) "column $c0; screen: $(LastLine $sid)"
+
+    # --- it moves by exactly what was typed, and back -------------------------------------------
+    # No newline: an unsubmitted draft at the prompt is the state the caller actually asks about.
+    Send-Ctl $s @('session', 'type', 'abcdefgh', '--target', $sid) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $c1 = Col $sid
+    Check 'typing 8 cells moves the column by 8' ($c1 - $c0 -eq 8) "before $c0, after $c1"
+    # Anchored to the screen: the caret must sit immediately after the text it typed. The typed
+    # text's POSITION rather than the line's length, because a prediction or a right-hand prompt
+    # segment legitimately paints to the right of the caret.
+    $line = LastLine $sid
+    $at = $line.IndexOf('abcdefgh')
+    Check 'the column is where the screen shows the caret' ($at -ge 0 -and $c1 -eq $at + 8) "column $c1, text at $at in [$line]"
+    Send-Ctl $s @('session', 'type', 'xyz', '--target', $sid) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $c2 = Col $sid
+    Check 'three more cells: three more columns' ($c2 - $c1 -eq 3) "before $c1, after $c2"
+    # Three deletes (0x7f is what the Backspace key sends), through session type with the byte
+    # allowed. A counter that only ever grows passes everything above this line.
+    Send-Ctl $s @('session', 'type', ([string][char]0x7f * 3), '--allow-control', '--target', $sid) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $c3 = Col $sid
+    Check 'and it moves BACK on delete' ($c3 -eq $c1) "expected $c1, got $c3"
+    Send-Ctl $s @('session', 'type', ([string][char]0x7f * 8), '--allow-control', '--target', $sid) | Out-Null
+    Start-Sleep -Milliseconds 1000
+
+    # --- a miss is a refusal, not a 0 -----------------------------------------------------------
+    $raw = CursorRaw 'no-such-session'
+    $r = ConvertFrom-Json $raw
+    Check 'an unknown target is refused (ok:false)' (-not $r.ok -and [bool][string]$r.error) "raw: $raw"
+
+    # --- the deferred wrap: the answer can EQUAL the width ---------------------------------------
+    # session write feeds the emulator only, never the shell, so the caret can be placed exactly.
+    # CUF 999 clamps to the last column, which yields the width without asking the window for it.
+    $wid = NewSession 'wrap'
+    Check 'a session for the wrap case' ([bool]$wid)
+    Check 'the wrap session reaches a prompt' (Wait-Prompt $wid) "screen: $(Text $wid)"
+    Send-Ctl $s @('session', 'write', ("`r" + [char]27 + '[999C'), '--target', $wid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    $cols = (Col $wid) + 1
+    Check 'the pane is wider than a prompt' ($cols -gt 20) "width $cols"
+    Send-Ctl $s @('session', 'write', ("`r" + ('x' * $cols)), '--target', $wid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    $atEnd = Col $wid
+    # ONE PAST the last cell: a caller that indexes with this number without clamping is off the grid.
+    Check 'after printing into the last column the answer equals the pane width' ($atEnd -eq $cols) "width $cols, column $atEnd"
+    Send-Ctl $s @('session', 'write', 'x', '--target', $wid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    $wrapped = Col $wid
+    Check 'the next print wraps to column 1' ($wrapped -eq 1) "column $wrapped"
+
+    # --- a pane whose shell has exited still answers; a session gone from the tree does not ------
+    $did = NewSession 'dead'
+    Check 'a session for the exited case' ([bool]$did)
+    Check 'the dead-to-be session reaches a prompt' (Wait-Prompt $did) "screen: $(Text $did)"
+    Send-Ctl $s @('session', 'type', "exit`r", '--target', $did) | Out-Null
+    $exited = $false
+    for ($i = 0; $i -lt 30; $i++) { Start-Sleep -Milliseconds 500; $n = Node $did; if ($n -and $n.exited) { $exited = $true; break } }
+    # Prove the premise: a shell that ignored `exit` would make the next check a duplicate.
+    Check 'the shell exited (tree says so)' $exited
+    $raw = CursorRaw $did
+    $r = ConvertFrom-Json $raw
+    # A dead child does not un-address the pane: the grid is still there, and a caller deciding
+    # whether to type must get a number here, not an error.
+    Check 'a pane whose shell has exited still reports its caret' ([bool]$r.ok -and (IsInteger $r.result)) "raw: $raw"
+
+    Send-Ctl $s @('session', 'close', '--target', $did) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    Check 'the closed session left the tree' (-not (Node $did))
+    $raw = CursorRaw $did
+    $r = ConvertFrom-Json $raw
+    Check 'a session gone from the tree is refused, not answered from a stale handle' (-not $r.ok) "raw: $raw"
+}
+finally {
+    if ($s) { Stop-Sandbox $s }
+}
+
+if ($fail) { "control-read: $fail failed"; exit 1 }
+"control-read: all passed"
+exit 0

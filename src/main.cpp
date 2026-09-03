@@ -6356,6 +6356,36 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         return ctlOkStr(dumpBufferText(target));
     }
+    if (cmd == "surface.cursor") {
+        // The caret COLUMN of the pane, as a bare JSON integer: {"ok":true,"result":<int>}. That is
+        // agterm's shape and agwinterm's (P1, agwinterm #221), so a script written against either
+        // product's cookbook works here unchanged; the conformance contract pins it as an integer.
+        // Column 0 is a real answer, not "no answer" - it goes out as the number 0, never omitted.
+        //
+        // Column ONLY, deliberately. The question this exists to answer is "is that composer empty
+        // before I type into it": the caret rests at a known column in an empty box, so a different
+        // column means a draft is sitting there and the send must refuse. One number, one compare.
+        // The row says nothing about that, and reporting it would only tempt callers into screen
+        // geometry that the two products lay out differently.
+        //
+        // The target resolves exactly as session.text / session.type do (the shared resolveTarget
+        // above), so the pane you CHECK is the pane you then TYPE INTO - a check against a different
+        // pane would be worse than no check. A pane whose child has exited still answers: its grid
+        // is still there to be read, and a caller deciding whether to type must get a number, not an
+        // error. Only a session gone from the tree is refused.
+        //
+        // Deferred wrap: after printing into the last column the core leaves the caret ONE PAST it
+        // (== cols) and wraps on the next print. That is reported as it is, so a caller must not use
+        // the value as a cell index without clamping. Same source as the painted caret (the renderer
+        // reads info.cursorCol), so the number here is the caret the user sees.
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        FfiEmuInfo info{};
+        EnterCriticalSection(&g_lock);
+        bool have = target->emu && emu_info(target->emu, &info);
+        LeaveCriticalSection(&g_lock);
+        if (!have) return ctlErr("no emulator behind that session");   // cannot happen for a listed session; refuse rather than invent a 0
+        return ctlOk(std::to_string(info.cursorCol));
+    }
     if (cmd == "session.status") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string st = req.get("args.status");
