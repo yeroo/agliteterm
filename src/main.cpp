@@ -6011,7 +6011,7 @@ static std::string lastCommandOutput(Session* s, bool* haveMarks) {
 // one. A skill that overpromises is worse than no skill.
 static const char* kSkillMarkdown = R"SKILL(---
 name: agliteterm
-description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, and poll for events - via the agwintermctl CLI or its control pipe.
+description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
 ---
 
 # agliteterm
@@ -6122,14 +6122,51 @@ terminal still moves you forward.
 `session output` needs FTCS shell integration (OSC 133) in the shell. Without it you get
 "no completed command marks" rather than a wrong answer - fall back to `session text`.
 
+Every session node of `tree --json` carries `statusChangedAt`: epoch SECONDS of the last status
+**write** - that agent's liveness clock. Every `session status` restamps it, including a re-assert
+of the same status, so `now - statusChangedAt` is how long ago the agent last said anything: a
+large age beside `"status":"active"` means its hook died, not that work is still running. Always
+present, even for a session that never set a status (then it is the session's own age).
+
+## Before typing into another agent's composer
+
+```
+agwintermctl surface cursor --target <id|name>     # the caret COLUMN, a bare integer
+```
+
+An empty composer parks the caret at a known column, so a **different** column means a draft is
+sitting there: do not send. One number, one compare - it replaces reading the rendered text and
+guessing at placeholder strings. Column `0` is a real answer (the caret at the left margin), not
+"no answer"; a miss is `ok:false`. The row is deliberately not reported. The target resolves
+exactly as `session text` / `session type` do, so the pane you check is the pane you type into.
+
+Two caveats:
+
+- the same column is necessary, not sufficient: a draft exactly one wrap width long parks the
+  caret back where it started, so back a match with `session text` of that row before typing
+- after a print into the last column the answer EQUALS the pane width (the wrap is deferred to the
+  next character), so do not use it as an index into a `session text` row without clamping
+
+## Which binary, which app
+
+```
+agwintermctl version [--json]
+```
+
+Two greppable lines: `cli` (the agwintermctl you actually ran, version and resolved path - several
+can coexist and none need be on PATH) and `app` (what answered on the pipe). The app line is what
+`ping` answers, `agliteterm <version>`, so it names the build that is really running. It exits 0
+and still prints the `cli` half when nothing is listening, marking the app `unavailable`.
+
 ## Sessions, workspaces, windows
 
 ```
 agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
 agwintermctl session copy|paste|type|text|output|status
+agwintermctl surface cursor
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
-agwintermctl tree --json | ping | sidebar on|off|toggle | quick on|off|toggle
+agwintermctl tree --json | ping | version | sidebar on|off|toggle | quick on|off|toggle
 ```
 
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and

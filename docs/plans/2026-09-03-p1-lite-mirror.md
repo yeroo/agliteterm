@@ -155,10 +155,10 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 - [x] build + run — must pass before task 4
 
 ### Task 4: the contract, the skill, the docs
-- [ ] `test/conformance.ps1` `Test-Shape`: add an `integer` kind — the result must be a whole
+- [x] `test/conformance.ps1` `Test-Shape`: add an `integer` kind — the result must be a whole
       number, not a string, not a float, not null. Mirror the exact same edit into the copy of the
       runner's comment header if it enumerates kinds
-- [ ] `test/control-api.json`: add, immediately after the `session.text` step, this step and
+- [x] `test/control-api.json`: add, immediately after the `session.text` step, this step and
       nothing else:
       ```json
       {
@@ -171,18 +171,23 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       and bump the verb count in the file's `$comment` by one. `tools/check-contract.ps1` will fail
       until agwinterm's copy carries the same step — that is expected and is the merge gate, not a
       bug to work around
-- [ ] `kSkillMarkdown` (`installAgentSkill`): document `surface cursor` (what the number means, the
+- [x] `kSkillMarkdown` (`installAgentSkill`): document `surface cursor` (what the number means, the
       "different column = draft, do not send" rule, the wrap caveat, and that the same column is
       necessary but not sufficient — a draft exactly one wrap width long parks the caret where it
       started, so back a match with `session text` of that row), `statusChangedAt` in `tree` (age
       of the last status **write**; a re-assert moves it), and `agwintermctl version`
-- [ ] `README.md` agwintermctl section: the same three, in the section's existing voice
-- [ ] `qa/control-read.md` (new, `qa/selection.md`'s style): one case proving `surface.cursor`
+- [x] `README.md` agwintermctl section: the same three, in the section's existing voice
+- [x] `qa/control-read.md` (new, `qa/selection.md`'s style): one case proving `surface.cursor`
       tracks the painted caret — feed a known prompt, compare the column with what a `PrintWindow`
       capture shows at the caret cell after typing more; one case for `statusChangedAt` going back
       **down** after a re-assert; one for `version` naming the sandbox's pipe and product
-- [ ] build, run `test/run-all.ps1` (expect `check-contract` to be the only red until the agwinterm
+- [x] build, run `test/run-all.ps1` (expect `check-contract` to be the only red until the agwinterm
       side merges; everything else green) — must pass before task 5
+
+- ➕ `check-contract` was green on the first run rather than red: agwinterm merged its sibling
+      step (#223) before this task landed, so the merge gate was already open. The local
+      `bingwintermctl.exe` still predates #221; `run-all.ps1 -Strict` was run with
+      `$env:AGWINTERMCTL` at agwinterm's Release build, as in tasks 1-3
 
 ### Task 5: [Final] Verify acceptance criteria
 - [ ] verify every requirement in Overview is implemented, and every "what agwinterm decided" line
