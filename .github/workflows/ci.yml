@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The ralphex -> revmux review bridge, driven against a stub revmux. Needs only
+      # Git Bash, so it runs before the build: a bridge that cannot open a round is a
+      # review that silently found nothing, and that is cheaper to learn in 20 seconds.
+      - name: Ralphex-Revmux bridge fixtures
+        shell: bash
+        run: ./tools/test-ralphex-revmux.sh
+
       # The core dll + pty-host come from agwinterm releases, pinned by native/pinned.json, and the
       # fetch REFUSES a release whose published abiVersion is not the one src/main.cpp requires.
       # That check is the whole reason this step is separate: across two repositories an ABI drift
