@@ -64,7 +64,7 @@ CAppModule _Module;
 #include "proto/pb_decode.h"
 #include "control.h"
 
-// ---- agwinterm-core C ABI (ABI v16) ----
+// ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
     int32_t rune;
     uint32_t fg, bg, attrs, width;
@@ -74,7 +74,10 @@ struct FfiCell {
 struct FfiEmuInfo {
     uint32_t cols, rows, cursorRow, cursorCol, cursorVisible, isAltScreen, historyCount;
     int64_t scrollGeneration;
-    uint32_t mouseClick, mouseDrag, mouseMotion, mouseSgr, bracketedPaste;
+    // mouseSgrPixels (?1016) arrived in v18 BETWEEN mouseSgr and bracketedPaste. This struct is
+    // filled by the core, so a missing field here is not a stale value but a write past the end of
+    // the caller's stack frame - a /GS fail-fast (0xC0000409) on the first emu_info call.
+    uint32_t mouseClick, mouseDrag, mouseMotion, mouseSgr, mouseSgrPixels, bracketedPaste;
     int32_t keyboardFlags;
     uint32_t scrollTop, scrollBottom, markCount, focusReporting, synchronizedOutput, win32InputMode, dynamicBg;
     int32_t cursorShape;
@@ -100,9 +103,11 @@ static uint8_t* (*emu_get_text)(void*, uint32_t, uint32_t*);   // 0 title, 1 cwd
 static uint8_t* (*emu_take_host_actions)(void*, uint32_t*);
 static void (*core_free_buf)(uint8_t*, uint32_t);
 
-// v16 added agwcore_emu_set_scrollback. lite does not call it yet, but the core handshake is an
-// EXACT match, so the pin has to move with the core it is built against.
-static constexpr uint32_t kRequiredAbi = 16;
+// v16 added agwcore_emu_set_scrollback; v17/v18 (agwinterm 0.17.10) added the image exports and
+// the mouseSgrPixels field of FfiEmuInfo above. lite calls none of the new exports, but the core
+// handshake is an EXACT match and the struct is shared, so the pin moves with the core it is
+// built against and the struct must be re-checked against lib.rs on every bump.
+static constexpr uint32_t kRequiredAbi = 18;
 static constexpr uint32_t kAttrBold = 1, kAttrItalic = 2, kAttrUnderline = 4,
                           kAttrInverse = 8, kAttrDim = 16, kAttrStrike = 32;
 static constexpr uint32_t kProtocolVersion = 2;
