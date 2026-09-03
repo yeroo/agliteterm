@@ -103,10 +103,10 @@ static uint8_t* (*emu_get_text)(void*, uint32_t, uint32_t*);   // 0 title, 1 cwd
 static uint8_t* (*emu_take_host_actions)(void*, uint32_t*);
 static void (*core_free_buf)(uint8_t*, uint32_t);
 
-// v16 added agwcore_emu_set_scrollback; v17/v18 (agwinterm 0.17.10) added the image exports and
-// the mouseSgrPixels field of FfiEmuInfo above. lite calls none of the new exports, but the core
-// handshake is an EXACT match and the struct is shared, so the pin moves with the core it is
-// built against and the struct must be re-checked against lib.rs on every bump.
+// v16 added agwcore_emu_set_scrollback. v18 (agwinterm 0.17.10; there was no 17) inserted
+// mouseSgrPixels into FfiEmuInfo above and added or changed NO export - a bump can be a struct
+// alone. The core handshake is an EXACT match and the structs are shared, so the pin moves with
+// the core it is built against and every struct above is re-checked against lib.rs on each bump.
 static constexpr uint32_t kRequiredAbi = 18;
 static constexpr uint32_t kAttrBold = 1, kAttrItalic = 2, kAttrUnderline = 4,
                           kAttrInverse = 8, kAttrDim = 16, kAttrStrike = 32;
@@ -351,6 +351,21 @@ struct Session {
     int64_t evicted = 0;        // total lines dropped off the front of this session's history
 };
 
+// Session::status is a std::string written from control-pipe threads (the session.status verb)
+// AND the UI thread (the Esc/Ctrl+C clear), and read from both (tree replies on pipe threads, the
+// sidebar and its custom-draw on the UI thread). g_lock deliberately does not cover it (it guards
+// the emulators and the list shape), so it has its own section, like the event log has g_evtLock.
+// Short values live in the small-string buffer and never reallocate, which is why an unlocked
+// `waiting-for-user-approval` written under a concurrent `tree` was a use-after-free nobody had
+// hit yet. Every read goes through statusOf(); the stamp rides along so the pair is a snapshot.
+static CRITICAL_SECTION g_statusLock;
+struct StatusSnap { std::string status; long long changedAt; };
+static StatusSnap statusOf(const Session* s) {
+    EnterCriticalSection(&g_statusLock);
+    StatusSnap r{ s->status, s->statusChangedAt };
+    LeaveCriticalSection(&g_statusLock);
+    return r;
+}
 // The ONLY writer of Session::status. Stamps statusChangedAt on EVERY write, including a re-assert
 // of the same status. This is not a bug: the question callers ask of statusChangedAt is "is this
 // agent's hook still alive", and a hook re-asserting `active` every 30 s is precisely the liveness
@@ -358,8 +373,10 @@ struct Session {
 // look dead. agwinterm stamps the same way through its one entry point (TerminalSession.SetStatus:
 // "every write, not every change"); a second bare `s->status =` here is how the two drift apart.
 static void setStatus(Session* s, const std::string& st) {
+    EnterCriticalSection(&g_statusLock);
     s->status = st;
     s->statusChangedAt = epochNow();
+    LeaveCriticalSection(&g_statusLock);
 }
 
 // Agent status classification for the sidebar: BLOCKED = agent needs you (bold name),
@@ -3492,7 +3509,7 @@ static void sendUtf8(wchar_t wc) {
     // #185 / main-app parity: scoped to working-class; blocked stays until the agent or user acts).
     if (wc == 0x1B || wc == 0x03) {
         Session* s = focusedSession();
-        if (s && statusClass(s->status) == AGST_WORKING) {
+        if (s && statusClass(statusOf(s).status) == AGST_WORKING) {
             setStatus(s, "idle");
             emitEvent("status", s->id, "idle");
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
@@ -3567,8 +3584,12 @@ struct UpdApply { std::wstring ver, payload, helper; };
 static bool g_updBusy = false;   // UI thread only: one interactive flow at a time
 
 static std::wstring updVersion() {
+    // Test seam. The return is the length WITHOUT the terminator on success, and the size WITH it
+    // when the buffer is too small - and then nothing was written, so a >0 check alone would hand
+    // back uninitialised stack. Now on every `ping`, so a 64-char override must not do that.
     wchar_t v[64];
-    if (GetEnvironmentVariableW(L"AGWINTERM_VERSION_OVERRIDE", v, 64) > 0) return v;   // test seam
+    DWORD n = GetEnvironmentVariableW(L"AGWINTERM_VERSION_OVERRIDE", v, 64);
+    if (n > 0 && n < 64) return std::wstring(v, n);
     std::wstring s;
     for (const char* p = AGWL_VERSION_STR; *p; p++) s += (wchar_t)*p;
     return s;
@@ -4027,7 +4048,7 @@ static void refreshTree() {
             if (g_flagView && !s->flagged) continue;                         // flagged view filter
             // Agent status cue: name goes bold when the agent needs you (blocked), italic + "(working…)"
             // while it's busy (italic applied in the tree's NM_CUSTOMDRAW). Others show plain.
-            int cls = s->exited ? AGST_NONE : statusClass(s->status);
+            int cls = s->exited ? AGST_NONE : statusClass(statusOf(s).status);
             std::wstring label = s->name.empty() ? (L"session " + std::to_wstring(vis)) : s->name;
             if (s->failed) label += L"  (failed to start)";   // restored spec whose app won't run here
             else if (s->exited) label += L"  (exited)";
@@ -5169,7 +5190,7 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
 // ---- flagged sessions + attention -------------------------------------------------------------
 static bool anyBlocked() {
     for (auto* s : g_sessions)
-        if (!s->hidden && !s->exited && statusClass(s->status) == AGST_BLOCKED) return true;
+        if (!s->hidden && !s->exited && statusClass(statusOf(s).status) == AGST_BLOCKED) return true;
     return false;
 }
 // Jump to the next blocked session (cycling from the current one). The agent-terminal loop: the
@@ -5181,7 +5202,7 @@ static void nextBlocked() {
     for (int k = 1; k <= n; k++) {
         int i = (start + k) % n;
         Session* s = g_sessions[i];
-        if (s->hidden || s->exited || statusClass(s->status) != AGST_BLOCKED) continue;
+        if (s->hidden || s->exited || statusClass(statusOf(s).status) != AGST_BLOCKED) continue;
         selectPrimary(i);
         g_activeWs = s->ws;
         if (g_focusWs >= 0) g_focusWs = s->ws;   // focus follows the jump (the row must be visible)
@@ -5659,7 +5680,7 @@ public:
                 }
                 LPARAM p = cd->nmcd.lItemlParam;   // italicise "working" agent rows
                 if (p >= 0 && p < (LPARAM)g_sessions.size() && !g_sessions[p]->exited &&
-                    statusClass(g_sessions[p]->status) == AGST_WORKING && g_treeItalic) {
+                    statusClass(statusOf(g_sessions[p]).status) == AGST_WORKING && g_treeItalic) {
                     SelectObject(cd->nmcd.hdc, g_treeItalic);
                     r = CDRF_NEWFONT;
                 }
@@ -6261,13 +6282,14 @@ static std::string ctlDispatch(const std::string& line) {
                 if (!first) sess += ",";
                 first = false;
                 std::string nm = s->name.empty() ? s->id : narrow(s->name);
+                StatusSnap st = statusOf(s);   // one snapshot: the status and ITS stamp, never a mixed pair
                 sess += "{\"id\":\"" + jsonEscape(s->id) + "\",\"name\":\"" + jsonEscape(nm) +
                         "\",\"active\":" + (g_pane[g_focus] == i2 ? "true" : "false") +
-                        ",\"status\":\"" + jsonEscape(s->status) + "\"" +
+                        ",\"status\":\"" + jsonEscape(st.status) + "\"" +
                         // ALWAYS present, never omitted for the default: `tree` says "active" with
                         // no age, and a consumer that has to tell "absent" from "old" gains nothing
                         // from an omission. Epoch seconds of the last status WRITE (see Session).
-                        ",\"statusChangedAt\":" + std::to_string(s->statusChangedAt) +
+                        ",\"statusChangedAt\":" + std::to_string(st.changedAt) +
                         ",\"flagged\":" + (s->flagged ? "true" : "false") +
                         ",\"exited\":" + (s->exited ? "true" : "false") +
                         // a spec that could not be relaunched on this machine: kept, not dropped
@@ -6445,12 +6467,14 @@ static std::string ctlDispatch(const std::string& line) {
         // above), so the pane you CHECK is the pane you then TYPE INTO - a check against a different
         // pane would be worse than no check. A pane whose child has exited still answers: its grid
         // is still there to be read, and a caller deciding whether to type must get a number, not an
-        // error. Only a session gone from the tree is refused.
+        // error. Only a target that no longer resolves is refused - a hidden split pane still
+        // answers by id, though `tree` never lists it.
         //
         // Deferred wrap: after printing into the last column the core leaves the caret ONE PAST it
         // (== cols) and wraps on the next print. That is reported as it is, so a caller must not use
-        // the value as a cell index without clamping. Same source as the painted caret (the renderer
-        // reads info.cursorCol), so the number here is the caret the user sees.
+        // the value as a cell index without clamping. Same info.cursorCol the renderer paints from,
+        // so WHEN a caret is painted it is this cell; none is painted at column == cols, in a
+        // scrolled-back or unfocused pane, or while a selection is live (see paintPane).
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         FfiEmuInfo info{};
         EnterCriticalSection(&g_lock);
@@ -6669,7 +6693,7 @@ static std::string ctlDispatch(const std::string& line) {
             int step = (dir[0] == 'p') ? -1 : 1;
             for (int k = 1; k <= (int)vis.size(); k++) {
                 int i2 = vis[(pos + step * k % (int)vis.size() + (int)vis.size()) % vis.size()];
-                if (statusClass(g_sessions[i2]->status) == AGST_BLOCKED) { pick = i2; break; }
+                if (statusClass(statusOf(g_sessions[i2]).status) == AGST_BLOCKED) { pick = i2; break; }
             }
             if (pick < 0) return ctlOkStr("none blocked");
         } else pick = vis[(pos + 1) % vis.size()];   // next (default)
@@ -7278,6 +7302,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_reqLock);
     InitializeCriticalSection(&g_evtLock);
+    InitializeCriticalSection(&g_statusLock);
     g_evtReady = true;   // from here on, anything worth reporting goes into the event log
     loadCore();
 

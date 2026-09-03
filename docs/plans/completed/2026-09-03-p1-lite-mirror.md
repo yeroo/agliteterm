@@ -190,7 +190,7 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 
 - ➕ `check-contract` was green on the first run rather than red: agwinterm merged its sibling
       step (#223) before this task landed, so the merge gate was already open. The local
-      `bingwintermctl.exe` still predates #221; `run-all.ps1 -Strict` was run with
+      `bin\agwintermctl.exe` still predates #221; `run-all.ps1 -Strict` was run with
       `$env:AGWINTERMCTL` at agwinterm's Release build, as in tasks 1-3
 
 ### Task 5: [Final] Verify acceptance criteria
