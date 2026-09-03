@@ -249,6 +249,21 @@ try {
     Start-Sleep -Milliseconds 300
     Check "another session's stamp is untouched by this one's write" ((Stamp $sid) -eq $other) "before $other, after $(Stamp $sid)"
     Check 'a different status stamps as well' ((Stamp $fresh) -ge $t2 -and (Node $fresh).status -eq 'blocked') "stamp $(Stamp $fresh)"
+
+    # The OTHER writer. Esc / Ctrl+C typed into a pane clears a working-class status (an interrupted
+    # agent turn never fires its Stop hook), and that write must stamp too: "every write" means
+    # every writer, not every caller of the verb. Posted WM_CHAR 0x1B to lite's own window - the
+    # same OnChar path a keyboard Esc takes - never keybd_event. The pane must be the focused one:
+    # session.new selected it; select again in case a later case moved focus.
+    Send-Ctl $s @('session', 'select', '--target', $fresh) | Out-Null
+    SetStatus $fresh 'active'
+    Start-Sleep -Milliseconds 300
+    $t3 = Stamp $fresh
+    Start-Sleep -Seconds 2
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0102, [IntPtr]0x1B, [IntPtr]1)
+    Start-Sleep -Milliseconds 500
+    Check 'Esc typed into a working pane clears its status to idle' ((Node $fresh).status -eq 'idle') "status: $((Node $fresh).status)"
+    Check 'and that clear stamped statusChangedAt too (every writer, not only the verb)' ((Stamp $fresh) -gt $t3) "before Esc $t3, after $(Stamp $fresh)"
     Send-Ctl $s @('session', 'close', '--target', $fresh) | Out-Null
 
     # --- targeting: exactly what session text / session type resolve ----------------------------

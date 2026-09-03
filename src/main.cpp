@@ -313,7 +313,8 @@ struct Session {
     // statusChangedAt. Seeded at construction, so a session whose status was never set reports its
     // own age rather than 0 — and since status is not persisted, a restored session is constructed
     // fresh and gets a fresh stamp: a stamp from a previous run would describe a hook that is not
-    // running. Stamped again on every session.status write (see the verb for why every write).
+    // running. Stamped again on EVERY write, whoever writes: go through setStatus, never assign
+    // status directly (see the session.status verb for why every write, not every change).
     long long statusChangedAt = epochNow();
     std::wstring name;             // custom name (rename); empty = "session N"
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
@@ -349,6 +350,17 @@ struct Session {
     int64_t lastHist = 0;       // historyCount last seen; scrolled-but-not-kept == evicted
     int64_t evicted = 0;        // total lines dropped off the front of this session's history
 };
+
+// The ONLY writer of Session::status. Stamps statusChangedAt on EVERY write, including a re-assert
+// of the same status. This is not a bug: the question callers ask of statusChangedAt is "is this
+// agent's hook still alive", and a hook re-asserting `active` every 30 s is precisely the liveness
+// signal - collapsing repeats would report the age of the FIRST write and make a healthy agent
+// look dead. agwinterm stamps the same way through its one entry point (TerminalSession.SetStatus:
+// "every write, not every change"); a second bare `s->status =` here is how the two drift apart.
+static void setStatus(Session* s, const std::string& st) {
+    s->status = st;
+    s->statusChangedAt = epochNow();
+}
 
 // Agent status classification for the sidebar: BLOCKED = agent needs you (bold name),
 // WORKING = agent busy (italic name + "(working…)"), NONE = plain.
@@ -3481,7 +3493,7 @@ static void sendUtf8(wchar_t wc) {
     if (wc == 0x1B || wc == 0x03) {
         Session* s = focusedSession();
         if (s && statusClass(s->status) == AGST_WORKING) {
-            s->status = "idle";
+            setStatus(s, "idle");
             emitEvent("status", s->id, "idle");
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         }
@@ -6128,8 +6140,9 @@ terminal still moves you forward.
 "no completed command marks" rather than a wrong answer - fall back to `session text`.
 
 Every session node of `tree --json` carries `statusChangedAt`: epoch SECONDS of the last status
-**write** - that agent's liveness clock. Every `session status` restamps it, including a re-assert
-of the same status, so `now - statusChangedAt` is how long ago the agent last said anything: a
+**write** - that agent's liveness clock. Every write restamps it - each `session status`,
+including a re-assert of the same status, and the Esc/Ctrl+C clear of a working status typed into
+the pane - so `now - statusChangedAt` is how long ago the status last moved or was re-asserted: a
 large age beside `"status":"active"` means its hook died, not that work is still running. Always
 present, even for a session that never set a status (then it is the session's own age).
 
@@ -6450,13 +6463,7 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
-        target->status = st;
-        // Stamp EVERY write, including a re-assert of the same status. This is not a bug. The
-        // question callers ask of statusChangedAt is "is this agent's hook still alive", and a hook
-        // re-asserting `active` every 30 s is precisely the liveness signal: collapsing repeats
-        // would report the age of the FIRST write and make a healthy agent look dead. agwinterm
-        // stamps the same way (TerminalSession.SetStatus: "every write, not every change").
-        target->statusChangedAt = epochNow();
+        setStatus(target, st);
         emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label

@@ -89,6 +89,10 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
   `SendInput`, `PrintWindow` never `CopyFromScreen`, never the real user profile.
 - Build with `./build.ps1`; the checks need the built exe. The core is not touched — no ABI
   movement is expected, and a change there means something went wrong.
+  - ⚠️ Overtaken after Task 5: the pin DID move, but not because of this plan's code. agwinterm
+    released 0.17.10 (ABI 18) so that lite's CI could drive `surface cursor` through a published
+    `agwintermctl`; lite tracks `latest`, so the same fetch that brought the CLI brought the ABI-18
+    core. See the ⚠️ under Task 5.
 
 ## Testing Strategy
 
@@ -203,7 +207,15 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       screen (a column is a column — assert no special-casing crept in). Pinned in
       `test/control-read.ps1` rather than eyeballed (see ➕ below)
 - [x] `git diff` on `native/` is empty and the build printed the same ABI as before (`abi 16`,
-      `v0.17.14`, as in task 4)
+      `v0.17.14`, as in task 4) — true when ticked; superseded by the ⚠️ below
+  - ⚠️ `kRequiredAbi` 16 → 18 (commit b51c5d6, after the plan was moved here): agwinterm 0.17.10
+    shipped core ABI 18 and lite pins `latest`. Moving the pin alone left lite crashing at start —
+    ABI 18 inserted `mouse_sgr_pixels` into `FfiEmuInfo` between `mouse_sgr` and `bracketed_paste`,
+    lite's mirror was one `uint32_t` short, and the core's write past the stack struct was a /GS
+    fail-fast (0xC0000409) before the control pipe answered. `FfiEmuInfo` is now field-for-field
+    the v0.17.10 `lib.rs`; `FfiCell`, `FfiMark`, the host-action blob and every resolved export were
+    compared and are unchanged. Re-verified against the RELEASED natives and CLI, no `AGWINTERMCTL`
+    override: `test/run-all.ps1 -Strict` all green, `check-contract` in step.
 - [x] run `test/run-all.ps1 -Strict` and the QA cases against a sandbox build — all suites green
       with `$env:AGWINTERMCTL` at agwinterm's Release build; all three `qa/control-read.md` cases
       pass (two harness findings on the way, ⚠️ below)
