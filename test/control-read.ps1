@@ -1,5 +1,5 @@
 # Control API — the read-only trio (P1-lite): `surface.cursor`, `statusChangedAt` on every `tree`
-# node; the truthful `ping` joins them in the same plan.
+# node, and a truthful `ping` (which is what `agwintermctl version` reports as the app).
 #
 # Every case here checks that the NUMBER IS RIGHT, not merely well-shaped. A cursor column that is
 # always 0 passes a shape test and breaks the caller in exactly the way the verb exists to prevent:
@@ -78,6 +78,39 @@ try {
     $sid = [string](Nodes | Select-Object -First 1).id
     if (-not $sid) { throw 'the sandbox has no session' }
     Check 'the first session reaches a prompt' (Wait-Prompt $sid) "screen: $(Text $sid)"
+
+    # --- ping names the build that is running, and version repeats it ---------------------------
+    # `agwintermctl version` (agwinterm #221) reports the app serving the pipe FROM ping's reply.
+    # lite used to answer a hard-coded "agliteterm 0.1" whatever was running, so `version` would
+    # have named a build that does not exist. The truth is the installer's AppVersion: build.ps1
+    # compiles exactly that string in, so the check reads it from the same place rather than
+    # trusting the exe about itself. (Start-Sandbox does not pass AGWINTERM_VERSION_OVERRIDE, the
+    # updater's test seam, so the sandbox reports its compiled version.)
+    $iss = Join-Path (Split-Path $PSScriptRoot -Parent) 'installer\agliteterm.iss'
+    $m = Select-String -Path $iss -Pattern '#define AppVersion "([^"]+)"'
+    $appVer = if ($m) { $m.Matches[0].Groups[1].Value } else { '' }
+    Check 'the installer script names a version' ([bool]$appVer) "no AppVersion in $iss"
+    $raw = Send-Ctl $s @('ping')
+    $r = ConvertFrom-Json $raw
+    $ping = [string]$r.result
+    Check 'ping answers ok with a string' ([bool]$r.ok -and $r.result -is [string]) "raw: $raw"
+    Check 'ping names the product' ($ping -match '^agliteterm ') "got [$ping]"
+    Check 'ping names the version the build printed, not a literal' ($ping -eq "agliteterm $appVer") "expected [agliteterm $appVer], got [$ping]"
+    # The CLI's own verb, run directly (Send-Ctl forces --json; the text form and the exit code are
+    # part of what is being checked). The CLI half is agwinterm's; the only lite-side fact is that
+    # the app line carries ping's string against the SANDBOX pipe, not the default one.
+    foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+    $vout = (& $ctl version --pipe $s.Pipe 2>&1 | Out-String)
+    $vcode = $LASTEXITCODE
+    Check 'agwintermctl version exits 0 against the sandbox' ($vcode -eq 0) "exit $vcode; output: $vout"
+    $appLine = ($vout -split "`r?`n" | Where-Object { $_ -match '^app ' } | Select-Object -First 1)
+    Check 'version prints an app line' ([bool]$appLine) "output: $vout"
+    Check 'the app line carries the string ping answered' ($appLine -and $appLine.Contains($ping)) "line [$appLine], ping [$ping]"
+    Check "the app line names the sandbox's pipe" ($appLine -and $appLine.Contains("\\.\pipe\$($s.Pipe)")) "line [$appLine]"
+    Check 'the app line does not say unavailable' ($appLine -and $appLine -notmatch 'unavailable') "line [$appLine]"
+    $vj = $null
+    try { $vj = (& $ctl version --pipe $s.Pipe --json 2>&1 | Out-String) | ConvertFrom-Json } catch { }
+    Check 'version --json reports the app available with that version' ($vj -and $vj.app.available -eq $true -and [string]$vj.app.version -eq $ping -and [string]$vj.app.pipe -eq $s.Pipe) "json: $($vj | ConvertTo-Json -Compress)"
 
     # --- the reply is a bare JSON integer -------------------------------------------------------
     $raw = CursorRaw $sid

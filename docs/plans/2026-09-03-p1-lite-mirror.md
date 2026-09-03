@@ -147,12 +147,12 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 - [x] build + run `test/control-read.ps1` — must pass before task 3
 
 ### Task 3: a truthful `ping`, and what `agwintermctl version` sees
-- [ ] `ping` answers `"agliteterm " + <compiled version>` (`updVersion()`), not `"agliteterm 0.1"`
-- [ ] `test/control-read.ps1`: `ping` names the product and the version the build printed (the
+- [x] `ping` answers `"agliteterm " + <compiled version>` (`updVersion()`), not `"agliteterm 0.1"`
+- [x] `test/control-read.ps1`: `ping` names the product and the version the build printed (the
       installer's `AppVersion`); `agwintermctl version --pipe <sandbox>` reports that string as the
       app and exits 0 — this is the only lite-side check `version` needs, since the CLI is
       agwinterm's
-- [ ] build + run — must pass before task 4
+- [x] build + run — must pass before task 4
 
 ### Task 4: the contract, the skill, the docs
 - [ ] `test/conformance.ps1` `Test-Shape`: add an `integer` kind — the result must be a whole

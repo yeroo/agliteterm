@@ -6190,7 +6190,10 @@ static std::string ctlDispatch(const std::string& line) {
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
 
-    if (cmd == "ping") return ctlOkStr("agliteterm 0.1");
+    // The compiled version, never a literal: `agwintermctl version` reports the app serving the pipe
+    // from this reply (the way agwinterm's ping says "agwinterm " + AppVersion()), and the About box
+    // and the self-updater read the same updVersion(), so all three name the same build.
+    if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
         std::string wss;
         for (int w = 0; w < (int)g_workspaces.size(); w++) {
