@@ -267,6 +267,17 @@ try {
     Start-Sleep -Milliseconds 500
     Check 'Esc typed into a working pane clears its status to idle' ((Node $fresh).status -eq 'idle') "status: $((Node $fresh).status)"
     Check 'and that clear stamped statusChangedAt too (every writer, not only the verb)' ((Stamp $fresh) -gt $t3) "before Esc $t3, after $(Stamp $fresh)"
+    # The other half of that rule: a blocked-class status is the agent waiting on the user, and Esc
+    # must NOT clear it - an unconditional clear would drop the needs-you cue while every check
+    # above still passed. Same pane, same posted key, the status and its stamp both stay put.
+    SetStatus $fresh 'blocked'
+    Start-Sleep -Milliseconds 300
+    $t4 = Stamp $fresh
+    Start-Sleep -Seconds 2
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0102, [IntPtr]0x1B, [IntPtr]1)
+    Start-Sleep -Milliseconds 500
+    Check 'Esc leaves a blocked status alone (working-class only)' ((Node $fresh).status -eq 'blocked') "status: $((Node $fresh).status)"
+    Check 'and did not restamp it' ((Stamp $fresh) -eq $t4) "before Esc $t4, after $(Stamp $fresh)"
     Send-Ctl $s @('session', 'close', '--target', $fresh) | Out-Null
 
     # --- targeting: exactly what session text / session type resolve ----------------------------

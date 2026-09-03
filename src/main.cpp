@@ -372,6 +372,7 @@ static StatusSnap statusOf(const Session* s) {
 // signal - collapsing repeats would report the age of the FIRST write and make a healthy agent
 // look dead. agwinterm stamps the same way through its one entry point (TerminalSession.SetStatus:
 // "every write, not every change"); a second bare `s->status =` here is how the two drift apart.
+// (clearWorkingStatus below decides under the lock and then calls this - not a second writer.)
 static void setStatus(Session* s, const std::string& st) {
     EnterCriticalSection(&g_statusLock);
     s->status = st;
@@ -390,11 +391,12 @@ static int statusClass(const std::string& s) {
 // The user-interrupt clear (Esc / Ctrl+C typed into the pane): idle ONLY IF the status is still
 // working-class, decided and written under one hold. As a statusOf() check followed by setStatus()
 // a hook's `blocked` landing between the two would have been overwritten with idle - the one
-// transition the policy says must not happen. Returns whether anything was written.
+// transition the policy says must not happen. The write itself still goes through setStatus (the
+// section is recursive), so that stays the one writer. Returns whether anything was written.
 static bool clearWorkingStatus(Session* s) {
     EnterCriticalSection(&g_statusLock);
     bool cleared = statusClass(s->status) == AGST_WORKING;
-    if (cleared) { s->status = "idle"; s->statusChangedAt = epochNow(); }
+    if (cleared) setStatus(s, "idle");
     LeaveCriticalSection(&g_statusLock);
     return cleared;
 }
@@ -4028,7 +4030,21 @@ static void updateStatus() {
 }
 static void refreshTree() {
     if (!g_tree) return;
-    LockG hold;   // UI thread walking g_sessions and reading names while pipe threads mutate both
+    // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
+    // here inline on a control-pipe thread, driving the UI thread's TreeView by cross-thread
+    // SendMessage. Under g_lock (below) that is a deadlock - the UI thread waits for g_lock in
+    // paintPane while this thread waits for the UI thread to pump - and even unlocked it was a
+    // worker thread mutating the tree control. Any other thread gets the posted rebuild instead.
+    if (GetWindowThreadProcessId(g_hwnd, nullptr) != GetCurrentThreadId()) {
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        return;
+    }
+    {
+    // Held for the rebuild only: this walks g_sessions and reads names that pipe threads mutate
+    // under g_lock. updateStatus and saveSessionState below take the lock themselves for exactly
+    // the reads that need it - saveSessionState releases it before its flushed writes, and a hold
+    // from here would keep every pty reader and control verb waiting through the disk I/O.
+    LockG hold;
     g_treeSyncing = true;
     TreeView_DeleteAllItems(g_tree);
     HTREEITEM sel = nullptr;
@@ -4087,6 +4103,7 @@ static void refreshTree() {
     }
     if (sel) TreeView_SelectItem(g_tree, sel);
     g_treeSyncing = false;
+    }   // g_lock released
     updateStatus();
     if (!g_restoring) saveSessionState();   // persist the workspace/session structure on every change
 }
@@ -6351,7 +6368,7 @@ static std::string ctlDispatch(const std::string& line) {
             if (wantWs < 0) {
                 if (wsCreate != "true" && wsCreate != "1")
                     return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
-                g_workspaces.push_back(want);
+                { LockG hold; g_workspaces.push_back(want); }   // `tree` walks this vector under g_lock
                 wantWs = (int)g_workspaces.size() - 1;
             }
         }
@@ -6722,7 +6739,11 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "workspace.new") {
         std::string nm = req.get("args.name");
-        g_workspaces.push_back(nm.empty() ? (L"workspace " + std::to_wstring(g_workspaces.size() + 1)) : widen(nm));
+        {   // under g_lock: `tree` (another pipe thread) and refreshTree walk this vector under it;
+            // a push_back that reallocates frees the std::wstring array they are reading
+            LockG hold;
+            g_workspaces.push_back(nm.empty() ? (L"workspace " + std::to_wstring(g_workspaces.size() + 1)) : widen(nm));
+        }
         g_activeWs = (int)g_workspaces.size() - 1;
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr(std::to_string(g_activeWs));
@@ -6732,7 +6753,7 @@ static std::string ctlDispatch(const std::string& line) {
         std::string nm = req.get("args.name");
         if (w < 0) return ctlErr("workspace not found");
         if (nm.empty()) return ctlErr("rename needs a name");
-        g_workspaces[w] = widen(tsvField(nm));
+        { LockG hold; g_workspaces[w] = widen(tsvField(nm)); }   // read under g_lock by `tree`
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
     }

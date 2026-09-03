@@ -162,12 +162,22 @@ function Start-Sandbox {
     # caller's own terminal instead of the sandbox. Start-Process -Environment ADDS to the inherited
     # block, it does not replace it - so the updater's test seam is scrubbed here as well, or a
     # shell that was testing the updater makes the sandbox answer `ping` with a made-up version.
-    foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE', 'AGWINTERM_VERSION_OVERRIDE') {
+    # Scrubbed from THIS process (environment is per process, and the suites run in-process), so
+    # the values go back once the child has captured its block: the terminal re-injects the first
+    # three into every new pane, but the override is set by hand and nothing else would restore it.
+    $scrub = 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE', 'AGWINTERM_VERSION_OVERRIDE'
+    $saved = @{}
+    foreach ($v in $scrub) {
+        $saved[$v] = [Environment]::GetEnvironmentVariable($v)
         Remove-Item "env:$v" -ErrorAction SilentlyContinue
     }
 
-    $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -PassThru `
-                            -Environment @{ LOCALAPPDATA = $home_ }
+    try {
+        $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -PassThru `
+                                -Environment @{ LOCALAPPDATA = $home_ }
+    } finally {
+        foreach ($v in $scrub) { if ($null -ne $saved[$v]) { [Environment]::SetEnvironmentVariable($v, $saved[$v]) } }
+    }
     $s = [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; AppDir = $home_; Hwnd = [IntPtr]::Zero }
     for ($i = 0; $i -lt 80; $i++) {
         Start-Sleep -Milliseconds 500
