@@ -24,7 +24,11 @@ DONE_SIGNAL='<<<RALPHEX:CODEX_REVIEW_DONE>>>'
 
 # Always emit the completion signal, on every exit path. Without it ralphex waits
 # out its idle timeout on a review that already finished.
-finish() { printf '%s\n' "$DONE_SIGNAL"; }
+NEW_LOG=""
+finish() {
+  if [ -n "$NEW_LOG" ]; then rm -f "$NEW_LOG"; fi
+  printf '%s\n' "$DONE_SIGNAL"
+}
 trap finish EXIT
 
 if [ -z "$PROMPT_FILE" ] || [ ! -f "$PROMPT_FILE" ]; then
@@ -54,10 +58,51 @@ HARD_TIMEOUT="${RALPHEX_REVMUX_HARD_TIMEOUT:-40m}"
 PLAN_NAME="$(grep -m1 -oE '[^ /\\]+\.md' "$PROMPT_FILE" 2>/dev/null | head -1 | sed 's/\.md$//')"
 [ -z "$PLAN_NAME" ] && PLAN_NAME="review"
 TASK="ralphex-${PLAN_NAME}"
-RUN="$(date +%Y%m%d-%H%M%S)"
-
-PATHS_JSON="$(revmux new --task "$TASK" --run "$RUN" 2>/dev/null)" || {
-  echo "ralphex-revmux: revmux new failed" >&2; exit 0; }
+# The timestamp reads well in a directory listing but is not unique: two external
+# reviews can open in the same second under the same deterministic task name, and
+# revmux refuses the second. The PID plus bash's per-process $RANDOM separates
+# concurrent callers, and the attempt suffix guarantees that a collision revmux
+# does report gets a genuinely fresh name to retry with.
+#
+# Worth retrying rather than giving up, because of the trap above: every failure
+# path here exits 0 having printed the done signal, so a collision left unretried
+# reaches ralphex as a review that ran and found nothing.
+#
+# Every failure retries, deliberately, rather than only the ones that read like a
+# taken name. The ported version gated the retry on
+# `grep -Eqi 'already exists|duplicate|collision'` and revmux says none of those:
+# its four refusals are "has already run", "is being written by a run holding it",
+# "was claimed by a run that never came back" and "is reserved", so the gate was
+# dead on arrival and would have gone dead again on the next wording change,
+# silently and in the direction of a review that looks clean. Two of those
+# messages end by advising "open a new round instead", which is what a retry does.
+# A failure a new name cannot cure costs two extra sub-second calls; the attempt
+# cap is what bounds this, not the wording.
+RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
+NEW_LOG="$(mktemp)" || { echo "ralphex-revmux: could not allocate revmux-new log" >&2; exit 0; }
+PATHS_JSON=""
+NEW_OK=false
+for attempt in 1 2 3; do
+  RUN="$RUN_STAMP-$$-${RANDOM:-0}-$attempt"
+  # The 2> below opens with O_TRUNC before revmux execs, so only the last attempt's
+  # refusal survives to the tail. That is the intent, but it is the redirect doing
+  # it, not a separate truncation: an edit to 2>> would silently change what gets
+  # reported and nothing here would look wrong.
+  if PATHS_JSON="$(revmux new --task "$TASK" --run "$RUN" 2>"$NEW_LOG")"; then
+    NEW_OK=true
+    break
+  fi
+done
+if [ "$NEW_OK" != true ]; then
+  # revmux's own words. The old code discarded them with 2>/dev/null: the log said
+  # "revmux new failed" and never which refusal caused it, so a misconfigured panel
+  # could not be told from a transient collision without opening the round
+  # directory. It is the trap at :32, not this redirect, that makes a bridge which
+  # failed here and a review that found nothing read alike.
+  tail -n 20 "$NEW_LOG" >&2
+  echo "ralphex-revmux: revmux new failed after $attempt attempts" >&2
+  exit 0
+fi
 
 # Take the scope path out of revmux's payload rather than joining it by hand.
 pluck() {
