@@ -28,6 +28,7 @@
 #define AGWL_VERSION_STR "dev"
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
+#include <ctime>        // time(): the statusChangedAt stamp is epoch seconds
 #include <string>
 #include <vector>
 #include <deque>
@@ -296,9 +297,19 @@ static const InstanceInfo* findInstance(const std::vector<InstanceInfo>& v, cons
 }
 
 // ---- sessions & layout ----
+// Epoch seconds, the unit `statusChangedAt` is published in (agwinterm: DateTimeOffset.UtcNow
+// .ToUnixTimeSeconds()). Not milliseconds, not ticks: a caller subtracts it from its own clock.
+static long long epochNow() { return (long long)time(nullptr); }
+
 struct Session {
     std::string id;
     std::string status = "idle";   // control-API agent status (sidebar dot)
+    // When `status` was last WRITTEN (epoch seconds), reported on every `tree` node as
+    // statusChangedAt. Seeded at construction, so a session whose status was never set reports its
+    // own age rather than 0 — and since status is not persisted, a restored session is constructed
+    // fresh and gets a fresh stamp: a stamp from a previous run would describe a hook that is not
+    // running. Stamped again on every session.status write (see the verb for why every write).
+    long long statusChangedAt = epochNow();
     std::wstring name;             // custom name (rename); empty = "session N"
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
     // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
@@ -6195,6 +6206,10 @@ static std::string ctlDispatch(const std::string& line) {
                 sess += "{\"id\":\"" + jsonEscape(s->id) + "\",\"name\":\"" + jsonEscape(nm) +
                         "\",\"active\":" + (g_pane[g_focus] == i2 ? "true" : "false") +
                         ",\"status\":\"" + jsonEscape(s->status) + "\"" +
+                        // ALWAYS present, never omitted for the default: `tree` says "active" with
+                        // no age, and a consumer that has to tell "absent" from "old" gains nothing
+                        // from an omission. Epoch seconds of the last status WRITE (see Session).
+                        ",\"statusChangedAt\":" + std::to_string(s->statusChangedAt) +
                         ",\"flagged\":" + (s->flagged ? "true" : "false") +
                         ",\"exited\":" + (s->exited ? "true" : "false") +
                         // a spec that could not be relaunched on this machine: kept, not dropped
@@ -6391,6 +6406,12 @@ static std::string ctlDispatch(const std::string& line) {
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
         target->status = st;
+        // Stamp EVERY write, including a re-assert of the same status. This is not a bug. The
+        // question callers ask of statusChangedAt is "is this agent's hook still alive", and a hook
+        // re-asserting `active` every 30 s is precisely the liveness signal: collapsing repeats
+        // would report the age of the FIRST write and make a healthy agent look dead. agwinterm
+        // stamps the same way (TerminalSession.SetStatus: "every write, not every change").
+        target->statusChangedAt = epochNow();
         emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label

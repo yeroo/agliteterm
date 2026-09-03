@@ -1,5 +1,5 @@
-# Control API — the read-only trio (P1-lite): `surface.cursor` first; `statusChangedAt` and the
-# truthful `ping` join it in the same plan.
+# Control API — the read-only trio (P1-lite): `surface.cursor`, `statusChangedAt` on every `tree`
+# node; the truthful `ping` joins them in the same plan.
 #
 # Every case here checks that the NUMBER IS RIGHT, not merely well-shaped. A cursor column that is
 # always 0 passes a shape test and breaks the caller in exactly the way the verb exists to prevent:
@@ -162,6 +162,61 @@ try {
     $raw = CursorRaw $did
     $r = ConvertFrom-Json $raw
     Check 'a session gone from the tree is refused, not answered from a stale handle' (-not $r.ok) "raw: $raw"
+
+    # --- statusChangedAt: the age of the last status WRITE, on every tree node --------------------
+    # `tree` says "status":"active" and nothing about how long ago; this field is what tells a
+    # working agent from one whose hook died forty minutes ago. Epoch SECONDS, a JSON number.
+    function Now { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+    function Stamp([string]$id) { (Node $id).statusChangedAt }
+    function SetStatus([string]$id, [string]$st) {
+        $r = ConvertFrom-Json (Send-Ctl $s @('session', 'status', $st, '--target', $id))
+        if (-not $r.ok) { throw "session status $st --target $id refused: $($r.error)" }
+    }
+    $fresh = NewSession 'stamp'
+    Check 'a session for the statusChangedAt cases' ([bool]$fresh)
+    Start-Sleep -Milliseconds 500
+    # On the wire as a bare number, not "1756900000" - the same shape agwinterm emits.
+    $rawTree = Send-Ctl $s @('tree')
+    Check 'tree carries statusChangedAt as a JSON number' ($rawTree -match '"id":"' + [regex]::Escape($fresh) + '"[^}]*"statusChangedAt":\d+') "raw: $rawTree"
+    $n = Node $fresh
+    Check 'the field is present on a session that never set a status' ($null -ne $n.statusChangedAt -and (IsInteger $n.statusChangedAt)) "node: $($n | ConvertTo-Json -Compress)"
+    Check 'and its status is still the default' ($n.status -eq 'idle') "status: $($n.status)"
+    # Seeded at creation: the session reports its OWN age rather than 0 (or 1970).
+    $t0 = Stamp $fresh
+    Check 'a never-written stamp is within a minute of now, not 0' ([math]::Abs((Now) - $t0) -le 60) "stamp $t0, now $(Now)"
+    # Every node, not only the new one: the first session never set a status either.
+    Check 'the first session (never written) carries it too' ((IsInteger (Stamp $sid)) -and [math]::Abs((Now) - (Stamp $sid)) -le 60) "stamp $(Stamp $sid)"
+
+    # Writing a status makes the age small.
+    Start-Sleep -Seconds 2
+    SetStatus $fresh 'active'
+    Start-Sleep -Milliseconds 300
+    $t1 = Stamp $fresh
+    Check 'setting a status stamps it now' ([math]::Abs((Now) - $t1) -le 5) "stamp $t1, now $(Now)"
+    Check 'the status itself was written' ((Node $fresh).status -eq 'active')
+    Check 'and the stamp did not move backwards' ($t1 -ge $t0) "seed $t0, after write $t1"
+
+    # THE re-assert rule. Back-dating is not reachable from outside, so prove it with time: the
+    # same status written again 2 s later must move the stamp FORWARD. Equal would mean repeats
+    # are collapsed, which reports the age of the first write and makes a healthy agent - a hook
+    # re-asserting `active` every 30 s - look dead. Exactly the decision someone will later
+    # mistake for a bug.
+    Start-Sleep -Seconds 2
+    SetStatus $fresh 'active'
+    Start-Sleep -Milliseconds 300
+    $t2 = Stamp $fresh
+    Check 're-asserting the SAME status moves the stamp forward (repeats are not collapsed)' ($t2 -gt $t1) "first write $t1, re-assert $t2"
+    Check 'the re-assert stamp is now-ish' ([math]::Abs((Now) - $t2) -le 5) "stamp $t2, now $(Now)"
+
+    # The age belongs to the pane whose status the node shows: writing one session's status must
+    # not touch another's stamp.
+    $other = Stamp $sid
+    Start-Sleep -Seconds 1
+    SetStatus $fresh 'blocked'
+    Start-Sleep -Milliseconds 300
+    Check "another session's stamp is untouched by this one's write" ((Stamp $sid) -eq $other) "before $other, after $(Stamp $sid)"
+    Check 'a different status stamps as well' ((Stamp $fresh) -ge $t2 -and (Node $fresh).status -eq 'blocked') "stamp $(Stamp $fresh)"
+    Send-Ctl $s @('session', 'close', '--target', $fresh) | Out-Null
 }
 finally {
     if ($s) { Stop-Sandbox $s }

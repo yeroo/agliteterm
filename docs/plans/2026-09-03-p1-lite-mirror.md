@@ -133,18 +133,18 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       merge gate as `check-contract`, not a bug to work around
 
 ### Task 2: `statusChangedAt`
-- [ ] add `long long statusChangedAt` (epoch seconds) to `struct Session`, initialised at
+- [x] add `long long statusChangedAt` (epoch seconds) to `struct Session`, initialised at
       construction — never `0` for a live session
-- [ ] stamp it in `session.status` on **every** write, including a re-assert of the same status,
+- [x] stamp it in `session.status` on **every** write, including a re-assert of the same status,
       with the liveness reasoning in a comment (see Overview). Restored sessions get a fresh stamp
       at restore time — a stamp from a previous run would describe a hook that is not running
-- [ ] emit `"statusChangedAt":<epoch seconds>` on every session node in `tree`, **always** — a
+- [x] emit `"statusChangedAt":<epoch seconds>` on every session node in `tree`, **always** — a
       consumer that has to distinguish "absent" from "old" gains nothing from an omission
-- [ ] `test/control-read.ps1`: the field is present and plausible (within a minute of now) for a
+- [x] `test/control-read.ps1`: the field is present and plausible (within a minute of now) for a
       session that never set a status; setting a status makes the age small; back-dating is not
       available from outside, so prove the re-assert rule with time: set `active`, wait 2 s, set
       `active` again, assert the stamp **moved forward** (equal would mean repeats are collapsed)
-- [ ] build + run `test/control-read.ps1` — must pass before task 3
+- [x] build + run `test/control-read.ps1` — must pass before task 3
 
 ### Task 3: a truthful `ping`, and what `agwintermctl version` sees
 - [ ] `ping` answers `"agliteterm " + <compiled version>` (`updVersion()`), not `"agliteterm 0.1"`
