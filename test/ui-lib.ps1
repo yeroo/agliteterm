@@ -90,11 +90,17 @@ public static class LiteUi {
         System.Threading.Thread.Sleep(300);
     }
 
+    // WM_KEYUP's lParam must carry the previous-state (bit 30) and transition (bit 31) flags, as a
+    // real keyboard's does. Posted with lParam 1 - a keydown-shaped lParam - Windows translates the
+    // keyup into a SECOND WM_CHAR, which lite (having swallowed the keydown's) forwards to the shell:
+    // for Backspace that is 0x08, which PSReadLine reads as Ctrl+Backspace and kills the whole word.
+    const int KeyUpLParam = unchecked((int)0xC0000001);
+
     /// <summary>A key with no modifiers, n times.</summary>
     public static void Key(IntPtr h, int vk, int times) {
         for (int i = 0; i < times; i++) {
             PostMessageW(h, 0x0100, (IntPtr)vk, (IntPtr)1);
-            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
             System.Threading.Thread.Sleep(30);
         }
         System.Threading.Thread.Sleep(250);
@@ -115,7 +121,7 @@ public static class LiteUi {
         for (int i = 0; i < times; i++) {
             PostMessageW(h, 0x0100, (IntPtr)vk, (IntPtr)1);
             System.Threading.Thread.Sleep(120);
-            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
             System.Threading.Thread.Sleep(80);
         }
         st[0x11] = 0; st[0xA2] = 0; st[0x10] = 0; st[0xA0] = 0;
@@ -135,7 +141,7 @@ public static class LiteUi {
         System.Threading.Thread.Sleep(400);
         st[0x11] = 0; st[0xA2] = 0; st[0x10] = 0; st[0xA0] = 0;
         SetKeyboardState(st);
-        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
         AttachThreadInput(me, it, false);
         System.Threading.Thread.Sleep(300);
     }

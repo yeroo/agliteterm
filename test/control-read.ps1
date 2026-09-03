@@ -250,6 +250,105 @@ try {
     Check "another session's stamp is untouched by this one's write" ((Stamp $sid) -eq $other) "before $other, after $(Stamp $sid)"
     Check 'a different status stamps as well' ((Stamp $fresh) -ge $t2 -and (Node $fresh).status -eq 'blocked') "stamp $(Stamp $fresh)"
     Send-Ctl $s @('session', 'close', '--target', $fresh) | Out-Null
+
+    # --- targeting: exactly what session text / session type resolve ----------------------------
+    # The pane you CHECK must be the pane you then TYPE INTO, so surface cursor goes through the
+    # same resolveTarget as the verbs that write. Pinned rather than assumed: by id prefix, by name,
+    # and an ambiguous name REFUSED rather than guessed - typing into the wrong twin is the failure
+    # this verb exists to prevent. session text is the reference throughout: whatever it says about
+    # a target, surface cursor must say too.
+    function TextOk([string]$t) { (ConvertFrom-Json (Send-Ctl $s @('session', 'text', '--target', $t))).ok }
+    # ids are "<prefix>-<n>"; a prefix of at least 4 characters resolves to the first session that
+    # carries it (an exact id always wins first). Under 4 it is not a prefix, it is a typo.
+    $pre = $sid.Substring(0, $sid.Length - 1)
+    if ($pre.Length -lt 4) { $pre = $sid }
+    $raw = CursorRaw $pre
+    $r = ConvertFrom-Json $raw
+    Check "an id prefix ('$pre') resolves, to the first session carrying it" ([bool]$r.ok -and $r.result -eq (Col $sid)) "raw: $raw, first session $(Col $sid)"
+    Check 'session text resolves that prefix the same way' ((TextOk $pre) -eq $true)
+    $short = $sid.Substring(0, 3)
+    $raw = CursorRaw $short
+    $r = ConvertFrom-Json $raw
+    Check "a prefix under 4 characters ('$short') is refused, not guessed" (-not $r.ok) "raw: $raw"
+
+    $nid = NewSession 'lookup-by-name'
+    Check 'a session for the by-name case' ([bool]$nid)
+    Check 'the named session reaches a prompt' (Wait-Prompt $nid) "screen: $(Text $nid)"
+    Send-Ctl $s @('session', 'type', 'named', '--target', $nid) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $raw = CursorRaw 'lookup-by-name'
+    $r = ConvertFrom-Json $raw
+    Check 'targeting by name answers ok' ([bool]$r.ok) "raw: $raw"
+    Check "and it is THAT session's caret, not the first session's" ($r.result -eq (Col $nid) -and (Col $nid) -ne (Col $sid)) "by name $($r.result), by id $(Col $nid), first session $(Col $sid)"
+    Check "the name lookup is case-insensitive, as session text's is" ((Col 'LOOKUP-BY-NAME') -eq (Col $nid) -and (TextOk 'LOOKUP-BY-NAME') -eq $true)
+
+    # Two sessions with one name: a guess would type into one of them. Refused, and the refusal
+    # says how many and how to disambiguate.
+    $twinA = NewSession 'twin'
+    $twinB = NewSession 'twin'
+    Check 'two sessions carry the same name' ([bool]$twinA -and [bool]$twinB -and $twinA -ne $twinB)
+    $raw = CursorRaw 'twin'
+    $r = ConvertFrom-Json $raw
+    Check 'an ambiguous name is refused, not guessed' (-not $r.ok) "raw: $raw"
+    Check 'and the refusal counts the matches and points at ids' ([string]$r.error -match 'names 2 sessions' -and [string]$r.error -match '\bid\b') "error: $($r.error)"
+    Check 'session text refuses the same name the same way' ((TextOk 'twin') -eq $false)
+    Check 'each twin still answers by id' ((IsInteger (Col $twinA)) -and (IsInteger (Col $twinB)))
+    foreach ($t in $twinA, $twinB, $nid) { Send-Ctl $s @('session', 'close', '--target', $t) | Out-Null }
+    Start-Sleep -Milliseconds 1500
+
+    # --- the split pane reports ITS OWN caret, not the primary's --------------------------------
+    # lite's split is a hidden session: `session split on` hands back its id, which is the only
+    # handle on it. Two panes, two carets - a caller checking the right-hand pane before typing
+    # there must not be told about the left one.
+    $prim = NewSession 'splitter'        # a fresh primary, so the split's owner is known
+    Check 'a session to split' ([bool]$prim)
+    Check 'the session to split reaches a prompt' (Wait-Prompt $prim) "screen: $(Text $prim)"
+    $raw = Send-Ctl $s @('session', 'split', 'on')
+    $r = ConvertFrom-Json $raw
+    $split = [string]$r.result
+    Check "session split on hands back the split pane's id" ([bool]$r.ok -and $split -and $split -ne $prim) "raw: $raw"
+    Check 'the split pane reaches a prompt' (Wait-Prompt $split) "screen: $(Text $split)"
+    $pc = Col $prim
+    $sc0 = Col $split
+    Send-Ctl $s @('session', 'type', '1234567', '--target', $split) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $sc1 = Col $split
+    Check 'typing 7 cells into the split moves ITS column by 7' ($sc1 - $sc0 -eq 7) "before $sc0, after $sc1"
+    Check "and leaves the primary's column where it was" ((Col $prim) -eq $pc) "primary before $pc, after $(Col $prim)"
+    Check 'the two panes report different carets' ($sc1 -ne (Col $prim)) "split $sc1, primary $(Col $prim)"
+    Send-Ctl $s @('session', 'type', ([string][char]0x7f * 7), '--allow-control', '--target', $split) | Out-Null
+    Start-Sleep -Milliseconds 1000
+    Send-Ctl $s @('session', 'split', 'off') | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $raw = CursorRaw $split
+    $r = ConvertFrom-Json $raw
+    Check 'a closed split pane is refused like any session that is gone' (-not $r.ok) "raw: $raw"
+    Check 'unsplitting left the primary answering' (IsInteger (Col $prim))
+    Send-Ctl $s @('session', 'close', '--target', $prim) | Out-Null
+    Start-Sleep -Milliseconds 1000
+
+    # --- the alt screen: a column is a column ---------------------------------------------------
+    # No special-casing may creep in: the renderer treats the alt screen as a different BUFFER,
+    # not a different coordinate system, and so does this verb. session write feeds the emulator
+    # only, so the caret can be placed exactly: enter the alt screen, CUP to a known column, read
+    # it; print there and it moves; leave, and the main screen's caret is back where it was.
+    $aid = NewSession 'altscreen'
+    Check 'a session for the alt-screen case' ([bool]$aid)
+    Check 'the alt-screen session reaches a prompt' (Wait-Prompt $aid) "screen: $(Text $aid)"
+    $main0 = Col $aid
+    $esc = [string][char]27
+    Send-Ctl $s @('session', 'write', ($esc + '[?1049h' + $esc + '[3;11H'), '--target', $aid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    $alt = Col $aid
+    # CUP is 1-based; the column reported is 0-based (the wrap case above: cells are 0..cols-1).
+    Check 'on the alt screen, CUP to column 11 reports 10' ($alt -eq 10) "column $alt"
+    Send-Ctl $s @('session', 'write', 'abc', '--target', $aid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    Check 'and printing there moves it by what was printed' ((Col $aid) -eq 13) "column $(Col $aid)"
+    Send-Ctl $s @('session', 'write', ($esc + '[?1049l'), '--target', $aid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    Check "leaving the alt screen restores the main screen's caret" ((Col $aid) -eq $main0) "before $main0, after $(Col $aid)"
+    Send-Ctl $s @('session', 'close', '--target', $aid) | Out-Null
 }
 finally {
     if ($s) { Stop-Sandbox $s }

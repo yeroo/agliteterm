@@ -29,6 +29,9 @@ function Col($t)   { (ConvertFrom-Json (Send-Ctl $s @('surface','cursor','--targ
 own side ("unknown command 'surface cursor'") before any pipe is opened; report the cursor case SKIP
 then, never PASS.
 
+**Last run:** 2026-09-03, agliteterm 0.17.14 against agwinterm's post-#221 `agwintermctl` — all
+three cases pass, including the wide-glyph follow-up (column and painted caret both move two cells).
+
 ---
 
 ## The column `surface.cursor` reports is the caret the window paints
@@ -47,10 +50,16 @@ a column caught mid-repaint is a race in the case, not a bug in the verb. Print 
 caret's starting cell is not the machine's theme: type `function prompt { 'QA> ' }` followed by
 Enter through `session type`, and wait for the new prompt.
 
-The sandbox window never has focus, so the caret is painted as a **hollow one-cell frame** in the
-default foreground (`FrameRect`), not a blinking block. That frame is what to look for; its width IS
-the cell width, so no font metric has to be known. No selection may be live: the caret is not painted
-over one.
+Do not assume how the caret is painted. When another window holds the foreground the caret is a
+static **hollow one-cell frame** (`FrameRect`); but a run started by an agent with nothing else on
+the desktop taking the foreground leaves the sandbox window focused (it was, on 2026-09-03), and then
+the caret is a **solid block blinking** at roughly half-second phases (`InvertRect`) — a single
+capture lands in the off phase half the time and reports "no caret". Locate it blink-proof: write
+DECTCEM off (`session write` of `ESC[?25l` — emulator only, the shell never sees it) and capture a
+reference; write `ESC[?25h`; then capture ~8 frames ~130 ms apart and keep the one that differs most
+from the reference. The differing pixels' bounding box is the caret cell (36 px for the frame, 96 for
+the block at 8×12), and its width IS the cell width, so no font metric has to be known. No selection
+may be live: the caret is not painted over one.
 
 **Steps:**
 1. Record `$c1 = Col (Sid)`. Capture the window with `PrintWindow` and locate the caret frame on the
@@ -59,7 +68,10 @@ over one.
    unsubmitted draft at the prompt, which is the state the caller asks about. Wait ~1s.
 3. Record `$c2 = Col (Sid)`. Capture again; `$x2` = the caret frame's left edge.
 4. Send three Backspaces through the real key path — `[LiteUi]::Key($s.Hwnd, 8, 3)` — wait ~1s,
-   record `$c3` and capture `$x3`.
+   record `$c3` and capture `$x3`. (Before 2026-09-03 that helper posted the keyup with lParam `1`;
+   Windows translates such a keyup into a second `WM_CHAR`, lite forwarded the `0x08`, and PSReadLine
+   read it as Ctrl+Backspace and killed the whole word — `$c3` came back at the prompt column. A
+   harness artefact, fixed in `test/ui-lib.ps1`; a real keyboard never produced it.)
 
 **Expect:**
 - `$c2 - $c1 -eq 10` and `$c3 -eq $c2 - 3` — the number moves by what was typed, and **back**;

@@ -190,12 +190,54 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       `$env:AGWINTERMCTL` at agwinterm's Release build, as in tasks 1-3
 
 ### Task 5: [Final] Verify acceptance criteria
-- [ ] verify every requirement in Overview is implemented, and every "what agwinterm decided" line
-      holds in lite — check each against the code, not the plan
-- [ ] verify the edge cases: target by id prefix; target by name; an ambiguous name is refused, not
+- [x] verify every requirement in Overview is implemented, and every "what agwinterm decided" line
+      holds in lite — check each against the code, not the plan. Checked in `src/main.cpp`:
+      `surface.cursor` answers `ctlOk(std::to_string(info.cursorCol))` read under `g_lock`, column
+      only, `0` goes out as the number 0; `session.status` stamps `statusChangedAt = epochNow()` on
+      every write with the liveness reasoning beside it; `Session::statusChangedAt` is seeded at
+      construction (and status is not persisted, so a restored session is constructed fresh);
+      `tree` emits it unconditionally on every node; `ping` is `"agliteterm " + narrow(updVersion())`;
+      targeting is the shared `resolveTarget`, nothing pane-specific invented
+- [x] verify the edge cases: target by id prefix; target by name; an ambiguous name is refused, not
       guessed; the split pane (`session split`) reports its own caret, not the primary's; the alt
-      screen (a column is a column — assert no special-casing crept in)
-- [ ] `git diff` on `native/` is empty and the build printed the same ABI as before
-- [ ] run `test/run-all.ps1 -Strict` and the QA cases against a sandbox build
-- [ ] agwinterm's `docs/lite-parity.md` is the tracker for this gap and lives in the other
+      screen (a column is a column — assert no special-casing crept in). Pinned in
+      `test/control-read.ps1` rather than eyeballed (see ➕ below)
+- [x] `git diff` on `native/` is empty and the build printed the same ABI as before (`abi 16`,
+      `v0.17.14`, as in task 4)
+- [x] run `test/run-all.ps1 -Strict` and the QA cases against a sandbox build — all suites green
+      with `$env:AGWINTERMCTL` at agwinterm's Release build; all three `qa/control-read.md` cases
+      pass (two harness findings on the way, ⚠️ below)
+- [x] agwinterm's `docs/lite-parity.md` is the tracker for this gap and lives in the other
       repository — do NOT edit it here; note in this plan's ⚠️/➕ section what it should say
+
+- ➕ the task-5 edge cases are now checks, in `test/control-read.ps1`: an id prefix of ≥4 chars
+      resolves (to the first session carrying it — the exact id always wins first) and `session text`
+      agrees; a 3-char prefix is refused; a name resolves case-insensitively to THAT session's caret;
+      two sessions named `twin` make `surface cursor --target twin` refuse with "names 2 sessions"
+      exactly as `session text` does, while each twin still answers by id; `session split on` hands
+      back a pane whose column moves by what is typed into it while the primary's does not, and the
+      unsplit pane is refused afterwards; on the alt screen `CUP 3;11` reports `10`, printing `abc`
+      makes it `13`, and `DECRST 1049` restores the main screen's column — no special-casing
+- ⚠️ harness, not product: `[LiteUi]::Key` / `KeyMods` / `Chord` in `test/ui-lib.ps1` posted
+      `WM_KEYUP` with lParam `1`. Windows translates a keyup without the transition bit into a second
+      `WM_CHAR`; lite had swallowed the keydown's and forwarded this one, so for Backspace the shell
+      got `0x08`, which PSReadLine reads as Ctrl+Backspace and kills the whole word. Found by
+      `qa/control-read.md` step 4 (`$c3` came back at the prompt column); a keydown alone deleted one
+      char, and a real keyboard never produces that keyup. Fixed: keyup lParam `0xC0000001`. No
+      `test/*.ps1` uses those helpers, so nothing else was affected
+- ⚠️ `qa/control-read.md` assumed the sandbox window never has focus (static hollow caret). A run
+      started by an agent with nothing else taking the foreground leaves it focused, and the caret is a
+      solid block blinking at ~half-second phases — a single capture misses it half the time, which is
+      what the first run's "no caret after typing" was. The case now says so and locates the caret
+      blink-proof (DECTCEM-off reference frame, then sampled frames); the run against 0.17.14 gives
+      x=225 at column 4, x=305 at column 14, x=281 after three Backspaces — one coordinate system
+- ➕ what agwinterm's `docs/lite-parity.md` should say once this merges (edit it THERE, in the PR
+      that closes the item, per that file's own rule): the "Being mirrored now: the read-only trio"
+      section becomes a closed item — P1-lite landed in agliteterm on 2026-09-03 (this branch's PR):
+      `surface.cursor` is implemented in lite (so lite's verb count is 42 and the verb gap shrinks by
+      one — recount from both dispatchers as the file's rule says rather than trusting these numbers),
+      `statusChangedAt` is on every lite `tree` node, and lite's `ping` answers
+      `"agliteterm <compiled version>"`, so `agwintermctl version` is truthful against lite. The
+      sentence "Until P1-lite merges, agliteterm's `check-contract` is red by design" should go: it
+      was never red, because #223 merged the canonical step before task 4 landed. The conformance
+      contract's `surface.cursor` step (`integer` kind) is now checked on both sides
