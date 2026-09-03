@@ -84,8 +84,8 @@ try {
     # lite used to answer a hard-coded "agliteterm 0.1" whatever was running, so `version` would
     # have named a build that does not exist. The truth is the installer's AppVersion: build.ps1
     # compiles exactly that string in, so the check reads it from the same place rather than
-    # trusting the exe about itself. (Start-Sandbox does not pass AGWINTERM_VERSION_OVERRIDE, the
-    # updater's test seam, so the sandbox reports its compiled version.)
+    # trusting the exe about itself. (Start-Sandbox scrubs AGWINTERM_VERSION_OVERRIDE, the updater's
+    # test seam, from the environment the sandbox inherits, so it reports its compiled version.)
     $iss = Join-Path (Split-Path $PSScriptRoot -Parent) 'installer\agliteterm.iss'
     $m = Select-String -Path $iss -Pattern '#define AppVersion "([^"]+)"'
     $appVer = if ($m) { $m.Matches[0].Groups[1].Value } else { '' }
@@ -217,8 +217,11 @@ try {
     # Seeded at creation: the session reports its OWN age rather than 0 (or 1970).
     $t0 = Stamp $fresh
     Check 'a never-written stamp is within a minute of now, not 0' ([math]::Abs((Now) - $t0) -le 60) "stamp $t0, now $(Now)"
-    # Every node, not only the new one: the first session never set a status either.
-    Check 'the first session (never written) carries it too' ((IsInteger (Stamp $sid)) -and [math]::Abs((Now) - (Stamp $sid)) -le 60) "stamp $(Stamp $sid)"
+    # Every node, not only the new one: the first session never set a status either. Its stamp is
+    # the sandbox's launch time, and the checks above this line can legitimately take longer than a
+    # minute on a cold runner (three Wait-Prompt ceilings alone budget 60 s) - so this pins presence
+    # and shape, and leaves "within a minute" to the session created three lines up.
+    Check 'the first session (never written) carries it too' ((IsInteger (Stamp $sid)) -and (Stamp $sid) -gt 0) "stamp $(Stamp $sid)"
 
     # Writing a status makes the age small.
     Start-Sleep -Seconds 2

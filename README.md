@@ -67,8 +67,10 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
-  a draft before typing into another agent's (after a print into the last column it equals the
-  pane width — clamp before indexing); every `tree` node carries `statusChangedAt`, epoch seconds
+  a draft before typing into another agent's (a *different* column proves a draft; an equal one
+  does not prove emptiness — a draft exactly one wrap width long parks the caret where it started,
+  so back a match with `session text`; after a print into the last column it equals the pane
+  width — clamp before indexing); every `tree` node carries `statusChangedAt`, epoch seconds
   of the last status **write**, restamped on every write including a re-assert of the same status,
   so a stale `"active"` shows its age; and `ping` names the running build (`agliteterm
   <version>`), which is what `agwintermctl version` reports as the app.
@@ -215,8 +217,8 @@ agents as first-class citizens first. 💜
 Needs MSVC with the **VC++ ATL component** (WTL rides on the ATL headers):
 
 ```powershell
-./build.ps1                 # -> bingliteterm.exe
-./installer/build.ps1       # -> installer\Outputgliteterm-setup-<ver>.exe
+./build.ps1                 # -> bin\agliteterm.exe
+./installer/build.ps1       # -> installer\Output\agliteterm-setup-<ver>.exe
 ```
 
 ### The core it rides on
@@ -236,9 +238,7 @@ else's machine.
 To build against a core you are changing:
 
 ```powershell
-./build.ps1 -NativeDir C:\srcgwinterm
-ative	arget
-elease
+./build.ps1 -NativeDir C:\src\agwinterm\native\target\release
 ```
 
 ## Tests

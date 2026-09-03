@@ -6,7 +6,7 @@
 #   - ALWAYS a sandbox instance: --pipe <name> and a throwaway %LOCALAPPDATA%. lite is plain Win32
 #     and reads the environment, so the override really does isolate it — unlike agwinterm, where
 #     .NET resolves the known folder and needs --app-id instead. Settings, though, live in
-#     HKCU\Softwaregliteterm and are NOT isolated: save and restore anything a case changes.
+#     HKCU\Software\agliteterm and are NOT isolated: save and restore anything a case changes.
 #   - NEVER inject global input. No keybd_event, no SendInput. Everything is PostMessage to this
 #     instance's own window handles, so whatever the user is typing in stays untouched. Ctrl+C is the
 #     one thing PostMessage cannot express alone (the modifier must be visible to GetKeyState), and
@@ -159,8 +159,10 @@ function Start-Sandbox {
     New-Item -ItemType Directory -Force $home_ | Out-Null
 
     # A check must never inherit the pane it is being RUN from, or `session type` lands in the
-    # caller's own terminal instead of the sandbox.
-    foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') {
+    # caller's own terminal instead of the sandbox. Start-Process -Environment ADDS to the inherited
+    # block, it does not replace it - so the updater's test seam is scrubbed here as well, or a
+    # shell that was testing the updater makes the sandbox answer `ping` with a made-up version.
+    foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE', 'AGWINTERM_VERSION_OVERRIDE') {
         Remove-Item "env:$v" -ErrorAction SilentlyContinue
     }
 

@@ -387,6 +387,17 @@ static int statusClass(const std::string& s) {
     if (s == "blocked" || s == "waiting" || s == "attention" || s == "input") return AGST_BLOCKED;
     return AGST_NONE;
 }
+// The user-interrupt clear (Esc / Ctrl+C typed into the pane): idle ONLY IF the status is still
+// working-class, decided and written under one hold. As a statusOf() check followed by setStatus()
+// a hook's `blocked` landing between the two would have been overwritten with idle - the one
+// transition the policy says must not happen. Returns whether anything was written.
+static bool clearWorkingStatus(Session* s) {
+    EnterCriticalSection(&g_statusLock);
+    bool cleared = statusClass(s->status) == AGST_WORKING;
+    if (cleared) { s->status = "idle"; s->statusChangedAt = epochNow(); }
+    LeaveCriticalSection(&g_statusLock);
+    return cleared;
+}
 static HFONT g_treeItalic;      // italic variant of the sidebar font (agent "working" rows)
 // Quick + scratch terminals: modal-ish popup windows, each hosting a dedicated (hidden) session. The
 // overlay is a scratch that runs a one-shot command. g_focusOverride redirects input/paint focus to a
@@ -3509,8 +3520,7 @@ static void sendUtf8(wchar_t wc) {
     // #185 / main-app parity: scoped to working-class; blocked stays until the agent or user acts).
     if (wc == 0x1B || wc == 0x03) {
         Session* s = focusedSession();
-        if (s && statusClass(statusOf(s).status) == AGST_WORKING) {
-            setStatus(s, "idle");
+        if (s && clearWorkingStatus(s)) {
             emitEvent("status", s->id, "idle");
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         }
@@ -4018,6 +4028,7 @@ static void updateStatus() {
 }
 static void refreshTree() {
     if (!g_tree) return;
+    LockG hold;   // UI thread walking g_sessions and reading names while pipe threads mutate both
     g_treeSyncing = true;
     TreeView_DeleteAllItems(g_tree);
     HTREEITEM sel = nullptr;
@@ -5949,6 +5960,7 @@ static void emitEvent(const char* type, const std::string& session, const std::s
 
 static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
     if (target.empty() || target == "active") return focusedSession();
+    LockG hold;   // the list shape and the names change under g_lock on other threads (see `tree`)
     for (Session* s : g_sessions)
         if (s->id == target) return s;
     for (Session* s : g_sessions)
@@ -6271,6 +6283,10 @@ static std::string ctlDispatch(const std::string& line) {
     // and the self-updater read the same updVersion(), so all three name the same build.
     if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
+        // This runs on a control-pipe thread while another pipe thread's session.new can push_back
+        // into g_sessions (a realloc frees the buffer this loop indexes) and session.rename can
+        // reassign a name this loop reads. Both mutate under g_lock, so the walk holds it too.
+        LockG hold;
         std::string wss;
         for (int w = 0; w < (int)g_workspaces.size(); w++) {
             if (w) wss += ",";
@@ -6569,7 +6585,11 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string nm = req.get("args.name");
         if (nm.empty()) return ctlErr("rename needs a name");
-        target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
+        {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
+            // reassignment frees the old buffer once the name outgrows the small-string buffer)
+            LockG hold;
+            target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
+        }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
     }

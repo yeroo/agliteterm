@@ -109,6 +109,8 @@ could not hide inside a second's rounding.
 3. `Send-Ctl $s @('session','status','active','--target',(Sid))` — the **same** status,
    deliberately. Wait ~1 s; record `$t3` and `$age3`.
 4. `Send-Ctl $s @('session','status','idle','--target',(Sid))`; record `$t4`.
+5. `Send-Ctl $s @('session','new','--name','virgin')` — a session no hook ever writes to — and
+   read its node from `Tree` by name.
 
 **Expect:**
 - `$now - $t1` is between 0 and 5 — seconds, not milliseconds, and not the epoch;
