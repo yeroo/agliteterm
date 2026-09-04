@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <atomic>    // the one-in-flight relayout flag
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
@@ -946,6 +947,7 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 #define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
+#define WM_APP_RELAYOUT    (WM_APP + 10)  // hostResize skipped a UI-thread resize (g_resizeLock busy); ask again once it frees
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
@@ -961,6 +963,9 @@ static CRITICAL_SECTION g_lock; // guards every session's emu + the session list
 // g_lock is what paintPane and every reader thread need (see hostResize). Ordered BEFORE g_lock
 // (hostResize takes this, then g_lock briefly); nothing else takes it, so there is no other order.
 static CRITICAL_SECTION g_resizeLock;
+// One WM_APP_RELAYOUT in flight at a time: hostResize sets it when the UI thread skips a resize on
+// the busy lock, and the handler clears it before laying out again.
+static std::atomic<bool> g_relayoutPending{ false };
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
 struct LockG {
@@ -1505,8 +1510,21 @@ static void hostResize(Session* s, int cols, int rows) {
     // The UI thread never WAITS for this lock: if a pipe thread is mid-round-trip the UI thread
     // leaves the resize for the next layout rather than blocking the message loop. A skipped
     // resize is self-correcting — the latch still differs, so the next WM_SIZE asks again.
+    // g_hwnd null or already destroyed answers 0, which no thread id equals, so this falls to the
+    // blocking branch — right for a pipe thread, and unreachable for the UI thread, which cannot be
+    // in here without its own window.
     bool onUi = GetWindowThreadProcessId(g_hwnd, nullptr) == GetCurrentThreadId();
-    if (onUi) { if (!TryEnterCriticalSection(&g_resizeLock)) return; }
+    if (onUi) {
+        // Skipped, not dropped. Nothing polls: every syncPaneSizes caller is an event (WM_SIZE, a
+        // select, a split, a font change), so "the next WM_SIZE asks again" is not something anyone
+        // owns — a drag that ends while a pipe thread holds the lock would leave the pane at the old
+        // grid, and a popup has no fallback layout at all (popup sessions are never in g_pane).
+        // Post one retry instead; the flag keeps a busy lock from filling the queue (revmux r2).
+        if (!TryEnterCriticalSection(&g_resizeLock)) {
+            if (!g_relayoutPending.exchange(true)) PostMessageW(g_hwnd, WM_APP_RELAYOUT, 0, 0);
+            return;
+        }
+    }
     else EnterCriticalSection(&g_resizeLock);
     struct ResizeGuard { ~ResizeGuard() { LeaveCriticalSection(&g_resizeLock); } } resizeGuard;
     int hadCols, hadRows;
@@ -1547,12 +1565,42 @@ static void hostResize(Session* s, int cols, int rows) {
 // Fit each shown pane's session to its rect. A pane with no viable rect (paneGridSize) is left
 // alone — not resized to 2x2 — so this is safe from the pipe threads while the window is minimised.
 static void syncPaneSizes() {
+    // The pointers come out under g_lock and the host round trip happens outside it — the same
+    // shape newSessionGrid, resolveTarget and callerWorkspace take. This runs on control-pipe
+    // threads too (session.select / split / duplicate through selectPrimary), where another
+    // thread's attachSession push_back reallocates g_sessions and frees the buffer this loop was
+    // indexing (revmux r2: the sibling of the walk r1 locked). No lock spans hostResize.
+    Session* want[2] = { nullptr, nullptr };
+    int grid[2][2]{};
+    {
+        LockG hold;
+        for (int p = 0; p < 2; p++) {
+            int idx = g_pane[p];
+            if (idx < 0 || idx >= (int)g_sessions.size()) continue;
+            want[p] = g_sessions[idx];
+        }
+    }
     for (int p = 0; p < 2; p++) {
-        int idx = g_pane[p];
-        if (idx < 0 || idx >= (int)g_sessions.size()) continue;
-        int cols, rows;
-        if (!paneGridSize(p, &cols, &rows)) continue;
-        hostResize(g_sessions[idx], cols, rows);
+        if (!want[p]) continue;
+        if (!paneGridSize(p, &grid[p][0], &grid[p][1])) continue;
+        hostResize(want[p], grid[p][0], grid[p][1]);
+    }
+}
+
+// Fit each live popup's session to its own window. syncPaneSizes cannot: a quick / scratch /
+// overlay session is never written into g_pane, so the only thing that ever sizes one is its own
+// WM_SIZE — and a resize skipped there (g_resizeLock busy) has nothing else to correct it. UI
+// thread only, like syncPaneSizes.
+static void refitPopupSessions() {
+    const std::pair<HWND, Session*> popups[] = {
+        { g_quickHwnd, g_quickSession }, { g_scratchHwnd, g_scratchSession }, { g_overlayHwnd, g_overlaySession },
+    };
+    for (const auto& pr : popups) {
+        HWND hw = pr.first; Session* s = pr.second;
+        if (!hw || !s || !IsWindow(hw) || !IsWindowVisible(hw) || IsIconic(hw)) continue;
+        RECT rc; GetClientRect(hw, &rc);
+        if (rc.right <= 0 || rc.bottom <= 0 || g_cw <= 0 || g_ch <= 0) continue;
+        hostResize(s, max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)));
     }
 }
 
@@ -5086,7 +5134,14 @@ static void paintPopup(HWND h, Session* s) {
     EndPaint(h, &ps);
 }
 static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    Session* s = (h == g_quickHwnd) ? g_quickSession : (h == g_scratchHwnd) ? g_scratchSession : g_overlaySession;
+    // A MATCH, not a fallthrough. CreateWindowExW dispatches WM_SIZE before it returns, so during a
+    // quick popup's creation g_quickHwnd is still null — and the old `: g_overlaySession` default
+    // then handed the QUICK window's grid to an open overlay's session, reflowing a running command
+    // in a window that never changed size, permanently (revmux r2, pre-existing). A window this
+    // proc does not yet know drives nothing.
+    Session* s = (h == g_quickHwnd) ? g_quickSession
+               : (h == g_scratchHwnd) ? g_scratchSession
+               : (h == g_overlayHwnd) ? g_overlaySession : nullptr;
     switch (m) {
         case WM_SETFOCUS:  g_focusOverride = s; return 0;
         case WM_KILLFOCUS: if (g_focusOverride == s) g_focusOverride = nullptr; return 0;
@@ -5157,9 +5212,11 @@ static void ensurePopupClass() {
 }
 static constexpr DWORD kPopupStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
 // The smallest popup that can host a prompt, in OUTER pixels: 30x8 cells of the live font plus the
-// frame. A physical minimum, not a policy clamp — but the API must never SILENTLY apply it, so
-// `session overlay` refuses a --size-percent that would land under it (naming the smallest that
-// fits) rather than opening something bigger than the caller asked for and answering ok.
+// frame. A physical minimum, applied HERE to every popup. It is never applied silently: the verb
+// raises the percentage it reports to overlayMinPercentRaw() first, so the reply names the size the
+// popup will actually have. Refusing under the floor was tried and reverted — it made lite answer
+// ok:false to the shared contract's `--size-percent 40` step, which agwinterm's frameless cover
+// (no floor) answers ok. Any new entry point that creates a popup owes the same raise.
 static void popupFloorPx(int& W, int& H) {
     RECT r{ 0, 0, 30 * g_cw, 8 * g_ch };
     AdjustWindowRectEx(&r, kPopupStyle, FALSE, 0);
@@ -5200,22 +5257,32 @@ static void overlayOuterSize(double f, int& W, int& H) {
     AdjustWindowRectEx(&r, kPopupStyle, FALSE, 0);
     W = r.right - r.left; H = r.bottom - r.top;
 }
-// The smallest --size-percent this window can show: below it the 30x8-cell popup minimum decides
-// the size instead. lite REPORTS the percentage actually in effect rather than echoing the number
-// asked for (revmux r1 of P2-lite found it echoing) and rather than refusing — the shared contract
-// runs `session overlay open --size-percent 40` and expects ok, and on a small window 40 % of the
-// client is under the minimum, so a refusal here would diverge from agwinterm, whose overlay is a
-// cover inside the content region with no window frame and no such floor. The caller compares what
-// it asked for with what it is told, as `sidebar width` already makes it. 0 = cannot say
-// (minimised, or no font metrics yet); the layout then decides, as paneGridSize does.
-static int overlayMinPercent() {
+// The smallest --size-percent this window can show, as a raw percentage that may exceed 100 (a
+// client under 30x8 cells cannot show the minimum popup at any percentage) and is 0 when the
+// question cannot be answered at all — the window is minimised, or there are no font metrics yet.
+// Below it the 30x8-cell popup minimum decides the size instead. lite REPORTS the percentage
+// actually in effect rather than echoing the number asked for (revmux r1 found it echoing) and
+// rather than refusing — the shared contract runs `session overlay open --size-percent 40` and
+// expects ok, and on a small window 40 % of the client is under the minimum, so a refusal would
+// diverge from agwinterm, whose overlay is a cover inside the content region with no window frame
+// and no such floor.
+static int overlayMinPercentRaw() {
     if (IsIconic(g_hwnd) || g_cw <= 0 || g_ch <= 0) return 0;
     RECT mc; GetClientRect(g_hwnd, &mc);
     if (mc.right <= 0 || mc.bottom <= 0) return 0;
     int pw = (30 * g_cw * 100 + (int)mc.right - 1) / (int)mc.right;     // ceil, in percent
     int ph = (8 * g_ch * 100 + (int)mc.bottom - 1) / (int)mc.bottom;
-    int n = pw > ph ? pw : ph;
-    return n < 1 ? 1 : (n > 100 ? 100 : n);
+    return pw > ph ? pw : ph;
+}
+// How the reply names the size, given what was asked for. The caller compares this with what it
+// asked for, as `sidebar width` already makes it — so it must never be a number the popup will not
+// have (revmux r2: a minimised window answered "at 40%" for a popup at the 30x8-cell floor, and an
+// absent flag answered "at 70%" for the same). The two states that cannot carry a percentage say so
+// instead, the way `sidebar width` answers applied:false with a note.
+static bool overlaySizeIsPercent(int rawMin) { return rawMin > 0 && rawMin <= 100; }
+static std::string overlaySizeReason(int rawMin) {
+    return rawMin == 0 ? "the smallest size this window can show (it is minimised, so the percentage could not be applied)"
+                       : "the smallest size this window can show (its client is under 30x8 cells, so no percentage fits)";
 }
 // Whether the foreground window belongs to THIS process — the user is in this window or one of its
 // popups, rather than working in another application.
@@ -5287,9 +5354,11 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is 0 (the flag was absent) or a validated 1..100 — the verb refused anything else before
-// this ran, so there is NO clamp here: 100 means the whole client area, and a clamp could only hide
-// a bug upstream. 0 gives lite's DEFAULT, a popup 70 % of the main window's client area. That
+// sizePct is 0 (the flag was absent, or the window could not be measured) or the EFFECTIVE 1..100
+// the verb already raised to the 30x8-cell minimum and reported. Nothing clamps the percentage here
+// — 100 means the whole client area — but createPopupWindowPx still applies that physical floor to
+// the pixels, so the popup matches sizePct only when the floor does not bind, which is exactly what
+// the verb's reply accounts for. 0 gives lite's DEFAULT, a popup 70 % of the main window's client. That
 // default is lite's own and differs from agwinterm's (a cover over the full content region): the
 // shared contract pins the reply shape and the refusals, not the default geometry, and the skill
 // says which default each product has. An empty command is refused by the verb, and the verb is
@@ -5598,6 +5667,7 @@ public:
         MESSAGE_HANDLER(WM_APP_FOCUSTERM, OnFocusTerm)
         MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
         MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
+        MESSAGE_HANDLER(WM_APP_RELAYOUT, OnRelayout)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -5925,6 +5995,16 @@ public:
     // which is never made while g_lock may be held (#20). Hidden: nothing to lay out, the width is
     // what the next show uses; it is still persisted so it survives a restart. Same save path as
     // the splitter drag and the View toggles.
+    // A resize the UI thread skipped because a control-pipe thread held g_resizeLock. Lay out
+    // again now that it is (probably) free: the panes through syncPaneSizes, and the popups, which
+    // syncPaneSizes never touches because their sessions are not in g_pane. If the lock is still
+    // busy each hostResize skips again and posts one more retry.
+    LRESULT OnRelayout(UINT, WPARAM, LPARAM, BOOL&) {
+        g_relayoutPending = false;
+        if (!g_sessions.empty()) syncPaneSizes();
+        refitPopupSessions();
+        return 0;
+    }
     LRESULT OnSidebarWidth(UINT, WPARAM, LPARAM, BOOL&) {
         if (g_showSidebar) relayout();   // repositions the tree (OnSize) and syncPaneSizes()
         saveColors();
@@ -6322,7 +6402,7 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
 // must not break to fix a preference. A hidden session (quick / scratch / overlay) also answers -1:
 // lite gives those the workspace that happened to be active when they were made, which is not a
 // workspace the caller can see in `tree`, so "the caller's workspace" has no honest answer there.
-static int callerWorkspace(const std::string& caller) {
+static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nullptr) {
     if (caller.empty() || caller == "active") return -1;   // "active" is a target word, never an id
     LockG hold;   // the list and s->ws change under g_lock on other threads (see `tree`)
     Session* hit = nullptr;
@@ -6332,7 +6412,9 @@ static int callerWorkspace(const std::string& caller) {
         for (Session* s : g_sessions)
             if (s->id.compare(0, caller.size(), caller) == 0) { hit = s; break; }
     if (!hit || hit->hidden) return -1;
-    return (hit->ws >= 0 && hit->ws < (int)g_workspaces.size()) ? hit->ws : -1;
+    if (hit->ws < 0 || hit->ws >= (int)g_workspaces.size()) return -1;
+    if (nameOut) *nameOut = g_workspaces[hit->ws];   // the identity, for the re-find after the create
+    return hit->ws;
 }
 
 // Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
@@ -6775,6 +6857,10 @@ static std::string ctlDispatch(const std::string& line) {
         // target: session.new stays targetless, and a target would turn a stale value into "session
         // not found" instead of the fallback.
         int wantWs = -1;
+        // The NAME of the workspace wantWs points at, captured with the index and re-found under the
+        // lock after the create: an index is only valid until someone deletes an earlier workspace
+        // (revmux r2). Empty when wantWs stays -1.
+        std::wstring wantWsName;
         std::string wsArg = req.get("args.workspace");
         std::string wsName = req.get("args.workspace-name");
         std::string wsCreate = req.get("args.create-workspace");
@@ -6784,23 +6870,24 @@ static std::string ctlDispatch(const std::string& line) {
         if (!wsArg.empty()) {
             bool digits = wsArg.find_first_not_of("0123456789") == std::string::npos;
             int n = digits ? atoi(wsArg.c_str()) : -1;
-            if (n >= 0 && n < (int)g_workspaces.size()) wantWs = n;
-            else return ctlErr("no workspace '" + wsArg + "' (ids are the indices `tree` reports)");
+            { LockG hold; if (n >= 0 && n < (int)g_workspaces.size()) { wantWs = n; wantWsName = g_workspaces[n]; } }
+            if (wantWs < 0) return ctlErr("no workspace '" + wsArg + "' (ids are the indices `tree` reports)");
         } else if (!wsName.empty()) {
             std::wstring want = widen(wsName);
-            for (int w = 0; w < (int)g_workspaces.size(); w++)
-                if (_wcsicmp(g_workspaces[w].c_str(), want.c_str()) == 0) { wantWs = w; break; }
+            { LockG hold;
+              for (int w = 0; w < (int)g_workspaces.size(); w++)
+                  if (_wcsicmp(g_workspaces[w].c_str(), want.c_str()) == 0) { wantWs = w; wantWsName = g_workspaces[w]; break; } }
             if (wantWs < 0) {
                 if (wsCreate != "true" && wsCreate != "1")
                     return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
                 // `tree` walks this vector under g_lock; the index is taken under the SAME hold, or two
                 // concurrent creators both read the trailing size and are told the same number
-                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; }
+                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; wantWsName = want; }
             }
         } else {
             std::string caller = req.get("args.caller");
             if (caller.empty()) caller = req.get("caller");
-            wantWs = callerWorkspace(caller);   // -1 = fall through to the active workspace (step 3)
+            wantWs = callerWorkspace(caller, &wantWsName);   // -1 = fall through to the active workspace (step 3)
         }
 
         int cols, rows;
@@ -6821,19 +6908,25 @@ static std::string ctlDispatch(const std::string& line) {
         if (!s) return ctlErr("create failed");
         // tsvField: the name reaches the state file, where a tab or newline would forge a record.
         if (!name.empty()) s->name = widen(tsvField(name));
-        // Re-validated under the lock, for all three sources of wantWs (--workspace, a created
-        // --workspace-name, the caller's own): the index was resolved BEFORE the host round trip
-        // that made the session, and another client's workspace.delete erases a name and shifts
-        // every later index under g_lock in between. A stale index would put the session in the
-        // wrong workspace, or out of range — where `tree`, which matches s->ws == w over the
-        // surviving workspaces, would omit it entirely while session.new had already answered with
-        // its id (revmux r1 of P2-lite). Out of range now means the active workspace, which is at
-        // least somewhere the caller can see.
+        // Re-resolved under the lock by NAME, for all three sources of wantWs (--workspace, a
+        // created --workspace-name, the caller's own): the index was resolved BEFORE the host round
+        // trip that made the session, and another client's workspace.delete erases a name and
+        // shifts every later index down under g_lock in between. Re-checking only the RANGE (what
+        // r1's fix did) leaves the worse half: [A,B,C,D] with B deleted makes index 2 name D, so
+        // the session lands in a workspace nobody asked for, silently (revmux r2). The name moves
+        // with the shift; only a workspace that is really gone falls back to the active one.
         {
             LockG hold;
-            if (wantWs >= 0)
-                s->ws = wantWs < (int)g_workspaces.size() ? wantWs
+            if (wantWs >= 0) {
+                int found = -1;
+                for (int w = 0; w < (int)g_workspaces.size(); w++)
+                    if (g_workspaces[w] == wantWsName) { found = w; break; }
+                if (found < 0)
+                    logWarn("session.new: workspace '%s' was deleted while the session was being created; it lands in the active one instead",
+                            narrow(wantWsName).c_str());
+                s->ws = found >= 0 ? found
                       : (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size() ? g_activeWs : 0);
+            }
         }
         selectPrimary((int)g_sessions.size() - 1);
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -7015,14 +7108,13 @@ static std::string ctlDispatch(const std::string& line) {
                               " is not a whole number in 1..100; omit --size-percent to use the default popup size");
             sizePct = n;
         }
-        // The percentage IN EFFECT: what was asked for, unless the 30x8-cell popup minimum is
-        // bigger, in which case that is what the caller gets and what the reply says. Never
-        // silently the caller's own number for a popup that is not that size.
-        int effectivePct = sizePct;
-        if (sizePct > 0) {
-            int minPct = overlayMinPercent();
-            if (minPct > 0 && effectivePct < minPct) effectivePct = minPct;
-        }
+        // The percentage IN EFFECT: what was asked for — or lite's default when the flag was
+        // absent, which is raised by the same rule and was not before (revmux r2) — unless the
+        // 30x8-cell popup minimum is bigger, in which case that is what the caller gets and what
+        // the reply says. Never silently the caller's own number for a popup that is not that size.
+        int rawMin = overlayMinPercentRaw();
+        int effectivePct = sizePct > 0 ? sizePct : (int)(kOverlayDefaultFraction * 100);
+        if (rawMin > 0 && rawMin <= 100 && effectivePct < rawMin) effectivePct = rawMin;
         std::string command = req.get("args.command");
         // The command is checked BEFORE the target (agwinterm's order; its fake host asserts it).
         if (action == "open" && command.empty()) return ctlErr("overlay open needs a command; nothing opened");
@@ -7046,18 +7138,21 @@ static std::string ctlDispatch(const std::string& line) {
         }
         if (action == "resize") {
             if (!open) return ctlErr("no overlay to resize on that target; open one first");
-            auto* rq = new OverlayReq{ std::string(), effectivePct };
+            auto* rq = new OverlayReq{ std::string(), sizePct > 0 ? effectivePct : 0 };
             if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_RESIZE, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was resized"); }
-            // The N IN EFFECT: the one asked for, the 30x8-cell minimum when that is bigger, or the
-            // default when the flag was omitted. Compare it with what you asked for.
-            return ctlOkStr("resized " + std::to_string(effectivePct > 0 ? effectivePct : (int)(kOverlayDefaultFraction * 100)) + "%");
+            // The size IN EFFECT, never the number asked for when the popup will not have it.
+            // "resized N%" (the documented shape) on a window that can answer; otherwise what it
+            // got and why.
+            return ctlOkStr(overlaySizeIsPercent(rawMin) ? "resized " + std::to_string(effectivePct) + "%"
+                                                         : "resized to " + overlaySizeReason(rawMin));
         }
-        auto* rq = new OverlayReq{ command, effectivePct };
+        auto* rq = new OverlayReq{ command, sizePct > 0 ? effectivePct : 0 };
         if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was opened"); }
-        // A status word carrying the percentage IN EFFECT, not the overlay's session id: the session
-        // does not exist yet when this reply is written (it is created by the posted message). Known
-        // gap, written down in the plan; the contract pins only that the reply is a string.
-        return ctlOkStr("overlay opened at " + std::to_string(effectivePct > 0 ? effectivePct : (int)(kOverlayDefaultFraction * 100)) + "%");
+        // A status word carrying the size IN EFFECT, not the overlay's session id: the session does
+        // not exist yet when this reply is written (it is created by the posted message). Known gap,
+        // written down in the plan; the contract pins only that the reply is a string.
+        return ctlOkStr("overlay opened at " + (overlaySizeIsPercent(rawMin) ? std::to_string(effectivePct) + "%"
+                                                                              : overlaySizeReason(rawMin)));
     }
     // ---- agwintermctl-dialect verbs over the features lite has -------------------------------
     auto wsResolve = [&](const std::string& sel, bool defaultActive) -> int {

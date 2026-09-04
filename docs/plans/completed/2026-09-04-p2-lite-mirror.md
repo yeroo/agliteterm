@@ -526,6 +526,46 @@ every one of them in this batch's own new code — all fixed in the next commit)
 - Two comments corrected: the `raiseIfAllowed` doc block sat on `foregroundIsOurs`, and
   `openOverlay`'s justified a keyboard path that does not exist (the dead empty-command arm went).
 
+**What revmux round 2 found** (`02-after-fix`, scoped to the r1 fix commit: **two Majors inside that
+fix**, three Minors, four pre-existing — the Minors and two cheap pre-existing ones fixed in the next
+commit, the remaining hang filed as #27).
+
+- ⚠️ **Major, in r1's own fix — the reply named a percentage the popup would not have.** Two gaps:
+  on a minimised window `overlayMinPercentRaw()` cannot answer, so the raise was skipped while
+  `createPopupWindowPx` still applied the 30x8-cell floor (`overlay opened at 40%` for a floor-sized
+  popup, never re-fitted — popup sessions are not in `g_pane`); and with the flag ABSENT the reply
+  reported a hard 70 % that the floor could equally bind. A client under 30x8 cells was answered
+  "100%" for a popup bigger than the whole client. Now the default is raised by the same rule, and
+  the two states that cannot carry a percentage say what they got and why instead of inventing a
+  number — the shape `sidebar width` already uses for `applied:false`. `resized N%` keeps its
+  documented wording.
+- ⚠️ **Major, in r1's own fix — a resize the UI thread skipped on the try-lock was dropped, not
+  deferred.** The comment claimed "the next WM_SIZE asks again"; nothing owns that retry. Every
+  `syncPaneSizes` caller is an event (a drag's last WM_SIZE, a select, a split, a font change), there
+  is no timer, and a popup has no fallback layout at all — so `resize --size-percent 80` during
+  contention answered `resized 80%` with the popup at 80 % and its pty still on the old grid,
+  permanently. A skip now posts `WM_APP_RELAYOUT` (one in flight, an atomic flag), and the handler
+  lays out the panes AND the popups (`refitPopupSessions`, which `syncPaneSizes` cannot do).
+- The workspace re-validation checked the stale index's RANGE but not its identity: with
+  `[A,B,C,D]` and B deleted during the create, index 2 silently names D. The workspace's NAME is
+  captured with the index (on all three paths — `--workspace`, a created `--workspace-name`, and the
+  caller's) and re-found under the assigning hold; only a workspace that is really gone falls back
+  to the active one, and that is logged.
+- Two comments still described the abandoned refusal design (`popupFloorPx`'s block said the verb
+  refuses under the floor; `openOverlay`'s said "there is NO clamp here" without mentioning that
+  `createPopupWindowPx` still applies the physical one).
+- Pre-existing, fixed because they sit on the code this batch rewrote: `syncPaneSizes` walked
+  `g_sessions` unlocked from control-pipe threads — the exact sibling of the walk r1 made
+  `newSessionGrid` lock, in the hotter path (the pointers now come out under `g_lock` and the host
+  round trip happens outside it); and `popupProc` resolved its session with an unguarded fallthrough
+  to `g_overlaySession`, so a quick popup's creation-time `WM_SIZE` (dispatched before
+  `g_quickHwnd` is assigned) reflowed an OPEN overlay's session to the quick window's grid,
+  permanently.
+- Pre-existing, **not** fixed here and filed as **#27**: `request()` has no read deadline and the UI
+  thread calls it (`OnSize` → `syncPaneSizes`, `popupProc`'s `WM_SIZE`, `applyFont`), so a pty-host
+  wedged behind its own input pump still freezes the message loop. r1's fix removed the `g_lock`
+  amplification, not this. P9-lite, with #21.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's
