@@ -82,8 +82,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   `session`/`created` event after `quick on`). And a call that answers `ok` did what was asked
   (parity batch P2): `session overlay open <cmd> --size-percent N` is validated as 1..100 and
   refused otherwise with nothing opened, and the reply carries the percentage **in effect** (a popup
-  cannot be under 30x8 cells, so a small window raises a low one); `resize` moves the popup and
-  refuses when none is open;
+  cannot be under 30x8 cells, so a small window raises a low one; a window that cannot be measured
+  at all — minimised, or a client under 30x8 cells — is told what it got and why, with no number);
+  `resize` moves the popup and refuses when none is open;
   `sidebar width [N]` reads or sets the divider (90..900 px, and never so wide that the terminal
   drops under 20 columns) and answers the width **in effect**, while an unknown sidebar op is
   refused instead of toggling; a bare `session new` lands in the **caller's** workspace, not the

@@ -32,7 +32,6 @@
 #include <string>
 #include <vector>
 #include <deque>
-#include <atomic>    // the one-in-flight relayout flag
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
@@ -485,6 +484,13 @@ static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices 
 static bool g_winFocused = true;      // frame has keyboard focus (solid caret) vs not (hollow)
 static bool g_caretOn = true;         // blink phase
 static const UINT_PTR kCaretTimer = 1;
+// The relayout retry (see hostResize): a ONE-SHOT timer, not a posted message. A posted retry
+// outranks paint and input and re-posts itself from its own handler, so while a control-pipe thread
+// held g_resizeLock the UI thread spun at 100 % CPU painting nothing and accepting no keystrokes —
+// strictly worse than the dropped resize it was fixing, and unbounded when the host is wedged
+// (#27). WM_TIMER is delivered only when the queue is empty, so the loop idles between attempts.
+static const UINT_PTR kRelayoutTimer = 2;
+static const UINT kRelayoutRetryMs = 60;
 static const UINT kCaretBlinkMs = 530;
 
 // ---- UI theme (Properties -> Appearance) -----------------------------------------------------
@@ -947,7 +953,6 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 #define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
-#define WM_APP_RELAYOUT    (WM_APP + 10)  // hostResize skipped a UI-thread resize (g_resizeLock busy); ask again once it frees
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
@@ -963,9 +968,6 @@ static CRITICAL_SECTION g_lock; // guards every session's emu + the session list
 // g_lock is what paintPane and every reader thread need (see hostResize). Ordered BEFORE g_lock
 // (hostResize takes this, then g_lock briefly); nothing else takes it, so there is no other order.
 static CRITICAL_SECTION g_resizeLock;
-// One WM_APP_RELAYOUT in flight at a time: hostResize sets it when the UI thread skips a resize on
-// the busy lock, and the handler clears it before laying out again.
-static std::atomic<bool> g_relayoutPending{ false };
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
 struct LockG {
@@ -1508,20 +1510,31 @@ static void hostResize(Session* s, int cols, int rows) {
     // is taken for the latch, dropped for the round trip, and re-taken to publish the result.
     //
     // The UI thread never WAITS for this lock: if a pipe thread is mid-round-trip the UI thread
-    // leaves the resize for the next layout rather than blocking the message loop. A skipped
-    // resize is self-correcting — the latch still differs, so the next WM_SIZE asks again.
+    // leaves the resize rather than blocking the message loop, and re-arms the retry timer below.
+    // Nothing to do? Answer before taking any lock. The authoritative compare-and-set is still
+    // under g_lock below; this early out is what keeps a retry that finds every grid already
+    // correct from arming another one (revmux r3), and it costs one locked read.
+    {
+        LockG hold;
+        if (s->cols == cols && s->rows == rows) return;
+    }
     // g_hwnd null or already destroyed answers 0, which no thread id equals, so this falls to the
     // blocking branch — right for a pipe thread, and unreachable for the UI thread, which cannot be
     // in here without its own window.
     bool onUi = GetWindowThreadProcessId(g_hwnd, nullptr) == GetCurrentThreadId();
     if (onUi) {
         // Skipped, not dropped. Nothing polls: every syncPaneSizes caller is an event (WM_SIZE, a
-        // select, a split, a font change), so "the next WM_SIZE asks again" is not something anyone
-        // owns — a drag that ends while a pipe thread holds the lock would leave the pane at the old
-        // grid, and a popup has no fallback layout at all (popup sessions are never in g_pane).
-        // Post one retry instead; the flag keeps a busy lock from filling the queue (revmux r2).
+        // select, a split, a font change), so the next WM_SIZE is not something anyone owns — a drag
+        // that ends while a pipe thread holds the lock would leave the pane at the old grid, and a
+        // popup has no fallback layout at all (popup sessions are never in g_pane).
+        //
+        // A ONE-SHOT TIMER, not a posted message: a posted retry is dispatched ahead of paint and
+        // input and re-arms from its own handler, so the UI thread spun at 100 % CPU for as long as
+        // the lock was held — forever, with a wedged pty-host (#27). WM_TIMER is delivered only when
+        // the queue is empty, and SetTimer with the same id just restarts the one timer, so there is
+        // nothing to stack and nothing to leak (revmux r3).
         if (!TryEnterCriticalSection(&g_resizeLock)) {
-            if (!g_relayoutPending.exchange(true)) PostMessageW(g_hwnd, WM_APP_RELAYOUT, 0, 0);
+            SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs, nullptr);
             return;
         }
     }
@@ -5667,7 +5680,6 @@ public:
         MESSAGE_HANDLER(WM_APP_FOCUSTERM, OnFocusTerm)
         MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
         MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
-        MESSAGE_HANDLER(WM_APP_RELAYOUT, OnRelayout)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -5893,6 +5905,17 @@ public:
         }
     }
     void OnTimer(UINT_PTR id) {
+        if (id == kRelayoutTimer) {
+            // A resize the UI thread skipped because a control-pipe thread held g_resizeLock. Kill
+            // the timer FIRST: hostResize re-arms it if the lock is still busy, and each attempt
+            // then costs one message per 60 ms with the loop idle in between, instead of a posted
+            // message that re-posts itself (revmux r3). The panes go through syncPaneSizes; the
+            // popups need refitPopupSessions, since their sessions are never in g_pane.
+            KillTimer(kRelayoutTimer);
+            if (!g_sessions.empty()) syncPaneSizes();
+            refitPopupSessions();
+            return;
+        }
         if (id != kCaretTimer) return;
         if (!g_winFocused) return;            // hollow caret doesn't blink
         g_caretOn = !g_caretOn;
@@ -5995,16 +6018,6 @@ public:
     // which is never made while g_lock may be held (#20). Hidden: nothing to lay out, the width is
     // what the next show uses; it is still persisted so it survives a restart. Same save path as
     // the splitter drag and the View toggles.
-    // A resize the UI thread skipped because a control-pipe thread held g_resizeLock. Lay out
-    // again now that it is (probably) free: the panes through syncPaneSizes, and the popups, which
-    // syncPaneSizes never touches because their sessions are not in g_pane. If the lock is still
-    // busy each hostResize skips again and posts one more retry.
-    LRESULT OnRelayout(UINT, WPARAM, LPARAM, BOOL&) {
-        g_relayoutPending = false;
-        if (!g_sessions.empty()) syncPaneSizes();
-        refitPopupSessions();
-        return 0;
-    }
     LRESULT OnSidebarWidth(UINT, WPARAM, LPARAM, BOOL&) {
         if (g_showSidebar) relayout();   // repositions the tree (OnSize) and syncPaneSizes()
         saveColors();
@@ -6626,7 +6639,10 @@ a session id (the popup is created after the reply is written). The popup is `--
 the window's client area on each side, **a whole number in 1..100** (anything else refused). A popup
 cannot be smaller than 30x8 cells, so on a small window a low percentage comes back RAISED to what
 fits and the reply says the percentage IN EFFECT (`overlay opened at N%`, `resized N%`) - compare it
-with what you asked for, as `sidebar width` already makes you:
+with what you asked for, as `sidebar width` already makes you. When the window cannot be measured at
+all - it is minimised, or its client is under 30x8 cells - there is no percentage to name and the
+reply says so instead (`overlay opened at the smallest size this window can show (...)`, `resized to
+the smallest size ...`), so a caller matching `at (\d+)%` must handle the miss:
 `0`, `150`, `-5` and `sixty` are refused naming the value and the range, and NO popup opens or
 moves. Omit the flag for lite's default popup (70 %; the full app's default is the whole region -
 the contract pins the reply and the refusal, not the geometry). `open` with no command is refused;
@@ -6918,11 +6934,19 @@ static std::string ctlDispatch(const std::string& line) {
         {
             LockG hold;
             if (wantWs >= 0) {
+                // The INDEX is the answer; the name only detects that it moved. Re-resolving by name
+                // first was worse than the range check it replaced: nothing keeps workspace names
+                // unique (`workspace new --name dev` twice, or a delete making the generated
+                // "workspace 3" repeat), so the first-match scan sent the session to a DIFFERENT
+                // workspace with the same name, deterministically and unlogged (revmux r3).
                 int found = -1;
-                for (int w = 0; w < (int)g_workspaces.size(); w++)
-                    if (g_workspaces[w] == wantWsName) { found = w; break; }
+                if (wantWs < (int)g_workspaces.size() && g_workspaces[wantWs] == wantWsName)
+                    found = wantWs;                                  // nothing moved: the common path
+                else                                                 // a delete shifted it; find it AT OR AFTER where it was
+                    for (int w = 0; w < (int)g_workspaces.size(); w++)
+                        if (g_workspaces[w] == wantWsName && (found < 0 || w >= wantWs)) { found = w; if (w >= wantWs) break; }
                 if (found < 0)
-                    logWarn("session.new: workspace '%s' was deleted while the session was being created; it lands in the active one instead",
+                    logWarn("session.new: workspace '%s' is gone (deleted or renamed) since it was resolved; the session lands in the active one instead",
                             narrow(wantWsName).c_str());
                 s->ws = found >= 0 ? found
                       : (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size() ? g_activeWs : 0);
@@ -7138,7 +7162,12 @@ static std::string ctlDispatch(const std::string& line) {
         }
         if (action == "resize") {
             if (!open) return ctlErr("no overlay to resize on that target; open one first");
-            auto* rq = new OverlayReq{ std::string(), sizePct > 0 ? effectivePct : 0 };
+            // effectivePct, never 0: with the flag absent it is exactly lite's default (70), so
+            // overlayFraction gives the same fraction it always did — and when the floor raised it,
+            // the popup is built from the number the reply just named. Posting 0 here meant
+            // openOverlay re-derived 70 % and only the binding AXIS got the floor, so a reply saying
+            // "80%" could describe a popup 80 % wide and 70 % tall (revmux r3).
+            auto* rq = new OverlayReq{ std::string(), effectivePct };
             if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_RESIZE, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was resized"); }
             // The size IN EFFECT, never the number asked for when the popup will not have it.
             // "resized N%" (the documented shape) on a window that can answer; otherwise what it
@@ -7146,7 +7175,7 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlOkStr(overlaySizeIsPercent(rawMin) ? "resized " + std::to_string(effectivePct) + "%"
                                                          : "resized to " + overlaySizeReason(rawMin));
         }
-        auto* rq = new OverlayReq{ command, sizePct > 0 ? effectivePct : 0 };
+        auto* rq = new OverlayReq{ command, effectivePct };   // the number the reply names (see resize above)
         if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was opened"); }
         // A status word carrying the size IN EFFECT, not the overlay's session id: the session does
         // not exist yet when this reply is written (it is created by the posted message). Known gap,

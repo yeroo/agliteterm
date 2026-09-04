@@ -566,6 +566,43 @@ commit, the remaining hang filed as #27).
   wedged behind its own input pump still freezes the message loop. r1's fix removed the `g_lock`
   amplification, not this. P9-lite, with #21.
 
+**What revmux round 3 found** (`03-after-fix2`, scoped to the r2 fix commit: **three Majors inside
+that fix**, four Minors, two pre-existing — fixed in the next commit).
+
+- ⚠️ **Major — the retry I added spun the UI thread.** `OnRelayout` cleared the flag, called
+  `syncPaneSizes` / `refitPopupSessions`, and every `hostResize` in them failed the try-lock and
+  posted another `WM_APP_RELAYOUT`. Posted messages outrank paint, input and `WM_TIMER`, so for as
+  long as a pipe thread held `g_resizeLock` the window burned a core, painted nothing and took no
+  keystrokes — and with a wedged pty-host (#27) that is forever. **Strictly worse than the dropped
+  resize it was fixing.** Now: a one-shot `SetTimer(kRelayoutTimer, 60 ms)`, which is delivered only
+  when the queue is empty and which `SetTimer` itself de-duplicates, and `hostResize` answers the
+  "nothing to do" case from a locked read BEFORE touching `g_resizeLock`, so a retry that finds every
+  grid correct arms nothing. The stuck-flag Minor disappeared with the flag.
+- ⚠️ **Major — the workspace re-find by NAME was a regression for duplicates.** Nothing keeps
+  workspace names unique (`workspace new --name dev` twice; a delete making the generated
+  "workspace 3" repeat), so the first-match scan sent the session to a *different* workspace with the
+  same name — deterministically, no race, unlogged, and on the caller-derived path that is the
+  documented default for a bare `session new`. The INDEX is primary again and the name only detects
+  a shift: unchanged index with a matching name wins, otherwise search preferring at-or-after where
+  it was, otherwise fall back and log (now "gone (deleted or renamed)", since a rename hits it too).
+- ⚠️ **Major — the absent-flag path still routed around the number it reported.** `effectivePct` was
+  raised and reported, but the posted `OverlayReq` carried `sizePct > 0 ? effectivePct : 0`, so with
+  no flag `openOverlay` re-derived 70 % and `createPopupWindowPx` floored each axis independently
+  while `overlayMinPercentRaw` returns the MAX of the two — a reply of "80%" for a popup 80 % wide
+  and 70 % tall. Both constructions post `effectivePct` now; with no flag and no raise it is exactly
+  70, so the default path is unchanged.
+- The skill and README documented only the `N%` shape this batch made conditional; they now name the
+  no-percentage reply and tell a caller matching `at (\d+)%` to handle the miss.
+- `OnRelayout` had been inserted between `OnSidebarWidth`'s doc block and `OnSidebarWidth`, orphaning
+  that comment onto the wrong handler — the same defect r1 fixed for `raiseIfAllowed`. Gone with the
+  handler (the retry lives in `OnTimer` now).
+- `hostResize` still opened with the "self-correcting — the next WM_SIZE asks again" clause that the
+  paragraph eight lines below explicitly refutes. Deleted.
+- Pre-existing, noted not fixed: `applyFont` re-fits only the panes, so a popup keeps a stale grid
+  after a font change (`refitPopupSessions` is the fix, one call); and a posted overlay applies a
+  size decision sampled from the geometry at request time, which is inherent to marshalling the
+  create to the UI thread.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's
