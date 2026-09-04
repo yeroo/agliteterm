@@ -6070,6 +6070,31 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
     return nullptr;
 }
 
+// The workspace of the pane that RAN a command, for `session.new` with no workspace named (P2,
+// agwinterm task 5a). `caller` is the pane's own AGWINTERM_SESSION_ID, which the CLI sends beside
+// the other args; it is an ID, so this resolves by exact id and then by the same >=4-char id prefix
+// resolveTarget accepts — and NEVER by name (agwinterm's CallerIsNeverASessionName). resolveTarget's
+// name arm is not reused on purpose: a session named like some other session's id would place the
+// new session in the wrong workspace by accident, which is the exact bug the caller rule removes.
+//
+// -1 when nothing resolves — a closed pane, a script run from an unrelated shell, the conformance
+// runner (which scrubs the env) — and the verb falls back rather than refusing: a working script
+// must not break to fix a preference. A hidden session (quick / scratch / overlay) also answers -1:
+// lite gives those the workspace that happened to be active when they were made, which is not a
+// workspace the caller can see in `tree`, so "the caller's workspace" has no honest answer there.
+static int callerWorkspace(const std::string& caller) {
+    if (caller.empty() || caller == "active") return -1;   // "active" is a target word, never an id
+    LockG hold;   // the list and s->ws change under g_lock on other threads (see `tree`)
+    Session* hit = nullptr;
+    for (Session* s : g_sessions)
+        if (s->id == caller) { hit = s; break; }
+    if (!hit && caller.size() >= 4)
+        for (Session* s : g_sessions)
+            if (s->id.compare(0, caller.size(), caller) == 0) { hit = s; break; }
+    if (!hit || hit->hidden) return -1;
+    return (hit->ws >= 0 && hit->ws < (int)g_workspaces.size()) ? hit->ws : -1;
+}
+
 // Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
 // scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
 // mark's outputLine..endLine can be handed straight in.
@@ -6422,17 +6447,31 @@ static std::string ctlDispatch(const std::string& line) {
         std::string cwd  = req.get("args.cwd");
         std::string command = req.get("args.command");
 
-        // Which workspace to create into. Without this the session landed in whatever workspace was
-        // active, and the active one moves every time a session is selected - so an agent creating
-        // several sessions scattered them wherever the user had last clicked. Same arguments and the
-        // same precedence as the full app (Program.ControlHost.cs NewSession): an explicit id wins,
-        // then a name, and --create-workspace makes a missing one rather than falling back.
-        //
-        // lite's workspace "id" is its index, which is what `tree` publishes.
+        // Which workspace to create into. Same arguments and the same precedence as the full app
+        // (Program.ControlHost.cs NewSession, ControlServer.cs session.new), in one place:
+        //   1. an explicit --workspace (an index, what `tree` publishes) or --workspace-name, refused
+        //      when unknown (--create-workspace makes a missing name rather than falling back);
+        //      BOTH given is refused before anything is created — two answers to "where?" are not
+        //      ranked (before P2, --workspace silently won by being tested first);
+        //   2. else the CALLER's workspace: `caller` is the pane that ran `session new` (the CLI
+        //      sends its AGWINTERM_SESSION_ID), so an agent gets sessions next to itself however
+        //      the user has clicked around meanwhile. Resolved by id only (callerWorkspace); a
+        //      caller that does not resolve is NOT refused, it falls through;
+        //   3. else the active workspace — the LAST answer, not the first. "Active" is a global the
+        //      UI rewrites on every click, every selection and every workspace.new over the API, so
+        //      an agent creating several sessions used to scatter them wherever the user had last
+        //      clicked. That was a lite report, and it is what step 2 ends.
+        // The CLI puts `caller` inside args (Program.cs: cargs["caller"], and cargs IS "args" on the
+        // wire); a top-level `caller` is accepted too for a hand-written line. It is never the
+        // target: session.new stays targetless, and a target would turn a stale value into "session
+        // not found" instead of the fallback.
         int wantWs = -1;
         std::string wsArg = req.get("args.workspace");
         std::string wsName = req.get("args.workspace-name");
         std::string wsCreate = req.get("args.create-workspace");
+        if (!wsArg.empty() && !wsName.empty())   // agwinterm's SessionNewWorkspaces.TwoSources, verbatim
+            return ctlErr("session.new: --workspace '" + wsArg + "' and --workspace-name '" + wsName +
+                          "' are two answers to one question; pass one of them. No session was created.");
         if (!wsArg.empty()) {
             bool digits = wsArg.find_first_not_of("0123456789") == std::string::npos;
             int n = digits ? atoi(wsArg.c_str()) : -1;
@@ -6449,6 +6488,10 @@ static std::string ctlDispatch(const std::string& line) {
                 // concurrent creators both read the trailing size and are told the same number
                 { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; }
             }
+        } else {
+            std::string caller = req.get("args.caller");
+            if (caller.empty()) caller = req.get("caller");
+            wantWs = callerWorkspace(caller);   // -1 = fall through to the active workspace (step 3)
         }
 
         int cols, rows;

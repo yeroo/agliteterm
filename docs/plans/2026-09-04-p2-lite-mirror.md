@@ -267,22 +267,22 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       pass; released 0.17.x CLI: 3 SKIPs, the CLI-side probes; conformance with the dev CLI: green)
 
 ### Task 3: a bare `session new` lands in the caller's workspace; the pair is refused
-- [ ] read the top-level **`caller`** field (`req.get("caller")` — top level beside `target`, NOT
+- [x] read the top-level **`caller`** field (`req.get("caller")` — top level beside `target`, NOT
       `args.caller`; agwinterm sends it there, and `session.new` must stay a targetless verb)
-- [ ] resolve it with an **id-or-prefix-only** helper (exact `s->id`, then the ≥4-char prefix rule
+- [x] resolve it with an **id-or-prefix-only** helper (exact `s->id`, then the ≥4-char prefix rule
       `resolveTarget` uses) — **never the name arm**: `AGWINTERM_SESSION_ID` is an id, and a name
       collision would place a session by accident. Under `LockG`, read `s->ws`
-- [ ] precedence, written in one comment: explicit `--workspace` / `--workspace-name` (unchanged);
+- [x] precedence, written in one comment: explicit `--workspace` / `--workspace-name` (unchanged);
       else the caller's `ws`; else `g_activeWs` — **the LAST answer**, with the sentence from the
       agwinterm plan about why ("active" is a global the UI rewrites on every click, every
       selection and every `workspace.new` over the API). A caller that does not resolve (closed
       pane, unrelated shell, the conformance runner which scrubs the env) is NOT refused
-- [ ] pass the index into the creation (`wantWs`), so `newSession()`'s `g_activeWs` read at `:1825`
+- [x] pass the index into the creation (`wantWs`), so `newSession()`'s `g_activeWs` read at `:1825`
       is overridden the same way an explicit workspace already is (`:6408`). Do not touch the
       pipe-thread creation itself (#21)
-- [ ] **`--workspace` with `--workspace-name` → `ctlErr`** before anything is created, agwinterm's
+- [x] **`--workspace` with `--workspace-name` → `ctlErr`** before anything is created, agwinterm's
       wording: "pass --workspace or --workspace-name, not both"
-- [ ] `test/control-honesty.ps1`: from a pane in workspace B with A active (make B via
+- [x] `test/control-honesty.ps1`: from a pane in workspace B with A active (make B via
       `workspace new`, put a session in it, then `workspace select` A), run a bare `session new`
       with `AGWINTERM_SESSION_ID` set to B's session — **through the CLI, so it must be a
       post-#226 client** (probe and SKIP otherwise) — and assert in `tree` that it landed in B;
@@ -290,7 +290,12 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       → B again (the regression test); `--workspace 0` beats a caller in B; a stale caller id
       falls back to active and CREATES; no caller (env scrubbed) → active, unchanged; the pair
       refused and no session created
-- [ ] build + run `test/control-honesty.ps1` — must pass before task 4
+- [x] build + run `test/control-honesty.ps1` — must pass before task 4
+      (➕ the CLI puts `caller` INSIDE `args` — agwinterm `Program.cs:159` `cargs["caller"]`, and
+      `cargs` is `args` on the wire; its server reads `GetString(args, "caller")`. lite reads
+      `args.caller` first and a top-level `caller` as a fallback for a hand-written line; the
+      suite pins both. `workspace select` / `session select` take `--target`, a positional is
+      silently "active" — the suite's setup asserts the select reply for that reason)
 
 ### Task 4: `--stdin` — prove the shared client against lite's decoder, and say so
 - [ ] `test/control-honesty.ps1`: pipe a here-string with a quote, a newline, two consecutive

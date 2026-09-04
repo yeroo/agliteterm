@@ -513,6 +513,142 @@ try {
     # No refusal above may have created a session: hidden sessions never show in `tree`, and the
     # visible count is what it was at the start.
     Check 'the tree still has exactly the sandbox first session' (@(Nodes).Count -eq 1) "nodes: $(@(Nodes).Count)"
+
+    # ---- session.new: the caller's workspace, and the refused pair --------------------------------
+    # The world here is `tree`: which workspace a new session appears under, which workspace is
+    # active, and how many sessions exist. The caller is the pane that ran `session new` - the CLI
+    # sends its AGWINTERM_SESSION_ID as `caller` (agwinterm #226) - so the CLI checks run with that
+    # variable SET to a sandbox session's id, which is the one thing Send-Ctl exists to scrub.
+    # A client that predates #226 never sends `caller`, and every bare create through it would land
+    # in the active workspace - a pass for the wrong reason - so those checks are gated on the same
+    # #226 marker the overlay checks use (the client-side `--size-percent sixty` refusal shipped in
+    # the same PR as `caller`). The server's half is pinned through a raw line either way.
+    "-- session.new --"
+    $cliSendsCaller = $cliRefusesNonNumber
+    function Send-CtlAs([string]$callerId, [string[]]$argv) {
+        foreach ($v in 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+        $env:AGWINTERM_SESSION_ID = $callerId
+        try { (& $ctl @argv --pipe $s.Pipe --json 2>&1) -join '' }
+        finally { Remove-Item env:AGWINTERM_SESSION_ID -ErrorAction SilentlyContinue }
+    }
+    # Where `tree` files a session: the workspace id (lite's index), or $null when it is nowhere.
+    function WsOf([string]$id) {
+        foreach ($w in (Tree).workspaces) { foreach ($n in $w.sessions) { if ([string]$n.id -eq $id) { return [string]$w.id } } }
+        return $null
+    }
+    function ActiveWs { [string]((Tree).workspaces | Where-Object { $_.active } | Select-Object -First 1).id }
+    function NodeCount { @(Nodes).Count }
+    # A created session shows in `tree` after a posted refresh; a refusal never shows at all.
+    function Wait-Node([string]$id, [int]$ms = 4000) {
+        for ($i = 0; $i -lt ($ms / 100); $i++) { if ($null -ne (WsOf $id)) { return $true }; Start-Sleep -Milliseconds 100 }
+        return $false
+    }
+
+    # Setup: workspace B beside the sandbox's A (0); a session in B named distinctively, so the
+    # name arm can be shown to be OFF; then A active again. `workspace new` makes the new one active
+    # (that is one of the fifteen writers), which is why the select back to A is explicit.
+    $wsA = ActiveWs
+    Check 'setup: the sandbox starts in workspace 0 (A), active' ($wsA -eq '0') "active $wsA"
+    $raw = Send-Ctl $s @('workspace', 'new', 'B')
+    $wsB = [string](ConvertFrom-Json $raw).result
+    Check 'setup: workspace new B answers its index' ($wsB -eq '1') "raw: $raw"
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'beta-agent', '--workspace', $wsB)
+    $bId = [string](ConvertFrom-Json $raw).result
+    Check 'setup: a session in B' ((Wait-Node $bId) -and (WsOf $bId) -eq $wsB) "id $bId, ws $(WsOf $bId)"
+    # `workspace select` and `session select` take --target (a positional is silently "active").
+    $raw = Send-Ctl $s @('workspace', 'select', '--target', $wsA)
+    Start-Sleep -Milliseconds 500
+    Check 'setup: A is the active workspace again (precondition: active is NOT where the caller is)' ((ConvertFrom-Json $raw).ok -and (ActiveWs) -eq $wsA) "raw: $raw, active $(ActiveWs)"
+    $n0 = NodeCount
+
+    if ($cliSendsCaller) {
+        # --- a bare create from a pane in B lands in B, with A active ---------------------------
+        $raw = Send-CtlAs $bId @('session', 'new', '--name', 'child-1')
+        $r = ConvertFrom-Json $raw
+        $c1 = [string]$r.result
+        Check 'a bare `session new` from a pane in B answers ok with an id' ([bool]$r.ok -and $c1) "raw: $raw"
+        Check "and `tree` files it in B, not in the active A" ((Wait-Node $c1) -and (WsOf $c1) -eq $wsB) "ws $(WsOf $c1), wanted $wsB"
+        Check 'and A stayed the active workspace (a create does not move "active")' ((ActiveWs) -eq $wsA) "active $(ActiveWs)"
+        # --- the regression: the user (or another agent) selects a session in A in between -------
+        $raw = Send-Ctl $s @('session', 'select', '--target', $sid)
+        Start-Sleep -Milliseconds 500
+        Check 'setup: a session in A was selected, so "active" is A by a second route' ((ConvertFrom-Json $raw).ok -and (ActiveWs) -eq $wsA) "raw: $raw, active $(ActiveWs)"
+        $raw = Send-CtlAs $bId @('session', 'new', '--name', 'child-2')
+        $c2 = [string](ConvertFrom-Json $raw).result
+        Check 'a second bare create from the same caller lands in B again (the redirect is gone)' ((Wait-Node $c2) -and (WsOf $c2) -eq $wsB) "ws $(WsOf $c2), wanted $wsB"
+        # --- an explicit workspace beats the caller ------------------------------------------------
+        $raw = Send-CtlAs $bId @('session', 'new', '--name', 'explicit-a', '--workspace', $wsA)
+        $ea = [string](ConvertFrom-Json $raw).result
+        Check '--workspace 0 from a caller in B lands in 0 (explicit wins)' ((Wait-Node $ea) -and (WsOf $ea) -eq $wsA) "ws $(WsOf $ea)"
+        $wsAName = [string]((Tree).workspaces | Where-Object { [string]$_.id -eq $wsA } | Select-Object -First 1).name
+        $raw = Send-CtlAs $bId @('session', 'new', '--name', 'explicit-name-a', '--workspace-name', $wsAName)
+        $en = [string](ConvertFrom-Json $raw).result
+        Check '--workspace-name of A from a caller in B lands in A (explicit wins)' ((Wait-Node $en) -and (WsOf $en) -eq $wsA) "raw: $raw, ws $(WsOf $en)"
+        # --- a stale caller is not refused: it creates, in the active workspace ------------------
+        $active = ActiveWs
+        $raw = Send-CtlAs 'no-such-pane-0000' @('session', 'new', '--name', 'orphan-not')
+        $r = ConvertFrom-Json $raw
+        $st = [string]$r.result
+        Check 'a stale caller id is NOT refused - the session is created' ([bool]$r.ok -and $st) "raw: $raw"
+        Check "and it landed in the active workspace ($active)" ((Wait-Node $st) -and (WsOf $st) -eq $active) "ws $(WsOf $st)"
+    } else {
+        Skip 'a bare `session new` from a pane in B lands in B (through the CLI)' 'this agwintermctl predates agwinterm #226 and never sends `caller` - set AGWINTERMCTL to a newer build'
+    }
+
+    # --- no caller at all (the env scrubbed, as the conformance runner does): active, unchanged ---
+    Send-Ctl $s @('workspace', 'select', '--target', $wsA) | Out-Null
+    Start-Sleep -Milliseconds 300
+    Check 'setup: A active' ((ActiveWs) -eq $wsA) "active $(ActiveWs)"
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'no-caller')
+    $nc = [string](ConvertFrom-Json $raw).result
+    Check 'a bare create with NO caller lands in the active workspace (the last answer, unchanged)' ((Wait-Node $nc) -and (WsOf $nc) -eq $wsA) "ws $(WsOf $nc)"
+
+    # --- the server's half through raw lines: id only, never a name; a short prefix is nothing ---
+    # `caller` rides inside args, where the CLI puts it (cargs is "args" on the wire).
+    function RawNew([string]$name, [string]$callerJson) {
+        Send-Raw ('{"cmd":"session.new","args":{"name":"' + $name + '","caller":' + $callerJson + '}}')
+    }
+    $raw = RawNew 'raw-by-id' ('"' + $bId + '"')
+    $ri = [string](ConvertFrom-Json $raw).result
+    Check 'raw: caller = B session id lands in B (the server reads args.caller)' ((Wait-Node $ri) -and (WsOf $ri) -eq $wsB) "raw: $raw, ws $(WsOf $ri)"
+    Check 'and A is still active' ((ActiveWs) -eq $wsA)
+    $raw = RawNew 'raw-by-name' '"beta-agent"'
+    $rn = [string](ConvertFrom-Json $raw).result
+    Check 'raw: caller = the B session NAME does not resolve - lands in active A (never the name arm)' ((Wait-Node $rn) -and (WsOf $rn) -eq $wsA) "raw: $raw, ws $(WsOf $rn)"
+    $short = $bId.Substring(0, 3)
+    $raw = RawNew 'raw-short-prefix' ('"' + $short + '"')
+    $rs = [string](ConvertFrom-Json $raw).result
+    Check "raw: a 3-char prefix '$short' does not resolve - lands in active A" ((Wait-Node $rs) -and (WsOf $rs) -eq $wsA) "raw: $raw, ws $(WsOf $rs)"
+    $raw = Send-Raw ('{"cmd":"session.new","caller":"' + $bId + '","args":{"name":"raw-top-level"}}')
+    $rt = [string](ConvertFrom-Json $raw).result
+    Check 'raw: a top-level caller (a hand-written line) is honoured too - lands in B' ((Wait-Node $rt) -and (WsOf $rt) -eq $wsB) "raw: $raw, ws $(WsOf $rt)"
+    $raw = RawNew 'raw-active-word' '"active"'
+    $ra = [string](ConvertFrom-Json $raw).result
+    Check 'raw: caller = "active" is a target word, not an id - lands in active A' ((Wait-Node $ra) -and (WsOf $ra) -eq $wsA) "raw: $raw, ws $(WsOf $ra)"
+
+    # --- the pair is refused before anything is created --------------------------------------------
+    $n1 = NodeCount
+    $twoSources = "session.new: --workspace '$wsA' and --workspace-name 'B' are two answers to one question; pass one of them. No session was created."
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'pair', '--workspace', $wsA, '--workspace-name', 'B')
+    $r = ConvertFrom-Json $raw
+    Check '--workspace with --workspace-name is refused with agwinterm''s wording' (-not $r.ok -and [string]$r.error -eq $twoSources) "raw: $raw"
+    if ($cliSendsCaller) {
+        $raw = Send-CtlAs $bId @('session', 'new', '--name', 'pair-caller', '--workspace', $wsA, '--workspace-name', 'B')
+        $r = ConvertFrom-Json $raw
+        Check 'the pair is refused with a caller too (the caller never breaks a tie)' (-not $r.ok -and [string]$r.error -eq $twoSources) "raw: $raw"
+    }
+    # Both unknown: the pair is refused first, before either value is looked up.
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'pair-unknown', '--workspace', '77', '--workspace-name', 'nowhere')
+    $r = ConvertFrom-Json $raw
+    Check 'the pair with two unknown values is refused as a pair (checked before either lookup)' (-not $r.ok -and [string]$r.error -match 'two answers to one question') "raw: $raw"
+    Start-Sleep -Milliseconds 1000
+    Check 'and no session was created by any of the three' ((NodeCount) -eq $n1) "nodes $n1 -> $(NodeCount)"
+    Check 'and the tree has no session named pair*' (-not (Nodes | Where-Object { [string]$_.name -like 'pair*' }))
+    # Unknown workspace refusals, unchanged from P1-lite: still refused, still nothing created.
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'nowhere', '--workspace', 'no-such-workspace')
+    Check 'session new --workspace no-such-workspace is still refused' (-not (ConvertFrom-Json $raw).ok) "raw: $raw"
+    Start-Sleep -Milliseconds 700
+    Check 'and created nothing' ((NodeCount) -eq $n1) "nodes $n1 -> $(NodeCount)"
 }
 finally {
     if ($s) { Stop-Sandbox $s }
