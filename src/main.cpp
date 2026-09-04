@@ -2405,8 +2405,11 @@ static void saveSessionState() {
         return;
     }
     std::string out = "V1\n";
-    for (const auto& w : g_workspaces) out += "W\t" + tsvField(narrow(w)) + "\n";
+    // The hold starts BEFORE the workspace walk: g_workspaces is pushed/erased/reassigned under
+    // g_lock on pipe threads, and this is the UI thread reading names into the file. (It was
+    // one line too low; refreshTree's former function-wide hold hid that on the common path.)
     EnterCriticalSection(&g_lock);
+    for (const auto& w : g_workspaces) out += "W\t" + tsvField(narrow(w)) + "\n";
     std::string flagLine;   // "F\t<i>..." = indices (in S-line order) of flagged sessions; old builds skip it
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
@@ -4006,12 +4009,15 @@ static bool handleKeyDown(WPARAM vk) {
 
 static void newSessionDialog(const char* cwd = nullptr);   // fwd (defined below, used by the context menu)
 
-// Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
-// UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
 // Fill the status bar's four parts: workspace · session count · terminal size · font.
 static void updateStatus() {
     if (!g_status) return;
     wchar_t buf[160];
+    // Its own hold: this reads g_workspaces (a reference INTO the vector) and walks g_sessions,
+    // both mutated under g_lock on pipe threads, and refreshTree no longer wraps this call. The
+    // status-bar SendMessages are same-thread and the emu_info hold below nests (recursive), so
+    // the hold spans only in-memory reads, never I/O.
+    LockG hold;
     const std::wstring& ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_workspaces[g_activeWs] : g_workspaces[0];
     std::wstring ws0 = (g_focusWs >= 0) ? ws + L"  (focused)" : ws;
     SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)ws0.c_str());
@@ -4028,6 +4034,8 @@ static void updateStatus() {
         wsprintfW(buf, L"%s %s", e.label, sz); SendMessageW(g_status, SB_SETTEXTW, 3, (LPARAM)buf);
     }
 }
+// Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
+// UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
 static void refreshTree() {
     if (!g_tree) return;
     // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
@@ -4041,9 +4049,9 @@ static void refreshTree() {
     }
     {
     // Held for the rebuild only: this walks g_sessions and reads names that pipe threads mutate
-    // under g_lock. updateStatus and saveSessionState below take the lock themselves for exactly
-    // the reads that need it - saveSessionState releases it before its flushed writes, and a hold
-    // from here would keep every pty reader and control verb waiting through the disk I/O.
+    // under g_lock. updateStatus and saveSessionState below each take the lock themselves (the
+    // first for its whole body, the second for its reads, released before the flushed writes);
+    // a hold from here would keep every pty reader and control verb waiting through the disk I/O.
     LockG hold;
     g_treeSyncing = true;
     TreeView_DeleteAllItems(g_tree);
@@ -4110,16 +4118,21 @@ static void refreshTree() {
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
 static void deleteWorkspace(int w) {
-    if ((int)g_workspaces.size() <= 1 || w < 0 || w >= (int)g_workspaces.size()) return;
-    g_workspaces.erase(g_workspaces.begin() + w);
-    for (auto* s : g_sessions) {
-        if (s->ws == w) s->ws = 0;
-        else if (s->ws > w) s->ws--;
+    {   // under g_lock: reached from workspace.delete on a pipe thread while `tree` (another pipe
+        // thread) and refreshTree index this vector under the lock; the erase moves every later
+        // name down and destroys the last, and the ws fixups must land with it
+        LockG hold;
+        if ((int)g_workspaces.size() <= 1 || w < 0 || w >= (int)g_workspaces.size()) return;
+        g_workspaces.erase(g_workspaces.begin() + w);
+        for (auto* s : g_sessions) {
+            if (s->ws == w) s->ws = 0;
+            else if (s->ws > w) s->ws--;
+        }
+        if (g_activeWs == w) g_activeWs = 0;
+        else if (g_activeWs > w) g_activeWs--;
+        if (g_focusWs == w) g_focusWs = -1;
+        else if (g_focusWs > w) g_focusWs--;
     }
-    if (g_activeWs == w) g_activeWs = 0;
-    else if (g_activeWs > w) g_activeWs--;
-    if (g_focusWs == w) g_focusWs = -1;
-    else if (g_focusWs > w) g_focusWs--;
     refreshTree();
 }
 
@@ -4163,7 +4176,8 @@ static void showTreeContextMenu() {
         case IDM_NEW: g_activeWs = cws; newSessionDialog(); break;
         case IDM_NEWWS: {
             wchar_t nm[32]; wsprintfW(nm, L"workspace %d", (int)g_workspaces.size() + 1);
-            g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; refreshTree();
+            { LockG hold; g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; }   // `tree` walks it under g_lock
+            refreshTree();
             break;
         }
         case IDM_DUP:
@@ -5850,7 +5864,7 @@ public:
             if (di->item.pszText && di->item.pszText[0]) {
                 std::wstring txt = di->item.pszText;
                 if (di->item.lParam >= 0) { int i = (int)di->item.lParam; if (i < (int)g_sessions.size()) g_sessions[i]->name = txt; }
-                else { int w = (int)(-di->item.lParam - 1); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }
+                else { LockG hold; int w = (int)(-di->item.lParam - 1); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }   // read under g_lock by `tree`
                 ::PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // re-decorate with status/count
             }
             return 0;   // FALSE — we refresh the label ourselves
@@ -5871,8 +5885,7 @@ public:
             case IDM_NEW: newSessionDialog(); break;                                     // profile picker
             case IDM_NEWWS: {                                                            // new workspace ("folder")
                 wchar_t nm[32]; wsprintfW(nm, L"workspace %d", (int)g_workspaces.size() + 1);
-                g_workspaces.push_back(nm);
-                g_activeWs = (int)g_workspaces.size() - 1;
+                { LockG hold; g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; }   // `tree` walks it under g_lock
                 refreshTree();
                 break;
             }
@@ -6368,8 +6381,9 @@ static std::string ctlDispatch(const std::string& line) {
             if (wantWs < 0) {
                 if (wsCreate != "true" && wsCreate != "1")
                     return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
-                { LockG hold; g_workspaces.push_back(want); }   // `tree` walks this vector under g_lock
-                wantWs = (int)g_workspaces.size() - 1;
+                // `tree` walks this vector under g_lock; the index is taken under the SAME hold, or two
+                // concurrent creators both read the trailing size and are told the same number
+                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; }
             }
         }
 
@@ -6739,14 +6753,18 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "workspace.new") {
         std::string nm = req.get("args.name");
+        int made;
         {   // under g_lock: `tree` (another pipe thread) and refreshTree walk this vector under it;
-            // a push_back that reallocates frees the std::wstring array they are reading
+            // a push_back that reallocates frees the std::wstring array they are reading. The index
+            // is taken under the same hold: two concurrent creators must not both be told the
+            // trailing one, and the reply must name the workspace THIS call made.
             LockG hold;
             g_workspaces.push_back(nm.empty() ? (L"workspace " + std::to_wstring(g_workspaces.size() + 1)) : widen(nm));
+            made = (int)g_workspaces.size() - 1;
+            g_activeWs = made;
         }
-        g_activeWs = (int)g_workspaces.size() - 1;
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
-        return ctlOkStr(std::to_string(g_activeWs));
+        return ctlOkStr(std::to_string(made));
     }
     if (cmd == "workspace.rename") {
         int w = wsResolve(req.get("target"), true);
