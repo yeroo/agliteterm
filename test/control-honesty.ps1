@@ -297,8 +297,14 @@ try {
     # Inlined, not the ActiveCols / Sidebar helpers: those are defined further down the file, and a
     # PowerShell function does not exist until its definition has been executed.
     $colsNow = [int](Nodes | Where-Object { $_.active } | Select-Object -First 1).cols
-    $sbNow = [int](ConvertFrom-Json (Send-Ctl $s @('sidebar', 'width'))).result.width
-    $cellW = if ($colsNow -gt 0) { ($mainBefore[0] - $sbNow - 5) / [double]$colsNow } else { 0 }
+    # The sidebar's SPAN, not its width: sidebarSpan() is 0 when the sidebar is hidden, and this
+    # block runs before the suite normalises ShowSidebar - the sandbox inherits it from the real
+    # profile, which ui-lib warns is not isolated. Subtracting a remembered width from a client that
+    # does not have a sidebar in it gave a cell size that was wrong by ~25 %, and the hard Check
+    # below then failed on inherited state rather than on the implementation (revmux r6).
+    $sb = (ConvertFrom-Json (Send-Ctl $s @('sidebar', 'width'))).result
+    $sbNow = if ($sb.visible) { [int]$sb.width + 5 } else { 0 }
+    $cellW = if ($colsNow -gt 0) { ($mainBefore[0] - $sbNow) / [double]$colsNow } else { 0 }
     $frameW = 0   # window outer minus client, measured from the resize itself below
     if ($cellW -ge 4) {
         $wantClient = [int]([math]::Round(36 * $cellW))

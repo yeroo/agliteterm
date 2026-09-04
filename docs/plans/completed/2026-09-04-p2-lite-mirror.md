@@ -664,6 +664,31 @@ fix** and nine Minors — fixed in the next commit).
   stress run never produced (it reports 0 rollbacks every time). The "BOTH axes" check can only
   fail on the height axis, since the width is what the raise is computed from.
 
+**What revmux round 6 found** (`06-after-fix5`, scoped to the r5 fix commit: **no Major or
+Critical**, six Minors and one immaterial — the substantive ones fixed in the next commit).
+
+- The refusal counter was a LIFETIME count, not a per-episode one: it reset only on an acceptance, so
+  after the give-up every later drag, split, select or font change was refused **silently and with no
+  retry**, indefinitely — and an undecodable control pipe is the long-lived state that log line is
+  the only diagnostic for. `hostResize` now takes an explicit `fromRetry` flag (passed by `OnTimer`'s
+  two sweeps, defaulted false everywhere else), so a real layout event starts a new episode and logs
+  again, while a timer sweep skips a session that has already given up — which also closes the
+  immaterial finding that another session's `SetTimer` could retry an exhausted one past its cap.
+  Explicit parameter rather than shared state, because pipe threads call this too.
+- The give-up line reported the constant 3 after the FOURTH failure, and said "refused" for an
+  outcome that may have been "no reply" or "undecodable". It reports the real count and the real
+  reason now.
+- **The r5 test derived the cell width by subtracting the sidebar unconditionally.** `sidebarSpan()`
+  is 0 when the sidebar is hidden, and this block runs before the suite normalises `ShowSidebar` —
+  the sandbox inherits it from the real profile, which `ui-lib.ps1` warns is not isolated. With the
+  sidebar hidden and a remembered width of 260 the derived cell was ~25 % wrong, the target window
+  came out too narrow, the reply took the descriptive form and the (now hard) `Check` failed on
+  inherited state rather than on the implementation — the same class as the CI-breaker r5 caught in
+  the same test. It reads `.visible` beside `.width` now and subtracts the span, not the width.
+- Three comments: the timer inventory still said the caret was the only timer four lines above
+  "lite's SECOND timer"; `OnTimer` described the refusal retries as fixed 60 ms attempts; and
+  `openOverlay`'s block opened with a claim the same block goes on to qualify.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's

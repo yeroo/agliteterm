@@ -485,7 +485,7 @@ static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices 
 // Caret state. A terminal cursor has to say two things: "input lands here" (blink) and "this window
 // has focus" (solid vs hollow). lite drew a static invert regardless, so switching sessions or
 // windows gave no cue at all that typing had moved. kCaretBlinkMs matches the main app's default
-// cursor-blink-ms; the caret timer is the only timer lite runs.
+// cursor-blink-ms. lite runs two timers: this one, always, and kRelayoutTimer, armed on demand.
 static bool g_winFocused = true;      // frame has keyboard focus (solid caret) vs not (hollow)
 static bool g_caretOn = true;         // blink phase
 static const UINT_PTR kCaretTimer = 1;
@@ -1502,7 +1502,12 @@ static HWND windowForSession(Session* s) {
     return g_hwnd;
 }
 
-static void hostResize(Session* s, int cols, int rows) {
+// fromRetry: this call came from the relayout TIMER, not from a real layout event (a WM_SIZE, a
+// select, a split, a font change). The difference decides two things — whether the refusal counter
+// starts a new episode, and whether a session that has already exhausted its retries is asked
+// again — so it is passed explicitly rather than kept in shared state a pipe thread would race
+// (revmux r6).
+static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
     // syncPaneSizes() runs on every session switch / select / split change, so most calls here ask
     // for the geometry the session already has. Forwarding those is not free: ConPTY reflows and
     // re-emits its screen on ANY resize, which garbles a full-screen TUI (the app was never told
@@ -1565,6 +1570,17 @@ static void hostResize(Session* s, int cols, int rows) {
         s->cols = cols;
         s->rows = rows;
     }
+    {
+        // A real layout event starts a NEW refusal episode: the count is "refusals in a row while
+        // chasing this on the timer", not "refusals ever". Left as a lifetime count it went silent
+        // after the give-up — every later drag, split or font change was refused with no log line
+        // and no retry, indefinitely, which is the one state (an undecodable control pipe) the log
+        // is the only diagnostic for. A timer sweep, conversely, must NOT re-ask a session that has
+        // already given up: another session's SetTimer would otherwise retry it past its own cap.
+        LockG hold;
+        if (!fromRetry) s->resizeRefusals = 0;
+        else if (s->resizeRefusals > kResizeRetryAttempts) return;
+    }
     if (!s->id.empty()) {   // a restore placeholder has no host session — only its emulator resizes
         agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -1597,12 +1613,12 @@ static void hostResize(Session* s, int cols, int rows) {
             // chasing stops. Logged on the first refusal and on the give-up, not on every tick.
             if (++s->resizeRefusals <= kResizeRetryAttempts) {
                 SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs << (s->resizeRefusals - 1), nullptr);
-                if (s->resizeRefusals == 1)
+                if (s->resizeRefusals == 1)   // once per episode; the retries below are the same refusal
                     logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, retrying on the layout timer",
                             s->id.c_str(), cols, rows, reason, hadCols, hadRows);
             } else if (s->resizeRefusals == kResizeRetryAttempts + 1) {
-                logWarn("resize %s to %dx%d refused %d times in a row (%s) — kept %dx%d and STOPPED retrying; the next layout event will ask again",
-                        s->id.c_str(), cols, rows, kResizeRetryAttempts, reason, hadCols, hadRows);
+                logWarn("resize %s to %dx%d not accepted %d times (%s), %d automatic retries — kept %dx%d and STOPPED chasing it; the next layout event starts over",
+                        s->id.c_str(), cols, rows, s->resizeRefusals, reason, kResizeRetryAttempts, hadCols, hadRows);
             }
             return;
         }
@@ -1614,7 +1630,7 @@ static void hostResize(Session* s, int cols, int rows) {
 
 // Fit each shown pane's session to its rect. A pane with no viable rect (paneGridSize) is left
 // alone — not resized to 2x2 — so this is safe from the pipe threads while the window is minimised.
-static void syncPaneSizes() {
+static void syncPaneSizes(bool fromRetry = false) {
     // The pointers come out under g_lock and the host round trip happens outside it — the same
     // shape newSessionGrid, resolveTarget and callerWorkspace take. This runs on control-pipe
     // threads too (session.select / split / duplicate through selectPrimary), where another
@@ -1633,7 +1649,7 @@ static void syncPaneSizes() {
     for (int p = 0; p < 2; p++) {
         if (!want[p]) continue;
         if (!paneGridSize(p, &grid[p][0], &grid[p][1])) continue;
-        hostResize(want[p], grid[p][0], grid[p][1]);
+        hostResize(want[p], grid[p][0], grid[p][1], fromRetry);
     }
 }
 
@@ -1641,7 +1657,7 @@ static void syncPaneSizes() {
 // overlay session is never written into g_pane, so the only thing that ever sizes one is its own
 // WM_SIZE — and a resize skipped there (g_resizeLock busy) has nothing else to correct it. UI
 // thread only, like syncPaneSizes.
-static void refitPopupSessions() {
+static void refitPopupSessions(bool fromRetry = false) {
     const std::pair<HWND, Session*> popups[] = {
         { g_quickHwnd, g_quickSession }, { g_scratchHwnd, g_scratchSession }, { g_overlayHwnd, g_overlaySession },
     };
@@ -1650,7 +1666,7 @@ static void refitPopupSessions() {
         if (!hw || !s || !IsWindow(hw) || !IsWindowVisible(hw) || IsIconic(hw)) continue;
         RECT rc; GetClientRect(hw, &rc);
         if (rc.right <= 0 || rc.bottom <= 0 || g_cw <= 0 || g_ch <= 0) continue;
-        hostResize(s, max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)));
+        hostResize(s, max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)), fromRetry);
     }
 }
 
@@ -5404,7 +5420,9 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is always the EFFECTIVE 1..100 the verb reported: it raised the number — or lite's 70 %
+// sizePct is the EFFECTIVE 1..100 the verb reported, which is what the popup is built from — though
+// see below: when the window cannot be measured there is no percentage and the reply says so. The
+// verb raised the number — or lite's 70 %
 // default, when the flag was absent — to the 30x8-cell minimum and posts THAT, so the popup is
 // built from the number the caller was given. overlayFraction still has a 0 arm; nothing on this
 // path reaches it any more (revmux r4/r5), and it is kept only so a future caller cannot trip on
@@ -5947,15 +5965,17 @@ public:
     void OnTimer(UINT_PTR id) {
         if (id == kRelayoutTimer) {
             // A resize that did not happen: the UI thread skipped it because a control-pipe thread
-            // held g_resizeLock, or the pty-host refused one and the rollback armed this (bounded by
-            // kResizeRetryAttempts — see hostResize). Kill
-            // the timer FIRST: hostResize re-arms it if the reason persists, and each attempt
-            // then costs one message per 60 ms with the loop idle in between, instead of a posted
-            // message that re-posts itself (revmux r3). The panes go through syncPaneSizes; the
-            // popups need refitPopupSessions, since their sessions are never in g_pane.
+            // held g_resizeLock, or the pty-host refused one and the rollback armed this. Kill the
+            // timer FIRST: hostResize re-arms it if the reason persists — immediately for the lock,
+            // and backing off 60/120/240 ms for a refusal before it gives up (kResizeRetryAttempts).
+            // Either way the loop is idle between attempts, unlike the posted message this replaced,
+            // which re-posted itself ahead of paint and input (revmux r3). Both sweeps pass
+            // fromRetry, so a session that has already given up is not asked again here. The panes
+            // go through syncPaneSizes; the popups need refitPopupSessions, since their sessions are
+            // never in g_pane.
             KillTimer(kRelayoutTimer);
-            if (!g_sessions.empty()) syncPaneSizes();
-            refitPopupSessions();
+            if (!g_sessions.empty()) syncPaneSizes(true);   // fromRetry: see hostResize
+            refitPopupSessions(true);
             return;
         }
         if (id != kCaretTimer) return;
