@@ -32,9 +32,28 @@ sends `sidebar width 300` as a *read*; report the affected steps SKIP on such a 
 `test/control-honesty.ps1` shows the probe (`sidebar width wide` refused client-side with "whole
 number" is the post-#226 tell).
 
-**Last run:** not yet — Task 8 of `docs/plans/2026-09-04-p2-lite-mirror.md` runs these against the
-branch build with agwinterm's post-#226 `agwintermctl`; record the date, the build and the client
-here when it does.
+**Last run:** 2026-09-04, branch `feat/p2-lite-mirror` (build v0.17.14 from `./build.ps1`, at the
+commit that fixes the empty overlay), agwinterm dev `agwintermctl` 1.0.0+5bd7033 (post-#226).
+Captures with `PrintWindow(PW_RENDERFULLCONTENT)` — it shows the popup's content, so a popup that
+captures **black** is an empty popup, which is what the first run of case 1 saw.
+- *The popup is the size asked for*: the first run **found a bug** — the popup was the right size
+  and empty, because `cmd /k` (any command with arguments) had been handed to the pty-host as an
+  executable path and spawned nothing behind `overlay opened` (Guards, below). After the fix:
+  PASS — 40 % gave a 433x256 client of the 1084x641 main client with the Clink banner and the
+  echoed marker in it; 150 was refused with the same handle at the same rect; `resize 80` made the
+  same handle 867x512; `closed` then `no overlay`; `resize` with nothing open refused.
+- *The divider moved*: PASS — 300 moved the tree child 120 px and the active session's cols 112 →
+  97 (−15 at the 8 px cell) with the `x` line wrapped beside the sidebar, nothing under it;
+  `sideways`, `5` and `901` refused with a capture pixel-identical to step 2's; 240 set while
+  hidden answered `applied:false` and was the width on `show`; 480 refused in the 484 px client
+  ("would leave 0 px for the terminal … under the 20-column minimum (160 px at this font)") and
+  applied in the 1084 px one. One observation, not this case's oracle: the status bar's grid text
+  stayed at `102 × 49` throughout — it is refreshed only with the tree, filed as #25.
+- *The window did NOT come to the front*: the automated form ran and passed (`test/control-honesty.ps1`,
+  a holder window of the test's own process: the 20× `quick` loop and the 5× overlay loop never
+  took the foreground; `window select` answered `not raised:` on this busy desktop and `selected`
+  once given the foreground). The Notepad-and-eyes form was **not run** — it needs a person's hands
+  off the keyboard for a minute and the machine was in use — so that half is a SKIP, not a pass.
 
 ---
 
@@ -43,6 +62,11 @@ here when it does.
 **Guards:** `session overlay open` read `args.size` while the CLI has always sent `size-percent`, so
 every `--size-percent N` anyone ever passed to lite was ignored and the hard-coded 70 % popup opened
 — and the call answered `ok`. The fix reads the right key and validates it 1..100; `resize` is new.
+This case's first run (2026-09-04) caught a second lie the rect checks could not: `cmd /k` — any
+command with arguments — was passed to the pty-host as an executable path, spawned nothing, and the
+popup opened at the right size and **empty** behind `overlay opened`; the command now runs through
+PowerShell `-NoExit -Command`, as `session new --command` does, and the suite reads the marker it
+prints back out of the overlay session.
 The automated check measures the popup's client rect against the main window's, which is the
 number; this case is the picture, because the number a `GetClientRect` gives and the popup a person
 sees can part ways (a popup drawn off-screen, a popup behind the main window, a second popup left

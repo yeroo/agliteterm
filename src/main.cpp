@@ -5205,7 +5205,14 @@ static void togglePopupTerminal(bool scratch) {
 // default is lite's own and differs from agwinterm's (a cover over the full content region): the
 // shared contract pins the reply shape and the refusals, not the default geometry, and the skill
 // says which default each product has. The verb never passes an empty command any more (it is
-// refused); the nullptr arm stays for the keyboard path.
+// refused); the empty arm stays for the keyboard path, a plain shell.
+//
+// The command runs the way `session new --command` runs one — PowerShell -NoExit -Command <it> —
+// so a command WITH arguments ("git log --oneline", "cmd /k") runs and its popup stays up after
+// it. Handed to the pty-host as the app it was taken as an executable path: "cmd /k" spawned
+// nothing, newSession answered nullptr, and the popup opened EMPTY while the verb had already
+// answered "overlay opened" (found by qa/control-honesty.md's first case, P2-lite task 8). If the
+// create still fails there is no popup to leave behind either: the window goes, and the log says.
 static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct) {
@@ -5213,9 +5220,18 @@ static void openOverlay(const std::string& command, int sizePct) {
     int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
     g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
-    g_overlaySession = newSession(max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)),
-                                  command.empty() ? nullptr : command.c_str());
-    if (g_overlaySession) { g_overlaySession->hidden = true; g_overlaySession->name = L"overlay"; }
+    int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
+    if (command.empty()) g_overlaySession = newSession(cols, rows);
+    else {
+        std::vector<std::string> cargs{ "-NoExit", "-Command", command };
+        g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs);
+    }
+    if (!g_overlaySession) {
+        logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
+        DestroyWindow(g_overlayHwnd);   // WM_DESTROY clears g_overlayHwnd; a later `resize` is refused truthfully
+        return;
+    }
+    g_overlaySession->hidden = true; g_overlaySession->name = L"overlay";
     showPopupRaised(g_overlayHwnd);
     g_focusOverride = g_overlaySession;
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);

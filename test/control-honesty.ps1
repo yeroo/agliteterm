@@ -182,13 +182,28 @@ try {
     Check 'no overlay popup exists at the start' ((OverlayHwnd) -eq [IntPtr]::Zero)
 
     # The positive control FIRST, so the finder is proved before any "nothing appeared" below.
-    # `cmd /k` keeps a prompt up, so the popup stays open for as long as the checks need it.
-    $raw = Overlay @('open', 'cmd', '/k', '--size-percent', '40')
+    # `cmd /k` keeps a prompt up, so the popup stays open for as long as the checks need it - and
+    # the command RUNS: the overlay session's id arrives as a `session`/`created` event (the
+    # session is hidden from `tree`) and its text carries what the command printed. A command
+    # with arguments used to be handed to the pty-host as an executable path, spawn nothing, and
+    # leave an EMPTY popup behind an "overlay opened" (found by the QA case, P2-lite task 8).
+    $ovMarker = 'overlay-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+    $raw = Overlay @('open', 'cmd', '/k', "echo $ovMarker", '--size-percent', '40')
     $r = ConvertFrom-Json $raw
     Check 'open --size-percent 40 answers ok with a status string' ([bool]$r.ok -and $r.result -is [string]) "raw: $raw"
     $h40 = Wait-Overlay $true
     Check 'and a popup titled "agliteterm - overlay" appeared' ($h40 -ne [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
+    $ovId = ''
+    for ($i = 0; $i -lt 30 -and -not $ovId; $i++) {
+        $ovId = [string](@((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' }) | Select-Object -Last 1).session
+        if (-not $ovId) { Start-Sleep -Milliseconds 200 }
+    }
+    Check 'and the overlay session was created (its id arrived as a session/created event)' ([bool]$ovId) "events since $cursor`: $(Send-Ctl $s @('events', '--since', "$cursor"))"
+    $ovSeen = $false
+    for ($i = 0; $i -lt 50 -and -not $ovSeen; $i++) { if (([string](Get-PaneText $s $ovId)).Contains($ovMarker)) { $ovSeen = $true } else { Start-Sleep -Milliseconds 200 } }
+    Check 'and the command RAN in it: `cmd /k echo <marker>` printed the marker into the overlay session' $ovSeen "overlay text: $(Get-PaneText $s $ovId)"
     $want40 = [int]($mainClient[0] * 0.4)
     $got = (ClientSize $h40)[0]
     Check "the popup's client width is 40% of the main window's (not the hard-coded 70%)" ([math]::Abs($got - $want40) -le $tol) "main client $($mainClient[0]), want ~$want40, got $got"
@@ -362,6 +377,30 @@ try {
     Overlay @('close') | Out-Null
     $gone = Wait-Overlay $false
     Check 'the default popup closed' ($gone -eq [IntPtr]::Zero)
+
+    # --- 100 means the whole client area, and a popup closed by hand is gone to `resize` ----------
+    # 100 on OPEN (resize 100 is pinned above): the popup's client is the main window's client on
+    # both sides - the old min(0.95, ...) clamp would have made it 95 %. Then the popup is closed
+    # the way the X button closes it (WM_CLOSE to the popup's own handle, this instance's window):
+    # WM_DESTROY clears the overlay pointer on the UI thread, so a `resize` a moment later is
+    # refused "open one first" and `close` answers "no overlay" - neither pretends the popup the
+    # caller remembers is still up.
+    $raw = Overlay @('open', 'cmd', '/k', '--size-percent', '100')
+    $r = ConvertFrom-Json $raw
+    Check 'open --size-percent 100 answers ok' ([bool]$r.ok) "raw: $raw"
+    $h100 = Wait-Overlay $true
+    Check 'and opened a popup' ($h100 -ne [IntPtr]::Zero)
+    $got = Wait-ClientWidth $h100 $mainClient[0] $tol
+    Check '100 on open means the WHOLE client area on both sides, not 95% of it' ([math]::Abs($got - $mainClient[0]) -le $tol -and [math]::Abs((ClientSize $h100)[1] - $mainClient[1]) -le $tol) "main $($mainClient -join 'x'), popup $((ClientSize $h100) -join 'x')"
+    [void][LiteUi]::PostMessageW($h100, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE: what the X button sends, to the popup's own handle
+    $gone = Wait-Overlay $false
+    Check 'setup: the popup closed by hand is gone' ($gone -eq [IntPtr]::Zero -and -not [LiteHonesty]::IsWindow($h100))
+    $raw = Overlay @('resize', '--size-percent', '50')
+    $r = ConvertFrom-Json $raw
+    Check 'resize on a popup the user closed by hand a moment ago is refused "open one first"' (-not $r.ok -and [string]$r.error -match 'no overlay to resize' -and [string]$r.error -match 'open one first') "raw: $raw"
+    Check 'and nothing reopened' ((OverlayHwnd) -eq [IntPtr]::Zero)
+    $raw = Overlay @('close')
+    Check 'and close after the hand-close answers "no overlay", not "closed"' ([string](ConvertFrom-Json $raw).result -eq 'no overlay') "raw: $raw"
 
     # ---- sidebar ---------------------------------------------------------------------------------
     # The world here is the native SysTreeView32 child (the sidebar) — its window rect IS the
@@ -543,6 +582,29 @@ try {
     $r = ConvertFrom-Json $raw
     Check 'raw width as the quoted string "300" is accepted (documented: the decoder cannot see the JSON kind)' ([bool]$r.ok -and [int]$r.result.width -eq 300) "raw: $raw"
     Check 'and applied' ((Wait-TreeWidth 300) -eq 300)
+
+    # --- `sidebar width` while a splitter drag is in progress -------------------------------------
+    # The drag and the set both write g_sidebarW and both lay out on the UI thread (the set is
+    # posted), so nothing races: the set lands between two mouse moves, the next move overwrites
+    # it, and the button-up saves what the DRAG ended at. What is owed is that, once the drag ends,
+    # a read, the tree child and the saved setting all agree on the drag's number - the set's
+    # `applied:true` was true for the moment it held. The drag is button and move messages POSTED
+    # to the sandbox's own handle (ui-lib's rule), starting on the splitter.
+    $midY = [int]((ClientSize $s.Hwnd)[1] / 2)
+    function Pt([int]$x, [int]$y) { [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0201, [IntPtr]1, (Pt ((TreeWidth) + 2) $midY))   # WM_LBUTTONDOWN on the splitter
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0200, [IntPtr]1, (Pt 340 $midY))                 # WM_MOUSEMOVE, button held
+    Check 'setup: a splitter drag is in progress (the tree followed the mouse to 340)' ((Wait-TreeWidth 340) -eq 340) "tree width $(TreeWidth)"
+    $raw = SidebarWidthSet '400'
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar width 400 mid-drag answers ok, applied' ([bool]$r.ok -and [int]$r.result.width -eq 400 -and $r.result.applied -eq $true) "raw: $raw"
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0200, [IntPtr]1, (Pt 360 $midY))                 # the drag continues
+    [void][LiteUi]::PostMessageW($s.Hwnd, 0x0202, [IntPtr]::Zero, (Pt 360 $midY))            # WM_LBUTTONUP ends it
+    Check 'the drag wins: the tree child ends at the drag''s 360' ((Wait-TreeWidth 360) -eq 360) "tree width $(TreeWidth)"
+    Check 'and `sidebar width` reads the same 360 - the reply and the divider agree once the drag ends' ([int](ConvertFrom-Json (Sidebar @('width'))).result.width -eq 360)
+    Check 'and HKCU SidebarW is the drag''s 360 (the button-up saved last)' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 360)
+    SidebarWidthSet '300' | Out-Null
+    Check 'setup: back at 300' ((Wait-TreeWidth 300) -eq 300)
     # A raw request with no op at all: the CLI always sends one, but the pipe is public. Toggle,
     # which is what the CLI sends for a bare `sidebar` — pinned so the "" case is a written fact.
     $raw = Send-Raw '{"cmd":"sidebar","target":"","args":{}}'
@@ -665,6 +727,24 @@ try {
     $raw = RawNew 'raw-active-word' '"active"'
     $ra = [string](ConvertFrom-Json $raw).result
     Check 'raw: caller = "active" is a target word, not an id - lands in active A' ((Wait-Node $ra) -and (WsOf $ra) -eq $wsA) "raw: $raw, ws $(WsOf $ra)"
+
+    # --- a caller that is a popup session (scratch here; quick and overlay are the same flag) ----
+    # The quick, scratch and overlay sessions are hidden from `tree` and belong to no workspace a
+    # caller could mean (their ws is whatever was active when the popup was first made), so a
+    # `session new` from inside one resolves the caller and then falls through to the active
+    # workspace - created, not refused, and visible in the tree. Scratch rather than quick: a
+    # dismissed scratch pad is torn down, so this leaves no hidden session behind for the quick
+    # terminal checks further down, which read the `created` event of a FRESH quick session.
+    $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+    Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+    Start-Sleep -Milliseconds 2500
+    $scratchId = [string](@((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' }) | Select-Object -Last 1).session
+    Check 'setup: the scratch popup is up, its session id is known, and it is hidden from tree' ([bool]$scratchId -and -not (Nodes | Where-Object { [string]$_.id -eq $scratchId })) "scratch id '$scratchId'"
+    $raw = RawNew 'from-scratch' ('"' + $scratchId + '"')
+    $rq = [string](ConvertFrom-Json $raw).result
+    Check 'raw: caller = the scratch session id is created (not refused) and lands in active A' ((Wait-Node $rq) -and (WsOf $rq) -eq $wsA) "raw: $raw, ws $(WsOf $rq)"
+    Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+    Start-Sleep -Milliseconds 500
 
     # --- the pair is refused before anything is created --------------------------------------------
     $n1 = NodeCount
@@ -967,18 +1047,18 @@ try {
     # width - the first session was CREATED at 2x2. This needs a fresh instance, so the main
     # sandbox is stopped first (its shutdown save lands before the seed) and a second one starts
     # on its own pipe, whose geometry values are unique to it and removed in `finally`.
-    "-- #23: SidebarW 900 in a 700 px window --"
+    "-- #23: SidebarW 900 in a 600 px window --"
     Stop-Sandbox $s; $s = $null
     $pipe23 = 'ctlhonesty23'
     if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
-    foreach ($kv in @(@('SidebarW', 900), @('ShowSidebar', 1), @("WinX-$pipe23", 150), @("WinY-$pipe23", 100), @("WinW-$pipe23", 700), @("WinH-$pipe23", 600), @("WinMax-$pipe23", 0))) {
+    foreach ($kv in @(@('SidebarW', 900), @('ShowSidebar', 1), @("WinX-$pipe23", 150), @("WinY-$pipe23", 100), @("WinW-$pipe23", 600), @("WinH-$pipe23", 600), @("WinMax-$pipe23", 0))) {
         New-ItemProperty -Path $regKey -Name $kv[0] -Value ([int]$kv[1]) -PropertyType DWord -Force | Out-Null
     }
-    $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe $pipe23 -Width 700 -Height 600
+    $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe $pipe23 -Width 600 -Height 600
     $aid = [string](Nodes | Where-Object { $_.active } | Select-Object -First 1).id
-    Check 'setup: the 700 px sandbox has a session' ([bool]$aid)
+    Check 'setup: the 600 px sandbox has a session' ([bool]$aid)
     $client = ClientSize $s.Hwnd
-    Check 'setup: its client is under 700 px wide' ($client[0] -gt 0 -and $client[0] -lt 700) "client $($client -join 'x')"
+    Check 'setup: its client is under 600 px wide' ($client[0] -gt 0 -and $client[0] -lt 600) "client $($client -join 'x')"
     $w = (ConvertFrom-Json (Sidebar @('width'))).result
     Check 'the sidebar started clamped: `sidebar width` reads under 900 and the tree is that wide' ([int]$w.width -lt 900 -and [int]$w.width -ge 90 -and (Wait-TreeWidth ([int]$w.width)) -eq [int]$w.width) "width $($w | ConvertTo-Json -Compress), tree $(TreeWidth)"
     Check 'and the first session was created beside it with at least 20 columns, not 2x2' ([int]$w.width + 5 -lt $client[0] -and (ColsOf $aid) -ge 20) "cols $(ColsOf $aid) in a $($client[0]) px client"

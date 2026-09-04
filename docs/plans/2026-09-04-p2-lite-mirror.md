@@ -425,18 +425,56 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 - [x] build + run `test/run-all.ps1 -Strict` locally with the dev CLI — must pass before task 8
 
 ### Task 8: [Final] Verify acceptance criteria
-- [ ] verify every Overview item against the CODE, not the plan
-- [ ] verify the edge cases: `--size-percent 100`; `resize` on a popup the user closed by hand a
-      moment ago; `sidebar width` while a splitter drag is in progress; a caller that is the
-      quick/scratch/overlay session; `session new --workspace 0 --workspace-name x`; a 900-px
-      sidebar restored into a 600-px window; `quick on` while the user is typing in another app
-- [ ] `tools/check-contract.ps1` green; `test/run-all.ps1 -Strict` green with the dev CLI; note
-      which checks SKIP with the released CLI and why (the release gate)
-- [ ] the 80-session stress from P1-lite r5 (`r5-stress.ps1` shape: two creators + a deleter + a
-      streaming pane) still runs to completion — #23's `hostResize` hold is a lock change, and a
-      lock change gets stressed before it gets reviewed
+- [x] verify every Overview item against the CODE, not the plan
+      (`session.overlay` reads `args.size-percent` from the field map, validates 1..100 and never
+      clamps, resolves a named target, has `resize`, answers `no overlay`, and `args.size` is gone;
+      `sidebar` is an op table with `width` and `state`, an unknown op refused; `session.new` reads
+      `args.caller` then top-level `caller`, resolves by id or ≥4-char prefix only and never a hidden
+      session, active is the LAST answer, the pair is refused before either lookup; `paneGridSize`
+      returns false for a non-viable rect, `hostResize` holds across the round trip and rolls the
+      latch back, `OnSize` re-clamps through `fitSidebarToClient` and the startup rect uses the
+      persisted width; `raiseIfAllowed` / `showPopupRaised` at the three sites, no raise in the
+      popup's `WM_CLOSE` / `WM_DESTROY`, one `window.*` arm each)
+      ➕ found by the QA case and FIXED here: `session overlay open cmd /k` — any command WITH
+      arguments — was handed to the pty-host as an executable path, spawned nothing, and left an
+      EMPTY popup behind "overlay opened"; every overlay check until now had measured the rect of
+      an empty popup. The command now runs through PowerShell `-NoExit -Command`, as
+      `session new --command` does; a failed create takes the popup down and logs; the suite pins
+      that the command RAN (the `created` event, and the echoed marker in the overlay session's text)
+- [x] verify the edge cases, each pinned in `test/control-honesty.ps1`: `open --size-percent 100`
+      is the whole client area on both sides; a `resize` after the popup was closed by hand
+      (`WM_CLOSE` to its own handle) is refused "open one first" and `close` says `no overlay`;
+      `sidebar width 400` during a posted splitter drag answers applied and the DRAG wins — read,
+      tree child and HKCU agree on the drag's 360 once it ends (both run on the UI thread, so no
+      race, only an order); a caller that is a popup session (scratch; quick and overlay carry the
+      same `hidden` flag) is created into the active workspace, not refused; `--workspace 0
+      --workspace-name x` is refused as the pair before either lookup; SidebarW 900 in a 600-px
+      window (was 700) starts clamped beside a ≥20-column pane; `quick on` while the user works in
+      another app is the #24 loop — the refused branch ran on this desktop
+- [x] `tools/check-contract.ps1` green ("in step with agwinterm"); `test/run-all.ps1 -Strict` with
+      the dev CLI: every suite green except `clipboard`'s "Ctrl+C copies the selection", which fails
+      identically run alone and on the committed tree (Task 5's ⚠️ — shared keyboard state through
+      `AttachThreadInput` while someone types on the machine; environmental, not this branch);
+      honesty + conformance re-run green under `-Strict` after the overlay fix. With the released
+      0.17.10 CLI: honesty 7 SKIPs (`--size-percent sixty` refused client-side, `sidebar width N`
+      through the CLI, `sidebar width wide`, `caller` through the CLI, and the three `--stdin`
+      probes), conformance 2 SKIPs (`sidebar width 260`, `sidebar width 5`) — the release gate,
+      green once agwinterm tags the release that carries #226
+- [x] the 80-session stress: `test/stress.ps1` (committed, run by hand — not in `run-all.ps1`): two
+      creators of 40 each (one into a workspace it creates, both selecting and splitting as they go)
+      + a deleter closing what it sees in `tree` + a streaming pane, while this script resizes and
+      minimises the window on the UI thread's path — 80 made, 80 closed, 78 s, process alive,
+      `ping` and `tree` answer, no pane under 20 columns, the stream still running, 0 host-refused
+      resizes rolled back
 - [ ] close #23 and #24 with the PR, quoting the check that pins each
 - [ ] mark P2-lite in agwinterm's batches index and `docs/lite-parity.md`
+- ➕ [x] found by the QA run, NOT fixed here (UI-only, not this batch's class): the status bar's
+      grid text is refreshed only by `refreshTree` → `updateStatus`, never by a layout, so after
+      `sidebar width` or a window resize it says the old grid while `tree` and the pane are right.
+      Filed as #25
+- ➕ [x] `qa/control-honesty.md` "Last run" recorded: cases 1 and 2 run with captures (case 1
+      found the empty overlay first, then passed on the fix); case 3's automated form passed and its
+      Notepad-and-eyes form is a SKIP — it needs a person with hands off the keyboard
 
 ## Technical Details
 
