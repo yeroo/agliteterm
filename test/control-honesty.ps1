@@ -875,7 +875,11 @@ try {
             Check 'window select whose raise Windows granted answers selected' ([bool]$r.ok -and [string]$r.result -eq 'selected') "raw: $raw"
         } else {
             "  (Windows REFUSED the raise - someone typed recently - so the refused branch is what gets checked)"
-            Check 'window select on a window Windows would not raise answers ok:false and says the raise was refused' (-not $r.ok -and [string]$r.error -match 'not brought to the front' -and [string]$r.error -match 'refused') "raw: $raw"
+            # Still ok, with a string that is NOT `selected`: the cross-product contract pins
+            # window.select on an existing window as ok + string (agwinterm answers `selected`
+            # unconditionally), and ok:false here would make one script behave differently against
+            # the two products on a busy desktop. The truth is in the result; ok:false is "not found".
+            Check 'window select on a window Windows would not raise answers ok with `not raised:` and says the raise was refused' ([bool]$r.ok -and [string]$r.result -ne 'selected' -and [string]$r.result -match '^not raised:' -and [string]$r.result -match 'refused') "raw: $raw"
             Check "and the foreground did not move from $fgName" ($fgNow -eq $holder) "foreground pid $(FgPid), lite is $litePid"
         }
         # The granted branch, forced: the lite window is GIVEN the foreground first (the test's own
@@ -888,7 +892,7 @@ try {
     } else {
         foreach ($n in 'quick on / off twenty times: the foreground never became the lite window or its popup',
                        'session overlay open / close five times: the foreground never became the lite window or its popup',
-                       'window select answers what the foreground says (selected, or ok:false with the refusal)',
+                       'window select answers what the foreground says (selected, or `not raised:` with the refusal)',
                        'window select on the window that holds the foreground answers selected') {
             Skip $n "$fgName could not take the foreground (pid $(FgPid) holds it - is someone typing on this machine?), so nothing can be said about who steals it"
         }

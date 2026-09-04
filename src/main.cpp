@@ -6353,16 +6353,21 @@ One call creates the session, names it, and runs the command as its shell:
 agwintermctl session new --name build --command "npm test" --cwd C:\src\app
 ```
 
-**Say which workspace, or you get whichever one is active** - and the active one moves every time a
-session is selected, so a run of sessions created without it scatters across whatever the user was
-clicking. The id is the index `tree` reports:
+**A bare `session new` lands in YOUR workspace** - the one holding the pane whose
+`AGWINTERM_SESSION_ID` the CLI sends as the caller - not in whichever workspace happens to be
+active. Active is a global the UI rewrites on every click, every selection and every
+`workspace new`, so a run of sessions created against it used to scatter across whatever the user
+was clicking; now they land next to you, however the user clicks around meanwhile. The active
+workspace is the LAST fallback, used only when the caller does not resolve (an unrelated shell, a
+closed pane). Name a workspace to go somewhere else - the id is the index `tree` reports:
 
 ```
 agwintermctl session new --name build --workspace 1
 agwintermctl session new --name build --workspace-name review [--create-workspace]
 ```
 
-A workspace that does not exist is refused, not silently swapped for the active one.
+A workspace that does not exist is refused, not silently swapped for the active one, and no session
+is created. `--workspace` beside `--workspace-name` is refused as two answers to one question.
 
 ## Typing, and the two verbs that are not the same thing
 
@@ -6413,6 +6418,41 @@ For a session that already exists, type into it (`\n` is sent as Enter):
 ```
 agwintermctl session type "npm test`n" --target build
 ```
+
+## A command in a popup over the window
+
+```
+agwintermctl session overlay open "git log --oneline" [--size-percent N]
+agwintermctl session overlay resize --size-percent N
+agwintermctl session overlay close
+```
+
+`open` runs the command in a popup terminal over the main window and answers a status word, not
+a session id (the popup is created after the reply is written). The popup is `--size-percent` of
+the window's client area on each side, **validated as a whole number in 1..100, never clamped**:
+`0`, `150`, `-5` and `sixty` are refused naming the value and the range, and NO popup opens or
+moves. Omit the flag for lite's default popup (70 %; the full app's default is the whole region -
+the contract pins the reply and the refusal, not the geometry). `open` with no command is refused;
+so is an action other than `open`, `close`, `resize`; so is a `--target` that names no session
+(nothing opened, resized or closed). `resize` with no overlay open is refused - open one first;
+`close` with none open answers `no overlay`, which is true afterwards. lite's overlay is one popup
+per window, so a target that does resolve is accepted whichever session it names.
+
+## The sidebar
+
+```
+agwintermctl sidebar show|hide|toggle          # on/off are show/hide
+agwintermctl sidebar state                     # {visible, width}
+agwintermctl sidebar width [N]                 # read, or set (pixels)
+```
+
+`width N` answers the width IN EFFECT with `visible` and `applied`, which is how you tell an
+honoured request from anything else; the divider actually moves and the setting is saved. Two
+limits, each refused by name: the range is **90..900** px (what the splitter and the saved setting
+already allow), and a width that would leave the terminal under 20 columns in the window as it is
+now - widen the window or ask for less. A set while the sidebar is hidden is remembered, answers
+`applied:false`, and takes effect on the next `show`. Any op not listed - `sideways`, a typo -
+is refused naming the five, and **nothing changes** (it used to toggle the sidebar).
 
 ## Find out what happened
 
@@ -6477,11 +6517,20 @@ agwintermctl session copy|paste|type|text|output|status
 agwintermctl surface cursor
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
-agwintermctl tree --json | ping | version | sidebar on|off|toggle | quick on|off|toggle
+agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width | quick on|off|toggle
 ```
 
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
 `window list` enumerates them.
+
+Nothing here takes the foreground from the user: `quick on` and `session overlay open` raise
+their popup only when this process already holds the foreground, and flash the taskbar button
+otherwise. `window select <name>` is the one verb whose purpose IS the raise, so it is attempted -
+and the reply says what happened: `selected` only when the window is in front afterwards, and a
+string starting `not raised:` (Windows kept the foreground with the app the user is working in;
+the button flashes) when it is not. Both are `ok` - the window exists and the request was made,
+which is the shape the contract pins and what the full app answers - so test the result, not
+`ok`: `ok:false` means the window was not found.
 
 ## What this terminal does NOT have
 
@@ -7231,6 +7280,11 @@ static std::string ctlDispatch(const std::string& line) {
             // whether or not the window came to the front). The truth is GetForegroundWindow
             // afterwards, polled briefly because activation of another instance's window lands on
             // that instance's thread; SetForegroundWindow's own return is not trusted.
+            // The refused case stays `ok` with a DIFFERENT string, not ctlErr: the cross-product
+            // contract pins window.select on an existing window as ok + string (agwinterm answers
+            // `selected` unconditionally there), and ok:false here would make one script behave
+            // differently against the two products on a busy desktop. `selected` is answered only
+            // when it is true; a caller reads the result, not just ok. ok:false is "window not found".
             bool wasIconic = IsIconic(w->hwnd) != FALSE;
             if (wasIconic) ShowWindow(w->hwnd, SW_RESTORE);
             SetForegroundWindow(w->hwnd);
@@ -7241,10 +7295,10 @@ static std::string ctlDispatch(const std::string& line) {
             }
             if (granted) return ctlOkStr("selected");
             FlashWindow(w->hwnd, TRUE);   // what Windows does for a refused raise; made explicit
-            return ctlErr("window '" + narrow(w->name) + "' was not brought to the front: Windows kept the "
-                          "foreground with another process (the raise was refused" +
-                          std::string(wasIconic ? "; the window was restored from the taskbar" : "") +
-                          "). Its taskbar button flashes instead.");
+            return ctlOkStr("not raised: window '" + narrow(w->name) + "' was not brought to the front, Windows kept the "
+                            "foreground with another process (the raise was refused" +
+                            std::string(wasIconic ? "; the window was restored from the taskbar" : "") +
+                            "). Its taskbar button flashes instead.");
         }
         if (cmd == "window.close" || cmd == "window.delete") {
             std::wstring nm = w->name;   // copy before the instance dies

@@ -385,23 +385,44 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       branch forced by giving lite the foreground first. The 20×/5× loop is non-vacuous only on an
       idle desktop (Windows itself refuses the old code's steal while someone types); the old
       binary failed the refused-branch `window select` check on this desktop, and passed the loop
+- ⚠️ (found in Task 7) the refused branch answered `ctlErr`, and that broke the cross-product
+      contract on a busy desktop: the conformance step `window.select` is pinned as ok + string,
+      and agwinterm's `WindowSelect` answers `selected` unconditionally (it never checks the raise),
+      so the dev-CLI `-Strict` run failed that step while Boris was typing elsewhere. Reconciled:
+      the refused branch stays **`ok`** with a result starting **`not raised:`** (the reason, and
+      that the button flashes); `selected` is answered only when `GetForegroundWindow` is the
+      window afterwards; `ok:false` stays "window not found". One script reads `ok` the same
+      against both products and the truth is in the result. Recorded under "where agliteterm is
+      ahead" in agwinterm's `docs/lite-parity.md`: agwinterm should copy the truthful string
 
 ### Task 7: the contract, the skill, the docs
-- [ ] copy agwinterm `main`'s `tests/conformance/control-api.json` (post-#226 sibling contract PR)
+- [x] copy agwinterm `main`'s `tests/conformance/control-api.json` (post-#226 sibling contract PR)
       to `test/control-api.json`; `tools/check-contract.ps1` must pass. Extend `Test-Shape` only if
-      a new step needs a kind it lacks
-- [ ] `test/conformance.ps1` runs green against a sandbox with the released CLI where it can, and
+      a new step needs a kind it lacks (#229's file, byte for byte; `check-contract` in step; the
+      new steps are `string` and `object` kinds the runner already has — `Test-Shape` untouched)
+- [x] `test/conformance.ps1` runs green against a sandbox with the released CLI where it can, and
       with `$env:AGWINTERMCTL` at the agwinterm dev build for the new steps
-- [ ] `kSkillMarkdown`: the overlay refusals and `--size-percent` range; `sidebar width` and the
+      (➕ the runner now probes the client, the P1-lite pattern: the 0.17.10 client has no width
+      argument and sends `sidebar width 260` as a READ — the set step passed as a read with the
+      right shape and the `sidebar width 5` refusal came back ok — so both steps SKIP on a client
+      that does not refuse `sidebar width wide` on its own side, and a skip fails under `-Strict`.
+      Released CLI: all pass with those 2 SKIPs; dev CLI `-Strict`: all pass)
+- [x] `kSkillMarkdown`: the overlay refusals and `--size-percent` range; `sidebar width` and the
       unknown-op refusal; the caller-workspace rule and the pair refusal; `--stdin`; `window.select`'s
       honest reply. Keep `session restore` in the "does NOT have" list
-- [ ] `README.md`: the verb count at `:65-68` if it changed, and the agwintermctl section
-- [ ] agwinterm `docs/lite-parity.md`: mark the P2-lite section done with this PR number, and
+- [x] `README.md`: the verb count at `:65-68` if it changed, and the agwintermctl section (43 with
+      `sidebar width`, counted the way `lite-parity.md` counts — distinct commands the dispatcher
+      answers; the tests section says which checks SKIP with the released client and where the dev
+      `agwintermctl` is)
+- [x] agwinterm `docs/lite-parity.md`: mark the P2-lite section done with this PR number, and
       **correct `:113-114`** — `sidebar.width` is mirrored here, not deferred to P10; `session.restore`
       stays P9. (A one-line agwinterm PR, or folded into its next docs change.)
-- [ ] `qa/control-honesty.md` (listed in `qa/product.md`): the popup is the size asked for; the
-      divider moved; the window did NOT come to the front while an agent loop ran
-- [ ] build + run `test/run-all.ps1 -Strict` locally with the dev CLI — must pass before task 8
+      (edited on agwinterm branch `docs/p2-lite-parity`, commit dc9ab74, local only — NOT pushed;
+      the PR number is a placeholder there until this PR opens, Task 8 fills it and pushes)
+- [x] `qa/control-honesty.md` (listed in `qa/product.md`): the popup is the size asked for; the
+      divider moved; the window did NOT come to the front while an agent loop ran (written; the
+      "Last run" line is Task 8's to fill)
+- [x] build + run `test/run-all.ps1 -Strict` locally with the dev CLI — must pass before task 8
 
 ### Task 8: [Final] Verify acceptance criteria
 - [ ] verify every Overview item against the CODE, not the plan
