@@ -6,7 +6,7 @@
 #   - ALWAYS a sandbox instance: --pipe <name> and a throwaway %LOCALAPPDATA%. lite is plain Win32
 #     and reads the environment, so the override really does isolate it — unlike agwinterm, where
 #     .NET resolves the known folder and needs --app-id instead. Settings, though, live in
-#     HKCU\Softwaregliteterm and are NOT isolated: save and restore anything a case changes.
+#     HKCU\Software\agliteterm and are NOT isolated: save and restore anything a case changes.
 #   - NEVER inject global input. No keybd_event, no SendInput. Everything is PostMessage to this
 #     instance's own window handles, so whatever the user is typing in stays untouched. Ctrl+C is the
 #     one thing PostMessage cannot express alone (the modifier must be visible to GetKeyState), and
@@ -90,11 +90,17 @@ public static class LiteUi {
         System.Threading.Thread.Sleep(300);
     }
 
+    // WM_KEYUP's lParam must carry the previous-state (bit 30) and transition (bit 31) flags, as a
+    // real keyboard's does. Posted with lParam 1 - a keydown-shaped lParam - Windows translates the
+    // keyup into a SECOND WM_CHAR, which lite (having swallowed the keydown's) forwards to the shell:
+    // for Backspace that is 0x08, which PSReadLine reads as Ctrl+Backspace and kills the whole word.
+    const int KeyUpLParam = unchecked((int)0xC0000001);
+
     /// <summary>A key with no modifiers, n times.</summary>
     public static void Key(IntPtr h, int vk, int times) {
         for (int i = 0; i < times; i++) {
             PostMessageW(h, 0x0100, (IntPtr)vk, (IntPtr)1);
-            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
             System.Threading.Thread.Sleep(30);
         }
         System.Threading.Thread.Sleep(250);
@@ -115,7 +121,7 @@ public static class LiteUi {
         for (int i = 0; i < times; i++) {
             PostMessageW(h, 0x0100, (IntPtr)vk, (IntPtr)1);
             System.Threading.Thread.Sleep(120);
-            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+            PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
             System.Threading.Thread.Sleep(80);
         }
         st[0x11] = 0; st[0xA2] = 0; st[0x10] = 0; st[0xA0] = 0;
@@ -135,7 +141,7 @@ public static class LiteUi {
         System.Threading.Thread.Sleep(400);
         st[0x11] = 0; st[0xA2] = 0; st[0x10] = 0; st[0xA0] = 0;
         SetKeyboardState(st);
-        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)1);
+        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
         AttachThreadInput(me, it, false);
         System.Threading.Thread.Sleep(300);
     }
@@ -153,13 +159,25 @@ function Start-Sandbox {
     New-Item -ItemType Directory -Force $home_ | Out-Null
 
     # A check must never inherit the pane it is being RUN from, or `session type` lands in the
-    # caller's own terminal instead of the sandbox.
-    foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') {
+    # caller's own terminal instead of the sandbox. Start-Process -Environment ADDS to the inherited
+    # block, it does not replace it - so the updater's test seam is scrubbed here as well, or a
+    # shell that was testing the updater makes the sandbox answer `ping` with a made-up version.
+    # Scrubbed from THIS process (environment is per process, and the suites run in-process), so
+    # the values go back once the child has captured its block: the terminal re-injects the first
+    # three into every new pane, but the override is set by hand and nothing else would restore it.
+    $scrub = 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE', 'AGWINTERM_VERSION_OVERRIDE'
+    $saved = @{}
+    foreach ($v in $scrub) {
+        $saved[$v] = [Environment]::GetEnvironmentVariable($v)
         Remove-Item "env:$v" -ErrorAction SilentlyContinue
     }
 
-    $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -PassThru `
-                            -Environment @{ LOCALAPPDATA = $home_ }
+    try {
+        $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -PassThru `
+                                -Environment @{ LOCALAPPDATA = $home_ }
+    } finally {
+        foreach ($v in $scrub) { if ($null -ne $saved[$v]) { [Environment]::SetEnvironmentVariable($v, $saved[$v]) } }
+    }
     $s = [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; AppDir = $home_; Hwnd = [IntPtr]::Zero }
     for ($i = 0; $i -lt 80; $i++) {
         Start-Sleep -Milliseconds 500

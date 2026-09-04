@@ -77,6 +77,15 @@ function Test-Shape($resp, [string]$kind, $fields) {
     $r = $resp.result
     switch ($kind) {
         'string' { if ($r -isnot [string]) { return "result is $($r.GetType().Name), expected string" } }
+        'integer' {
+            # A whole number on the wire, as a JSON number: not "7", not 7.5, not null. surface.cursor
+            # is why this kind exists - a bare integer is the reply agterm and agwinterm share, and
+            # ConvertFrom-Json turns it into [int]/[long]; a string means a product started quoting
+            # it, a [double] means a fraction crept in, and $null means the field was dropped.
+            if ($null -eq $r) { return "result is null, expected integer" }
+            if ($r -is [string]) { return "result is a string, expected a bare integer" }
+            if ($r -isnot [int] -and $r -isnot [long]) { return "result is $($r.GetType().Name), expected integer" }
+        }
         'object' {
             if ($r -isnot [psobject]) { return "result is not an object" }
             foreach ($f in $fields) { if ($r.PSObject.Properties.Name -notcontains $f) { return "result is missing '$f'" } }

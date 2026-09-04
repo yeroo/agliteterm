@@ -28,6 +28,7 @@
 #define AGWL_VERSION_STR "dev"
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
+#include <ctime>        // time(): the statusChangedAt stamp is epoch seconds
 #include <string>
 #include <vector>
 #include <deque>
@@ -63,7 +64,7 @@ CAppModule _Module;
 #include "proto/pb_decode.h"
 #include "control.h"
 
-// ---- agwinterm-core C ABI (ABI v16) ----
+// ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
     int32_t rune;
     uint32_t fg, bg, attrs, width;
@@ -73,7 +74,10 @@ struct FfiCell {
 struct FfiEmuInfo {
     uint32_t cols, rows, cursorRow, cursorCol, cursorVisible, isAltScreen, historyCount;
     int64_t scrollGeneration;
-    uint32_t mouseClick, mouseDrag, mouseMotion, mouseSgr, bracketedPaste;
+    // mouseSgrPixels (?1016) arrived in v18 BETWEEN mouseSgr and bracketedPaste. This struct is
+    // filled by the core, so a missing field here is not a stale value but a write past the end of
+    // the caller's stack frame - a /GS fail-fast (0xC0000409) on the first emu_info call.
+    uint32_t mouseClick, mouseDrag, mouseMotion, mouseSgr, mouseSgrPixels, bracketedPaste;
     int32_t keyboardFlags;
     uint32_t scrollTop, scrollBottom, markCount, focusReporting, synchronizedOutput, win32InputMode, dynamicBg;
     int32_t cursorShape;
@@ -99,9 +103,11 @@ static uint8_t* (*emu_get_text)(void*, uint32_t, uint32_t*);   // 0 title, 1 cwd
 static uint8_t* (*emu_take_host_actions)(void*, uint32_t*);
 static void (*core_free_buf)(uint8_t*, uint32_t);
 
-// v16 added agwcore_emu_set_scrollback. lite does not call it yet, but the core handshake is an
-// EXACT match, so the pin has to move with the core it is built against.
-static constexpr uint32_t kRequiredAbi = 16;
+// v16 added agwcore_emu_set_scrollback. v18 (agwinterm 0.17.10; there was no 17) inserted
+// mouseSgrPixels into FfiEmuInfo above and added or changed NO export - a bump can be a struct
+// alone. The core handshake is an EXACT match and the structs are shared, so the pin moves with
+// the core it is built against and every struct above is re-checked against lib.rs on each bump.
+static constexpr uint32_t kRequiredAbi = 18;
 static constexpr uint32_t kAttrBold = 1, kAttrItalic = 2, kAttrUnderline = 4,
                           kAttrInverse = 8, kAttrDim = 16, kAttrStrike = 32;
 static constexpr uint32_t kProtocolVersion = 2;
@@ -296,9 +302,20 @@ static const InstanceInfo* findInstance(const std::vector<InstanceInfo>& v, cons
 }
 
 // ---- sessions & layout ----
+// Epoch seconds, the unit `statusChangedAt` is published in (agwinterm: DateTimeOffset.UtcNow
+// .ToUnixTimeSeconds()). Not milliseconds, not ticks: a caller subtracts it from its own clock.
+static long long epochNow() { return (long long)time(nullptr); }
+
 struct Session {
     std::string id;
     std::string status = "idle";   // control-API agent status (sidebar dot)
+    // When `status` was last WRITTEN (epoch seconds), reported on every `tree` node as
+    // statusChangedAt. Seeded at construction, so a session whose status was never set reports its
+    // own age rather than 0 — and since status is not persisted, a restored session is constructed
+    // fresh and gets a fresh stamp: a stamp from a previous run would describe a hook that is not
+    // running. Stamped again on EVERY write, whoever writes: go through setStatus, never assign
+    // status directly (see the session.status verb for why every write, not every change).
+    long long statusChangedAt = epochNow();
     std::wstring name;             // custom name (rename); empty = "session N"
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
     // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
@@ -334,6 +351,35 @@ struct Session {
     int64_t evicted = 0;        // total lines dropped off the front of this session's history
 };
 
+// Session::status is a std::string written from control-pipe threads (the session.status verb)
+// AND the UI thread (the Esc/Ctrl+C clear), and read from both (tree replies on pipe threads, the
+// sidebar and its custom-draw on the UI thread). g_lock deliberately does not cover it (it guards
+// the emulators and the list shape), so it has its own section, like the event log has g_evtLock.
+// Short values live in the small-string buffer and never reallocate, which is why an unlocked
+// `waiting-for-user-approval` written under a concurrent `tree` was a use-after-free nobody had
+// hit yet. Every read goes through statusOf(); the stamp rides along so the pair is a snapshot.
+static CRITICAL_SECTION g_statusLock;
+struct StatusSnap { std::string status; long long changedAt; };
+static StatusSnap statusOf(const Session* s) {
+    EnterCriticalSection(&g_statusLock);
+    StatusSnap r{ s->status, s->statusChangedAt };
+    LeaveCriticalSection(&g_statusLock);
+    return r;
+}
+// The ONLY writer of Session::status. Stamps statusChangedAt on EVERY write, including a re-assert
+// of the same status. This is not a bug: the question callers ask of statusChangedAt is "is this
+// agent's hook still alive", and a hook re-asserting `active` every 30 s is precisely the liveness
+// signal - collapsing repeats would report the age of the FIRST write and make a healthy agent
+// look dead. agwinterm stamps the same way through its one entry point (TerminalSession.SetStatus:
+// "every write, not every change"); a second bare `s->status =` here is how the two drift apart.
+// (clearWorkingStatus below decides under the lock and then calls this - not a second writer.)
+static void setStatus(Session* s, const std::string& st) {
+    EnterCriticalSection(&g_statusLock);
+    s->status = st;
+    s->statusChangedAt = epochNow();
+    LeaveCriticalSection(&g_statusLock);
+}
+
 // Agent status classification for the sidebar: BLOCKED = agent needs you (bold name),
 // WORKING = agent busy (italic name + "(working…)"), NONE = plain.
 enum { AGST_NONE, AGST_WORKING, AGST_BLOCKED };
@@ -341,6 +387,18 @@ static int statusClass(const std::string& s) {
     if (s == "working" || s == "busy" || s == "active" || s == "running") return AGST_WORKING;
     if (s == "blocked" || s == "waiting" || s == "attention" || s == "input") return AGST_BLOCKED;
     return AGST_NONE;
+}
+// The user-interrupt clear (Esc / Ctrl+C typed into the pane): idle ONLY IF the status is still
+// working-class, decided and written under one hold. As a statusOf() check followed by setStatus()
+// a hook's `blocked` landing between the two would have been overwritten with idle - the one
+// transition the policy says must not happen. The write itself still goes through setStatus (the
+// section is recursive), so that stays the one writer. Returns whether anything was written.
+static bool clearWorkingStatus(Session* s) {
+    EnterCriticalSection(&g_statusLock);
+    bool cleared = statusClass(s->status) == AGST_WORKING;
+    if (cleared) setStatus(s, "idle");
+    LeaveCriticalSection(&g_statusLock);
+    return cleared;
 }
 static HFONT g_treeItalic;      // italic variant of the sidebar font (agent "working" rows)
 // Quick + scratch terminals: modal-ish popup windows, each hosting a dedicated (hidden) session. The
@@ -2347,8 +2405,11 @@ static void saveSessionState() {
         return;
     }
     std::string out = "V1\n";
-    for (const auto& w : g_workspaces) out += "W\t" + tsvField(narrow(w)) + "\n";
+    // The hold starts BEFORE the workspace walk: g_workspaces is pushed/erased/reassigned under
+    // g_lock on pipe threads, and this is the UI thread reading names into the file. (It was
+    // one line too low; refreshTree's former function-wide hold hid that on the common path.)
     EnterCriticalSection(&g_lock);
+    for (const auto& w : g_workspaces) out += "W\t" + tsvField(narrow(w)) + "\n";
     std::string flagLine;   // "F\t<i>..." = indices (in S-line order) of flagged sessions; old builds skip it
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
@@ -3464,8 +3525,7 @@ static void sendUtf8(wchar_t wc) {
     // #185 / main-app parity: scoped to working-class; blocked stays until the agent or user acts).
     if (wc == 0x1B || wc == 0x03) {
         Session* s = focusedSession();
-        if (s && statusClass(s->status) == AGST_WORKING) {
-            s->status = "idle";
+        if (s && clearWorkingStatus(s)) {
             emitEvent("status", s->id, "idle");
             PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         }
@@ -3539,8 +3599,12 @@ struct UpdApply { std::wstring ver, payload, helper; };
 static bool g_updBusy = false;   // UI thread only: one interactive flow at a time
 
 static std::wstring updVersion() {
+    // Test seam. The return is the length WITHOUT the terminator on success, and the size WITH it
+    // when the buffer is too small - and then nothing was written, so a >0 check alone would hand
+    // back uninitialised stack. Now on every `ping`, so a 64-char override must not do that.
     wchar_t v[64];
-    if (GetEnvironmentVariableW(L"AGWINTERM_VERSION_OVERRIDE", v, 64) > 0) return v;   // test seam
+    DWORD n = GetEnvironmentVariableW(L"AGWINTERM_VERSION_OVERRIDE", v, 64);
+    if (n > 0 && n < 64) return std::wstring(v, n);
     std::wstring s;
     for (const char* p = AGWL_VERSION_STR; *p; p++) s += (wchar_t)*p;
     return s;
@@ -3945,12 +4009,15 @@ static bool handleKeyDown(WPARAM vk) {
 
 static void newSessionDialog(const char* cwd = nullptr);   // fwd (defined below, used by the context menu)
 
-// Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
-// UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
 // Fill the status bar's four parts: workspace · session count · terminal size · font.
 static void updateStatus() {
     if (!g_status) return;
     wchar_t buf[160];
+    // Its own hold: this reads g_workspaces (a reference INTO the vector) and walks g_sessions,
+    // both mutated under g_lock on pipe threads, and refreshTree no longer wraps this call. The
+    // status-bar SendMessages are same-thread and the emu_info hold below nests (recursive), so
+    // the hold spans only in-memory reads, never I/O.
+    LockG hold;
     const std::wstring& ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_workspaces[g_activeWs] : g_workspaces[0];
     std::wstring ws0 = (g_focusWs >= 0) ? ws + L"  (focused)" : ws;
     SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)ws0.c_str());
@@ -3967,8 +4034,25 @@ static void updateStatus() {
         wsprintfW(buf, L"%s %s", e.label, sz); SendMessageW(g_status, SB_SETTEXTW, 3, (LPARAM)buf);
     }
 }
+// Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
+// UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
 static void refreshTree() {
     if (!g_tree) return;
+    // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
+    // here inline on a control-pipe thread, driving the UI thread's TreeView by cross-thread
+    // SendMessage. Under g_lock (below) that is a deadlock - the UI thread waits for g_lock in
+    // paintPane while this thread waits for the UI thread to pump - and even unlocked it was a
+    // worker thread mutating the tree control. Any other thread gets the posted rebuild instead.
+    if (GetWindowThreadProcessId(g_hwnd, nullptr) != GetCurrentThreadId()) {
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        return;
+    }
+    {
+    // Held for the rebuild only: this walks g_sessions and reads names that pipe threads mutate
+    // under g_lock. updateStatus and saveSessionState below each take the lock themselves (the
+    // first for its whole body, the second for its reads, released before the flushed writes);
+    // a hold from here would keep every pty reader and control verb waiting through the disk I/O.
+    LockG hold;
     g_treeSyncing = true;
     TreeView_DeleteAllItems(g_tree);
     HTREEITEM sel = nullptr;
@@ -3999,7 +4083,7 @@ static void refreshTree() {
             if (g_flagView && !s->flagged) continue;                         // flagged view filter
             // Agent status cue: name goes bold when the agent needs you (blocked), italic + "(working…)"
             // while it's busy (italic applied in the tree's NM_CUSTOMDRAW). Others show plain.
-            int cls = s->exited ? AGST_NONE : statusClass(s->status);
+            int cls = s->exited ? AGST_NONE : statusClass(statusOf(s).status);
             std::wstring label = s->name.empty() ? (L"session " + std::to_wstring(vis)) : s->name;
             if (s->failed) label += L"  (failed to start)";   // restored spec whose app won't run here
             else if (s->exited) label += L"  (exited)";
@@ -4027,22 +4111,28 @@ static void refreshTree() {
     }
     if (sel) TreeView_SelectItem(g_tree, sel);
     g_treeSyncing = false;
+    }   // g_lock released
     updateStatus();
     if (!g_restoring) saveSessionState();   // persist the workspace/session structure on every change
 }
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
 static void deleteWorkspace(int w) {
-    if ((int)g_workspaces.size() <= 1 || w < 0 || w >= (int)g_workspaces.size()) return;
-    g_workspaces.erase(g_workspaces.begin() + w);
-    for (auto* s : g_sessions) {
-        if (s->ws == w) s->ws = 0;
-        else if (s->ws > w) s->ws--;
+    {   // under g_lock: reached from workspace.delete on a pipe thread while `tree` (another pipe
+        // thread) and refreshTree index this vector under the lock; the erase moves every later
+        // name down and destroys the last, and the ws fixups must land with it
+        LockG hold;
+        if ((int)g_workspaces.size() <= 1 || w < 0 || w >= (int)g_workspaces.size()) return;
+        g_workspaces.erase(g_workspaces.begin() + w);
+        for (auto* s : g_sessions) {
+            if (s->ws == w) s->ws = 0;
+            else if (s->ws > w) s->ws--;
+        }
+        if (g_activeWs == w) g_activeWs = 0;
+        else if (g_activeWs > w) g_activeWs--;
+        if (g_focusWs == w) g_focusWs = -1;
+        else if (g_focusWs > w) g_focusWs--;
     }
-    if (g_activeWs == w) g_activeWs = 0;
-    else if (g_activeWs > w) g_activeWs--;
-    if (g_focusWs == w) g_focusWs = -1;
-    else if (g_focusWs > w) g_focusWs--;
     refreshTree();
 }
 
@@ -4086,7 +4176,8 @@ static void showTreeContextMenu() {
         case IDM_NEW: g_activeWs = cws; newSessionDialog(); break;
         case IDM_NEWWS: {
             wchar_t nm[32]; wsprintfW(nm, L"workspace %d", (int)g_workspaces.size() + 1);
-            g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; refreshTree();
+            { LockG hold; g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; }   // `tree` walks it under g_lock
+            refreshTree();
             break;
         }
         case IDM_DUP:
@@ -5141,7 +5232,7 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
 // ---- flagged sessions + attention -------------------------------------------------------------
 static bool anyBlocked() {
     for (auto* s : g_sessions)
-        if (!s->hidden && !s->exited && statusClass(s->status) == AGST_BLOCKED) return true;
+        if (!s->hidden && !s->exited && statusClass(statusOf(s).status) == AGST_BLOCKED) return true;
     return false;
 }
 // Jump to the next blocked session (cycling from the current one). The agent-terminal loop: the
@@ -5153,7 +5244,7 @@ static void nextBlocked() {
     for (int k = 1; k <= n; k++) {
         int i = (start + k) % n;
         Session* s = g_sessions[i];
-        if (s->hidden || s->exited || statusClass(s->status) != AGST_BLOCKED) continue;
+        if (s->hidden || s->exited || statusClass(statusOf(s).status) != AGST_BLOCKED) continue;
         selectPrimary(i);
         g_activeWs = s->ws;
         if (g_focusWs >= 0) g_focusWs = s->ws;   // focus follows the jump (the row must be visible)
@@ -5631,7 +5722,7 @@ public:
                 }
                 LPARAM p = cd->nmcd.lItemlParam;   // italicise "working" agent rows
                 if (p >= 0 && p < (LPARAM)g_sessions.size() && !g_sessions[p]->exited &&
-                    statusClass(g_sessions[p]->status) == AGST_WORKING && g_treeItalic) {
+                    statusClass(statusOf(g_sessions[p]).status) == AGST_WORKING && g_treeItalic) {
                     SelectObject(cd->nmcd.hdc, g_treeItalic);
                     r = CDRF_NEWFONT;
                 }
@@ -5773,7 +5864,7 @@ public:
             if (di->item.pszText && di->item.pszText[0]) {
                 std::wstring txt = di->item.pszText;
                 if (di->item.lParam >= 0) { int i = (int)di->item.lParam; if (i < (int)g_sessions.size()) g_sessions[i]->name = txt; }
-                else { int w = (int)(-di->item.lParam - 1); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }
+                else { LockG hold; int w = (int)(-di->item.lParam - 1); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }   // read under g_lock by `tree`
                 ::PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // re-decorate with status/count
             }
             return 0;   // FALSE — we refresh the label ourselves
@@ -5794,8 +5885,7 @@ public:
             case IDM_NEW: newSessionDialog(); break;                                     // profile picker
             case IDM_NEWWS: {                                                            // new workspace ("folder")
                 wchar_t nm[32]; wsprintfW(nm, L"workspace %d", (int)g_workspaces.size() + 1);
-                g_workspaces.push_back(nm);
-                g_activeWs = (int)g_workspaces.size() - 1;
+                { LockG hold; g_workspaces.push_back(nm); g_activeWs = (int)g_workspaces.size() - 1; }   // `tree` walks it under g_lock
                 refreshTree();
                 break;
             }
@@ -5900,6 +5990,7 @@ static void emitEvent(const char* type, const std::string& session, const std::s
 
 static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
     if (target.empty() || target == "active") return focusedSession();
+    LockG hold;   // the list shape and the names change under g_lock on other threads (see `tree`)
     for (Session* s : g_sessions)
         if (s->id == target) return s;
     for (Session* s : g_sessions)
@@ -6000,7 +6091,7 @@ static std::string lastCommandOutput(Session* s, bool* haveMarks) {
 // one. A skill that overpromises is worse than no skill.
 static const char* kSkillMarkdown = R"SKILL(---
 name: agliteterm
-description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, and poll for events - via the agwintermctl CLI or its control pipe.
+description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
 ---
 
 # agliteterm
@@ -6111,14 +6202,52 @@ terminal still moves you forward.
 `session output` needs FTCS shell integration (OSC 133) in the shell. Without it you get
 "no completed command marks" rather than a wrong answer - fall back to `session text`.
 
+Every session node of `tree --json` carries `statusChangedAt`: epoch SECONDS of the last status
+**write** - that agent's liveness clock. Every write restamps it - each `session status`,
+including a re-assert of the same status, and the Esc/Ctrl+C clear of a working status typed into
+the pane - so `now - statusChangedAt` is how long ago the status last moved or was re-asserted: a
+large age beside `"status":"active"` means its hook died, not that work is still running. Always
+present, even for a session that never set a status (then it is the session's own age).
+
+## Before typing into another agent's composer
+
+```
+agwintermctl surface cursor --target <id|name>     # the caret COLUMN, a bare integer
+```
+
+An empty composer parks the caret at a known column, so a **different** column means a draft is
+sitting there: do not send. One number, one compare - it replaces reading the rendered text and
+guessing at placeholder strings. Column `0` is a real answer (the caret at the left margin), not
+"no answer"; a miss is `ok:false`. The row is deliberately not reported. The target resolves
+exactly as `session text` / `session type` do, so the pane you check is the pane you type into.
+
+Two caveats:
+
+- the same column is necessary, not sufficient: a draft exactly one wrap width long parks the
+  caret back where it started, so back a match with `session text` of that row before typing
+- after a print into the last column the answer EQUALS the pane width (the wrap is deferred to the
+  next character), so do not use it as an index into a `session text` row without clamping
+
+## Which binary, which app
+
+```
+agwintermctl version [--json]
+```
+
+Two greppable lines: `cli` (the agwintermctl you actually ran, version and resolved path - several
+can coexist and none need be on PATH) and `app` (what answered on the pipe). The app line is what
+`ping` answers, `agliteterm <version>`, so it names the build that is really running. It exits 0
+and still prints the `cli` half when nothing is listening, marking the app `unavailable`.
+
 ## Sessions, workspaces, windows
 
 ```
 agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
 agwintermctl session copy|paste|type|text|output|status
+agwintermctl surface cursor
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
-agwintermctl tree --json | ping | sidebar on|off|toggle | quick on|off|toggle
+agwintermctl tree --json | ping | version | sidebar on|off|toggle | quick on|off|toggle
 ```
 
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
@@ -6179,8 +6308,15 @@ static std::string ctlDispatch(const std::string& line) {
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
 
-    if (cmd == "ping") return ctlOkStr("agliteterm 0.1");
+    // The compiled version, never a literal: `agwintermctl version` reports the app serving the pipe
+    // from this reply (the way agwinterm's ping says "agwinterm " + AppVersion()), and the About box
+    // and the self-updater read the same updVersion(), so all three name the same build.
+    if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
+        // This runs on a control-pipe thread while another pipe thread's session.new can push_back
+        // into g_sessions (a realloc frees the buffer this loop indexes) and session.rename can
+        // reassign a name this loop reads. Both mutate under g_lock, so the walk holds it too.
+        LockG hold;
         std::string wss;
         for (int w = 0; w < (int)g_workspaces.size(); w++) {
             if (w) wss += ",";
@@ -6192,9 +6328,14 @@ static std::string ctlDispatch(const std::string& line) {
                 if (!first) sess += ",";
                 first = false;
                 std::string nm = s->name.empty() ? s->id : narrow(s->name);
+                StatusSnap st = statusOf(s);   // one snapshot: the status and ITS stamp, never a mixed pair
                 sess += "{\"id\":\"" + jsonEscape(s->id) + "\",\"name\":\"" + jsonEscape(nm) +
                         "\",\"active\":" + (g_pane[g_focus] == i2 ? "true" : "false") +
-                        ",\"status\":\"" + jsonEscape(s->status) + "\"" +
+                        ",\"status\":\"" + jsonEscape(st.status) + "\"" +
+                        // ALWAYS present, never omitted for the default: `tree` says "active" with
+                        // no age, and a consumer that has to tell "absent" from "old" gains nothing
+                        // from an omission. Epoch seconds of the last status WRITE (see Session).
+                        ",\"statusChangedAt\":" + std::to_string(st.changedAt) +
                         ",\"flagged\":" + (s->flagged ? "true" : "false") +
                         ",\"exited\":" + (s->exited ? "true" : "false") +
                         // a spec that could not be relaunched on this machine: kept, not dropped
@@ -6240,8 +6381,9 @@ static std::string ctlDispatch(const std::string& line) {
             if (wantWs < 0) {
                 if (wsCreate != "true" && wsCreate != "1")
                     return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
-                g_workspaces.push_back(want);
-                wantWs = (int)g_workspaces.size() - 1;
+                // `tree` walks this vector under g_lock; the index is taken under the SAME hold, or two
+                // concurrent creators both read the trailing size and are told the same number
+                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; }
             }
         }
 
@@ -6356,11 +6498,43 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         return ctlOkStr(dumpBufferText(target));
     }
+    if (cmd == "surface.cursor") {
+        // The caret COLUMN of the pane, as a bare JSON integer: {"ok":true,"result":<int>}. That is
+        // agterm's shape and agwinterm's (P1, agwinterm #221), so a script written against either
+        // product's cookbook works here unchanged; the conformance contract pins it as an integer.
+        // Column 0 is a real answer, not "no answer" - it goes out as the number 0, never omitted.
+        //
+        // Column ONLY, deliberately. The question this exists to answer is "is that composer empty
+        // before I type into it": the caret rests at a known column in an empty box, so a different
+        // column means a draft is sitting there and the send must refuse. One number, one compare.
+        // The row says nothing about that, and reporting it would only tempt callers into screen
+        // geometry that the two products lay out differently.
+        //
+        // The target resolves exactly as session.text / session.type do (the shared resolveTarget
+        // above), so the pane you CHECK is the pane you then TYPE INTO - a check against a different
+        // pane would be worse than no check. A pane whose child has exited still answers: its grid
+        // is still there to be read, and a caller deciding whether to type must get a number, not an
+        // error. Only a target that no longer resolves is refused - a hidden split pane still
+        // answers by id, though `tree` never lists it.
+        //
+        // Deferred wrap: after printing into the last column the core leaves the caret ONE PAST it
+        // (== cols) and wraps on the next print. That is reported as it is, so a caller must not use
+        // the value as a cell index without clamping. Same info.cursorCol the renderer paints from,
+        // so WHEN a caret is painted it is this cell; none is painted at column == cols, in a
+        // scrolled-back or unfocused pane, or while a selection is live (see paintPane).
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        FfiEmuInfo info{};
+        EnterCriticalSection(&g_lock);
+        bool have = target->emu && emu_info(target->emu, &info);
+        LeaveCriticalSection(&g_lock);
+        if (!have) return ctlErr("no emulator behind that session");   // cannot happen for a listed session; refuse rather than invent a 0
+        return ctlOk(std::to_string(info.cursorCol));
+    }
     if (cmd == "session.status") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
-        target->status = st;
+        setStatus(target, st);
         emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label
@@ -6442,7 +6616,11 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string nm = req.get("args.name");
         if (nm.empty()) return ctlErr("rename needs a name");
-        target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
+        {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
+            // reassignment frees the old buffer once the name outgrows the small-string buffer)
+            LockG hold;
+            target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
+        }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
     }
@@ -6566,7 +6744,7 @@ static std::string ctlDispatch(const std::string& line) {
             int step = (dir[0] == 'p') ? -1 : 1;
             for (int k = 1; k <= (int)vis.size(); k++) {
                 int i2 = vis[(pos + step * k % (int)vis.size() + (int)vis.size()) % vis.size()];
-                if (statusClass(g_sessions[i2]->status) == AGST_BLOCKED) { pick = i2; break; }
+                if (statusClass(statusOf(g_sessions[i2]).status) == AGST_BLOCKED) { pick = i2; break; }
             }
             if (pick < 0) return ctlOkStr("none blocked");
         } else pick = vis[(pos + 1) % vis.size()];   // next (default)
@@ -6575,17 +6753,25 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "workspace.new") {
         std::string nm = req.get("args.name");
-        g_workspaces.push_back(nm.empty() ? (L"workspace " + std::to_wstring(g_workspaces.size() + 1)) : widen(nm));
-        g_activeWs = (int)g_workspaces.size() - 1;
+        int made;
+        {   // under g_lock: `tree` (another pipe thread) and refreshTree walk this vector under it;
+            // a push_back that reallocates frees the std::wstring array they are reading. The index
+            // is taken under the same hold: two concurrent creators must not both be told the
+            // trailing one, and the reply must name the workspace THIS call made.
+            LockG hold;
+            g_workspaces.push_back(nm.empty() ? (L"workspace " + std::to_wstring(g_workspaces.size() + 1)) : widen(nm));
+            made = (int)g_workspaces.size() - 1;
+            g_activeWs = made;
+        }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
-        return ctlOkStr(std::to_string(g_activeWs));
+        return ctlOkStr(std::to_string(made));
     }
     if (cmd == "workspace.rename") {
         int w = wsResolve(req.get("target"), true);
         std::string nm = req.get("args.name");
         if (w < 0) return ctlErr("workspace not found");
         if (nm.empty()) return ctlErr("rename needs a name");
-        g_workspaces[w] = widen(tsvField(nm));
+        { LockG hold; g_workspaces[w] = widen(tsvField(nm)); }   // read under g_lock by `tree`
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
     }
@@ -7175,6 +7361,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_reqLock);
     InitializeCriticalSection(&g_evtLock);
+    InitializeCriticalSection(&g_statusLock);
     g_evtReady = true;   // from here on, anything worth reporting goes into the event log
     loadCore();
 

@@ -94,8 +94,10 @@ Cases must not assume the main app's behaviour. As of 0.17.11:
 
 ## What is here, and what is still a script
 
-`qa/selection.md` holds the selection cases and `qa/panes.md` the split-pane ones (a split belongs
-to its session, closes with it, and comes back with it after a restart). **Clipboard and host actions stay in
+`qa/selection.md` holds the selection cases, `qa/panes.md` the split-pane ones (a split belongs
+to its session, closes with it, and comes back with it after a restart), and `qa/control-read.md`
+the read-only control verbs (`surface cursor` against the painted caret, `statusChangedAt` against a
+real clock, `agwintermctl version` against the sandbox's pipe). **Clipboard and host actions stay in
 `test/clipboard.ps1`** — OSC 52 writes, query replies, right-click paste while a TUI holds the mouse
 — because CI runs `test/run-all.ps1 -Strict` and those checks would lose their only automated home
 until the markdown cases have a CI story. Port them when that exists, not before: coverage that runs
