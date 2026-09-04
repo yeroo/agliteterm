@@ -466,8 +466,14 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       minimises the window on the UI thread's path — 80 made, 80 closed, 78 s, process alive,
       `ping` and `tree` answer, no pane under 20 columns, the stream still running, 0 host-refused
       resizes rolled back
-- [ ] close #23 and #24 with the PR, quoting the check that pins each
-- [ ] mark P2-lite in agwinterm's batches index and `docs/lite-parity.md`
+- [x] close #23 and #24 with the PR, quoting the check that pins each (PR **#26**, opened
+      2026-09-04 with `Closes #23. Closes #24.`; the body quotes the minimised-window and the
+      SidebarW-900-in-600-px checks for #23 and the 20×/5× foreground loop plus both `window select`
+      branches for #24; the issues close when it merges)
+- [x] mark P2-lite in agwinterm's batches index and `docs/lite-parity.md` (agwinterm PR **#231**, branch
+      `docs/p2-lite-parity`: the P2 entry and the P8 list say "shipped as agliteterm #26", lite-parity's
+      "mirrored" section carries the number, `sidebar.width` corrected to mirrored-in-P2-lite,
+      `session.restore` stays P9, `window.select`'s truthful reply under "where agliteterm is ahead")
 - ➕ [x] found by the QA run, NOT fixed here (UI-only, not this batch's class): the status bar's
       grid text is refreshed only by `refreshTree` → `updateStatus`, never by a layout, so after
       `sidebar width` or a window resize it says the old grid while `tree` and the pane are right.
