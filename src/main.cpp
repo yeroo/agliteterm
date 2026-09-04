@@ -5084,8 +5084,12 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // Overlay and SCRATCH are transient: closing tears the window AND its session down (a
             // scratch pad you closed is gone — reopening starts fresh). Quick hides and keeps its
             // session, that being the point of a quick terminal.
+            // No SetForegroundWindow(g_hwnd) here or in WM_DESTROY (#24): the popup is OWNED by the
+            // main window, and Windows hands activation back to the owner by itself when an owned
+            // window hides or dies. The explicit raise only mattered when the foreground was
+            // elsewhere — and then it was a steal from whatever the user was doing.
             if (h == g_overlayHwnd || h == g_scratchHwnd) { DestroyWindow(h); return 0; }
-            ShowWindow(h, SW_HIDE); SetForegroundWindow(g_hwnd); return 0;
+            ShowWindow(h, SW_HIDE); return 0;
         case WM_DESTROY: {
             Session** slot = (h == g_overlayHwnd) ? &g_overlaySession
                            : (h == g_scratchHwnd) ? &g_scratchSession : nullptr;
@@ -5096,7 +5100,6 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         if (g_sessions[i] == *slot) { closeSessionAt(i); break; }
                 *slot = nullptr;
                 if (h == g_overlayHwnd) g_overlayHwnd = nullptr; else g_scratchHwnd = nullptr;
-                SetForegroundWindow(g_hwnd);
             }
             return 0;
         }
@@ -5139,6 +5142,35 @@ static void overlayOuterSize(double f, int& W, int& H) {
     AdjustWindowRectEx(&r, kPopupStyle, FALSE, 0);
     W = r.right - r.left; H = r.bottom - r.top;
 }
+// #24: bring `h` to the front only when this process ALREADY holds the foreground — the user is in
+// this window or one of its popups, and the raise is a hand-off between them. When the foreground
+// belongs to another process, the user is working somewhere else: never take it (a `quick on` or
+// `session overlay open` from an agent loop used to pop the window over whatever they were typing
+// into, every time — the report). Flash the taskbar button instead, the HA_BELL pattern, unless
+// the caller says the moment is not worth a flash (dismissing a popup). Windows itself refuses a
+// background SetForegroundWindow while the user is actively typing, but grants it once the input
+// has gone quiet for the foreground-lock timeout — which is exactly when an agent loop runs.
+// Returns whether the raise was made (not whether Windows honoured it; window.select checks that).
+static bool foregroundIsOurs() {
+    HWND fg = GetForegroundWindow();
+    DWORD fgPid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    return fg && fgPid == GetCurrentProcessId();
+}
+static bool raiseIfAllowed(HWND h, bool flashOtherwise = true) {
+    if (foregroundIsOurs()) { SetForegroundWindow(h); return true; }
+    if (flashOtherwise) FlashWindow(g_hwnd, TRUE);
+    return false;
+}
+// Show a popup and raise it under the same rule. SW_SHOW ACTIVATES the window it shows, and
+// activation is a second road to the foreground that Windows grants a background process under
+// the same idle-timeout rule — so when the foreground is not ours the popup is shown WITHOUT
+// activation (SW_SHOWNA; it still sits above its owner, being owned) and the button flashes.
+static void showPopupRaised(HWND h) {
+    if (foregroundIsOurs()) { ShowWindow(h, SW_SHOW); SetForegroundWindow(h); return; }
+    ShowWindow(h, SW_SHOWNA);
+    FlashWindow(g_hwnd, TRUE);
+}
 // Toggle a quick (scratch=false) or scratch (scratch=true) popup terminal: show/hide, creating its
 // window + dedicated hidden session on first use.
 static void togglePopupTerminal(bool scratch) {
@@ -5146,10 +5178,12 @@ static void togglePopupTerminal(bool scratch) {
     Session*& sess = scratch ? g_scratchSession : g_quickSession;
     if (hw && IsWindowVisible(hw)) {
         // Dismissing: quick hides (its session is the point), scratch is torn down — a dismissed
-        // scratch pad is gone, however you dismissed it (toggle key, X button, anything).
+        // scratch pad is gone, however you dismissed it (toggle key, X button, anything). The
+        // owner gets activation back from Windows; the raise is only for when the popup WAS the
+        // foreground and the main window should follow it, and a dismiss is not worth a flash.
         if (scratch) DestroyWindow(hw);
         else ShowWindow(hw, SW_HIDE);
-        SetForegroundWindow(g_hwnd);
+        raiseIfAllowed(g_hwnd, false);
         return;
     }
     if (!hw) {
@@ -5158,8 +5192,7 @@ static void togglePopupTerminal(bool scratch) {
         sess = newSession(max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)));   // windowForSession routes to hw (set above)
         if (sess) { sess->hidden = true; sess->name = scratch ? L"scratch" : L"quick"; }      // not in the sidebar / not persisted
     }
-    ShowWindow(hw, SW_SHOW);
-    SetForegroundWindow(hw);
+    showPopupRaised(hw);
     g_focusOverride = sess;
     InvalidateRect(hw, nullptr, FALSE);
 }
@@ -5183,8 +5216,7 @@ static void openOverlay(const std::string& command, int sizePct) {
     g_overlaySession = newSession(max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)),
                                   command.empty() ? nullptr : command.c_str());
     if (g_overlaySession) { g_overlaySession->hidden = true; g_overlaySession->name = L"overlay"; }
-    ShowWindow(g_overlayHwnd, SW_SHOW);
-    SetForegroundWindow(g_overlayHwnd);
+    showPopupRaised(g_overlayHwnd);
     g_focusOverride = g_overlaySession;
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);
 }
@@ -7192,9 +7224,27 @@ static std::string ctlDispatch(const std::string& line) {
         const InstanceInfo* w = findInstance(insts, sel);
         if (!w) return ctlErr("window not found");
         if (cmd == "window.select") {
-            if (IsIconic(w->hwnd)) ShowWindow(w->hwnd, SW_RESTORE);
+            // The raise IS this verb's purpose, so it is made unconditionally (not raiseIfAllowed) —
+            // but Windows decides whether a process that is not in the foreground may take it, and
+            // it refuses while the user is working in another app. The reply says what happened
+            // (#24, the same defect class as the rest of this batch: `selected` was answered
+            // whether or not the window came to the front). The truth is GetForegroundWindow
+            // afterwards, polled briefly because activation of another instance's window lands on
+            // that instance's thread; SetForegroundWindow's own return is not trusted.
+            bool wasIconic = IsIconic(w->hwnd) != FALSE;
+            if (wasIconic) ShowWindow(w->hwnd, SW_RESTORE);
             SetForegroundWindow(w->hwnd);
-            return ctlOkStr("selected");
+            bool granted = false;
+            for (int i = 0; i < 12 && !granted; i++) {
+                granted = GetForegroundWindow() == w->hwnd;
+                if (!granted) Sleep(20);
+            }
+            if (granted) return ctlOkStr("selected");
+            FlashWindow(w->hwnd, TRUE);   // what Windows does for a refused raise; made explicit
+            return ctlErr("window '" + narrow(w->name) + "' was not brought to the front: Windows kept the "
+                          "foreground with another process (the raise was refused" +
+                          std::string(wasIconic ? "; the window was restored from the taskbar" : "") +
+                          "). Its taskbar button flashes instead.");
         }
         if (cmd == "window.close" || cmd == "window.delete") {
             std::wstring nm = w->name;   // copy before the instance dies
@@ -7267,30 +7317,6 @@ static std::string ctlDispatch(const std::string& line) {
                          ",\"x\":" + std::to_string(rc.left) + ",\"y\":" + std::to_string(rc.top) +
                          ",\"w\":" + std::to_string(rc.right - rc.left) +
                          ",\"h\":" + std::to_string(rc.bottom - rc.top) +
-                         ",\"minimized\":" + (IsIconic(w->hwnd) ? "true" : "false") +
-                         ",\"active\":" + (GetForegroundWindow() == w->hwnd ? "true" : "false") + "}");
-        }
-        if (cmd == "window.zoom") {
-            ShowWindow(w->hwnd, IsZoomed(w->hwnd) ? SW_RESTORE : SW_MAXIMIZE);
-            return ctlOkStr(IsZoomed(w->hwnd) ? "maximized" : "restored");
-        }
-        if (cmd == "window.move" || cmd == "window.resize") {
-            RECT rc; GetWindowRect(w->hwnd, &rc);
-            int x = rc.left, y = rc.top, cw = rc.right - rc.left, chh = rc.bottom - rc.top;
-            std::string sx = req.get("args.x"), sy = req.get("args.y"), sw = req.get("args.w"), sh = req.get("args.h");
-            if (!sx.empty()) x = atoi(sx.c_str());
-            if (!sy.empty()) y = atoi(sy.c_str());
-            if (!sw.empty()) cw = atoi(sw.c_str());
-            if (!sh.empty()) chh = atoi(sh.c_str());
-            SetWindowPos(w->hwnd, nullptr, x, y, cw, chh, SWP_NOZORDER | SWP_NOACTIVATE);
-            return ctlOkStr("ok");
-        }
-        if (cmd == "window.state") {
-            RECT rc; GetWindowRect(w->hwnd, &rc);
-            return ctlOk("{\"name\":\"" + jsonEscape(narrow(w->name)) +
-                         "\",\"x\":" + std::to_string(rc.left) + ",\"y\":" + std::to_string(rc.top) +
-                         ",\"w\":" + std::to_string(rc.right - rc.left) + ",\"h\":" + std::to_string(rc.bottom - rc.top) +
-                         ",\"maximized\":" + (IsZoomed(w->hwnd) ? "true" : "false") +
                          ",\"minimized\":" + (IsIconic(w->hwnd) ? "true" : "false") +
                          ",\"active\":" + (GetForegroundWindow() == w->hwnd ? "true" : "false") + "}");
         }

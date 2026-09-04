@@ -350,23 +350,41 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       foreground on the machine), not a Task 5 regression. Left for Task 8 to re-check.
 
 ### Task 6: #24 — the window stops coming to the front on its own
-- [ ] a helper `raiseIfAllowed(HWND)`: `SetForegroundWindow` only when
+- [x] a helper `raiseIfAllowed(HWND)`: `SetForegroundWindow` only when
       `GetForegroundWindow()` belongs to this process (or `GetWindowThreadProcessId` matches);
       otherwise `FlashWindow(TRUE)` — the `HA_BELL` pattern (`:5649`). Use it at `:5034`, `:5044`,
       `:5059`
-- [ ] delete the raises in the popup's `WM_CLOSE` (`:4987`) and `WM_DESTROY` (`:4998`) — Windows
+- [x] delete the raises in the popup's `WM_CLOSE` (`:4987`) and `WM_DESTROY` (`:4998`) — Windows
       restores activation to the owner on its own
-- [ ] `window.select` (`:6857`): keep the raise (it is the verb's purpose) but reply whether it was
+- [x] `window.select` (`:6857`): keep the raise (it is the verb's purpose) but reply whether it was
       **granted** — `GetForegroundWindow() == hwnd` afterwards — instead of always `selected`; the
       same defect class as the rest of this batch
-- [ ] delete the dead duplicate `window.zoom` / `window.move` / `window.resize` / `window.state`
+- [x] delete the dead duplicate `window.zoom` / `window.move` / `window.resize` / `window.state`
       arms at `:6944-6963`
-- [ ] `test/control-honesty.ps1`: start a sandbox, give the foreground to a SECOND sandbox (its own
+- [x] `test/control-honesty.ps1`: start a sandbox, give the foreground to a SECOND sandbox (its own
       hwnd, `SetForegroundWindow` from the test is a user-process gesture — acceptable, or use
       `window select` on it), then call `quick on` / `quick off` twenty times and `session overlay
       open`/`close` five times on the FIRST; assert `GetForegroundWindow()` never became the first
       sandbox's hwnd; assert `window select` on a window that cannot be raised reports it
-- [ ] build + run — must pass before task 7
+- [x] build + run — must pass before task 7
+
+- ➕ [x] `ShowWindow(SW_SHOW)` ACTIVATES the window it shows, and activation is a second road to
+      the foreground that Windows grants a background process under the same idle-timeout rule —
+      so `showPopupRaised` shows the popup with `SW_SHOWNA` when the foreground is not ours
+      (owned windows still sit above their owner), and the guard is not bypassed by the show
+- ➕ [x] the dismiss path (`quick off`) raises the owner only when the popup WAS the foreground
+      and never flashes: a dismiss from an agent loop is not worth a taskbar blink
+- ⚠️ the test's "second window holding focus" is a plain top-level window of the TEST process
+      (STATIC class, its own handle), not a second sandbox: it can take the foreground with the
+      `AttachThreadInput` gesture `clipboard.ps1` already uses, and hands it back to whoever had it
+      before (Firefox, on the day). `LockSetForegroundWindow` / `AllowSetForegroundWindow` are
+      ERROR_ACCESS_DENIED for it — Windows reserves both for the process the user last typed INTO,
+      which a test never is — so neither branch of `window select` can be FORCED: the check is the
+      property (the reply matches `GetForegroundWindow` afterwards, branch printed; refused on a
+      busy desktop, which is the report's case, granted on an idle one or CI), plus the granted
+      branch forced by giving lite the foreground first. The 20×/5× loop is non-vacuous only on an
+      idle desktop (Windows itself refuses the old code's steal while someone types); the old
+      binary failed the refused-branch `window select` check on this desktop, and passed the loop
 
 ### Task 7: the contract, the skill, the docs
 - [ ] copy agwinterm `main`'s `tests/conformance/control-api.json` (post-#226 sibling contract PR)

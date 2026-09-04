@@ -64,6 +64,41 @@ public static class LiteHonesty {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowExW(uint ex, string cls, string title, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public POINT pt; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PeekMessageW(out MSG m, IntPtr h, uint min, uint max, uint remove);
+    [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DispatchMessageW(ref MSG m);
+    // The "other app" for the #24 checks: a plain top-level window of THIS process (a STATIC control
+    // needs no window procedure of its own), placed to the right of the sandbox.
+    public static IntPtr MakeHolder(string title) {
+        return CreateWindowExW(0, "STATIC", title, 0x10CF0000 /* WS_OVERLAPPEDWINDOW | WS_VISIBLE */, 900, 100, 320, 200, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+    }
+    public static void Pump() { MSG m; while (PeekMessageW(out m, IntPtr.Zero, 0, 0, 1)) { TranslateMessage(ref m); DispatchMessageW(ref m); } }
+    public static uint PidOf(IntPtr h) { uint pid = 0; if (h != IntPtr.Zero) GetWindowThreadProcessId(h, out pid); return pid; }
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    // Give `h` (a window of this process) the foreground. A plain SetForegroundWindow is refused
+    // when another process holds the foreground and the user has typed recently; attaching this
+    // thread's input queue to the foreground thread's (the clipboard suite's trick) makes the
+    // request come from the queue that owns the foreground, which is what a user's own click does.
+    // Returns whether the foreground is h afterwards.
+    public static bool TakeForeground(IntPtr h) {
+        if (SetForegroundWindow(h) && GetForegroundWindow() == h) return true;
+        IntPtr fg = GetForegroundWindow();
+        uint pid; uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, out pid);
+        uint me = GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+        try { BringWindowToTop(h); SetForegroundWindow(h); }
+        finally { if (attached) AttachThreadInput(me, fgThread, false); }
+        return GetForegroundWindow() == h;
+    }
 }
 '@
 
@@ -764,6 +799,107 @@ try {
         Skip 'a lone 0x80 on --stdin is refused and the pane receives nothing' 'no --stdin in this agwintermctl'
         Skip 'the quick terminal is typed into by its session id from the events stream' 'no --stdin in this agwintermctl'
     }
+
+    # ---- #24: the window stops coming to the front on its own ----------------------------------
+    # The report: an agent loop calling `quick on/off` and `session overlay open/close` kept popping
+    # the lite window over whatever Boris was working in. Every one of those paths raised itself
+    # with an unguarded SetForegroundWindow, and Windows GRANTS a background process the foreground
+    # once the user's input has been quiet for the foreground-lock timeout - exactly when an agent
+    # loop runs. Now a popup is raised only when this process already holds the foreground, and the
+    # taskbar button flashes otherwise. The user's "other app" here is a plain top-level window of
+    # THIS test process (its own window - no global input), given the foreground once; the oracle
+    # is GetForegroundWindow sampled after every call, which must never belong to the sandbox's
+    # process. Vacuity guard first: the popups DID appear, so the loop exercised the raise paths.
+    # When the holder cannot take the foreground at all (someone is typing on this machine right
+    # now), the section SKIPs rather than assert about a foreground it does not own.
+    "-- #24: the foreground stays where the user left it --"
+    $quickTitle = 'agliteterm ' + [char]0x2014 + ' quick'
+    function QuickHwnd { [LiteHonesty]::FindWindowW('AgwintermLitePopup', $quickTitle) }
+    function FgPid { [LiteHonesty]::PidOf([LiteHonesty]::GetForegroundWindow()) }
+    $litePid = [uint32]$s.Proc.Id
+    $fgBefore = [LiteHonesty]::GetForegroundWindow()   # whoever the user is in right now gets it back at the end
+    $holder = [LiteHonesty]::MakeHolder('control-honesty: the window the user is working in')
+    [LiteHonesty]::Pump()
+    $held = $false
+    for ($i = 0; $i -lt 10 -and -not $held; $i++) {
+        $held = [LiteHonesty]::TakeForeground($holder)
+        [LiteHonesty]::Pump()
+        if (-not $held) { Start-Sleep -Milliseconds 200 }
+    }
+    $fgName = 'this test''s own window'
+    if ($held) {
+        $stolen = @()
+        $quickSeen = $false
+        for ($i = 1; $i -le 20; $i++) {
+            Send-Ctl $s @('quick', 'on') | Out-Null
+            Start-Sleep -Milliseconds 150; [LiteHonesty]::Pump()
+            $q = QuickHwnd
+            if ($q -ne [IntPtr]::Zero -and [LiteHonesty]::IsWindowVisible($q)) { $quickSeen = $true }
+            if ((FgPid) -eq $litePid) { $stolen += "quick on #$i" }
+            Send-Ctl $s @('quick', 'off') | Out-Null
+            Start-Sleep -Milliseconds 150; [LiteHonesty]::Pump()
+            if ((FgPid) -eq $litePid) { $stolen += "quick off #$i" }
+        }
+        Check 'setup: quick on showed its popup during the loop (the raise path was exercised)' $quickSeen
+        Check 'quick on / off twenty times: the foreground never became the lite window or its popup' ($stolen.Count -eq 0) "taken at: $($stolen -join ', ')"
+        $stolen = @()
+        $overlaySeen = 0
+        for ($i = 1; $i -le 5; $i++) {
+            Overlay @('open', 'cmd.exe') | Out-Null
+            if ((Wait-Overlay $true) -ne [IntPtr]::Zero) { $overlaySeen++ }
+            Start-Sleep -Milliseconds 150; [LiteHonesty]::Pump()
+            if ((FgPid) -eq $litePid) { $stolen += "overlay open #$i" }
+            Overlay @('close') | Out-Null
+            Wait-Overlay $false | Out-Null
+            Start-Sleep -Milliseconds 150; [LiteHonesty]::Pump()
+            if ((FgPid) -eq $litePid) { $stolen += "overlay close #$i" }
+        }
+        Check 'setup: session overlay open showed its popup five times (the raise path was exercised)' ($overlaySeen -eq 5) "seen $overlaySeen"
+        Check 'session overlay open / close five times: the foreground never became the lite window or its popup' ($stolen.Count -eq 0) "taken at: $($stolen -join ', ')"
+        Check "and the foreground is still $fgName, where the user left it" ([LiteHonesty]::GetForegroundWindow() -eq $holder) "foreground pid $(FgPid), lite is $litePid"
+
+        # `window select`: the raise IS the verb's purpose, so it is still made - but Windows decides
+        # whether a process that is not in the foreground gets it: refused while the user has typed
+        # recently, granted once input has been quiet for the foreground-lock timeout. Neither can
+        # be forced from here - LockSetForegroundWindow and AllowSetForegroundWindow are the right of
+        # the process the user last typed INTO (ERROR_ACCESS_DENIED for everyone else, the holder
+        # included), and a test never is that process. So the check is the property the verb owes:
+        # the reply matches where the foreground actually went. Which branch ran is printed; on a
+        # busy desktop it is the refusal (the report's case), on an idle one or in CI the grant.
+        $raw = Send-Ctl $s @('window', 'select', $s.Pipe)
+        $r = ConvertFrom-Json $raw
+        $fgNow = [IntPtr]::Zero
+        for ($i = 0; $i -lt 10; $i++) { $fgNow = [LiteHonesty]::GetForegroundWindow(); if ($fgNow -eq $s.Hwnd) { break }; Start-Sleep -Milliseconds 100 }
+        if ($fgNow -eq $s.Hwnd) {
+            "  (Windows GRANTED the raise - the desktop is idle - so the granted branch is what gets checked)"
+            Check 'window select whose raise Windows granted answers selected' ([bool]$r.ok -and [string]$r.result -eq 'selected') "raw: $raw"
+        } else {
+            "  (Windows REFUSED the raise - someone typed recently - so the refused branch is what gets checked)"
+            Check 'window select on a window Windows would not raise answers ok:false and says the raise was refused' (-not $r.ok -and [string]$r.error -match 'not brought to the front' -and [string]$r.error -match 'refused') "raw: $raw"
+            Check "and the foreground did not move from $fgName" ($fgNow -eq $holder) "foreground pid $(FgPid), lite is $litePid"
+        }
+        # The granted branch, forced: the lite window is GIVEN the foreground first (the test's own
+        # gesture, as a click on it would be), after which its raise of itself is a hand-off inside
+        # the process that owns the foreground, which Windows always allows.
+        Check 'setup: the lite window was given the foreground' ([LiteHonesty]::TakeForeground($s.Hwnd)) "foreground pid $(FgPid), lite is $litePid"
+        $raw = Send-Ctl $s @('window', 'select', $s.Pipe)
+        Check 'window select on the window that holds the foreground answers selected' ([string](ConvertFrom-Json $raw).result -eq 'selected') "raw: $raw"
+        Check 'and it is still in front' ([LiteHonesty]::GetForegroundWindow() -eq $s.Hwnd) "foreground pid $(FgPid), lite is $litePid"
+    } else {
+        foreach ($n in 'quick on / off twenty times: the foreground never became the lite window or its popup',
+                       'session overlay open / close five times: the foreground never became the lite window or its popup',
+                       'window select answers what the foreground says (selected, or ok:false with the refusal)',
+                       'window select on the window that holds the foreground answers selected') {
+            Skip $n "$fgName could not take the foreground (pid $(FgPid) holds it - is someone typing on this machine?), so nothing can be said about who steals it"
+        }
+    }
+    # The foreground goes back to whoever had it before the holder took it - this test process is
+    # the foreground process while the holder lives, so it may hand the foreground on; then the
+    # holder goes.
+    if ($fgBefore -ne [IntPtr]::Zero -and [LiteHonesty]::IsWindow($fgBefore)) { [void][LiteHonesty]::SetForegroundWindow($fgBefore) }
+    [void][LiteHonesty]::DestroyWindow($holder)
+    [LiteHonesty]::Pump()
+    Start-Sleep -Milliseconds 300
 
     # ---- #23: a pane never collapses to 2 columns -----------------------------------------------
     # The report: a pane at 2 columns after the window sat minimised while an agent kept calling
