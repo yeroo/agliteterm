@@ -965,8 +965,11 @@ static int g_cw = 8, g_ch = 16;
 static CRITICAL_SECTION g_lock; // guards every session's emu + the session list shape
 // Serialises hostResize: one resize reaches the pty-host at a time, so the latch, the host and the
 // emulator cannot disagree. Deliberately NOT g_lock — the round trip under it is unbounded, and
-// g_lock is what paintPane and every reader thread need (see hostResize). Ordered BEFORE g_lock
-// (hostResize takes this, then g_lock briefly); nothing else takes it, so there is no other order.
+// g_lock is what paintPane and every reader thread need (see hostResize). The invariant, stated as
+// a rule rather than a sequence: **g_lock must not be held when g_resizeLock is acquired.**
+// hostResize is the only taker, and it takes g_lock briefly TWICE — once for its early out, which
+// releases before the try-lock precisely for this reason, and once inside for the latch — so a
+// reader who sees two holds must not widen either across the acquisition.
 static CRITICAL_SECTION g_resizeLock;
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
@@ -1511,9 +1514,12 @@ static void hostResize(Session* s, int cols, int rows) {
     //
     // The UI thread never WAITS for this lock: if a pipe thread is mid-round-trip the UI thread
     // leaves the resize rather than blocking the message loop, and re-arms the retry timer below.
-    // Nothing to do? Answer before taking any lock. The authoritative compare-and-set is still
-    // under g_lock below; this early out is what keeps a retry that finds every grid already
-    // correct from arming another one (revmux r3), and it costs one locked read.
+    // Nothing to do? Answer before taking g_resizeLock — under g_lock, which this scope RELEASES
+    // before the try-lock below, because g_lock must never be held while g_resizeLock is acquired
+    // (a thread inside the body holds g_resizeLock and wants g_lock; holding them the other way
+    // round here would be a real inversion). Do not merge this block into the locked block below.
+    // It is what keeps a retry that finds every grid already correct from arming another one
+    // (revmux r3); the authoritative compare-and-set is still the one under g_lock inside.
     {
         LockG hold;
         if (s->cols == cols && s->rows == rows) return;
@@ -1557,14 +1563,21 @@ static void hostResize(Session* s, int cols, int rows) {
         req.cmd.resize.rows = (uint32_t)rows;
         ReqOutcome why;
         if (!request(req, &rep, &why) && !s->exited) {
-            // The host did not take it: roll the latch back so the next syncPaneSizes sees a
-            // difference and asks again, and leave the emulator at the size the host still has.
+            // The host did not take it: roll the latch back and ARM THE RETRY. "The next
+            // syncPaneSizes asks again" is not something anyone owns (see the top of this
+            // function), and the early out above makes that reachable: while this request was in
+            // flight the latch already advertised the new size, so a concurrent caller asking for
+            // the SAME grid returned without arming anything, and an already-armed timer that fired
+            // in that window killed itself for the same reason. The timer is the one thing that
+            // outlives both, so the rollback owes it (revmux r4). The emulator keeps the size the
+            // host still has.
             // An EXITED session is the one exception — there is no shell behind it to reflow, the
             // host has nothing to say about it, and the emulator is the only thing left to fit.
             LockG hold;
             s->cols = hadCols;
             s->rows = hadRows;
-            logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, asked again on the next layout",
+            SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs, nullptr);   // whoever else asked may have gone
+            logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, retrying on the layout timer",
                     s->id.c_str(), cols, rows,
                     why == ReqOutcome::Refused ? "refused" : why == ReqOutcome::Undecodable ? "undecodable reply" : "no reply",
                     hadCols, hadRows);
@@ -5367,8 +5380,10 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is 0 (the flag was absent, or the window could not be measured) or the EFFECTIVE 1..100
-// the verb already raised to the 30x8-cell minimum and reported. Nothing clamps the percentage here
+// sizePct is always the EFFECTIVE 1..100 the verb reported: it raised the number (or lite's 70 %
+// default, when the flag was absent) to the 30x8-cell minimum and posts THAT, so the popup is
+// built from the number the caller was given. overlayFraction still has a 0 arm; nothing on this
+// path reaches it any more (revmux r4), and it is kept only so a future caller cannot trip on it. Nothing clamps the percentage here
 // — 100 means the whole client area — but createPopupWindowPx still applies that physical floor to
 // the pixels, so the popup matches sizePct only when the floor does not bind, which is exactly what
 // the verb's reply accounts for. 0 gives lite's DEFAULT, a popup 70 % of the main window's client. That
@@ -6942,9 +6957,17 @@ static std::string ctlDispatch(const std::string& line) {
                 int found = -1;
                 if (wantWs < (int)g_workspaces.size() && g_workspaces[wantWs] == wantWsName)
                     found = wantWs;                                  // nothing moved: the common path
-                else                                                 // a delete shifted it; find it AT OR AFTER where it was
+                else
+                    // It moved. Prefer the first match AT OR AFTER where it was; failing that the
+                    // NEAREST one below, because a delete shifts indices down by as little as one
+                    // and the first match in the list can be a different workspace that happens to
+                    // share the name — `[A, dev, X, dev]` with X deleted leaves the target at 2,
+                    // not at 1 (revmux r4).
                     for (int w = 0; w < (int)g_workspaces.size(); w++)
-                        if (g_workspaces[w] == wantWsName && (found < 0 || w >= wantWs)) { found = w; if (w >= wantWs) break; }
+                        if (g_workspaces[w] == wantWsName) {
+                            if (found < 0 || w >= wantWs || w > found) found = w;
+                            if (w >= wantWs) break;
+                        }
                 if (found < 0)
                     logWarn("session.new: workspace '%s' is gone (deleted or renamed) since it was resolved; the session lands in the active one instead",
                             narrow(wantWsName).c_str());
@@ -8124,7 +8147,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (!g_hwnd) fatal(L"could not create the main window");
     g_frame.SetWindowText(g_isDefaultInstance ? L"agliteterm"
                                               : (L"agliteterm \x2014 " + g_instance).c_str());
-    SetTimer(g_hwnd, kCaretTimer, kCaretBlinkMs, nullptr);   // the caret blink (lite's only timer)
+    SetTimer(g_hwnd, kCaretTimer, kCaretBlinkMs, nullptr);   // the caret blink (the other is kRelayoutTimer, armed on demand)
     announceInstance(g_hwnd);   // visible to the other windows' window.* verbs
     g_frame.SetMenu(buildMenuBar());
     g_frame.SetIcon(g_appIcon, TRUE);    // VGA black+cyan terminal icon (window + taskbar)

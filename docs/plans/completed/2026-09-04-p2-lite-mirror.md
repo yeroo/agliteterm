@@ -567,7 +567,8 @@ commit, the remaining hang filed as #27).
   amplification, not this. P9-lite, with #21.
 
 **What revmux round 3 found** (`03-after-fix2`, scoped to the r2 fix commit: **three Majors inside
-that fix**, four Minors, two pre-existing — fixed in the next commit).
+that fix** and four Minors, all fixed in the next commit, plus two pre-existing items recorded
+but deliberately NOT fixed).
 
 - ⚠️ **Major — the retry I added spun the UI thread.** `OnRelayout` cleared the flag, called
   `syncPaneSizes` / `refitPopupSessions`, and every `hostResize` in them failed the try-lock and
@@ -602,6 +603,35 @@ that fix**, four Minors, two pre-existing — fixed in the next commit).
   after a font change (`refitPopupSessions` is the fix, one call); and a posted overlay applies a
   size decision sampled from the geometry at request time, which is inherent to marshalling the
   create to the UI thread.
+
+**What revmux round 4 found** (`04-after-fix3`, scoped to the r3 fix commit: **no Major or
+Critical** — the round the batch was working towards — plus ten Minors and two pre-existing, the
+substantive Minors fixed in the next commit).
+
+- The r3 early out could DROP a resize: the latch is set optimistically before the host round trip,
+  so a concurrent caller asking for the same grid returned without arming anything, and an
+  already-armed timer that fired in that window killed itself for the same reason — then the host
+  refused, the latch rolled back, and nothing was scheduled. The **rollback path now arms
+  `kRelayoutTimer`**, which is the one thing that outlives both, and its log line says so.
+- The duplicate-name scan took the FIRST match below `wantWs`, not the nearest — but a delete
+  shifts by as little as one, so `[A, dev, X, dev]` with X deleted put the session in the wrong
+  `dev`. It prefers the first match at-or-after, then the nearest below.
+- Three comments were still wrong after r3: the early out says it runs "before taking any lock"
+  while holding `g_lock`; the `g_resizeLock` rule described a *sequence* (`hostResize` takes it then
+  `g_lock`) that the early out reverses, when the real invariant is "**`g_lock` must not be held
+  when `g_resizeLock` is acquired**" — stated that way now, with why the early out's scope closes
+  where it does; and the caret `SetTimer` still called itself "lite's only timer".
+- `openOverlay`'s doc still said `sizePct` may be 0, which r3 made impossible.
+- The plan's own r3 summary said the two deliberately-unfixed pre-existing items were "fixed in the
+  next commit". Corrected.
+- **The absent-flag fix had no test that would fail if it were reverted.** The no-flag check
+  measured against a hard-coded 70 % on a window where the floor never binds. There is now a case
+  that shrinks the main window until the minimum exceeds 70 %, resizes with no flag, parses the
+  percentage out of the reply and measures **both axes** against it — it reports 85 % on this
+  machine and would catch the reply/popup split on either dimension.
+- Pre-existing, still not fixed and recorded as such: `applyFont` re-fits only the panes, so a popup
+  keeps a stale grid after a font change; and an overlay reply uses geometry sampled before the UI
+  thread applies the request, which is inherent to marshalling the create.
 
 ## Technical Details
 
