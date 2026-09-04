@@ -47,6 +47,11 @@ $cliRefusesNonNumber = $probe -match 'whole number'
 # (op=width, the number dropped), which would make a set look like a read that happened to pass.
 $probe = (& $ctl sidebar width wide --pipe 'honesty-probe' --json 2>&1) -join ''
 $cliHasSidebarWidth = $probe -match 'whole number'
+# And for `session type --stdin`: a post-#226 client refuses `--stdin` beside positional text on its
+# own side ("one source for the text, not two"), before any pipe; the 0.17.x client has no such
+# flag, takes it as a boolean and goes to the pipe with the positional.
+$probe = ('x' | & $ctl session type --stdin positional --pipe 'honesty-probe' --json 2>&1) -join ''
+$cliHasStdin = $probe -match 'one source'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -649,6 +654,116 @@ try {
     Check 'session new --workspace no-such-workspace is still refused' (-not (ConvertFrom-Json $raw).ok) "raw: $raw"
     Start-Sleep -Milliseconds 700
     Check 'and created nothing' ((NodeCount) -eq $n1) "nodes $n1 -> $(NodeCount)"
+
+    # ---- session.type --stdin: the shared client against lite's decoder -------------------------
+    # No server change rides with this: lite's handler already takes args.text, folds \n to \r and
+    # refuses control bytes. What is owed is the proof that text the argv path cannot carry - a
+    # quote, a newline, a run of spaces, a leading `--` - reaches the pane BYTE FOR BYTE through the
+    # CLI's --stdin and lite's own JSON decoder (src/control.h), and that the argv path really does
+    # lose it, silently, with an `ok` reply. The oracle is a `cmd /k` pane: cmd's `echo` prints its
+    # argument verbatim (quotes and inner spaces kept), so the echoed row IS the bytes the shell
+    # received; the second line carries no Enter (the reader strips exactly ONE trailing newline,
+    # the one the pipe adds) and sits at the prompt as typed. A pane's rows are read TrimEnd'ed:
+    # trailing blanks are the renderer's, and Clink (present on some machines) paints a hint after
+    # the draft, so a draft is matched by Contains, never by EndsWith.
+    "-- session.type --stdin --"
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'stdin-oracle', '--command', 'cmd /k')
+    $oid = [string](ConvertFrom-Json $raw).result
+    Check 'setup: a cmd /k pane to echo into' ((Wait-Node $oid)) "raw: $raw"
+    function OracleRows { @(([string](Get-PaneText $s $oid)) -split "`n" | ForEach-Object { $_.TrimEnd() }) }
+    function Wait-Row([scriptblock]$pred, [int]$ms = 6000) {
+        for ($i = 0; $i -lt ($ms / 200); $i++) { if (OracleRows | Where-Object $pred) { return $true }; Start-Sleep -Milliseconds 200 }
+        return [bool](OracleRows | Where-Object $pred)
+    }
+    Check 'setup: the cmd pane painted something (a banner or a prompt)' (Wait-Row { $_ -ne '' } 10000)
+    Start-Sleep -Milliseconds 1500
+    # A direct CLI call with a piped stdin, scrubbed like Send-Ctl (a suite run from inside a pane
+    # would otherwise carry its own AGWINTERM_SESSION_ID as the default target).
+    function Invoke-CtlStdin([string]$in, [string[]]$argv) {
+        foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+        ($in | & $ctl @argv --pipe $s.Pipe --json 2>&1) -join ''
+    }
+    $line1 = 'echo --lead "quoted"  two-spaces'     # a leading --word, a quote, two consecutive spaces
+    $line2 = 'tail  --end "q"'                     # after the newline: another run of spaces, no Enter
+    $text = $line1 + "`n" + $line2
+    $echoed = $line1.Substring(5)                  # what cmd's echo prints: everything after `echo `
+
+    # --- first the argv path, word-split the way cmd and bash hand words over --------------------
+    # The words reach the CLI one by one: the newline and the run of spaces are gone before the CLI
+    # ever sees them (that is what word-splitting is), and `--lead` / `--end` are options to its
+    # parser, not text. The call still answers ok - the loss is silent, which is the point of
+    # --stdin. Enter afterwards so cmd echoes what did arrive; the pane never sees $line2 as such.
+    $words = $text -split '\s+'
+    $raw = Send-Ctl $s (@('session', 'type') + $words + @('--target', $oid))
+    Check 'the same text as word-split argv answers ok ("typed") - the loss is silent' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    Start-Sleep -Milliseconds 800
+    $draft = [string](OracleRows | Where-Object { $_ -match 'echo' } | Select-Object -Last 1)
+    Check 'and what arrived is one line: no row carries the run of two spaces' ($draft -and -not (OracleRows | Where-Object { $_.Contains('  two-spaces') })) "draft row: [$draft]"
+    Check 'nor the second line - the newline did not survive argv' (-not (OracleRows | Where-Object { $_.Contains($line2) })) "rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
+    Send-Ctl $s @('session', 'type', "`n", '--target', $oid) | Out-Null
+    Start-Sleep -Milliseconds 800
+
+    if ($cliHasStdin) {
+        # --- --stdin: the here-string, and both lines back byte for byte ------------------------
+        $raw = Invoke-CtlStdin $text @('session', 'type', '--stdin', '--target', $oid)
+        $r = ConvertFrom-Json $raw
+        Check 'session type --stdin with a quote, a newline, two spaces and a leading -- answers ok "typed"' ([bool]$r.ok -and [string]$r.result -eq 'typed') "exit $LASTEXITCODE, raw: $raw"
+        Check "the first line ran and cmd echoed its argument byte for byte: [$echoed]" (Wait-Row { $_ -eq $echoed }) "rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
+        Check "the second line sits at the prompt as typed: [$line2]" (Wait-Row { $_.Contains($line2) }) "rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
+        Check 'and was NOT submitted (one trailing newline stripped, none invented)' (-not (OracleRows | Where-Object { $_ -match "'tail' is not recognized" }))
+        # A second newline at the end IS the Enter: the draft runs, and cmd says so.
+        $raw = Invoke-CtlStdin "`n" @('session', 'type', '--stdin', '--target', $oid)
+        Check 'a text of two newlines (one stripped, one kept) presses Enter' ([bool](ConvertFrom-Json $raw).ok -and (Wait-Row { $_ -match "'tail' is not recognized" })) "raw: $raw, rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
+
+        # --- invalid UTF-8 from a file: refused by the CLI, and the pane received NOTHING ---------
+        # `echo <marker> ` then a lone 0x80 then LF. The refusal is client-side (StdinText, agwinterm
+        # #226); the lite half is that nothing reaches the pane - not the `echo <marker>` before the
+        # bad byte, not a U+FFFD in its place. The marker is the oracle: a whole-text "unchanged"
+        # compare is at the mercy of a prompt that paints late (a git-backed prompt takes seconds
+        # here), while a marker that never appears cannot be confused with anything already there.
+        # Redirected from a file so the bytes are exactly these: a PowerShell pipe would re-encode.
+        $badMarker = 'bad-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $prefix = [Text.Encoding]::ASCII.GetBytes("echo $badMarker ")
+        $bad = Join-Path $env:TEMP ('honesty-stdin-' + $badMarker + '.bin')
+        [IO.File]::WriteAllBytes($bad, [byte[]]($prefix + @(0x80, 0x0A)))
+        $so = "$bad.out"; $se = "$bad.err"
+        foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+        $p = Start-Process -FilePath $ctl -ArgumentList @('session', 'type', '--stdin', '--target', $oid, '--pipe', $s.Pipe, '--json') `
+                           -RedirectStandardInput $bad -RedirectStandardOutput $so -RedirectStandardError $se -NoNewWindow -Wait -PassThru
+        $err = [string](Get-Content $se -Raw -ErrorAction SilentlyContinue)
+        Check "a lone 0x80 on --stdin: non-zero exit, the refusal names byte offset $($prefix.Length) and 0x80" ($p.ExitCode -ne 0 -and $err -match "byte offset $($prefix.Length)\b" -and $err -match '0x80') "exit $($p.ExitCode), stderr: $err, stdout: $(Get-Content $so -Raw -ErrorAction SilentlyContinue)"
+        Start-Sleep -Milliseconds 2000
+        $rowsAfter = OracleRows
+        Check 'and the pane received nothing - not the `echo <marker>` before the bad byte, not a U+FFFD' (-not ($rowsAfter | Where-Object { $_.Contains($badMarker) -or $_.Contains([string][char]0xFFFD) })) "rows: $(($rowsAfter | Where-Object { $_ }) -join ' | ')"
+        Remove-Item $bad, $so, $se -ErrorAction SilentlyContinue
+
+        # --- the quick terminal: no `quick type` verb; it is `session type --target <its id>` ------
+        # `quick on` answers ok, not an id; the id arrives as a `session`/`created` event and the
+        # session is hidden from `tree`. By id it is a target like any other (by NAME it is not - the
+        # skill says so, and this pins it).
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        $raw = Send-Ctl $s @('quick', 'on')
+        Check 'quick on answers ok (a string, not an id)' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $qid = [string]($created | Select-Object -Last 1).session
+        Check 'its session id arrived as a session/created event' ([bool]$qid) "events since $cursor`: $($created | ConvertTo-Json -Compress)"
+        Check 'and that session is not in tree (hidden)' ($qid -and -not (Nodes | Where-Object { [string]$_.id -eq $qid }))
+        $marker = 'quick-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $raw = Invoke-CtlStdin "echo $marker" @('session', 'type', '--stdin', '--target', $qid)
+        Check 'session type --stdin --target <quick session id> answers ok' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+        $seen = $false
+        for ($i = 0; $i -lt 30; $i++) { if (([string](Get-PaneText $s $qid)).Contains($marker)) { $seen = $true; break }; Start-Sleep -Milliseconds 200 }
+        Check 'and the quick pane shows the text' $seen "quick text: $(Get-PaneText $s $qid)"
+        $raw = Send-Ctl $s @('session', 'type', 'x', '--target', 'quick')
+        Check '--target quick (the NAME) is refused: hidden sessions are addressed by id only' (-not (ConvertFrom-Json $raw).ok) "raw: $raw"
+        Send-Ctl $s @('quick', 'off') | Out-Null
+        Start-Sleep -Milliseconds 500
+    } else {
+        Skip 'session type --stdin round-trips a quote, a newline, two spaces and a leading --' 'this agwintermctl predates agwinterm #226 and has no --stdin - set AGWINTERMCTL to a newer build'
+        Skip 'a lone 0x80 on --stdin is refused and the pane receives nothing' 'no --stdin in this agwintermctl'
+        Skip 'the quick terminal is typed into by its session id from the events stream' 'no --stdin in this agwintermctl'
+    }
 }
 finally {
     if ($s) { Stop-Sandbox $s }

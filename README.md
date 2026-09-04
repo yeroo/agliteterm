@@ -73,7 +73,13 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   width — clamp before indexing); every `tree` node carries `statusChangedAt`, epoch seconds
   of the last status **write**, restamped on every write including a re-assert of the same status,
   so a stale `"active"` shows its age; and `ping` names the running build (`agliteterm
-  <version>`), which is what `agwintermctl version` reports as the app.
+  <version>`), which is what `agwintermctl version` reports as the app. `session type --stdin`
+  takes the text from standard input as bytes — how quotes, newlines, runs of spaces and a
+  leading `--` are sent, none of which survives the argv path (exactly one trailing newline is
+  dropped; invalid UTF-8 is refused before anything is sent). The flag lives in the shared
+  `agwintermctl`; lite's server side is unchanged. There is no `quick type`: the quick terminal
+  is a hidden session, typed into as `session type --target <its id>` (the id arrives as a
+  `session`/`created` event after `quick on`).
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's

@@ -6242,6 +6242,23 @@ A workspace that does not exist is refused, not silently swapped for the active 
 REFUSED rather than stripped, because a NUL truncates your command while its Return still fires.
 Pass `--allow-control` when you mean one (an escape sequence for a TUI, a lone ^C).
 
+`session type --stdin --target <id>` takes the text from standard input, as bytes. This is how
+text with quotes, newlines, runs of spaces or a leading `--` is sent: on the argv path a shell
+splits words (a run of spaces and a newline are gone before the CLI sees them), the option parser
+eats a `--word` and the word after it, and a quote has to survive two shells' quoting rules -
+every one of those losses is silent and the call still answers ok. Pipe a here-string
+(`@"..."@ | agwintermctl session type --stdin --target <id>`) or redirect a file. Exactly one
+trailing newline is dropped (the one the pipe adds), so end the text with TWO newlines to press
+Enter. Invalid UTF-8 is refused by the CLI with the byte offset and NOTHING is sent (exit 2).
+`--stdin` beside positional text is refused as ambiguous. `--allow-control` still applies, and
+lite's side is unchanged: the same decoder, the same control-byte refusal, whichever way the text
+came in.
+
+There is no `quick type` verb. The quick terminal is a hidden session: `quick on` answers `ok`,
+not an id; the id arrives as a `session` / `created` event (`events --since <cursor>`), the
+session is not in `tree`, and it is targeted by that id ONLY - `--target quick`, the name, is
+refused. So `session type --stdin --target <quick session id>` types into it.
+
 `session write` does NOT reach the shell. It injects bytes into the terminal's display, so it paints
 a pane without any program having printed anything — useful for a banner or a marker, and no use at
 all for sending keys.

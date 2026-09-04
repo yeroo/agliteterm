@@ -298,16 +298,25 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       silently "active" — the suite's setup asserts the select reply for that reason)
 
 ### Task 4: `--stdin` — prove the shared client against lite's decoder, and say so
-- [ ] `test/control-honesty.ps1`: pipe a here-string with a quote, a newline, two consecutive
+- [x] `test/control-honesty.ps1`: pipe a here-string with a quote, a newline, two consecutive
       spaces and a leading `--` into `session type --stdin` through the CLI (probe for `--stdin`;
       SKIP when the client predates it), then read it back with `session text` **byte for byte**;
       send the same text as positional argv and show what is lost. A lone `0x80` from a file:
       non-zero exit and the pane received nothing — that is CLI-side, but it is the only lite-side
       proof that nothing reaches the pane
-- [ ] docs: `kSkillMarkdown` `session type` prose (`:6156-6158`) and `README.md` — `--stdin` is how
+- [x] docs: `kSkillMarkdown` `session type` prose (`:6156-6158`) and `README.md` — `--stdin` is how
       text with quotes or newlines is sent; lite's server behaviour is unchanged. `quick type` is
       spelled `session type --target <quick session id>` here too
-- [ ] build + run — must pass before task 5
+- [x] build + run — must pass before task 5
+      (➕ the oracle is a `cmd /k` pane: cmd's `echo` prints its argument verbatim, so the echoed
+      row IS the bytes the shell received. Word-split argv is shown first: the newline and the run
+      of spaces are gone before the CLI sees them and the call still answers `ok`. A whole-text
+      "unchanged" compare was tried for the 0x80 case and dropped: a git-backed prompt paints
+      seconds late; a marker that never appears is the oracle instead. ➕ the quick terminal is
+      pinned too: `quick on` answers `ok`, the id arrives as a `session`/`created` event, the
+      session is hidden from `tree`, `--target quick` by name is refused, and
+      `session type --stdin --target <id>` reaches it. Dev CLI `-Strict`: all pass; released
+      0.17.x CLI: 3 more SKIPs, the `--stdin` probes)
 
 ### Task 5: #23 — a pane never collapses to 2 columns
 - [ ] `paneGridSize` (`:1374`): a non-viable rect — the window minimised (`IsIconic(g_hwnd)`), or
