@@ -114,6 +114,15 @@ static constexpr uint32_t kProtocolVersion = 2;
 static constexpr int kSidebarW = 180;
 static constexpr int kSplitterW = 5;   // draggable divider between the sidebar and the terminal
 static constexpr int kSidebarMinW = 90;   // the splitter will not shrink the left pane past this
+// The `sidebar width` API range is 90..900 (pixels): Min is what the splitter already refuses to
+// go under, Max is what the registry loader has always accepted, so the API allows exactly what
+// the two existing paths allow and nothing a hand-edited value could not already produce. Outside
+// it is REFUSED, not clamped (P2 contract: a clamp answers ok to a script that checks nothing else).
+// A width inside the range can still leave no room for a terminal in a narrow window, so a set is
+// also refused when the content region would drop under kMinContentCols cells of the live font —
+// the #23 trigger a setter would otherwise add (a pane at 2 columns).
+static constexpr int kSidebarMaxW = 900;
+static constexpr int kMinContentCols = 20;
 static int g_sidebarW = kSidebarW;     // current (resizable) sidebar width
 static bool g_showSidebar = true, g_showToolbar = true, g_showStatus = true;   // View menu toggles (persisted)
 static bool g_flagView = false;   // sidebar shows only flagged sessions (toolbar pennant / View menu)
@@ -929,6 +938,7 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 #define WM_APP_FOCUSTERM   (WM_APP + 7)   // "give the terminal keyboard focus back", posted (see OnNotify)
 #define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
+#define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
 struct NotifyMsg { std::wstring title, body; };
 static std::string g_pendingOverlayCmd; static int g_pendingOverlaySize;
 static HICON g_appIcon;         // big (taskbar / alt-tab)
@@ -2180,7 +2190,8 @@ static void loadColors() {   // Properties->Colors overrides (default fg/bg + on
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DefBg", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_defBg = v & 0xFFFFFF;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_dosPalette = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= TH_CLASSIC) g_themeMode = (int)v;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v >= 90 && v <= 900) g_sidebarW = v;
+    // The same range `sidebar width` accepts (kSidebarMinW..kSidebarMaxW): one number set, two readers.
+    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (int)v >= kSidebarMinW && (int)v <= kSidebarMaxW) g_sidebarW = v;
     // 0 = follow the shell. The range is clamped rather than trusted: this is a font height, and a
     // hand-edited 2000 would make the sidebar a single unreadable row.
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (v == 0 || (v >= 6 && v <= 24))) g_treeFontPt = (int)v;
@@ -5353,6 +5364,7 @@ public:
         MESSAGE_HANDLER(WM_APP_UPDATE, OnAppUpdate)
         MESSAGE_HANDLER(WM_APP_FOCUSTERM, OnFocusTerm)
         MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
+        MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -5666,6 +5678,16 @@ public:
         EnterCriticalSection(&g_lock); cmd = g_pendingOverlayCmd; sz = g_pendingOverlaySize; LeaveCriticalSection(&g_lock);
         if (wp == OVL_RESIZE) resizeOverlay(sz);
         else openOverlay(cmd, sz);
+        return 0;
+    }
+    // `sidebar width N` stored g_sidebarW on a control-pipe thread and posted this. The layout runs
+    // HERE because relayout() SENDS WM_SIZE — from a pipe thread that is a cross-thread SendMessage,
+    // which is never made while g_lock may be held (#20). Hidden: nothing to lay out, the width is
+    // what the next show uses; it is still persisted so it survives a restart. Same save path as
+    // the splitter drag and the View toggles.
+    LRESULT OnSidebarWidth(UINT, WPARAM, LPARAM, BOOL&) {
+        if (g_showSidebar) relayout();   // repositions the tree (OnSize) and syncPaneSizes()
+        saveColors();
         return 0;
     }
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
@@ -6378,7 +6400,11 @@ static std::string ctlDispatch(const std::string& line) {
                         ",\"exited\":" + (s->exited ? "true" : "false") +
                         // a spec that could not be relaunched on this machine: kept, not dropped
                         ",\"failed\":" + (s->failed ? "true" : "false") +
-                        ",\"unread\":" + std::to_string(s->unread) + "}";
+                        ",\"unread\":" + std::to_string(s->unread) +
+                        // Beyond the contract (extra fields are allowed): the grid the session was
+                        // last resized to. It is how a caller sees that `sidebar width` moved the
+                        // content region, and the oracle #23 needs (a pane that collapsed to 2).
+                        ",\"cols\":" + std::to_string(s->cols) + ",\"rows\":" + std::to_string(s->rows) + "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +
                    "\",\"active\":" + (w == g_activeWs ? "true" : "false") +
@@ -6901,9 +6927,69 @@ static std::string ctlDispatch(const std::string& line) {
         }
         return ctlOkStr("ok");
     }
-    if (cmd == "sidebar") {   // op on|off|toggle
+    if (cmd == "sidebar") {   // op show|hide|toggle|state|width (on/off = show/hide)
+        // P2 (agwinterm #226 mirror). This used to run every op through wantOn, which treats
+        // anything that is not `on`/`off` as "toggle": `sidebar width`, `sidebar state`, `sidebar
+        // show` and a typo all FLIPPED the sidebar and answered ok. Now an explicit table, and an
+        // op that is not in it is refused and changes nothing. The wordings are agwinterm's, minus
+        // the ops lite does not have (expand/collapse/mode). Absent op: the CLI sends `toggle`, and
+        // the raw-pipe "" is read the same way (JsonReq::get cannot tell absent from empty).
+        std::string op = req.get("args.op");
+        if (op.empty() || op == "on") op = op.empty() ? "toggle" : "show";
+        else if (op == "off") op = "hide";
+        auto sidebarJson = [&](bool withApplied) {   // {width, visible[, applied[, note]]}
+            std::string j = "{\"width\":" + std::to_string(g_sidebarW) +
+                            ",\"visible\":" + (g_showSidebar ? "true" : "false");
+            if (withApplied) {
+                j += std::string(",\"applied\":") + (g_showSidebar ? "true" : "false");
+                if (!g_showSidebar)
+                    j += ",\"note\":\"sidebar is hidden: width remembered, not applied; it takes effect on the next `sidebar show`\"";
+            }
+            return j + "}";
+        };
+        // `state` is not in the cross-product contract (agwinterm's is a string with a mode lite
+        // has no equivalent of); an object with the visibility AND the width is the honest shape
+        // here, the same one `width` answers so a reader has one parser.
+        if (op == "state") return ctlOk(sidebarJson(false));
+        if (op == "width") {
+            // The strict reader, the shape --size-percent has: absent -> a read; present and all
+            // digits in kSidebarMinW..kSidebarMaxW -> a set; anything else (0, -5, 901, 60.5, a
+            // string, a boolean) -> refused naming the value and the range. Presence comes from the
+            // field map, and a quoted "300" is indistinguishable from 300 to this parser (the CLI
+            // never sends a string; it refuses a non-number on its own side).
+            auto wf = req.fields.find("args.width");
+            if (wf == req.fields.end()) return ctlOk(sidebarJson(false));
+            const std::string& raw = wf->second;
+            bool digits = !raw.empty() && raw.size() <= 4;
+            for (char c : raw) if (c < '0' || c > '9') digits = false;
+            int want = digits ? atoi(raw.c_str()) : 0;
+            if (!digits || want < kSidebarMinW || want > kSidebarMaxW)
+                return ctlErr("sidebar width " + (raw.empty() ? std::string("\"\"") : raw) + " is not a whole number in " +
+                              std::to_string(kSidebarMinW) + ".." + std::to_string(kSidebarMaxW) +
+                              " (pixels); `sidebar width` with no value reads the current width, `sidebar hide` hides it. Nothing changed.");
+            // The second limit, against the LIVE client width: in range for the sidebar is not the
+            // same as leaving room for a terminal. Named separately from the range refusal above, so
+            // the caller knows whether to ask for less or to widen the window. Checked whether or
+            // not the sidebar is shown — a remembered width would hit the same wall on `show`.
+            // GetClientRect is a plain read, safe from this thread.
+            RECT c{}; GetClientRect(g_hwnd, &c);
+            int content = (int)c.right - (want + kSplitterW), minContent = kMinContentCols * g_cw;
+            if (content < minContent)
+                return ctlErr("sidebar width " + raw + " would leave " + std::to_string(content < 0 ? 0 : content) +
+                              " px for the terminal in a " + std::to_string(c.right) + " px window, under the " +
+                              std::to_string(kMinContentCols) + "-column minimum (" + std::to_string(minContent) +
+                              " px at this font); widen the window or ask for less. Nothing changed.");
+            // Store here (the same int write the splitter drag makes; the layout that consumes it
+            // is posted, never run from this thread), so the reply and the next read agree at once.
+            g_sidebarW = want;
+            PostMessageW(g_hwnd, WM_APP_SIDEBARW, 0, 0);
+            return ctlOk(sidebarJson(true));
+        }
+        if (op != "show" && op != "hide" && op != "toggle")
+            return ctlErr("sidebar: unknown op '" + op + "'. One of: show|hide|toggle|state|width (on/off = show/hide). Nothing changed.");
         bool cur = g_showSidebar;
-        if (wantOn(req.get("args.op"), cur) != cur) PostMessageW(g_hwnd, WM_COMMAND, IDM_TG_SIDEBAR, 0);
+        bool want = op == "show" ? true : op == "hide" ? false : !cur;
+        if (want != cur) PostMessageW(g_hwnd, WM_COMMAND, IDM_TG_SIDEBAR, 0);
         return ctlOkStr("ok");
     }
     // ---- window.* — each lite window is a process; the instance registry is the "library" ------

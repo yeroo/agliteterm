@@ -230,34 +230,41 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 - [x] build + run `test/control-honesty.ps1` — must pass before task 2
 
 ### Task 2: `sidebar` stops toggling on words it does not know, and gets `width`
-- [ ] replace `wantOn` for this verb with an explicit op table: `show`/`on`, `hide`/`off`,
+- [x] replace `wantOn` for this verb with an explicit op table: `show`/`on`, `hide`/`off`,
       `toggle`, `state`, `width`; anything else → `ctlErr` naming the ops, **and nothing changes**
       (today it toggles — pin that it no longer does with a before/after `window.state` read)
-- [ ] `sidebar state` → `ctlOk` JSON `{"visible":bool,"width":N}` (agwinterm's `sidebar state`
+- [x] `sidebar state` → `ctlOk` JSON `{"visible":bool,"width":N}` (agwinterm's `sidebar state`
       is a string with the width appended; lite has no mode, so an object is the honest shape —
       but check what the contract PR pins for `sidebar width`'s reply and use THAT shape for
       `width`; `state` is not in the contract)
-- [ ] `sidebar width` (no N) → the width in effect; `sidebar width N` → set. Reply carries `width`
+- [x] `sidebar width` (no N) → the width in effect; `sidebar width N` → set. Reply carries `width`
       (in effect) and `visible`; when hidden, the width is stored (it is what `show` will use),
       persisted, and the reply says `applied:false`
-- [ ] the range: reconcile the three lite numbers — `kSidebarMinW = 90` (`:116`), the registry
+- [x] the range: reconcile the three lite numbers — `kSidebarMinW = 90` (`:116`), the registry
       loader's 90..900 (`:2182`), the drag cap of 60 % of the client (`:5451`). Choose `Min = 90`,
       `Max = 900` as the API range (document why: it is what the splitter and the registry already
       allow), refuse outside it naming the range, **and additionally refuse a width that would
       leave the content region narrower than `kMinContentCols * g_cw`** (a new constant, say 20
       columns) against the LIVE client width — this is the #23 trigger a setter would otherwise add.
       Say in the comment that the refusal names which of the two limits was hit
-- [ ] the set runs on the UI thread: store the width, then POST the relayout (`WM_COMMAND` with a
+- [x] the set runs on the UI thread: store the width, then POST the relayout (`WM_COMMAND` with a
       new id, or `WM_APP_*`), which repositions the tree (`:5592`) and `syncPaneSizes()` (`:5596`);
       persist through the existing save path (`:2220`). The pipe thread never calls `relayout()`
-- [ ] `test/control-honesty.ps1`: set 300 → reply 300, `window.state`/`sidebar state` agree, and
+      (a new `WM_APP_SIDEBARW`, handled by `OnSidebarWidth`: relayout if shown, then `saveColors`)
+- [x] `test/control-honesty.ps1`: set 300 → reply 300, `window.state`/`sidebar state` agree, and
       **the content region moved** — the active session's `cols` (via `tree` or `surface cursor`
       geometry, or `emu_info` through `session text` width) shrank by ~120/g_cw; `89` and `901`
       refused and the width did not move; a width that would leave < 20 columns refused (shrink the
       sandbox window first with `window resize` if lite has it, else skip with a note); set while
       hidden → `applied:false`, then `sidebar show` → applied; `sidebar bogus` refused and the
       sidebar did not flip; `on`/`off` behave as `show`/`hide`. **Save and restore HKCU `SidebarW`**
-- [ ] build + run `test/control-honesty.ps1` — must pass before task 3
+      (➕ `tree` nodes now carry `cols`/`rows` — the oracle for "the content region moved", and the
+      one Task 5's #23 check will use; the divider itself is read from the SysTreeView32 child's
+      window rect. The narrow-window case shrinks the sandbox with `SetWindowPos` on its own hwnd
+      and proves the same 600 is accepted once the window is wide again. `ShowSidebar` is saved and
+      restored beside `SidebarW`, since every hide/show writes it)
+- [x] build + run `test/control-honesty.ps1` — must pass before task 3 (dev CLI `-Strict`: all
+      pass; released 0.17.x CLI: 3 SKIPs, the CLI-side probes; conformance with the dev CLI: green)
 
 ### Task 3: a bare `session new` lands in the caller's workspace; the pair is refused
 - [ ] read the top-level **`caller`** field (`req.get("caller")` — top level beside `target`, NOT

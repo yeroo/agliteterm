@@ -42,6 +42,11 @@ if (-not $exe) { "  SKIP  no build at $Exe"; exit ($Strict ? 1 : 0) }
 # flag instead and the server sees no size at all. The probe never needs a pipe either way.
 $probe = (& $ctl session overlay open x --size-percent sixty --pipe 'honesty-probe' --json 2>&1) -join ''
 $cliRefusesNonNumber = $probe -match 'whole number'
+# The same probe for `sidebar width N`: a post-#226 client refuses `sidebar width wide` on its own
+# side; the 0.17.x client has no width argument at all and sends `sidebar width 300` as a READ
+# (op=width, the number dropped), which would make a set look like a read that happened to pass.
+$probe = (& $ctl sidebar width wide --pipe 'honesty-probe' --json 2>&1) -join ''
+$cliHasSidebarWidth = $probe -match 'whole number'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -49,9 +54,11 @@ using System.Runtime.InteropServices;
 public static class LiteHonesty {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 }
 '@
 
@@ -105,6 +112,22 @@ function Send-Raw([string]$json) {
         $r = New-Object System.IO.StreamReader($c, $enc)
         return $r.ReadLine()
     } finally { $c.Dispose() }
+}
+
+# HKCU is NOT isolated by the sandbox (ui-lib's rules): the instance loads SidebarW/ShowSidebar
+# from the real profile and every set, hide and show below writes them back. Both are saved here
+# and put back in `finally`, whatever the checks did with them — and a value that was absent is
+# removed again, not written as a default.
+$regKey = 'HKCU:\Software\agliteterm'
+$regSaved = @{}
+foreach ($n in 'SidebarW', 'ShowSidebar') {
+    $regSaved[$n] = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue).$n } else { $null }
+}
+function Restore-Reg {
+    foreach ($n in 'SidebarW', 'ShowSidebar') {
+        if ($null -ne $regSaved[$n]) { New-ItemProperty -Path $regKey -Name $n -Value ([int]$regSaved[$n]) -PropertyType DWord -Force | Out-Null }
+        elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue }
+    }
 }
 
 try {
@@ -300,12 +323,201 @@ try {
     $gone = Wait-Overlay $false
     Check 'the default popup closed' ($gone -eq [IntPtr]::Zero)
 
+    # ---- sidebar ---------------------------------------------------------------------------------
+    # The world here is the native SysTreeView32 child (the sidebar) — its window rect IS the
+    # divider's position, and its visibility IS the toggle's state — plus the active session's grid
+    # from `tree`, which is what a narrower content region has to change. The reply is never the
+    # only witness.
+    "-- sidebar --"
+    function Sidebar([string[]]$rest) { Send-Ctl $s (@('sidebar') + $rest) }
+    function TreeHwnd { [LiteHonesty]::FindWindowExW($s.Hwnd, [IntPtr]::Zero, 'SysTreeView32', $null) }
+    function TreeWidth {
+        $r = New-Object LiteHonesty+RECT
+        [void][LiteHonesty]::GetWindowRect((TreeHwnd), [ref]$r)
+        return ($r.Right - $r.Left)
+    }
+    function TreeVisible { [LiteHonesty]::IsWindowVisible((TreeHwnd)) }
+    function StateVisible { [bool](ConvertFrom-Json (Send-Ctl $s @('window', 'state'))).result.sidebarVisible }
+    function ActiveCols { [int](Nodes | Where-Object { $_.active } | Select-Object -First 1).cols }
+    function Wait-TreeWidth([int]$want, [int]$ms = 3000) {
+        for ($i = 0; $i -lt ($ms / 100); $i++) { if ((TreeWidth) -eq $want) { return $want }; Start-Sleep -Milliseconds 100 }
+        return (TreeWidth)
+    }
+    function Wait-TreeVisible([bool]$want, [int]$ms = 3000) {
+        for ($i = 0; $i -lt ($ms / 100); $i++) { if ((TreeVisible) -eq $want) { return $want }; Start-Sleep -Milliseconds 100 }
+        return (TreeVisible)
+    }
+    # A set goes through the CLI when the client can express one. The 0.17.x client sends
+    # `sidebar width 300` as a READ (it has no width argument), which would turn every set below
+    # into a read that happens to pass; on that client the sets go through a raw line on lite's
+    # pipe, so the SERVER is still pinned, and one SKIP records that the CLI path was not.
+    function SidebarWidthSet([string]$n) {
+        if ($cliHasSidebarWidth) { return (Sidebar @('width', $n)) }
+        return (Send-Raw ('{"cmd":"sidebar","target":"","args":{"op":"width","width":' + $n + '}}'))
+    }
+    if (-not $cliHasSidebarWidth) { Skip 'sidebar width N through the CLI' 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read; the sets below use a raw pipe line - set AGWINTERMCTL to a newer build' }
+
+    Check 'the sandbox has a SysTreeView32 sidebar child' ((TreeHwnd) -ne [IntPtr]::Zero)
+    # Normalise: the sandbox loaded the REAL profile's SidebarW/ShowSidebar, which can be anything
+    # in range. Shown, at the default 180, so every delta below is a known number.
+    Sidebar @('show') | Out-Null
+    Check 'setup: the sidebar is shown' ((Wait-TreeVisible $true) -eq $true)
+    SidebarWidthSet '180' | Out-Null
+    Check 'setup: the sidebar is 180 px wide' ((Wait-TreeWidth 180) -eq 180) "tree width $(TreeWidth)"
+    Start-Sleep -Milliseconds 500
+
+    # --- reads: `width` and `state` are objects, and they agree with the window -----------------
+    $raw = Sidebar @('width')
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar width (no value) answers an object with width and visible' ([bool]$r.ok -and $r.result -is [pscustomobject] -and $r.result.width -is [long] -and $r.result.visible -is [bool]) "raw: $raw"
+    Check 'and no applied field on a read' ($null -eq $r.result.PSObject.Properties['applied']) "raw: $raw"
+    Check 'and the width is the tree child''s actual width' ([int]$r.result.width -eq (TreeWidth)) "reply $($r.result.width), tree $(TreeWidth)"
+    $raw = Sidebar @('state')
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar state answers {visible, width}' ([bool]$r.ok -and $r.result.visible -eq $true -and [int]$r.result.width -eq 180) "raw: $raw"
+    Check 'and agrees with window.state sidebarVisible' ((StateVisible) -eq $true)
+    Check 'and `sidebar state` did not flip the sidebar (it used to toggle)' ((TreeVisible) -and (StateVisible))
+
+    # --- set 300: the reply, the divider, and the content region all moved -----------------------
+    $mainClient = ClientSize $s.Hwnd
+    $cols0 = ActiveCols
+    Check 'the active session reports its cols in `tree`' ($cols0 -gt 20) "cols $cols0"
+    # The cell width is not published; derive it from the content region the session already has.
+    $cw = [math]::Round(($mainClient[0] - 180 - 5) / [double]$cols0)
+    $raw = SidebarWidthSet '300'
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar width 300 answers width 300, visible, applied' ([bool]$r.ok -and [int]$r.result.width -eq 300 -and $r.result.visible -eq $true -and $r.result.applied -eq $true) "raw: $raw"
+    Check 'and the tree child is 300 px wide' ((Wait-TreeWidth 300) -eq 300) "tree width $(TreeWidth)"
+    Start-Sleep -Milliseconds 700
+    $r2 = (ConvertFrom-Json (Sidebar @('state'))).result
+    Check 'and sidebar state / window.state agree' ([int]$r2.width -eq 300 -and $r2.visible -eq $true -and (StateVisible)) "state: $($r2 | ConvertTo-Json -Compress)"
+    $cols1 = ActiveCols
+    $wantCols = [math]::Floor(($mainClient[0] - 300 - 5) / $cw)
+    Check "and the content region moved: the active session's cols shrank by ~120/cw" ($cols1 -lt $cols0 -and [math]::Abs($cols1 - $wantCols) -le 1) "cols $cols0 -> $cols1, cell ~$cw px, want ~$wantCols"
+    Check 'and HKCU SidebarW was persisted' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 300)
+
+    # --- out of range is refused naming the range, and the divider did not move -----------------
+    foreach ($bad in '89', '901', '0') {
+        $raw = SidebarWidthSet $bad
+        $r = ConvertFrom-Json $raw
+        Check "sidebar width $bad is refused naming the value and 90..900" (-not $r.ok -and [string]$r.error -match "width $bad " -and [string]$r.error -match '90\.\.900' -and [string]$r.error -match 'Nothing changed') "raw: $raw"
+    }
+    Start-Sleep -Milliseconds 700
+    Check 'and the tree child is still 300 px' ((TreeWidth) -eq 300) "tree width $(TreeWidth)"
+    Check 'and `sidebar width` still reads 300' ([int](ConvertFrom-Json (Sidebar @('width'))).result.width -eq 300)
+
+    # --- the second limit: a width that leaves no terminal is refused against the LIVE window ----
+    # 600 is inside the range. In a 700-px window it leaves ~80 px for the terminal (under twenty
+    # cells of any font); in the 1100-px sandbox it leaves ~480 and is accepted — the same number,
+    # two answers, because the limit is the live client width and not a constant.
+    [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, 150, 100, 700, 700, 0x0004)
+    Start-Sleep -Milliseconds 1200
+    $narrow = ClientSize $s.Hwnd
+    Check 'setup: the window is ~700 px wide' ($narrow[0] -lt 720 -and $narrow[0] -gt 600) "client $($narrow -join 'x')"
+    $raw = SidebarWidthSet '600'
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar width 600 in a 700-px window is refused for the content minimum' (-not $r.ok -and [string]$r.error -match '600' -and [string]$r.error -match '20-column' -and [string]$r.error -match 'Nothing changed') "raw: $raw"
+    Check 'and the refusal names the window width, so the caller knows which limit hit' ([string]$r.error -match "$($narrow[0]) px window") "error: $($r.error)"
+    Start-Sleep -Milliseconds 700
+    Check 'and the tree child is still 300 px' ((TreeWidth) -eq 300) "tree width $(TreeWidth)"
+    [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, 150, 100, 1100, 700, 0x0004)
+    Start-Sleep -Milliseconds 1200
+    $raw = SidebarWidthSet '600'
+    $r = ConvertFrom-Json $raw
+    Check 'the same 600 in the 1100-px window is accepted' ([bool]$r.ok -and [int]$r.result.width -eq 600) "raw: $raw"
+    Check 'and applied' ((Wait-TreeWidth 600) -eq 600) "tree width $(TreeWidth)"
+    SidebarWidthSet '300' | Out-Null
+    Check 'setup: back at 300' ((Wait-TreeWidth 300) -eq 300)
+
+    # --- set while hidden: remembered and persisted, reported as not applied --------------------
+    $raw = Sidebar @('hide')
+    Check 'sidebar hide answers ok' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    Check 'and the tree child is hidden' ((Wait-TreeVisible $false) -eq $false)
+    Check 'and window.state says so' (-not (StateVisible))
+    $raw = SidebarWidthSet '250'
+    $r = ConvertFrom-Json $raw
+    Check 'sidebar width 250 while hidden answers width 250, visible:false, applied:false' ([bool]$r.ok -and [int]$r.result.width -eq 250 -and $r.result.visible -eq $false -and $r.result.applied -eq $false) "raw: $raw"
+    Check 'and says the width is remembered, not applied' ([string]$r.result.note -match 'remembered, not applied' -and [string]$r.result.note -match 'sidebar show') "note: $($r.result.note)"
+    Start-Sleep -Milliseconds 700
+    Check 'and the sidebar stayed hidden' (-not (TreeVisible) -and -not (StateVisible))
+    Check 'and HKCU SidebarW was persisted while hidden' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 250)
+    $r2 = (ConvertFrom-Json (Sidebar @('state'))).result
+    Check 'and sidebar state carries the remembered width beside visible:false' ([int]$r2.width -eq 250 -and $r2.visible -eq $false) "state: $($r2 | ConvertTo-Json -Compress)"
+    Sidebar @('show') | Out-Null
+    Check 'sidebar show brings it back' ((Wait-TreeVisible $true) -eq $true)
+    Check 'at the remembered 250 px' ((Wait-TreeWidth 250) -eq 250) "tree width $(TreeWidth)"
+
+    # --- an unknown op is refused and flips nothing; it used to toggle ---------------------------
+    foreach ($op in 'bogus', 'sideways', 'width=300') {
+        $before = StateVisible
+        $raw = Sidebar @($op)
+        $r = ConvertFrom-Json $raw
+        Check "sidebar $op is refused naming the ops" (-not $r.ok -and [string]$r.error -match [regex]::Escape($op) -and [string]$r.error -match 'show\|hide\|toggle\|state\|width' -and [string]$r.error -match 'Nothing changed') "raw: $raw"
+        Start-Sleep -Milliseconds 700
+        Check "and the sidebar did not flip (visible before: $before)" ((StateVisible) -eq $before -and (TreeVisible) -eq $before)
+    }
+    Check 'and the width did not move either' ((TreeWidth) -eq 250)
+    # The specific old bug: `show` on a shown sidebar toggled it off.
+    Sidebar @('show') | Out-Null
+    Start-Sleep -Milliseconds 700
+    Check 'sidebar show on a shown sidebar leaves it shown' ((TreeVisible) -and (StateVisible))
+
+    # --- on/off are show/hide; toggle toggles ---------------------------------------------------
+    $raw = Sidebar @('off')
+    Check 'sidebar off hides' ([bool](ConvertFrom-Json $raw).ok -and (Wait-TreeVisible $false) -eq $false) "raw: $raw"
+    Sidebar @('off') | Out-Null
+    Start-Sleep -Milliseconds 700
+    Check 'sidebar off again stays hidden (an alias of hide, not a toggle)' (-not (TreeVisible))
+    $raw = Sidebar @('on')
+    Check 'sidebar on shows' ([bool](ConvertFrom-Json $raw).ok -and (Wait-TreeVisible $true) -eq $true) "raw: $raw"
+    Sidebar @('on') | Out-Null
+    Start-Sleep -Milliseconds 700
+    Check 'sidebar on again stays shown' ((TreeVisible))
+    Sidebar @('toggle') | Out-Null
+    Check 'sidebar toggle hides' ((Wait-TreeVisible $false) -eq $false)
+    Sidebar @('toggle') | Out-Null
+    Check 'sidebar toggle shows' ((Wait-TreeVisible $true) -eq $true)
+    Check 'and the width survived the toggles' ((TreeWidth) -eq 250) "tree width $(TreeWidth)"
+
+    # --- the client's half, and the server's decoder ------------------------------------------
+    if ($cliHasSidebarWidth) {
+        foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
+        $out = (& $ctl sidebar width wide --pipe $s.Pipe --json 2>&1) -join ''
+        $code = $LASTEXITCODE
+        Check 'sidebar width wide is refused by the client, non-zero exit' ($code -ne 0 -and $out -match 'whole number') "exit $code, output: $out"
+        Start-Sleep -Milliseconds 500
+        Check 'and the width did not move' ((TreeWidth) -eq 250)
+    } else {
+        Skip 'sidebar width wide is refused by the client' 'this agwintermctl predates agwinterm #226 - set AGWINTERMCTL to a newer build'
+    }
+    function RawSidebarWidth([string]$json) { Send-Raw ('{"cmd":"sidebar","target":"","args":{"op":"width","width":' + $json + '}}') }
+    foreach ($case in @(@('"wide"', 'a JSON string'), @('300.5', 'a float'), @('true', 'a boolean'), @('""', 'an empty string'), @('-5', 'a negative number'))) {
+        $raw = RawSidebarWidth $case[0]
+        $r = ConvertFrom-Json $raw
+        Check "raw width $($case[1]) ($($case[0])) is refused by lite's decoder" (-not $r.ok -and [string]$r.error -match '90\.\.900') "raw: $raw"
+    }
+    Start-Sleep -Milliseconds 700
+    Check 'and none of them moved the divider' ((TreeWidth) -eq 250)
+    # Documented, not desired (the same reader as --size-percent): a QUOTED "300" is accepted.
+    $raw = RawSidebarWidth '"300"'
+    $r = ConvertFrom-Json $raw
+    Check 'raw width as the quoted string "300" is accepted (documented: the decoder cannot see the JSON kind)' ([bool]$r.ok -and [int]$r.result.width -eq 300) "raw: $raw"
+    Check 'and applied' ((Wait-TreeWidth 300) -eq 300)
+    # A raw request with no op at all: the CLI always sends one, but the pipe is public. Toggle,
+    # which is what the CLI sends for a bare `sidebar` — pinned so the "" case is a written fact.
+    $raw = Send-Raw '{"cmd":"sidebar","target":"","args":{}}'
+    Check 'a raw sidebar request with no op toggles (what the CLI sends for a bare `sidebar`)' ([bool](ConvertFrom-Json $raw).ok -and (Wait-TreeVisible $false) -eq $false) "raw: $raw"
+    Sidebar @('show') | Out-Null
+    Wait-TreeVisible $true | Out-Null
+
     # No refusal above may have created a session: hidden sessions never show in `tree`, and the
     # visible count is what it was at the start.
     Check 'the tree still has exactly the sandbox first session' (@(Nodes).Count -eq 1) "nodes: $(@(Nodes).Count)"
 }
 finally {
     if ($s) { Stop-Sandbox $s }
+    # After the sandbox exits: its own shutdown save (if any) must not land after the restore.
+    Restore-Reg
 }
 
 if ($fail) { "control-honesty: $fail failed"; exit 1 }
