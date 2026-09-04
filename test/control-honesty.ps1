@@ -191,7 +191,8 @@ try {
     $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
     $raw = Overlay @('open', 'cmd', '/k', "echo $ovMarker", '--size-percent', '40')
     $r = ConvertFrom-Json $raw
-    Check 'open --size-percent 40 answers ok with a status string' ([bool]$r.ok -and $r.result -is [string]) "raw: $raw"
+    Check 'open --size-percent 40 answers ok with a status string naming the percentage in effect' `
+        ([bool]$r.ok -and $r.result -is [string] -and [string]$r.result -match '^overlay opened at \d+%$') "raw: $raw"
     $h40 = Wait-Overlay $true
     Check 'and a popup titled "agliteterm - overlay" appeared' ($h40 -ne [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
@@ -225,6 +226,25 @@ try {
         $now = OverlayHwnd
         Check "and the open popup is the same one, untouched" ($now -eq $h40 -and ((ClientSize $now) -join 'x') -eq ($size40 -join 'x')) "was $h40 $($size40 -join 'x'), now $now $((ClientSize $now) -join 'x')"
     }
+    # A percentage under the 30x8-cell popup minimum: the popup cannot be that small, so the
+    # minimum decides the size and the REPLY SAYS WHICH percentage is in effect. It used to echo
+    # the number asked for while opening something several times bigger — the deleted clamp wearing
+    # a different hat (revmux r1). Not a refusal: the shared contract runs `--size-percent 40` and
+    # expects ok, and on a small window 40 is itself under the minimum; refusing would make lite
+    # answer ok:false where agwinterm (a cover with no window frame) answers ok.
+    $rawTiny = Overlay @('resize', '--size-percent', '1')
+    $rTiny = ConvertFrom-Json $rawTiny
+    Check '--size-percent 1 is accepted (a popup that small cannot exist; the minimum decides)' ([bool]$rTiny.ok) "raw: $rawTiny"
+    Check 'and the reply reports the percentage IN EFFECT, not the 1 that was asked for' `
+        ([string]$rTiny.result -match '^resized (\d+)%$' -and [int]$Matches[1] -gt 1) "result: $($rTiny.result)"
+    $effPct = [int]$Matches[1]
+    Start-Sleep -Milliseconds 900
+    $gotMin = (ClientSize (OverlayHwnd))[0]
+    $wantMin = [int]($mainClient[0] * $effPct / 100)
+    Check 'and the popup really is the size the reply named' ([math]::Abs($gotMin - $wantMin) -le ([math]::Max($tol, 12))) "reported $effPct% (~$wantMin px), got $gotMin px"
+    $raw = Overlay @('resize', '--size-percent', '40')   # back to the size the rest of the block assumes
+    Wait-ClientWidth $h40 $size40[0] $tol | Out-Null
+
     if ($cliRefusesNonNumber) {
         # The client's half: a non-number never reaches the pipe. Run directly (not through Send-Ctl)
         # because the exit code and stderr ARE the check.
@@ -1025,8 +1045,26 @@ try {
     $small = @(Nodes | Where-Object { [int]$_.cols -lt 20 })
     Check 'no session in the tree collapsed while minimised (every cols >= 20)' ($small.Count -eq 0) ('collapsed: ' + (($small | ForEach-Object { "$($_.id)=$($_.cols)" }) -join ' '))
     Check 'the selected session keeps the grid the window gave it before the minimise' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
+    # `sidebar width N` while minimised: a 0x0 client makes the live-width limit refuse EVERY value
+    # in range, with advice ("widen the window") that no control verb can follow. It is remembered
+    # instead, reported as not applied, and the first layout after the restore puts it in effect —
+    # the same "do not act now" paneGridSize answers for a non-viable rect (revmux r1).
+    $wBefore = [int](ConvertFrom-Json (Sidebar @('width'))).result.width
+    $rawMinW = SidebarWidthSet '250'
+    $rMinW = ConvertFrom-Json $rawMinW
+    Check 'sidebar width 250 while minimised is accepted, not refused' ([bool]$rMinW.ok) "raw: $rawMinW"
+    Check 'and it reports the width remembered but not applied' `
+        ([int]$rMinW.result.width -eq 250 -and $rMinW.result.applied -eq $false -and [string]$rMinW.result.note -match 'minimis') "result: $($rMinW.result | ConvertTo-Json -Compress)"
     [void][LiteUi]::ShowWindow($s.Hwnd, 9)    # SW_RESTORE
     Check 'setup: the sandbox is restored' ((Wait-Minimized $false) -eq $false)
+    Start-Sleep -Milliseconds 800
+    $rAfter = ConvertFrom-Json (Sidebar @('width'))
+    Check 'and after the restore the remembered width is the one in effect' ([int]$rAfter.result.width -eq 250) "result: $($rAfter.result | ConvertTo-Json -Compress)"
+    # Hand the sidebar back: every cols check below compares against $c0, measured with the width
+    # this block found, and a narrower sidebar is a wider terminal.
+    SidebarWidthSet "$wBefore" | Out-Null
+    Wait-TreeWidth $wBefore | Out-Null
+    Start-Sleep -Milliseconds 400
     Start-Sleep -Milliseconds 1000
     Check 'after restore the shown pane has the same grid as before: same geometry, same cols' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
     # The session split while minimised: showing it lays both its panes out from the rect the

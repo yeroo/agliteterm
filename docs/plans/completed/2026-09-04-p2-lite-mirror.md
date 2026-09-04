@@ -482,6 +482,50 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       found the empty overlay first, then passed on the fix); case 3's automated form passed and its
       Notepad-and-eyes form is a SKIP — it needs a person with hands off the keyboard
 
+**What revmux round 1 found** (`.revmux/tasks/p2-lite/01-initial`, **four Majors** and eight Minors,
+every one of them in this batch's own new code — all fixed in the next commit).
+
+- ⚠️ **Major — `hostResize` held `g_lock` across an unbounded pty-host round trip.** `request()` is a
+  synchronous read on a non-overlapped pipe with no timeout, and a child that stops draining its
+  input makes the host's input pump block holding that session's pty mutex, so every Resize for it
+  queues behind. With `g_lock` held, that stall freezes `paintPane`, every reader thread, `tree` and
+  the status bar — the whole window, unrecoverably. There is no lock-order inversion (the reader
+  thread never touches `g_reqLock`), which is what the commit's comment argued; the unbounded wait
+  is what it missed. Now: a new **`g_resizeLock`** serialises the resize, `g_lock` is taken only for
+  the latch and for `emu_resize`, and **the UI thread try-locks** and leaves a busy resize to the
+  next layout rather than blocking the message loop. The 80-session stress re-run green.
+- ⚠️ **Major — the 30x8-cell popup floor silently enlarged a valid low `--size-percent`** while the
+  reply echoed the number asked for; below about 23 % of a normal window every value landed on the
+  floor. First fixed by refusing under the minimum — **which broke the shared contract**: its
+  `session overlay open --size-percent 40` step expects `ok`, and on a small window 40 % is itself
+  under the floor, so lite would have refused a call agwinterm honours (its overlay is a cover
+  inside the content region, no window frame, no floor). The shipped answer is the review's other
+  option: raise to the minimum and **report the percentage in effect** — `overlay opened at N%`,
+  `resized N%` — the same shape `sidebar width` already uses. Skill and README say so.
+- ⚠️ **Major — a popup shown without activation still claimed `g_focusOverride`.** `SW_SHOWNA` (the
+  #24 fix) means no `WM_SETFOCUS`, and the override is cleared only by the popup's `WM_KILLFOCUS`,
+  which cannot fire for a window that never had focus. So after a background `quick on`, every
+  keystroke the user typed into the MAIN window went to the hidden quick session, silently. Now
+  `showPopupRaised` returns whether it activated, only an activated popup claims input, and a hide
+  drops the override.
+- ⚠️ **Major — `newSessionGrid` walked `g_sessions` from control-pipe threads with no lock**, reached
+  exactly when the window is not viable, which is the state the new stress drives. `LockG hold`, as
+  its two neighbours already do.
+- The sidebar **preference** was overwritten by a transient fit: narrow the window, then hide the
+  sidebar (a toggle calls `saveColors`), and a 900 px preference was gone for good. `g_sidebarWPref`
+  is now what the drag, `sidebar width` and the registry write, and what gets persisted;
+  `fitSidebarToClient` derives the effective width from it every layout, so a widen restores it.
+- Overlay `open` and `resize` shared one pending payload, so a queued open ran at a later resize's
+  size; the payload travels with the posted message now (a heap `OverlayReq`, freed by the handler).
+- `sidebar width N` was refused while minimised with advice no verb can follow ("widen the window");
+  it is remembered, reported `applied:false` with a note, and applied at the first layout after the
+  restore — the same "do not act now" `paneGridSize` answers.
+- `--size-percent 100` put the popup partly off screen (the fixed +80/+60 offset plus a full-client
+  size); popups are **centred** over the main window and clamped to the monitor work area, on create
+  and on resize, which also makes `qa/control-honesty.md`'s "centred over the main window" true.
+- Two comments corrected: the `raiseIfAllowed` doc block sat on `foregroundIsOurs`, and
+  `openOverlay`'s justified a keyboard path that does not exist (the dead empty-command arm went).
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's
