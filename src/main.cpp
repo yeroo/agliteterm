@@ -923,7 +923,8 @@ static int tbImageOf(int cmdId) {
 }
 #define WM_APP_REFRESHTREE (WM_APP + 3)   // posted from worker threads to rebuild the tree on the UI thread
 #define WM_APP_TRAY        (WM_APP + 4)   // system-tray icon notifications
-#define WM_APP_OVERLAY     (WM_APP + 5)   // control thread -> UI thread: open an overlay (creates a window)
+#define WM_APP_OVERLAY     (WM_APP + 5)   // control thread -> UI thread: open (wParam OVL_OPEN, creates a window) or resize (OVL_RESIZE) the overlay
+enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 #define WM_APP_UPDATE      (WM_APP + 6)   // self-update worker -> UI thread (balloon / message / apply)
 #define WM_APP_FOCUSTERM   (WM_APP + 7)   // "give the terminal keyboard focus back", posted (see OnNotify)
 #define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
@@ -5010,16 +5011,33 @@ static void ensurePopupClass() {
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_IBEAM); wc.hIcon = g_appIcon;
     RegisterClassW(&wc); reg = true;
 }
-// A popup terminal window sized wf x hf fractions of the main window, owned by it (floats above, hides
-// when it minimizes, never behind it).
-static HWND createPopupWindow(const wchar_t* title, double wf, double hf) {
+static constexpr DWORD kPopupStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+// A popup terminal window of W x H OUTER pixels, owned by the main window (floats above, hides when
+// it minimizes, never behind it). Floored at a 30x8-cell terminal: anything smaller cannot host a
+// prompt, and this floor is a physical minimum rather than a policy clamp (see openOverlay).
+static HWND createPopupWindowPx(const wchar_t* title, int W, int H) {
     ensurePopupClass();
     RECT mw; GetWindowRect(g_hwnd, &mw);
-    int W = max(30 * g_cw, (int)((mw.right - mw.left) * wf)), H = max(8 * g_ch, (int)((mw.bottom - mw.top) * hf));
-    HWND h = CreateWindowExW(0, L"AgwintermLitePopup", title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    W = max(30 * g_cw, W); H = max(8 * g_ch, H);
+    HWND h = CreateWindowExW(0, L"AgwintermLitePopup", title, kPopupStyle,
                              mw.left + 80, mw.top + 60, W, H, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     darkTitleBar(h, g_th.dark);   // popup terminals follow the theme's title bar
     return h;
+}
+// A popup terminal window sized wf x hf fractions of the main WINDOW rect (quick / scratch).
+static HWND createPopupWindow(const wchar_t* title, double wf, double hf) {
+    RECT mw; GetWindowRect(g_hwnd, &mw);
+    return createPopupWindowPx(title, (int)((mw.right - mw.left) * wf), (int)((mw.bottom - mw.top) * hf));
+}
+// The overlay's OUTER size for a fraction f of the main window's CLIENT area: the contract says
+// "--size-percent N is that fraction of the content area", so the popup's client rect is what
+// carries N, and the frame is added on top of it (the check in test/control-honesty.ps1 measures
+// the popup's client rect against the main window's).
+static void overlayOuterSize(double f, int& W, int& H) {
+    RECT mc; GetClientRect(g_hwnd, &mc);
+    RECT r{ 0, 0, (LONG)(mc.right * f), (LONG)(mc.bottom * f) };
+    AdjustWindowRectEx(&r, kPopupStyle, FALSE, 0);
+    W = r.right - r.left; H = r.bottom - r.top;
 }
 // Toggle a quick (scratch=false) or scratch (scratch=true) popup terminal: show/hide, creating its
 // window + dedicated hidden session on first use.
@@ -5046,11 +5064,21 @@ static void togglePopupTerminal(bool scratch) {
     InvalidateRect(hw, nullptr, FALSE);
 }
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
-// time; opening a new overlay replaces the previous. An empty command opens a plain shell.
+// time; opening a new overlay replaces the previous.
+//
+// sizePct is 0 (the flag was absent) or a validated 1..100 — the verb refused anything else before
+// this ran, so there is NO clamp here: 100 means the whole client area, and a clamp could only hide
+// a bug upstream. 0 gives lite's DEFAULT, a popup 70 % of the main window's client area. That
+// default is lite's own and differs from agwinterm's (a cover over the full content region): the
+// shared contract pins the reply shape and the refusals, not the default geometry, and the skill
+// says which default each product has. The verb never passes an empty command any more (it is
+// refused); the nullptr arm stays for the keyboard path.
+static const double kOverlayDefaultFraction = 0.7;
+static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct) {
     if (g_overlayHwnd) DestroyWindow(g_overlayHwnd);   // one at a time; WM_DESTROY kills the old session + clears state
-    double f = sizePct > 0 ? min(0.95, sizePct / 100.0) : 0.7;
-    g_overlayHwnd = createPopupWindow(L"agliteterm — overlay", f, f);
+    int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
+    g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     g_overlaySession = newSession(max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)),
                                   command.empty() ? nullptr : command.c_str());
@@ -5059,6 +5087,15 @@ static void openOverlay(const std::string& command, int sizePct) {
     SetForegroundWindow(g_overlayHwnd);
     g_focusOverride = g_overlaySession;
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);
+}
+// `session overlay resize`: the popup that is open takes the new fraction; WM_SIZE in popupProc
+// re-grids its session. UI thread only (SetWindowPos on a window this thread owns) — the verb posts
+// here. The pipe thread checked g_overlayHwnd before posting, but the user can close the popup by
+// hand between the check and this running, so "nothing open" is a silent no-op here and not a bug.
+static void resizeOverlay(int sizePct) {
+    if (!g_overlayHwnd) return;
+    int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
+    SetWindowPos(g_overlayHwnd, nullptr, 0, 0, max(30 * g_cw, W), max(8 * g_ch, H), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // ---- sidebar drag & drop ----------------------------------------------------------------------
@@ -5624,10 +5661,11 @@ public:
         else if (LOWORD(lp) == WM_LBUTTONDBLCLK) showMainWindow();
         return 0;
     }
-    LRESULT OnOverlay(UINT, WPARAM, LPARAM, BOOL&) {   // marshaled from the control thread
+    LRESULT OnOverlay(UINT, WPARAM wp, LPARAM, BOOL&) {   // marshaled from the control thread
         std::string cmd; int sz;
         EnterCriticalSection(&g_lock); cmd = g_pendingOverlayCmd; sz = g_pendingOverlaySize; LeaveCriticalSection(&g_lock);
-        openOverlay(cmd, sz);
+        if (wp == OVL_RESIZE) resizeOverlay(sz);
+        else openOverlay(cmd, sz);
         return 0;
     }
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
@@ -6555,13 +6593,70 @@ static std::string ctlDispatch(const std::string& line) {
             }
         return ctlOkStr("closed");
     }
-    if (cmd == "session.overlay") {   // run a command in an overlay popup over the active session
+    if (cmd == "session.overlay") {   // run a command in an overlay popup over the main window
+        // P2-lite. Every branch that does not do what was asked answers ctlErr, and a refusal
+        // leaves the world untouched: before this, `--size-percent` was read from the wrong key
+        // (`size`, which the CLI never sends) so every N was ignored; an unknown action fell
+        // through to open; open with no command opened a plain shell; the target was never read;
+        // close with nothing open said "closed". The wordings are agwinterm's — the unit suites
+        // there assert them, and one API gives one answer.
         std::string action = req.get("args.action");
-        if (action == "close") { if (g_overlayHwnd) PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0); return ctlOkStr("closed"); }
+        if (action.empty()) action = "open";
+        if (action != "open" && action != "close" && action != "resize")
+            return ctlErr("overlay action '" + action + "' is not one of open, close, resize; nothing done");
+        // --size-percent: validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
+        // client area; openOverlay says why that differs from agwinterm's full region). Present ->
+        // all digits in 1..100, else refused naming the value, the range and the way to get the
+        // default. JsonReq::get answers "" for absent AND empty, so presence is read from the map.
+        // The parser keeps a number as its raw text and a string as its content, so a quoted "60"
+        // arrives as 60 and is accepted — lite cannot see the JSON kind; the CLI never sends a
+        // string (it refuses a non-number client-side, agwinterm Program.cs), and anything that is
+        // not all digits ("sixty", 60.5, -5, true) is refused here.
+        int sizePct = 0;
+        auto sp = req.fields.find("args.size-percent");
+        if (sp != req.fields.end()) {
+            const std::string& raw = sp->second;
+            bool digits = !raw.empty() && raw.size() <= 3;
+            for (char c : raw) if (c < '0' || c > '9') digits = false;
+            int n = digits ? atoi(raw.c_str()) : 0;
+            if (!digits || n < 1 || n > 100)
+                return ctlErr("size-percent " + (raw.empty() ? std::string("\"\"") : raw) +
+                              " is not a whole number in 1..100; omit --size-percent to use the default popup size");
+            sizePct = n;
+        }
         std::string command = req.get("args.command");
-        int sizePct = atoi(req.get("args.size").c_str());
+        // The command is checked BEFORE the target (agwinterm's order; its fake host asserts it).
+        if (action == "open" && command.empty()) return ctlErr("overlay open needs a command; nothing opened");
+        // A NAMED target (not empty, not `active`) that resolves to no session is refused for all
+        // three actions with one wording: the overlay the caller meant may still be up, and ok
+        // would say it is gone. lite's overlay is a window-level popup, not per-session, so a
+        // target that DOES resolve is accepted whichever session it names — the popup covers the
+        // main window either way. Empty / `active` stays accepted even with no active session, so
+        // a bare close in an empty window is not contract-dependent on a session existing.
+        const std::string& tgt = req.get("target");
+        if (!tgt.empty() && tgt != "active" && !target)
+            return ctlErr(targetWhy.empty() ? "no session matches that target; nothing opened, resized or closed" : targetWhy);
+        // g_overlayHwnd is written on the UI thread; this read is the same one close always made.
+        // The user can close the popup by hand between this read and the posted message running —
+        // resizeOverlay then does nothing, and the caller's next `resize` is refused truthfully.
+        bool open = g_overlayHwnd != nullptr;
+        if (action == "close") {
+            if (!open) return ctlOkStr("no overlay");   // idempotent: "no overlay open" is true afterwards
+            PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
+            return ctlOkStr("closed");
+        }
+        if (action == "resize") {
+            if (!open) return ctlErr("no overlay to resize on that target; open one first");
+            EnterCriticalSection(&g_lock); g_pendingOverlaySize = sizePct; LeaveCriticalSection(&g_lock);
+            PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_RESIZE, 0);   // SetWindowPos on the UI thread, never from here
+            // The N in effect: the one asked for, or the default when the flag was omitted.
+            return ctlOkStr("resized " + std::to_string(sizePct > 0 ? sizePct : (int)(kOverlayDefaultFraction * 100)) + "%");
+        }
         EnterCriticalSection(&g_lock); g_pendingOverlayCmd = command; g_pendingOverlaySize = sizePct; LeaveCriticalSection(&g_lock);
-        PostMessageW(g_hwnd, WM_APP_OVERLAY, 0, 0);   // create on the UI thread
+        PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, 0);   // create on the UI thread
+        // A status word, not the overlay's session id: the session does not exist yet when this
+        // reply is written (it is created by the posted message). Known gap, written down in the
+        // plan; the contract pins only that the reply is a string.
         return ctlOkStr("overlay opened");
     }
     // ---- agwintermctl-dialect verbs over the features lite has -------------------------------

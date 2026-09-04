@@ -199,35 +199,35 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
 ## Implementation Steps
 
 ### Task 1: `session.overlay` — the right argument, validated, and honest about failure
-- [ ] read **`args.size-percent`** (keep `args.size` as a silent alias for one release? No — nothing
+- [x] read **`args.size-percent`** (keep `args.size` as a silent alias for one release? No — nothing
       ever sent it except lite's own tests, if any; grep and drop it)
-- [ ] a strict reader: **absent** → lite's default popup (70 %, unchanged — say in the comment that
+- [x] a strict reader: **absent** → lite's default popup (70 %, unchanged — say in the comment that
       this is lite's default and differs from agwinterm's full-region, and that the contract pins
       shape only); **present and all digits in 1..100** → that fraction of the main window's client
       area; **anything else** → `ctlErr` naming the value and the range and that omitting the flag
       gives the default. `JsonReq::get` cannot tell absent from empty, so use `req.fields.count(…)`
-- [ ] delete the `min(0.95, …)` clamp in `openOverlay` (`:5050`) — with validation upstream a clamp
+- [x] delete the `min(0.95, …)` clamp in `openOverlay` (`:5050`) — with validation upstream a clamp
       can only hide a bug; 100 means the whole client area
-- [ ] **resolve the target** (`resolveTarget`) before anything else: a **named** target (non-empty,
+- [x] **resolve the target** (`resolveTarget`) before anything else: a **named** target (non-empty,
       not `active`) that resolves to nothing → `ctlErr("no session matches that target; nothing
       opened, resized or closed")` for open, resize and close alike. lite's overlay is a window-level
       popup, so a target that DOES resolve is accepted whichever session it names; write that down
-- [ ] `open` with an empty command → `ctlErr("overlay open needs a command; nothing opened")`,
+- [x] `open` with an empty command → `ctlErr("overlay open needs a command; nothing opened")`,
       checked BEFORE the target (agwinterm's order; its fake asserts it)
-- [ ] add **`resize`**: with an overlay open, re-size the popup to the new fraction on the UI thread
+- [x] add **`resize`**: with an overlay open, re-size the popup to the new fraction on the UI thread
       (post it — a new `WM_APP_OVERLAY` code or a second message; never `SetWindowPos` from the pipe
       thread) and reply `ctlOkStr("resized N%")` with the N asked for; with no overlay →
       `ctlErr("no overlay to resize on that target; open one first")`
-- [ ] `close` with nothing open → `ctlOkStr("no overlay")` (today `closed`), and an untargeted
+- [x] `close` with nothing open → `ctlOkStr("no overlay")` (today `closed`), and an untargeted
       close in an empty window stays `ok` — the conformance step depends on it
-- [ ] any action other than `open` / `close` / `resize` → `ctlErr` naming the three (today it opens)
-- [ ] `test/control-honesty.ps1`: `--size-percent 0`, `-5`, `150`, `sixty` each refused and **no
+- [x] any action other than `open` / `close` / `resize` → `ctlErr` naming the three (today it opens)
+- [x] `test/control-honesty.ps1`: `--size-percent 0`, `-5`, `150`, `sixty` each refused and **no
       popup appeared** (`FindWindow` on the popup class, or `tree`'s overlay flag if lite emits one
       — pick the oracle that cannot pass vacuously); `40` opens a popup whose client width is ~40 %
       of the main window's (measure with `GetWindowRect`, ±1 cell); `resize 80` moves it; `resize`
       with nothing open refused; `open` with no command refused and nothing opened; `close
       --target no-such` refused; untargeted `close` with nothing open `ok` "no overlay"
-- [ ] build + run `test/control-honesty.ps1` — must pass before task 2
+- [x] build + run `test/control-honesty.ps1` — must pass before task 2
 
 ### Task 2: `sidebar` stops toggling on words it does not know, and gets `width`
 - [ ] replace `wantOn` for this verb with an explicit op table: `show`/`on`, `hide`/`off`,

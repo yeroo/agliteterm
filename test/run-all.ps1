@@ -14,7 +14,7 @@ $failed = @()
 # actually see, and because the interesting ones are about intent that reads badly as code.
 # clipboard.ps1 stays: CI runs this runner, and its OSC 52 / host-action drain coverage would have
 # no home until the markdown cases have a CI story of their own.
-foreach ($t in 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read') {
+foreach ($t in 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty') {
     $script = Join-Path $PSScriptRoot "$t.ps1"
     if (-not (Test-Path $script)) { continue }
     # Each child sets $ErrorActionPreference = 'Stop', so it can die before reaching its own exit
