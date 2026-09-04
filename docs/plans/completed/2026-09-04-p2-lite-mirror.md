@@ -633,6 +633,37 @@ substantive Minors fixed in the next commit).
   keeps a stale grid after a font change; and an overlay reply uses geometry sampled before the UI
   thread applies the request, which is inherent to marshalling the create.
 
+**What revmux round 5 found** (`05-after-fix4`, scoped to the r4 fix commit: **two Majors in that
+fix** and nine Minors — fixed in the next commit).
+
+- ⚠️ **Major — the rollback re-armed the retry unconditionally.** The rollback restores the latch, so
+  the next `syncPaneSizes` computes the same target, misses the early out and re-issues the same
+  request; `OnTimer` leads straight back to it. Nothing counted attempts and the retry cannot
+  influence what is refusing, so a host answering `ok:false` for one session turned the UI thread
+  into a 60 ms loop: a synchronous round trip per pane and popup sixteen times a second, each
+  writing a `logWarn` that opens, appends to and closes the log file. The same unbounded shape the
+  r3 Major was about, on a different trigger. Now a per-session `resizeRefusals` counter backs off
+  (60, 120, 240 ms) and **stops** after three, logging the first refusal and the give-up rather than
+  every tick, and resetting the moment the host accepts. The next real layout event still asks.
+- ⚠️ **Major — the r4 test would have failed CI, deterministically.** It hard-coded a 300 px window,
+  but the reported minimum is `ceil(30 * cellW * 100 / clientW)`, which only lands in 71..100 while
+  the client is between 30 and ~43 cells. The shipped default font is AGWin Bitmap Complete 16 at a
+  10 px cell (`setDefaultFont`, and `build.ps1` copies the packs into `bin`), so on a fresh runner
+  with no remembered font the minimum exceeds 100, the reply takes the descriptive form, the regex
+  misses and the case **skips** — and `-Strict` fails the suite on a skip. The author's 85 % reading
+  came from a font remembered in HKCU on this machine, which `test/ui-lib.ps1` warns is not
+  isolated. The width is now DERIVED from the cell size the content region already publishes
+  (36 cells, the middle of the band at any cell size), the frame is measured rather than guessed,
+  and the case **asserts instead of skipping**, so a font metric can never turn the gate red.
+- Comments corrected: the second "only timer" claim on the caret `SetTimer`; the `g_resizeLock`
+  rule's "takes g_lock twice" (it is several); `OnTimer`'s account of why the timer exists (lock
+  contention *and* a refusal); `openOverlay`'s kept "0 gives lite's DEFAULT" sentence and the
+  133-column line the splice left; and the workspace re-find block, which still described the
+  name-first design r3 reverted.
+- Recorded, not fixed: the rollback arming has no test — it needs a host that refuses, which the
+  stress run never produced (it reports 0 rollbacks every time). The "BOTH axes" check can only
+  fail on the height axis, since the width is what the raise is computed from.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's

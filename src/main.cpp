@@ -352,6 +352,11 @@ struct Session {
     int cols = 0, rows = 0;     // geometry last pushed to the host (0 = never sized yet)
     int scrollOff = 0;          // rows scrolled up into history (0 = live)
     bool exited = false;
+    // Consecutive pty-host refusals of a resize for THIS session. The retry timer is armed from the
+    // rollback, and a host that keeps refusing would otherwise make that a 60 ms forever-loop: a
+    // synchronous round trip per pane and popup sixteen times a second, each writing a log line
+    // that opens, appends to and closes the file (revmux r5). Reset on the first acceptance.
+    int resizeRefusals = 0;
     // Restore placeholder: this spec's app would not start on THIS machine, so there is no shell
     // behind it. The entry is kept anyway (empty id, exited) so the name/workspace/cwd/args survive
     // instead of vanishing — a failed spec used to be dropped, and the user was never told.
@@ -484,13 +489,18 @@ static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices 
 static bool g_winFocused = true;      // frame has keyboard focus (solid caret) vs not (hollow)
 static bool g_caretOn = true;         // blink phase
 static const UINT_PTR kCaretTimer = 1;
-// The relayout retry (see hostResize): a ONE-SHOT timer, not a posted message. A posted retry
+// The relayout retry (see hostResize) — lite's SECOND timer, beside the caret blink. A ONE-SHOT
+// timer, not a posted message: a posted retry
 // outranks paint and input and re-posts itself from its own handler, so while a control-pipe thread
 // held g_resizeLock the UI thread spun at 100 % CPU painting nothing and accepting no keystrokes —
 // strictly worse than the dropped resize it was fixing, and unbounded when the host is wedged
 // (#27). WM_TIMER is delivered only when the queue is empty, so the loop idles between attempts.
 static const UINT_PTR kRelayoutTimer = 2;
 static const UINT kRelayoutRetryMs = 60;
+// How many times in a row a REFUSED resize re-arms the timer before it gives up (60, 120, 240 ms).
+// The lock-contention retry is bounded by the lock freeing; a refusing host is not bounded by
+// anything, so it needs a count of its own (revmux r5).
+static const int kResizeRetryAttempts = 3;
 static const UINT kCaretBlinkMs = 530;
 
 // ---- UI theme (Properties -> Appearance) -----------------------------------------------------
@@ -967,9 +977,10 @@ static CRITICAL_SECTION g_lock; // guards every session's emu + the session list
 // emulator cannot disagree. Deliberately NOT g_lock — the round trip under it is unbounded, and
 // g_lock is what paintPane and every reader thread need (see hostResize). The invariant, stated as
 // a rule rather than a sequence: **g_lock must not be held when g_resizeLock is acquired.**
-// hostResize is the only taker, and it takes g_lock briefly TWICE — once for its early out, which
-// releases before the try-lock precisely for this reason, and once inside for the latch — so a
-// reader who sees two holds must not widen either across the acquisition.
+// hostResize is the only taker, and it takes g_lock briefly SEVERAL times — the early out (which
+// releases before the try-lock precisely for this reason), the latch, the rollback, and the final
+// emu_resize — so a reader who sees repeated holds must not widen any of them across the
+// acquisition of g_resizeLock.
 static CRITICAL_SECTION g_resizeLock;
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
@@ -1576,15 +1587,28 @@ static void hostResize(Session* s, int cols, int rows) {
             LockG hold;
             s->cols = hadCols;
             s->rows = hadRows;
-            SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs, nullptr);   // whoever else asked may have gone
-            logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, retrying on the layout timer",
-                    s->id.c_str(), cols, rows,
-                    why == ReqOutcome::Refused ? "refused" : why == ReqOutcome::Undecodable ? "undecodable reply" : "no reply",
-                    hadCols, hadRows);
+            const char* reason = why == ReqOutcome::Refused ? "refused"
+                               : why == ReqOutcome::Undecodable ? "undecodable reply" : "no reply";
+            // BOUNDED. The retry cannot fix what is refusing — it re-issues the same request — so it
+            // backs off (60, 120, 240 ms) and then stops. A host that keeps saying no is not a
+            // transient busy lock, and the unbounded version of this was the r3 Major all over
+            // again: the UI thread waking 16 times a second, one synchronous round trip per pane and
+            // popup, a log line each time. The next real layout event still asks; only the automatic
+            // chasing stops. Logged on the first refusal and on the give-up, not on every tick.
+            if (++s->resizeRefusals <= kResizeRetryAttempts) {
+                SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs << (s->resizeRefusals - 1), nullptr);
+                if (s->resizeRefusals == 1)
+                    logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, retrying on the layout timer",
+                            s->id.c_str(), cols, rows, reason, hadCols, hadRows);
+            } else if (s->resizeRefusals == kResizeRetryAttempts + 1) {
+                logWarn("resize %s to %dx%d refused %d times in a row (%s) — kept %dx%d and STOPPED retrying; the next layout event will ask again",
+                        s->id.c_str(), cols, rows, kResizeRetryAttempts, reason, hadCols, hadRows);
+            }
             return;
         }
     }
     LockG hold;
+    s->resizeRefusals = 0;   // the host took it: the next refusal starts its own backoff
     emu_resize(s->emu, cols, rows);
 }
 
@@ -5380,14 +5404,15 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is always the EFFECTIVE 1..100 the verb reported: it raised the number (or lite's 70 %
-// default, when the flag was absent) to the 30x8-cell minimum and posts THAT, so the popup is
+// sizePct is always the EFFECTIVE 1..100 the verb reported: it raised the number — or lite's 70 %
+// default, when the flag was absent — to the 30x8-cell minimum and posts THAT, so the popup is
 // built from the number the caller was given. overlayFraction still has a 0 arm; nothing on this
-// path reaches it any more (revmux r4), and it is kept only so a future caller cannot trip on it. Nothing clamps the percentage here
-// — 100 means the whole client area — but createPopupWindowPx still applies that physical floor to
-// the pixels, so the popup matches sizePct only when the floor does not bind, which is exactly what
-// the verb's reply accounts for. 0 gives lite's DEFAULT, a popup 70 % of the main window's client. That
-// default is lite's own and differs from agwinterm's (a cover over the full content region): the
+// path reaches it any more (revmux r4/r5), and it is kept only so a future caller cannot trip on
+// it. Nothing clamps the percentage here — 100 means the whole client area — but
+// createPopupWindowPx still applies the physical 30x8-cell floor to the PIXELS, which is what the
+// verb accounts for: when the window cannot be measured at all (minimised, or a client under 30x8
+// cells) there is no percentage to name and the reply says what it got and why instead. lite's 70 %
+// default is its own and differs from agwinterm's (a cover over the full content region): the
 // shared contract pins the reply shape and the refusals, not the default geometry, and the skill
 // says which default each product has. An empty command is refused by the verb, and the verb is
 // the only caller (WM_APP_OVERLAY is posted from nowhere else), so there is no empty arm here.
@@ -5921,8 +5946,10 @@ public:
     }
     void OnTimer(UINT_PTR id) {
         if (id == kRelayoutTimer) {
-            // A resize the UI thread skipped because a control-pipe thread held g_resizeLock. Kill
-            // the timer FIRST: hostResize re-arms it if the lock is still busy, and each attempt
+            // A resize that did not happen: the UI thread skipped it because a control-pipe thread
+            // held g_resizeLock, or the pty-host refused one and the rollback armed this (bounded by
+            // kResizeRetryAttempts — see hostResize). Kill
+            // the timer FIRST: hostResize re-arms it if the reason persists, and each attempt
             // then costs one message per 60 ms with the loop idle in between, instead of a posted
             // message that re-posts itself (revmux r3). The panes go through syncPaneSizes; the
             // popups need refitPopupSessions, since their sessions are never in g_pane.
@@ -6939,13 +6966,15 @@ static std::string ctlDispatch(const std::string& line) {
         if (!s) return ctlErr("create failed");
         // tsvField: the name reaches the state file, where a tab or newline would forge a record.
         if (!name.empty()) s->name = widen(tsvField(name));
-        // Re-resolved under the lock by NAME, for all three sources of wantWs (--workspace, a
-        // created --workspace-name, the caller's own): the index was resolved BEFORE the host round
-        // trip that made the session, and another client's workspace.delete erases a name and
-        // shifts every later index down under g_lock in between. Re-checking only the RANGE (what
-        // r1's fix did) leaves the worse half: [A,B,C,D] with B deleted makes index 2 name D, so
-        // the session lands in a workspace nobody asked for, silently (revmux r2). The name moves
-        // with the shift; only a workspace that is really gone falls back to the active one.
+        // Re-checked under the lock for all three sources of wantWs (--workspace, a created
+        // --workspace-name, the caller's own). The INDEX is the answer and the name is only how a
+        // shift is detected: the index was resolved BEFORE the host round trip that made the
+        // session, and another client's workspace.delete erases a name and shifts every later index
+        // down under g_lock in between. Checking only the RANGE (r1) left the worse half —
+        // [A,B,C,D] with B deleted makes index 2 name D, so the session lands in a workspace nobody
+        // asked for (r2). Re-resolving by NAME FIRST was worse still, because nothing keeps names
+        // unique and the first match won (r3). So: the index if the name still sits there, else the
+        // nearest match, else the active workspace with a log line.
         {
             LockG hold;
             if (wantWs >= 0) {

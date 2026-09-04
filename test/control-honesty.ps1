@@ -282,34 +282,53 @@ try {
     $size70 = ClientSize $h40
 
     # The absent-flag path posts the number it REPORTS. Shrink the main window until the 30x8-cell
-    # popup minimum is above 70 %, then resize with NO flag: the reply must name the raised
+    # popup minimum is ABOVE 70 %, then resize with NO flag: the reply must name the raised
     # percentage and the popup must be that percentage on BOTH axes. Before this, the reply was
     # raised while the posted request carried 0, so openOverlay re-derived 70 % and only the binding
     # axis got the floor - a reply of "80%" for a popup 80 % wide and 70 % tall (revmux r3/r4).
+    #
+    # The width is DERIVED, not hard-coded: the reported minimum is ceil(30 * cellW * 100 / clientW),
+    # so it lands in 71..100 only while clientW is between 30 and ~42.8 cells. A fixed 300 px sits
+    # in that band for an 8 px cell and outside it for the shipped 10 px bitmap default, which made
+    # this case skip - and a skip fails -Strict, so CI went red on a font metric (revmux r5). The
+    # cell comes from the content region the session already has, the way the sidebar block does it,
+    # and the target is 36 cells: the middle of the band for any cell size.
     $mainBefore = ClientSize $s.Hwnd
-    $wr = ConvertFrom-Json (Send-Ctl $s @('window', 'resize', '--w', '300', '--h', '780'))
-    if ($wr.ok) {
-        Start-Sleep -Milliseconds 900
+    # Inlined, not the ActiveCols / Sidebar helpers: those are defined further down the file, and a
+    # PowerShell function does not exist until its definition has been executed.
+    $colsNow = [int](Nodes | Where-Object { $_.active } | Select-Object -First 1).cols
+    $sbNow = [int](ConvertFrom-Json (Send-Ctl $s @('sidebar', 'width'))).result.width
+    $cellW = if ($colsNow -gt 0) { ($mainBefore[0] - $sbNow - 5) / [double]$colsNow } else { 0 }
+    $frameW = 0   # window outer minus client, measured from the resize itself below
+    if ($cellW -ge 4) {
+        $wantClient = [int]([math]::Round(36 * $cellW))
+        foreach ($attempt in 1..3) {
+            $null = Send-Ctl $s @('window', 'resize', '--w', "$($wantClient + $frameW)", '--h', '780')
+            Start-Sleep -Milliseconds 900
+            $small = ClientSize $s.Hwnd
+            $frameW = ($wantClient + $frameW) - $small[0]      # the frame, now measured
+            if ([math]::Abs($small[0] - $wantClient) -le 4) { break }
+        }
         $small = ClientSize $s.Hwnd
         $rawS = Overlay @('resize')
         $rS = ConvertFrom-Json $rawS
+        Check 'a no-flag resize in a narrow window is accepted' ([bool]$rS.ok) "raw: $rawS"
+        Check "and it reports a RAISED percentage, not lite's 70% default (client $($small -join 'x'), cell ~$([int]$cellW)px)" `
+            ([string]$rS.result -match '^resized (\d+)%$' -and [int]$Matches[1] -gt 70) "result: $($rS.result)"
         if ([string]$rS.result -match '^resized (\d+)%$' -and [int]$Matches[1] -gt 70) {
             $pct = [int]$Matches[1]
             Start-Sleep -Milliseconds 900
             $pop = ClientSize (OverlayHwnd)
             $wantW = [int]($small[0] * $pct / 100); $wantH = [int]($small[1] * $pct / 100)
-            Check "a no-flag resize in a narrow window reports the RAISED percentage ($pct%)" ([bool]$rS.ok) "raw: $rawS"
             Check 'and the popup is that percentage on BOTH axes, not 70% on the other one' `
                 ([math]::Abs($pop[0] - $wantW) -le ([math]::Max($tol, 14)) -and [math]::Abs($pop[1] - $wantH) -le ([math]::Max($tol, 30))) `
                 "reported $pct% of $($small -join 'x') (~$wantW x $wantH), popup $($pop -join 'x')"
-        } else {
-            Skip 'a no-flag resize in a narrow window reports the raised percentage' "the 360 px window still shows 70% (reply: $($rS.result)); nothing to raise on this font"
         }
-        Send-Ctl $s @('window', 'resize', '--w', "$($mainBefore[0] + 20)", '--h', "$($mainBefore[1] + 40)") | Out-Null
+        Send-Ctl $s @('window', 'resize', '--w', "$($mainBefore[0] + $frameW)", '--h', "$($mainBefore[1] + 40)") | Out-Null
         Start-Sleep -Milliseconds 900
         $mainClient = ClientSize $s.Hwnd     # the outer size went in; the client that came back is what counts
     } else {
-        Skip 'a no-flag resize in a narrow window reports the raised percentage' "window resize is not available here: $($wr.error)"
+        Check 'the content region publishes a usable cell size for the narrow-window case' $false "cols $colsNow, client $($mainBefore -join 'x'), sidebar $sbNow"
     }
     $raw = Overlay @('resize', '--size-percent', '70')
     Wait-ClientWidth $h40 ([int]($mainClient[0] * 0.7)) $tol | Out-Null
