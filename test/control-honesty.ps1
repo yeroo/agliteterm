@@ -764,9 +764,95 @@ try {
         Skip 'a lone 0x80 on --stdin is refused and the pane receives nothing' 'no --stdin in this agwintermctl'
         Skip 'the quick terminal is typed into by its session id from the events stream' 'no --stdin in this agwintermctl'
     }
+
+    # ---- #23: a pane never collapses to 2 columns -----------------------------------------------
+    # The report: a pane at 2 columns after the window sat minimised while an agent kept calling
+    # session new / select / split over the pipe. A minimised window has a 0x0 client rect, and
+    # paneGridSize answered max(2, negative) = 2 for it, which every pipe-thread caller pushed to
+    # the pty-host: the shell reflowed at 2 columns and the pane never came back. The oracle is the
+    # grid `tree` reports per session (cols): a session created or laid out while minimised keeps
+    # a real grid, and after restore the shown pane's grid is what the SAME geometry gave before
+    # the minimise. The minimise is ShowWindow on the sandbox's own handle - its window, not
+    # global input - and `window state` confirms it took.
+    "-- #23: a minimised window --"
+    function Minimized { [bool](ConvertFrom-Json (Send-Ctl $s @('window', 'state'))).result.minimized }
+    function Wait-Minimized([bool]$want, [int]$ms = 4000) {
+        for ($i = 0; $i -lt ($ms / 100); $i++) { if ((Minimized) -eq $want) { return $want }; Start-Sleep -Milliseconds 100 }
+        return (Minimized)
+    }
+    function ColsOf([string]$id) { [int](Nodes | Where-Object { [string]$_.id -eq $id } | Select-Object -First 1).cols }
+    Send-Ctl $s @('session', 'split', 'off') | Out-Null
+    Start-Sleep -Milliseconds 500
+    $aid = [string](Nodes | Where-Object { $_.active } | Select-Object -First 1).id
+    $c0 = ColsOf $aid
+    Check 'setup: the shown pane has a real grid to compare against (>= 20 columns)' ([bool]$aid -and $c0 -ge 20) "active $aid cols $c0"
+    [void][LiteUi]::ShowWindow($s.Hwnd, 6)    # SW_MINIMIZE, on this instance's own handle
+    Check 'setup: the sandbox is minimised (window state says so)' ((Wait-Minimized $true) -eq $true)
+    Start-Sleep -Milliseconds 300
+    # Created while minimised: there is no rect to size from, so the create uses the grid the
+    # pane's session last had. It used to be 2x2, and the shell had reflowed at 2 columns before
+    # the window was ever restored.
+    $raw = Send-Ctl $s @('session', 'new', '--name', 'made-minimised')
+    $nid = [string](ConvertFrom-Json $raw).result
+    Check 'session new while minimised answers ok with an id' ((Wait-Node $nid)) "raw: $raw"
+    Check "and the new session was created at the pane's last grid, not 2x2" ((ColsOf $nid) -eq $c0) "cols $(ColsOf $nid), expected $c0"
+    $raw = Send-Ctl $s @('session', 'split', 'on')
+    $splitId = [string](ConvertFrom-Json $raw).result
+    Check "session split on while minimised answers ok with the split's id" ([bool](ConvertFrom-Json $raw).ok -and [bool]$splitId) "raw: $raw"
+    $raw = Send-Ctl $s @('session', 'select', '--target', $aid)
+    Check 'session select while minimised answers ok' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    Start-Sleep -Milliseconds 500
+    $small = @(Nodes | Where-Object { [int]$_.cols -lt 20 })
+    Check 'no session in the tree collapsed while minimised (every cols >= 20)' ($small.Count -eq 0) ('collapsed: ' + (($small | ForEach-Object { "$($_.id)=$($_.cols)" }) -join ' '))
+    Check 'the selected session keeps the grid the window gave it before the minimise' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
+    [void][LiteUi]::ShowWindow($s.Hwnd, 9)    # SW_RESTORE
+    Check 'setup: the sandbox is restored' ((Wait-Minimized $false) -eq $false)
+    Start-Sleep -Milliseconds 1000
+    Check 'after restore the shown pane has the same grid as before: same geometry, same cols' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
+    # The session split while minimised: showing it lays both its panes out from the rect the
+    # window has NOW - each about half the width, one pixel and one floor apart from c0/2.
+    Send-Ctl $s @('session', 'select', '--target', $nid) | Out-Null
+    Start-Sleep -Milliseconds 1000
+    $half = ColsOf $nid
+    Check 'showing the split made while minimised gives its pane half the width, not 2' ($half -ge 20 -and $half -le [int][math]::Floor($c0 / 2) -and $half -ge [int][math]::Floor($c0 / 2) - 2) "cols $half, expected about $([int][math]::Floor($c0 / 2))"
+    Send-Ctl $s @('session', 'split', 'off') | Out-Null
+    Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+    Start-Sleep -Milliseconds 500
+    Check 'unsplit again, the pane is back at its full grid' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
+
+    # ---- #23: two persisted values that cannot coexist ------------------------------------------
+    # SidebarW (one value for every instance) and WinW-<instance> are each valid on their own; a
+    # sidebar saved at 900 from a wide monitor and a window rect saved at 700 on the laptop meet at
+    # the first WM_SIZE, and the layout used to honour the sidebar and hand the terminal a negative
+    # width - the first session was CREATED at 2x2. This needs a fresh instance, so the main
+    # sandbox is stopped first (its shutdown save lands before the seed) and a second one starts
+    # on its own pipe, whose geometry values are unique to it and removed in `finally`.
+    "-- #23: SidebarW 900 in a 700 px window --"
+    Stop-Sandbox $s; $s = $null
+    $pipe23 = 'ctlhonesty23'
+    if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
+    foreach ($kv in @(@('SidebarW', 900), @('ShowSidebar', 1), @("WinX-$pipe23", 150), @("WinY-$pipe23", 100), @("WinW-$pipe23", 700), @("WinH-$pipe23", 600), @("WinMax-$pipe23", 0))) {
+        New-ItemProperty -Path $regKey -Name $kv[0] -Value ([int]$kv[1]) -PropertyType DWord -Force | Out-Null
+    }
+    $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe $pipe23 -Width 700 -Height 600
+    $aid = [string](Nodes | Where-Object { $_.active } | Select-Object -First 1).id
+    Check 'setup: the 700 px sandbox has a session' ([bool]$aid)
+    $client = ClientSize $s.Hwnd
+    Check 'setup: its client is under 700 px wide' ($client[0] -gt 0 -and $client[0] -lt 700) "client $($client -join 'x')"
+    $w = (ConvertFrom-Json (Sidebar @('width'))).result
+    Check 'the sidebar started clamped: `sidebar width` reads under 900 and the tree is that wide' ([int]$w.width -lt 900 -and [int]$w.width -ge 90 -and (Wait-TreeWidth ([int]$w.width)) -eq [int]$w.width) "width $($w | ConvertTo-Json -Compress), tree $(TreeWidth)"
+    Check 'and the first session was created beside it with at least 20 columns, not 2x2' ([int]$w.width + 5 -lt $client[0] -and (ColsOf $aid) -ge 20) "cols $(ColsOf $aid) in a $($client[0]) px client"
+    $log23 = Join-Path $s.AppDir "agliteterm\agliteterm-$pipe23.log"
+    $logLine = if (Test-Path $log23) { Get-Content $log23 | Where-Object { $_ -match 'sidebar width 900 leaves under 20 columns' } | Select-Object -First 1 }
+    Check 'and the log says which value gave way, and that it was not saved' ([bool]$logLine -and $logLine -match 'not saved') "log: $log23`n$logLine"
+    Check 'HKCU SidebarW is still 900: a narrow window does not overwrite the preference' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 900)
 }
 finally {
     if ($s) { Stop-Sandbox $s }
+    # The second sandbox's geometry values are its own; they were seeded here, so they go.
+    foreach ($n in 'WinX', 'WinY', 'WinW', 'WinH', 'WinMax') {
+        if (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name "$n-ctlhonesty23" -ErrorAction SilentlyContinue }
+    }
     # After the sandbox exits: its own shutdown save (if any) must not land after the restore.
     Restore-Reg
 }

@@ -319,25 +319,35 @@ What agwinterm decided, and lite must match (each is a contract, not a style):
       0.17.x CLI: 3 more SKIPs, the `--stdin` probes)
 
 ### Task 5: #23 — a pane never collapses to 2 columns
-- [ ] `paneGridSize` (`:1374`): a non-viable rect — the window minimised (`IsIconic(g_hwnd)`), or
+- [x] `paneGridSize` (`:1374`): a non-viable rect — the window minimised (`IsIconic(g_hwnd)`), or
       `contentW <= 0`, or fewer than one cell — **does not answer**: return `false` (or leave the
       out-params untouched and return a flag) and make every caller skip the resize instead of
       pushing 2×2. `OnSize` already guards `SIZE_MINIMIZED`; `session.new` / `session.split` /
       `syncPaneSizes` on a pipe thread do not — they now inherit the guard
-- [ ] `hostResize` (`:1394`): the compare-and-set, the host request and `emu_resize` under one
+- [x] `hostResize` (`:1394`): the compare-and-set, the host request and `emu_resize` under one
       hold, and **check `request()`'s return** — on failure roll `s->cols` / `s->rows` back so the
       next `syncPaneSizes` retries. The hold spans a pipe round trip to the pty-host, not a
       cross-thread `SendMessage`; say so in the comment and say why that is allowed (the UI thread
       never waits on a pipe thread for this)
-- [ ] re-clamp `g_sidebarW` in `OnSize` against the current client width with the same
+- [x] re-clamp `g_sidebarW` in `OnSize` against the current client width with the same
       `kMinContentCols` rule Task 2 introduced, and validate the two persisted values against each
       other at load (`:2182` vs the startup rect `:7415`)
-- [ ] `test/control-honesty.ps1` (or `control-read.ps1`): minimise the sandbox
+- [x] `test/control-honesty.ps1` (or `control-read.ps1`): minimise the sandbox
       (`ShowWindow(SW_MINIMIZE)` on the sandbox's own hwnd — its own handle, not global input),
       drive `session select` / `session split` / `session new` over the pipe, restore, and assert
       every visible session's cols from `tree`/`emu` matches its pane rect; a sidebar saved at 900
       and a window opened at 700 px wide starts with a clamped sidebar and a ≥20-column pane
-- [ ] build + run — must pass before task 6
+- [x] build + run — must pass before task 6
+- ➕ [x] the default startup rect (`:7752`) sizes from the PERSISTED `g_sidebarW` plus the splitter,
+      not the constant `kSidebarW`, so a first window really gives the terminal the 100 columns
+      the rect promises; `session new` while minimised uses `newSessionGrid` (the pane's last
+      grid, else the other pane's, else 80x24) since a create needs a number; a CREATED session's
+      latch starts at its grid so `tree` reports it while minimised instead of 0
+- ⚠️ `test/run-all.ps1 -Strict` with the dev CLI: every suite green except `clipboard`'s
+      "Ctrl+C copies the selection", which fails IDENTICALLY on the committed tree without this
+      change (stash + rebuild + rerun on 2026-09-04): pre-existing and environmental (the check
+      sets shared keyboard state through `AttachThreadInput`, so it depends on what holds the
+      foreground on the machine), not a Task 5 regression. Left for Task 8 to re-check.
 
 ### Task 6: #24 — the window stops coming to the front on its own
 - [ ] a helper `raiseIfAllowed(HWND)`: `SetForegroundWindow` only when

@@ -1381,13 +1381,67 @@ static void paneRect(int pane, RECT client, RECT* out) {
     else *out = { contentX + half + 1, top, client.right, bottom };
 }
 
-static void paneGridSize(int pane, int* cols, int* rows) {
+// The grid a pane's rect holds, or false when there is no rect to size from — the window is
+// minimised (its client rect is 0x0, and IsIconic is the same guard OnSize has as SIZE_MINIMIZED),
+// the sidebar is wider than the client, or a pane holds less than one cell. It used to answer 2x2
+// in every one of those cases, and every caller pushed that to the pty-host and the emulator: the
+// shell reflowed at 2 columns and the pane never recovered (#23). A false here is "do not resize",
+// not "resize to something small"; the next real WM_SIZE (restore, widen) asks again.
+static bool paneGridSize(int pane, int* cols, int* rows) {
+    if (IsIconic(g_hwnd)) return false;
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     RECT pr;
     paneRect(pane, rc, &pr);
-    *cols = max(2L, (pr.right - pr.left) / g_cw);
-    *rows = max(2L, (pr.bottom - pr.top) / g_ch);
+    long w = pr.right - pr.left, h = pr.bottom - pr.top;
+    if (w <= 0 || h <= 0 || g_cw <= 0 || g_ch <= 0) return false;
+    long c = w / g_cw, r = h / g_ch;
+    if (c < 1 || r < 1) return false;
+    *cols = (int)c;
+    *rows = (int)r;
+    return true;
+}
+
+// The grid a NEW session is created with. A create needs a number even when the window has no
+// viable rect (`session new` over the pipe while the window sits minimised in the taskbar is the
+// #23 report); the grid the pane's session was last sized to is the best guess, else the other
+// pane's, else 80x24 — never 2x2. The first layout after the window is viable again (OnSize ->
+// syncPaneSizes) corrects it, which it could not do for a shell that had already reflowed at 2.
+static void newSessionGrid(int pane, int* cols, int* rows) {
+    if (paneGridSize(pane, cols, rows)) return;
+    for (int p : { pane, 1 - pane }) {
+        int idx = (p >= 0 && p < 2) ? g_pane[p] : -1;
+        if (idx < 0 || idx >= (int)g_sessions.size()) continue;
+        Session* s = g_sessions[idx];
+        if (s->cols >= 1 && s->rows >= 1) { *cols = s->cols; *rows = s->rows; return; }
+    }
+    *cols = 80;
+    *rows = 24;
+}
+
+// The widest sidebar that leaves kMinContentCols cells of the live font for the terminal in a
+// client `clientW` wide — the one rule `sidebar width` refuses against, the splitter drag stops at,
+// and OnSize re-clamps to (fitSidebarToClient). It is under kSidebarMinW in a window narrower than
+// a minimum sidebar plus the columns; the sidebar then keeps its minimum and paneGridSize decides
+// whether what is left is a pane at all.
+static int maxSidebarW(int clientW) { return clientW - kSplitterW - kMinContentCols * g_cw; }
+
+// Re-clamp g_sidebarW against the client the window HAS. Two persisted values (SidebarW, and the
+// WinW-<instance> rect) are each valid on their own and can still be impossible together — a
+// sidebar saved at 900 from a wide monitor and a window rect saved at 700 on the laptop — and until
+// this the layout honoured the sidebar and gave the terminal a negative width (#23). Applied only
+// while the sidebar is SHOWN: a hidden sidebar's width is not in effect, and `sidebar show` runs
+// this layout again. Not persisted here: the value in effect is what `sidebar width` reads, and the
+// existing save paths (a drag, a set, a toggle) write it when the user next touches it, so a
+// window narrowed for a moment does not overwrite a wide monitor's preference.
+static bool fitSidebarToClient(int clientW) {
+    if (!g_showSidebar || clientW <= 0) return false;
+    int fit = max(kSidebarMinW, min(g_sidebarW, maxSidebarW(clientW)));
+    if (fit == g_sidebarW) return false;
+    logWarn("sidebar width %d leaves under %d columns of the terminal in a %d px client; using %d (not saved)",
+            g_sidebarW, kMinContentCols, clientW, fit);
+    g_sidebarW = fit;
+    return true;
 }
 
 static Session* focusedSession() {
@@ -1408,7 +1462,20 @@ static void hostResize(Session* s, int cols, int rows) {
     // for the geometry the session already has. Forwarding those is not free: ConPTY reflows and
     // re-emits its screen on ANY resize, which garbles a full-screen TUI (the app was never told
     // anything changed, so it never redraws). Only a real change goes to the host.
+    //
+    // ONE hold of g_lock spans the compare-and-set, the pty-host round trip and emu_resize. This
+    // runs on the UI thread (WM_SIZE) and on control-pipe threads (session.select / split / new
+    // through syncPaneSizes) at once; with the latch outside the hold, thread A latched 120 and
+    // went to the host, thread B read "already 120" and returned, and when A's request failed the
+    // latch, the host and the emulator disagreed for good — the pane stuck at the size nothing
+    // asked for (#23). The hold spans a pipe write and read on g_reqLock, NOT a cross-thread
+    // SendMessage: the #20 rule exists because the UI thread pumps a sent message while the sender
+    // holds g_lock and the UI thread is waiting for that same lock. The pty-host answers on its own
+    // pipe and never needs the UI thread to pump anything, so the most a hold here costs the UI
+    // thread is the wait for one host reply, which its own WM_SIZE resize pays anyway.
+    LockG hold;
     if (s->cols == cols && s->rows == rows) return;
+    int hadCols = s->cols, hadRows = s->rows;
     s->cols = cols;
     s->rows = rows;
     if (!s->id.empty()) {   // a restore placeholder has no host session — only its emulator resizes
@@ -1418,19 +1485,32 @@ static void hostResize(Session* s, int cols, int rows) {
         strcpy_s(req.cmd.resize.id, s->id.c_str());
         req.cmd.resize.cols = (uint32_t)cols;
         req.cmd.resize.rows = (uint32_t)rows;
-        request(req, &rep);
+        ReqOutcome why;
+        if (!request(req, &rep, &why) && !s->exited) {
+            // The host did not take it: roll the latch back so the next syncPaneSizes sees a
+            // difference and asks again, and leave the emulator at the size the host still has.
+            // An EXITED session is the one exception — there is no shell behind it to reflow, the
+            // host has nothing to say about it, and the emulator is the only thing left to fit.
+            s->cols = hadCols;
+            s->rows = hadRows;
+            logWarn("resize %s to %dx%d not accepted by the pty-host (%s) — kept %dx%d, asked again on the next layout",
+                    s->id.c_str(), cols, rows,
+                    why == ReqOutcome::Refused ? "refused" : why == ReqOutcome::Undecodable ? "undecodable reply" : "no reply",
+                    hadCols, hadRows);
+            return;
+        }
     }
-    EnterCriticalSection(&g_lock);
     emu_resize(s->emu, cols, rows);
-    LeaveCriticalSection(&g_lock);
 }
 
+// Fit each shown pane's session to its rect. A pane with no viable rect (paneGridSize) is left
+// alone — not resized to 2x2 — so this is safe from the pipe threads while the window is minimised.
 static void syncPaneSizes() {
     for (int p = 0; p < 2; p++) {
         int idx = g_pane[p];
         if (idx < 0 || idx >= (int)g_sessions.size()) continue;
         int cols, rows;
-        paneGridSize(p, &cols, &rows);
+        if (!paneGridSize(p, &cols, &rows)) continue;
         hostResize(g_sessions[idx], cols, rows);
     }
 }
@@ -1835,6 +1915,12 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->cwd = cwd ? cwd : "";
     s->ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_activeWs : 0;   // into the active workspace
     s->emu = emu_new(cols, rows);
+    // A CREATED session's host and emulator are both at this grid, so the latch says so: the first
+    // syncPaneSizes at the same geometry is then the no-op it should be (it used to forward a
+    // 0 -> N "change" the host reflowed on), and a session created while the window is minimised
+    // reports its real grid in `tree` instead of 0 (#23). An ADOPTED session's host is at whatever
+    // grid it had; the latch stays 0 so the first layout really does resize it.
+    if (!repaint) { s->cols = cols; s->rows = rows; }
     s->childPid = rep.body.attach.child_pid;
     s->data = openPipe(std::wstring(rep.body.attach.pipe, rep.body.attach.pipe + strlen(rep.body.attach.pipe)), 5000, true);
     if (s->data == INVALID_HANDLE_VALUE) { emu_free(s->emu); delete s; return nullptr; }
@@ -1992,7 +2078,7 @@ static void reopenClosed() {
     if (g_closedStack.empty()) return;
     ClosedSpec sp = g_closedStack.back(); g_closedStack.pop_back();
     if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws;
-    int c, r; paneGridSize(g_focus, &c, &r);
+    int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
     if (s) { s->name = sp.name; selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
@@ -2011,7 +2097,7 @@ static void toggleSplit() {
     Session* prim = (p0 >= 0 && p0 < (int)g_sessions.size()) ? g_sessions[p0] : nullptr;
     if (!prim) return;                               // nothing to attach a split to
     if (g_pane[1] < 0) {
-        int c, r; paneGridSize(g_focus, &c, &r);   // approximate; syncPaneSizes resizes both after
+        int c, r; newSessionGrid(g_focus, &c, &r);   // approximate; syncPaneSizes resizes both after
         Session* s = newSession(c, r);
         if (s) {
             s->hidden = true;
@@ -2191,6 +2277,9 @@ static void loadColors() {   // Properties->Colors overrides (default fg/bg + on
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_dosPalette = v != 0;
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= TH_CLASSIC) g_themeMode = (int)v;
     // The same range `sidebar width` accepts (kSidebarMinW..kSidebarMaxW): one number set, two readers.
+    // In range is not the same as fitting the window this instance saved (WinW-<instance>, read
+    // later by loadWindowRect): the pair is checked against each other at the first WM_SIZE, once
+    // the client width exists — fitSidebarToClient, from OnSize.
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (int)v >= kSidebarMinW && (int)v <= kSidebarMaxW) g_sidebarW = v;
     // 0 = follow the shell. The range is clamped rather than trusted: this is a font height, and a
     // hand-edited 2000 would make the sidebar a single unreadable row.
@@ -3893,7 +3982,7 @@ static void palChar(wchar_t wc) {   // printable input -> query (both frame + po
 
 static void runKbAction(int a) {
     switch (a) {
-        case KB_NEW: { int c, r; paneGridSize(g_focus, &c, &r); Session* s = newSession(c, r); if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); } break; }
+        case KB_NEW: { int c, r; newSessionGrid(g_focus, &c, &r); Session* s = newSession(c, r); if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); } break; }
         case KB_NEWWS: SendMessageW(g_hwnd, WM_COMMAND, IDM_NEWWS, 0); break;
         case KB_CLOSE: closeFocused(); break;
         case KB_SPLIT: toggleSplit(); break;
@@ -4195,7 +4284,7 @@ static void showTreeContextMenu() {
         case IDM_DUP:
             if (isSession) {
                 g_activeWs = cws;
-                int c, r; paneGridSize(g_focus, &c, &r);
+                int c, r; newSessionGrid(g_focus, &c, &r);
                 Session* s = newSession(c, r);
                 if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
             }
@@ -4351,7 +4440,7 @@ static void newSessionDialog(const char* cwd) {
     auto profs = detectProfiles();
     int i = pickProfileDialog(profs);
     if (i < 0 || i >= (int)profs.size()) return;
-    int c, r; paneGridSize(g_focus, &c, &r);
+    int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, profs[i].app.c_str(), &profs[i].args, cwd);
     if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
@@ -5497,7 +5586,9 @@ public:
     void OnMouseMove(UINT nFlags, CPoint pt) {
         if (g_splitDrag) {   // the splitter resizes the LEFT pane (the sidebar); terminal takes the rest
             RECT c; GetClientRect(&c);
-            g_sidebarW = max(kSidebarMinW, min((int)(c.right * 0.6), (int)pt.x));
+            // 60 % of the client at most, and never past what leaves kMinContentCols for the
+            // terminal — the same wall `sidebar width` refuses against (#23).
+            g_sidebarW = max(kSidebarMinW, min(min((int)(c.right * 0.6), maxSidebarW((int)c.right)), (int)pt.x));
             relayout();
             return;
         }
@@ -5635,6 +5726,11 @@ public:
                 RECT sr; m_status.GetWindowRect(&sr); g_statusH = sr.bottom - sr.top;
             }
         }
+        // Before the tree is placed: the sidebar never takes more than leaves kMinContentCols for
+        // the terminal (#23). This is also where the two persisted values meet for the first time
+        // — SidebarW and the WinW-<instance> rect — because the first WM_SIZE comes from CreateEx,
+        // with the fonts already measured; loadColors alone cannot see the client width.
+        fitSidebarToClient(size.cx);
         if (m_tree.IsWindow()) {      // resizable sidebar between the toolbar and the status bar
             m_tree.ShowWindow(g_showSidebar ? SW_SHOW : SW_HIDE);
             if (g_showSidebar)
@@ -6512,7 +6608,7 @@ static std::string ctlDispatch(const std::string& line) {
         }
 
         int cols, rows;
-        paneGridSize(g_focus, &cols, &rows);
+        newSessionGrid(g_focus, &cols, &rows);
 
         // --command runs it as the session's shell, which is the whole point: the caller wants the
         // command RUNNING, not typed into a prompt that may not be ready to receive it yet.
@@ -6807,7 +6903,7 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
-        int cols, rows; paneGridSize(0, &cols, &rows);
+        int cols, rows; newSessionGrid(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
         Session* s = newSession(cols, rows, app.empty() ? nullptr : app.c_str(),
@@ -6833,7 +6929,7 @@ static std::string ctlDispatch(const std::string& line) {
         bool want = wantOn(req.get("args.op"), cur);
         if (want && !cur) {
             int c, r;
-            paneGridSize(1, &c, &r);        // approximate; syncPaneSizes fixes both below
+            newSessionGrid(1, &c, &r);        // approximate; syncPaneSizes fixes both below
             Session* s = newSession(c, r);
             if (!s) return ctlErr("split failed");
             s->hidden = true;               // a split shell, not a tree session
@@ -7034,7 +7130,7 @@ static std::string ctlDispatch(const std::string& line) {
             // GetClientRect is a plain read, safe from this thread.
             RECT c{}; GetClientRect(g_hwnd, &c);
             int content = (int)c.right - (want + kSplitterW), minContent = kMinContentCols * g_cw;
-            if (content < minContent)
+            if (want > maxSidebarW((int)c.right))   // == content < minContent; one rule with OnSize and the drag
                 return ctlErr("sidebar width " + raw + " would leave " + std::to_string(content < 0 ? 0 : content) +
                               " px for the terminal in a " + std::to_string(c.right) + " px window, under the " +
                               std::to_string(kMinContentCols) + "-column minimum (" + std::to_string(minContent) +
@@ -7428,7 +7524,7 @@ static bool restoreSessions() {
 
     g_restoring = true;
     if (!wss.empty()) g_workspaces = wss;
-    int cols, rows; paneGridSize(0, &cols, &rows);
+    int cols, rows; newSessionGrid(0, &cols, &rows);
     int firstIdx = -1, built = 0, adopted = 0, dead = 0;
     std::vector<Session*> bySpec;   // spec index -> the session it produced (null if it could not start)
 
@@ -7653,7 +7749,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_appIconSm = loadAppIcon(true);
     applyTheme();   // resolve the saved theme BEFORE any window exists, so nothing flashes light
 
-    RECT want{ 0, 0, kSidebarW + 100 * g_cw, 30 * g_ch };
+    // The default rect (no saved WinW-<instance>): the PERSISTED sidebar plus the splitter, then 100
+    // columns of the live font. It used the constant kSidebarW, so a saved SidebarW of 400 opened a
+    // first window whose terminal was 45 columns narrower than the 100 this rect promises (#23's
+    // other half: the two values are each valid alone and were never sized together).
+    RECT want{ 0, 0, g_sidebarW + kSplitterW + 100 * g_cw, 30 * g_ch };
     // WS_CLIPCHILDREN keeps the terminal paint out of the native tree child.
     AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW, TRUE);   // TRUE = has a menu bar
     int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT, ww = want.right - want.left, wh = want.bottom - want.top;
@@ -7744,7 +7844,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     reapExitedHostSessions();   // after adoption has had its chance, on every launch path
     if (!restored || wantLaunch) {   // fresh first session, or an EXTRA one for the launch args
         int cols, rows;
-        paneGridSize(0, &cols, &rows);
+        newSessionGrid(0, &cols, &rows);
         Session* s = newSession(cols, rows, haveProf ? argApp.c_str() : nullptr,
                                 (haveProf && !argAppArgs.empty()) ? &argAppArgs : nullptr,
                                 g_argDir.empty() ? nullptr : g_argDir.c_str());
