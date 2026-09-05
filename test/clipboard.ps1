@@ -174,7 +174,17 @@ try {
     # much the runner's shell had already scrolled.
     Ctl @('session', 'type', "& '$markerPs1'`r") | Out-Null
     Start-Sleep 3
-    [ClipIn]::Drag($h, 200, 80, 960, 555)
+    # Start the drag past the SIDEBAR, not at a fixed x. The sidebar's width is persisted in HKCU,
+    # which is shared with every other suite and with the user's own agliteterm (test/ui-lib.ps1), so
+    # a hard-coded 200 lands inside a sidebar any wider than ~195 and the drag selects nothing - which
+    # is exactly what conformance's `sidebar width 260` step caused once the client could send it.
+    $sbSpan = 0
+    try {
+        $sbr = (ConvertFrom-Json (Ctl @('sidebar', 'width'))).result
+        if ($sbr.visible) { $sbSpan = [int]$sbr.width + 5 }
+    } catch { $sbSpan = 0 }
+    $dragX = [Math]::Max(200, $sbSpan + 40)
+    [ClipIn]::Drag($h, $dragX, 80, 960, 555)
     Start-Sleep 1
     if ($clipOk) {
         # Overwrite what auto-copy-on-release already put there, so only Ctrl+C can restore it.

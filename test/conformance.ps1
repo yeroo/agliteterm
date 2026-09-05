@@ -49,6 +49,29 @@ $contract = Get-Content $Spec -Raw | ConvertFrom-Json
 $pipe = 'conform'
 $vars = @{}
 $checked = 0
+$skipped = 0
+
+# The client probe (the P1-lite pattern, test/control-read.ps1): a step the CLI at hand cannot
+# SEND is skipped, not passed. A post-#226 agwintermctl refuses `sidebar width wide` on its own
+# side ("needs a whole number") before any pipe is opened; the 0.17.x client has no width argument
+# and sends `sidebar width 300` as a READ - so the set step would pass as a read that happened to
+# have the right shape, and the `sidebar width 5` refusal would come back ok. Under -Strict a skip
+# is a failure, which is the release gate until agwinterm tags the release that carries #226.
+$probe = (& $ctl sidebar width wide --pipe 'conform-probe' --json 2>&1) -join ''
+$cliHasSidebarWidth = $probe -match 'whole number'
+
+# HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
+# `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
+# every later suite - and the user's own agliteterm - inherits it. clipboard's drag starts at x=200,
+# which is inside a 260 px sidebar, so it selected nothing and Ctrl+C had nothing to copy. Saved here
+# and restored in `finally`, the rule ui-lib states for anything a case changes.
+$regKey = 'HKCU:\Software\agliteterm'
+$savedSidebar = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).SidebarW } else { $null }
+function Needs-NewClient($argv) {
+    $a = [string[]]@($argv)
+    return ($a.Count -eq 3 -and $a[0] -eq 'sidebar' -and $a[1] -eq 'width' -and $a[2] -match '^\d+$' -and -not $cliHasSidebarWidth)
+}
+function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  $name — $why" }
 
 # Substitute {captured} values into an argument list.
 function Expand-Args($argv) {
@@ -119,6 +142,7 @@ try {
             if ($parts[0] -eq 'window.new') { Invoke-Ctl @('window', 'new', '--name', $parts[1]) | Out-Null; Start-Sleep -Seconds 6 }
         }
         $argv = Expand-Args $step.args
+        if (Needs-NewClient $argv) { Skip "$($step.verb) ($($argv -join ' '))" 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'; continue }
         $resp = Invoke-Ctl $argv
         $why = Test-Shape $resp $step.result $step.fields
         Check $step.verb ($null -eq $why) $why
@@ -147,12 +171,18 @@ try {
     # A script branches on ok, so a bad target must come back as a refusal — not a crash, and not a
     # cheerful ok:true that did nothing.
     foreach ($e in $contract.errors) {
+        if (Needs-NewClient $e.args) { Skip "refuses: $($e.args -join ' ')" 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'; continue }
         $resp = Invoke-Ctl (Expand-Args $e.args)
         $isRefusal = ($null -ne $resp) -and ($resp.PSObject.Properties.Name -notcontains '__raw') -and (-not $resp.ok) -and $resp.error
         Check "refuses: $($e.args -join ' ')" $isRefusal
     }
 }
 finally {
+    # Put the sidebar width back: the contract's `sidebar width 260` step is a real set, and HKCU is
+    # shared with every other suite and with the user's own agliteterm (see the note where it is saved).
+    if ($null -ne $savedSidebar) { Set-ItemProperty -Path $regKey -Name SidebarW -Value $savedSidebar -Type DWord -ErrorAction SilentlyContinue }
+    elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name SidebarW -ErrorAction SilentlyContinue }
+
     # Close ONLY what this run created, by name, through the pipe — never by enumerating processes.
     # A blanket "stop every agliteterm" here would close the windows the developer is working in,
     # which is the exact accident this suite's rules exist to prevent.
@@ -168,10 +198,11 @@ finally {
 }
 # A conformance suite that checks nothing must never report success. This is the guard for the
 # failure that actually happened: a silent empty run.
-if ($checked -lt $contract.steps.Count) {
+if ($checked + $skipped -lt $contract.steps.Count) {
     "conformance: only $checked of $($contract.steps.Count) verbs were exercised"
     exit 1
 }
 if ($fail) { "conformance: $fail FAILED"; exit 1 }
-"conformance: all passed"
+if ($skipped -and $Strict) { "conformance: $skipped skipped under -Strict"; exit 1 }
+"conformance: all passed$(if ($skipped) { " ($skipped skipped)" })"
 exit 0

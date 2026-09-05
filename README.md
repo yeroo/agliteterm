@@ -63,7 +63,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   registry escape hatch is `RightClickPaste` / `CopyOnCtrlC` (DWORD `0`) under
   `HKCU\Software\agliteterm`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  42 verbs covering sessions, workspaces, windows, and the tree (`agwintermctl --pipe
+  43 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -73,7 +73,25 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   width — clamp before indexing); every `tree` node carries `statusChangedAt`, epoch seconds
   of the last status **write**, restamped on every write including a re-assert of the same status,
   so a stale `"active"` shows its age; and `ping` names the running build (`agliteterm
-  <version>`), which is what `agwintermctl version` reports as the app.
+  <version>`), which is what `agwintermctl version` reports as the app. `session type --stdin`
+  takes the text from standard input as bytes — how quotes, newlines, runs of spaces and a
+  leading `--` are sent, none of which survives the argv path (exactly one trailing newline is
+  dropped; invalid UTF-8 is refused before anything is sent). The flag lives in the shared
+  `agwintermctl`; lite's server side is unchanged. There is no `quick type`: the quick terminal
+  is a hidden session, typed into as `session type --target <its id>` (the id arrives as a
+  `session`/`created` event after `quick on`). And a call that answers `ok` did what was asked
+  (parity batch P2): `session overlay open <cmd> --size-percent N` is validated as 1..100 and
+  refused otherwise with nothing opened, and the reply carries the percentage **in effect** (a popup
+  cannot be under 30x8 cells, so a small window raises a low one; a window that cannot be measured
+  at all — minimised, or a client under 30x8 cells — is told what it got and why, with no number);
+  `resize` moves the popup and refuses when none is open;
+  `sidebar width [N]` reads or sets the divider (90..900 px, and never so wide that the terminal
+  drops under 20 columns) and answers the width **in effect**, while an unknown sidebar op is
+  refused instead of toggling; a bare `session new` lands in the **caller's** workspace, not the
+  active one, and `--workspace` beside `--workspace-name` is refused; `window select` says
+  `selected` only when the window really came to the front. No verb steals the foreground from
+  the app you are typing in — a popup raises only when agliteterm already holds it, and flashes
+  the taskbar button otherwise.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's
@@ -259,5 +277,9 @@ Rules the suite obeys, each learned from a real incident:
 interrupted writes, `.bak` fallback, bogus apps, and old and future file formats. The checks that
 drive the control pipe need `agwintermctl` — from an installed agwinterm, from `bin/` (the fetch
 pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. They skip with a message
-when it is absent rather than failing obscurely.
+when it is absent rather than failing obscurely. A check that needs a client newer than the
+fetched release — `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field, all
+agwinterm #226 — probes the client first and SKIPs on an older one (`-Strict` turns that into a
+failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
+dev build: `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
 
