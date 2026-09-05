@@ -463,6 +463,45 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       for P3) and by its plan moving to `docs/plans/completed/`, which happens when this plan
       completes. PR #28's body carries the validation above; revmux rounds follow it)
 
+**What revmux round 1 found** (`.revmux/tasks/p3-lite-mirror/01-initial`, full branch at
+`26ae272`): no Major or Critical; nine Minors, six of them fixed in `ca527a6` because four are real
+product gaps and the round rule (two minimum, and a lock change never ships without its own round)
+meant a fix round was due anyway. Round 2 is scoped to that commit.
+
+- **A save preempted between releasing `g_lock` and taking `g_saveLock` could publish an OLDER
+  snapshot last** — two locks in sequence do not give "the later snapshot wins" on their own.
+  Every buffer is now stamped under `g_lock` (`g_saveStamp`), the last stamp published is kept
+  under `g_saveLock`, and an overtaken buffer is dropped unwritten.
+- **`restore.capture` answered ok when the save failed** (no state directory, unwritable, full
+  disk — each already `logWarn`ed). `saveSessionState` returns whether it published; the verb
+  refuses on `false`, naming that the slots are in memory and not on disk, and leaves them (rolling
+  them back would make the tree disagree with a capture that read the processes correctly).
+- **An exited pane's stale shell pid could capture a recycled pid's child.** `Session::childPid`
+  is set once and never cleared; `livePid()` withholds it for an exited session, so the pane reads
+  as null — the honest answer for a shell that is gone.
+- **The `CDDS_ITEMPREPAINT` gate read `context.empty()` without `g_lock`** while the post-paint
+  below took it for the same field. Both under the hold now.
+- Wording: the hidden-session refusal said a split is "never restored" (it is — its `P` line; it
+  has no row and no session line), in the verb, the README and the skill text; the probe comment
+  counted four gated entries (five); "K after P" stated as a requirement in three places (a
+  convention — the reader collects line types in file order and applies them in its own);
+  `docs/state-file.md` and two code comments named "the `P` set refused" as a cause of the pane-1
+  drop (unreachable: the `K` set is refused by the same comparison in the same pass) and omitted
+  the reachable one (a `K` naming a split the file has no `P` for); QA step 2 expected the typed
+  text in the `K` line where step 1, the fixture and the recorded run all have the
+  process-reported command line.
+- Not taken: the fixture killing pings by command-line marker (immaterial — the marker is the
+  suite's own, and the process tree is not reachable from `session type`).
+
+**What the suite run for the fix found.** `run-all -Strict` under `pwsh -NoProfile` failed ONE
+check the author's runs (a UTF-8 profile) and CI (the P3 block skipped) had never executed: a
+context of `café 🚀` came back from `tree` as `caf? ??` while the raw pipe carried it intact.
+Lite's `jsonEscape` passed raw UTF-8 through — valid JSON, but it reaches callers through
+`agwintermctl`'s stdout and a shell that decodes native output with its own console code page.
+agwinterm's server escapes non-ASCII as `\uXXXX`; lite now does the same (surrogate pairs above the
+BMP, `\ufffd` for a malformed byte), so the wire is ASCII and no code page on either side can change
+what a caller reads. Every reply goes through it, so the whole suite was re-run: 573/573, 0 SKIP.
+
 ## Technical Details
 
 - **Why the row and not the caption.** agterm's item says "title bar and tree". Lite's caption is
