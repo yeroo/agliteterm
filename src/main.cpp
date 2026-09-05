@@ -352,10 +352,12 @@ struct Session {
     int cols = 0, rows = 0;     // geometry last pushed to the host (0 = never sized yet)
     int scrollOff = 0;          // rows scrolled up into history (0 = live)
     bool exited = false;
-    // Consecutive pty-host refusals of a resize for THIS session. The retry timer is armed from the
-    // rollback, and a host that keeps refusing would otherwise make that a 60 ms forever-loop: a
-    // synchronous round trip per pane and popup sixteen times a second, each writing a log line
-    // that opens, appends to and closes the file (revmux r5). Reset on the first acceptance.
+    // Refusals in ONE episode of chasing a resize on the timer — not refusals ever. The retry timer
+    // is armed from the rollback, and a host that keeps refusing would otherwise make that a 60 ms
+    // forever-loop: a synchronous round trip per pane and popup sixteen times a second, each writing
+    // a log line that opens, appends to and closes the file (revmux r5). An episode ends at an
+    // accepted resize OR at the next real layout request (hostResize's `fromRetry` is false there),
+    // so a drag after a give-up starts over and is heard again; only the automatic chasing stops.
     int resizeRefusals = 0;
     // Restore placeholder: this spec's app would not start on THIS machine, so there is no shell
     // behind it. The entry is kept anyway (empty id, exited) so the name/workspace/cwd/args survive
@@ -977,10 +979,11 @@ static CRITICAL_SECTION g_lock; // guards every session's emu + the session list
 // emulator cannot disagree. Deliberately NOT g_lock — the round trip under it is unbounded, and
 // g_lock is what paintPane and every reader thread need (see hostResize). The invariant, stated as
 // a rule rather than a sequence: **g_lock must not be held when g_resizeLock is acquired.**
-// hostResize is the only taker, and it takes g_lock briefly SEVERAL times — the early out (which
-// releases before the try-lock precisely for this reason), the latch, the rollback, and the final
-// emu_resize — so a reader who sees repeated holds must not widen any of them across the
-// acquisition of g_resizeLock.
+// hostResize is the only taker, and it takes g_lock briefly several times — read that function for
+// the current set; the one that matters here is its FIRST, the early out, which releases before the
+// try-lock precisely for this reason. The rule is what to preserve, not the count: no hold may be
+// widened across the acquisition of g_resizeLock. (This sentence has gone stale twice by listing the
+// holds, so it no longer lists them.)
 static CRITICAL_SECTION g_resizeLock;
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
@@ -1564,22 +1567,25 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
     struct ResizeGuard { ~ResizeGuard() { LeaveCriticalSection(&g_resizeLock); } } resizeGuard;
     int hadCols, hadRows;
     {
+        // ONE hold, and the order inside it is load-bearing. Every exit between the latch write and
+        // the host's answer must either roll the latch back or complete the resize — a return that
+        // leaves it advanced publishes a grid the shell and the emulator do not have, which `tree`
+        // then reports and newSessionGrid then inherits (revmux r7 found exactly that: the
+        // exhausted-retry check sat AFTER the write). So: decide, THEN commit.
+        //
+        // A real layout event starts a NEW refusal episode — the count is "refusals in a row while
+        // chasing this on the timer", not "refusals ever". Left as a lifetime count it went silent
+        // after the give-up: every later drag, split or font change refused with no log line and no
+        // retry, indefinitely, which is the one state (an undecodable control pipe) the log is the
+        // only diagnostic for. A timer sweep, conversely, must NOT re-ask a session that has already
+        // given up — another session's SetTimer would otherwise retry it past its own cap.
         LockG hold;
-        if (s->cols == cols && s->rows == rows) return;
-        hadCols = s->cols; hadRows = s->rows;
+        if (s->cols == cols && s->rows == rows) return;                       // decided
+        if (fromRetry && s->resizeRefusals > kResizeRetryAttempts) return;    // decided
+        if (!fromRetry) s->resizeRefusals = 0;
+        hadCols = s->cols; hadRows = s->rows;                                 // committed
         s->cols = cols;
         s->rows = rows;
-    }
-    {
-        // A real layout event starts a NEW refusal episode: the count is "refusals in a row while
-        // chasing this on the timer", not "refusals ever". Left as a lifetime count it went silent
-        // after the give-up — every later drag, split or font change was refused with no log line
-        // and no retry, indefinitely, which is the one state (an undecodable control pipe) the log
-        // is the only diagnostic for. A timer sweep, conversely, must NOT re-ask a session that has
-        // already given up: another session's SetTimer would otherwise retry it past its own cap.
-        LockG hold;
-        if (!fromRetry) s->resizeRefusals = 0;
-        else if (s->resizeRefusals > kResizeRetryAttempts) return;
     }
     if (!s->id.empty()) {   // a restore placeholder has no host session — only its emulator resizes
         agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
@@ -5420,9 +5426,11 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is the EFFECTIVE 1..100 the verb reported, which is what the popup is built from — though
-// see below: when the window cannot be measured there is no percentage and the reply says so. The
-// verb raised the number — or lite's 70 %
+// sizePct is the 1..100 the verb POSTED, and the popup is built from it. It equals the percentage
+// the caller was told whenever overlayMinPercentRaw() could answer (1..100); when it could not — the
+// window is minimised, or its client is under 30x8 cells — there is no percentage to report, the
+// reply says what it got and why instead, and the number arriving here is simply the request or the
+// default with the physical floor applied below. The verb raised the number — or lite's 70 %
 // default, when the flag was absent — to the 30x8-cell minimum and posts THAT, so the popup is
 // built from the number the caller was given. overlayFraction still has a 0 arm; nothing on this
 // path reaches it any more (revmux r4/r5), and it is kept only so a future caller cannot trip on

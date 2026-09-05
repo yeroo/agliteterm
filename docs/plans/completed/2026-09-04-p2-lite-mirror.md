@@ -689,6 +689,31 @@ Critical**, six Minors and one immaterial — the substantive ones fixed in the 
   "lite's SECOND timer"; `OnTimer` described the refusal retries as fixed 60 ms attempts; and
   `openOverlay`'s block opened with a claim the same block goes on to qualify.
 
+**What revmux round 7 found** (`07-after-fix6`, scoped to the r6 fix commit: **one Major in that
+fix** and three Minors — fixed in the next commit).
+
+- ⚠️ **Major — the exhausted-retry return abandoned a committed latch.** r6 put the "this session has
+  given up, do not re-ask it" check AFTER the block that writes `s->cols`/`s->rows`, so that one exit
+  left the latch advanced without asking the host and without `emu_resize`. Every other exit between
+  the write and the host's answer either rolls back or completes; this one published a grid nothing
+  actually had. `tree` reports that field (the control-honesty test's own oracle), `newSessionGrid`
+  inherits it, and — worst — the early out then MATCHES it, so every later genuine layout event for
+  the same grid returned immediately without contacting the host or resetting the counter. It made
+  the silent-and-un-retried state r6 filed reachable again through a different door, and it
+  contradicted both the `g_resizeLock` declaration ("so the latch, the host and the emulator cannot
+  disagree") and `newSession`'s own comment. The blocks are merged now and ordered **decide, then
+  commit**: the no-op compare, the exhausted check, the episode reset, and only then `hadCols` /
+  `hadRows` and the write — which also removes a back-to-back re-acquisition of the recursive
+  `g_lock` and makes it structurally hard to add another un-rolled-back exit.
+- The `g_resizeLock` rule's inventory of `hostResize`'s `g_lock` holds went stale for the second time
+  (r5 already corrected it once, from "twice" to a list of four; this change added a fifth). It no
+  longer lists them — it states the rule, names the one hold that matters for the ordering, and
+  points at the function.
+- The `resizeRefusals` declaration still said acceptance was its only reset, which r6 made false.
+- `openOverlay` still called `sizePct` "the percentage the verb reported", which is not true on the
+  cannot-measure path: it is the value the verb POSTED, equal to the reported one only when
+  `overlayMinPercentRaw()` could answer.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's
