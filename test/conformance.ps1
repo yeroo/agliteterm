@@ -59,6 +59,14 @@ $skipped = 0
 # is a failure, which is the release gate until agwinterm tags the release that carries #226.
 $probe = (& $ctl sidebar width wide --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasSidebarWidth = $probe -match 'whole number'
+
+# HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
+# `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
+# every later suite - and the user's own agliteterm - inherits it. clipboard's drag starts at x=200,
+# which is inside a 260 px sidebar, so it selected nothing and Ctrl+C had nothing to copy. Saved here
+# and restored in `finally`, the rule ui-lib states for anything a case changes.
+$regKey = 'HKCU:\Software\agliteterm'
+$savedSidebar = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).SidebarW } else { $null }
 function Needs-NewClient($argv) {
     $a = [string[]]@($argv)
     return ($a.Count -eq 3 -and $a[0] -eq 'sidebar' -and $a[1] -eq 'width' -and $a[2] -match '^\d+$' -and -not $cliHasSidebarWidth)
@@ -170,6 +178,11 @@ try {
     }
 }
 finally {
+    # Put the sidebar width back: the contract's `sidebar width 260` step is a real set, and HKCU is
+    # shared with every other suite and with the user's own agliteterm (see the note where it is saved).
+    if ($null -ne $savedSidebar) { Set-ItemProperty -Path $regKey -Name SidebarW -Value $savedSidebar -Type DWord -ErrorAction SilentlyContinue }
+    elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name SidebarW -ErrorAction SilentlyContinue }
+
     # Close ONLY what this run created, by name, through the pipe — never by enumerating processes.
     # A blanket "stop every agliteterm" here would close the windows the developer is working in,
     # which is the exact accident this suite's rules exist to prevent.
