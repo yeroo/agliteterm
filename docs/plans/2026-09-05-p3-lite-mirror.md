@@ -301,43 +301,67 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       (restore-matrix `-Strict` 40/40 and control-honesty `-Strict` 262/262 with the dev client)
 
 ### Task 5: `restore.capture` — the verb, the `K` line, the read-back
-- [ ] `restore.capture` in `ctlDispatch`: **snapshot** under `LockG` — for a bare call every
+- [x] `restore.capture` in `ctlDispatch`: **snapshot** under `LockG` — for a bare call every
       non-hidden session plus each one's `splitId` shell (the panes `P` lines restore), as
       `(Session*, ownerId, paneId, childPid)`; `--target`: `resolveTarget`; an unknown target →
       agwinterm's `UnknownTarget(target)` wording; a hidden session that no visible session's
       `splitId` names (quick/scratch/overlay) → `CoverPane(id)` wording; a present-but-empty target
       (`req.fields.find("target")` found and empty — the CLI refuses it too, so also pin it with a
-      raw JSON line) → `EmptyTarget` wording. Every refusal returns before the query
-- [ ] **query** with no lock held (`captureForeground`); `false` → `QueryFailed` wording, nothing
+      raw JSON line) → `EmptyTarget` wording. Every refusal returns before the query.
+      A visible session named as the target captures its own shell (pane 0; lite keeps no
+      per-session focused pane), `active` is the focused pane (may be the split shell), a split's id
+      captures that one pane; an ambiguous name is refused in the verb's words with lite's "names N
+      sessions" detail
+- [x] **query** with no lock held (`captureForeground`); `false` → `QueryFailed` wording, nothing
       written
-- [ ] **write** under `LockG`: for each snapshot entry still in `g_sessions`, `capturedCmd = found
+- [x] **write** under `LockG`: for each snapshot entry still in `g_sessions`, `capturedCmd = found
       ? cmd : ""` (null written too — a fresh capture replaces an older checkpoint); entries closed
-      since the snapshot are dropped from the reply, not written; build `panes[]` from what landed
-- [ ] **save from the pipe thread**: call `saveSessionState()` directly after the write so the reply
+      since the snapshot are dropped from the reply, not written (pointer AND id re-checked, a freed
+      Session's address can be reused); build `panes[]` from what landed
+- [x] **save from the pipe thread**: call `saveSessionState()` directly after the write so the reply
       describes a state that is on disk (agwinterm's rule). `saveSessionState` gets a
       `g_saveLock` (a CS around the `.tmp` write + rename only, acquired AFTER `g_lock` is
       released — state the ordering in the comment) so a pipe-thread save cannot collide with the
       UI thread's; then post `WM_APP_REFRESHTREE` for the tree. This is the first pipe-thread save —
-      the comment says so and why
-- [ ] reply `ctlOk` with agwinterm's shape: `captured` = the non-null count, `replayOnRestore`
+      the comment says so and why. `g_saveLock` is a scoped hold from the `g_lock` release to the
+      end of the function, so the zero-session read that precedes the `.tmp` write is serialised too
+- [x] reply `ctlOk` with agwinterm's shape: `captured` = the non-null count, `replayOnRestore`
       **`false`**, `panes` in snapshot order with `pane`, `session` (the owner's id), `captured`
       string or `null`
-- [ ] the `K` line: `K\t<idx>\t<pane0>\t<pane1>` per session with at least one captured command
+- [x] the `K` line: `K\t<idx>\t<pane0>\t<pane1>` per session with at least one captured command
       (`tsvField` on each; empty = none; pane 1 = the `splitId` shell's slot, or empty when no
       split), with the `P` count guard on load and the same additive comment; `restoreSessions`
       loads pane 0's slot onto the session and pane 1's onto the split it creates from the `P`
       line (both are re-created, so the slot lands on the new `Session`). A slot is a STRING with
-      no rules beyond `tsvField` — nothing to validate on load except the index
-- [ ] `tree --json`: `"capturedCommands":{"<paneId>":"<cmd>",…}` on the owning session node,
+      no rules beyond `tsvField` — nothing to validate on load except the index. Written AFTER the
+      `P` lines (pane 1 names the split the `P` line rebuilds); a pane-1 slot whose split was not
+      restored (the `P` set refused, the split failed to start) is dropped with a `logWarn` naming
+      the session; a dead entry keeps pane 0's slot like its name
+- [x] `tree --json`: `"capturedCommands":{"<paneId>":"<cmd>",…}` on the owning session node,
       emitted only when any pane of that session has one — `AppendPaneMap`'s shape
       (`ControlServer.cs:470`); the split's id appears as a key even though lite's tree has no
       split node (comment: that is where the pane-id read-back lives until P9 adds `paneIds`)
-- [ ] `restore capture` with no `restore` sub-verb / unknown sub-verb: the CLI already answers the
+- [x] `restore capture` with no `restore` sub-verb / unknown sub-verb: the CLI already answers the
       usage line client-side — nothing to do server-side beyond `restore.capture`; `restore.clear`
       stays unimplemented (P9) and an unknown `cmd` keeps lite's existing refusal
-- [ ] `test/control-honesty.ps1` P3 block (Testing Strategy above); `test/restore-matrix.ps1`
+- [x] `test/control-honesty.ps1` P3 block (Testing Strategy above); `test/restore-matrix.ps1`
       cells `capture-graceful`, `capture-killed`, `capture-split` (a `K` line with both fields);
-      run both `-Strict` before task 6
+      run both `-Strict` before task 6 — honesty `-Strict` 293/293, restore-matrix `-Strict` 43/43
+      with the dev client (agwinterm's Release `agwintermctl`, the one that answers the `restore`
+      usage line); the released client SKIPs the three capture cells (exit 0 plain, 1 under
+      `-Strict`). The capture half is 31 checks: reply shape / every-pane listing / the ping under
+      the pane's shell read back from the reply, `tree` and the `K` line / `--target` a split id, a
+      session name / unknown, raw-JSON empty, CLI-empty and scratch-cover refusals each asserted
+      against the tree AND the file / re-capture of nothing writes null (the `K` field empties, the
+      key and the line vanish when both slots are empty). The foreground child is a `ping -n 3xx
+      127.0.0.1` typed into the pane, found and stopped by that marker
+      ➕ the honesty flake Task 4 named is fixed at its cause: while the mouse is captured, EVERY
+      relayout the drag causes moves the tree/terminal boundary under the physical cursor, and
+      Windows queues a synthetic WM_MOUSEMOVE at the cursor's real position — so a pause after the
+      button-down could never be enough while the mouse sat over the sandbox (it did again here:
+      441, 1 of 293). For the drag section only, the sandbox's own window is moved out from under
+      the cursor (SetWindowPos on it, ui-lib's rule, no input injected) and put back after; the
+      cursor position is READ, never moved
 
 ### Task 6: docs, contract, trackers
 - [ ] `tools/check-contract.ps1 -Update` → `test/control-api.json`; `test/conformance.ps1 -Strict`

@@ -68,9 +68,11 @@ public static class LiteHonesty {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr h);
@@ -678,12 +680,26 @@ try {
     # to the sandbox's own handle (ui-lib's rule), starting on the splitter.
     $midY = [int]((ClientSize $s.Hwnd)[1] / 2)
     function Pt([int]$x, [int]$y) { [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
+    # While the mouse is captured, Windows queues a synthetic WM_MOUSEMOVE at the REAL cursor's
+    # position whenever the window under the cursor changes - on SetCapture (inside the button-down)
+    # and again on every relayout the drag itself causes, since the tree/terminal boundary moves under
+    # the cursor. With the physical mouse sitting over the sandbox, every posted move was overwritten
+    # and the tree ended wherever the mouse sat (441 with the mouse at screen x 599; a pause after the
+    # button-down was not enough). So, for the drag only, the sandbox's own window is moved out from
+    # under the cursor (SetWindowPos on it is ui-lib's rule, no input is injected) and put back after.
+    $curPt = New-Object LiteHonesty+POINT; [void][LiteHonesty]::GetCursorPos([ref]$curPt)
+    $winRc = New-Object LiteHonesty+RECT; [void][LiteHonesty]::GetWindowRect($s.Hwnd, [ref]$winRc)
+    $dragMoved = $false
+    if ($curPt.X -ge $winRc.Left -and $curPt.X -lt $winRc.Right -and $curPt.Y -ge $winRc.Top -and $curPt.Y -lt $winRc.Bottom) {
+        # Below the cursor if that keeps the window on the desktop, else to its right.
+        $desk = New-Object LiteHonesty+RECT; [void][LiteHonesty]::GetWindowRect([LiteHonesty]::GetDesktopWindow(), [ref]$desk)
+        $nx = $winRc.Left; $ny = $curPt.Y + 20
+        if ($ny + 200 -gt $desk.Bottom) { $ny = $winRc.Top; $nx = $curPt.X + 20 }
+        [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, $nx, $ny, 0, 0, 0x0005)   # SWP_NOSIZE | SWP_NOZORDER
+        Start-Sleep -Milliseconds 500
+        $dragMoved = $true
+    }
     [void][LiteUi]::PostMessageW($s.Hwnd, 0x0201, [IntPtr]1, (Pt ((TreeWidth) + 2) $midY))   # WM_LBUTTONDOWN on the splitter
-    # SetCapture (inside the button-down) makes Windows queue a synthetic WM_MOUSEMOVE at the REAL
-    # cursor's position. Posted straight after the button-down, the 340 move would be processed
-    # first and then overwritten by that synthetic move - the tree ends wherever the physical
-    # mouse happens to sit over the window (441 with the mouse at screen x 599). Let the synthetic
-    # move land first, then drag.
     Start-Sleep -Milliseconds 300
     [void][LiteUi]::PostMessageW($s.Hwnd, 0x0200, [IntPtr]1, (Pt 340 $midY))                 # WM_MOUSEMOVE, button held
     Check 'setup: a splitter drag is in progress (the tree followed the mouse to 340)' ((Wait-TreeWidth 340) -eq 340) "tree width $(TreeWidth)"
@@ -697,6 +713,10 @@ try {
     Check 'and HKCU SidebarW is the drag''s 360 (the button-up saved last)' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 360)
     SidebarWidthSet '300' | Out-Null
     Check 'setup: back at 300' ((Wait-TreeWidth 300) -eq 300)
+    if ($dragMoved) {   # the drag is over: the window goes back where every later coordinate expects it
+        [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, $winRc.Left, $winRc.Top, 0, 0, 0x0005)
+        Start-Sleep -Milliseconds 500
+    }
     # A raw request with no op at all: the CLI always sends one, but the pipe is public. Toggle,
     # which is what the CLI sends for a bare `sidebar` — pinned so the "" case is a written fact.
     $raw = Send-Raw '{"cmd":"sidebar","target":"","args":{}}'
@@ -1267,6 +1287,139 @@ try {
         Start-Sleep -Milliseconds 300
     }
 
+    # ---- P3: restore.capture ------------------------------------------------------------------------
+    # Capture the foreground command of every real pane (or of one named pane) into a durable slot
+    # NOW, save, and report per pane. The reply is agwinterm's RestoreCaptureReply object, the
+    # refusal wording is agwinterm's verbatim, and every refusal is asserted twice: the reply, then
+    # the world — `tree --json`'s capturedCommands AND the K line in the state file, since "nothing
+    # saved" is a claim about the disk. The presence oracle is proved first (no node carries the key
+    # and the file has no K line before the first capture). The foreground child is a `ping` typed
+    # into the pane: a real process under the pane's shell, found by the same Toolhelp32 walk the
+    # verb runs, and stopped again by its distinctive argument.
+    "-- P3: restore.capture --"
+    if (-not $cliHasP3) {
+        Skip 'restore.capture (the whole block)' "the client at $ctl predates P3 (no `restore` command)"
+    } else {
+        # An empty element (a setup that answered no id) would make Send-Ctl throw and take the whole
+        # suite down; answered as a refusal instead, so the check that reads it fails and names it.
+        function Cap([string[]]$rest) {
+            if (@($rest | Where-Object { -not $_ }).Count -gt 0) { return '{"ok":false,"error":"(test: an empty argument reached restore capture)"}' }
+            Send-Ctl $s (@('restore', 'capture') + $rest)
+        }
+        function CapNode([string]$id) { Nodes | Where-Object { [string]$_.id -eq $id } | Select-Object -First 1 }
+        function CapsOf([string]$id) {   # the node's capturedCommands as "key=value;..." or '' when absent
+            $n = CapNode $id
+            if (-not $n -or -not $n.PSObject.Properties['capturedCommands']) { return '' }
+            (@($n.capturedCommands.PSObject.Properties | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ';')
+        }
+        function AnyCaps { [bool](Nodes | Where-Object { $_.PSObject.Properties['capturedCommands'] }) }
+        $stateFile = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
+        function KLines { @((Get-Content $stateFile -Raw) -split "`n" | Where-Object { $_ -like "K`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
+        # The pings: `-n 3xx 127.0.0.1` is the marker each one is found and stopped by.
+        function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+        function Wait-Ping([string]$n, [bool]$present, [int]$ms = 8000) {
+            for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Ping-Procs $n).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
+            return $false
+        }
+        function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; [void](Wait-Ping $n $false) }
+        $capId = [string](Get-CtlResult $s @('session', 'new', '--name', 'cap-a'))
+        Start-Sleep -Milliseconds 800
+        Check 'setup: a fresh session for the capture checks' ([bool]$capId -and [bool](CapNode $capId)) "id '$capId'"
+        Check 'before any capture, no node carries capturedCommands and the file has no K line (the presence oracle)' (-not (AnyCaps) -and @(KLines).Count -eq 0) "K: $(KLines -join ' / ')"
+        Send-Ctl $s @('session', 'select', '--target', $capId) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $capSplit = [string](Get-CtlResult $s @('session', 'split', 'on'))
+        Start-Sleep -Milliseconds 1500
+        Check 'setup: cap-a has a split shell, addressed by the id session split answered' ([bool]$capSplit -and -not (CapNode $capSplit)) "split '$capSplit'"
+        Stop-Ping '303'; Stop-Ping '305'   # a leftover from an aborted run would be found under the wrong shell
+        Send-Ctl $s @('session', 'type', "ping -n 303 127.0.0.1`n", '--target', $capId) | Out-Null
+        Check 'setup: a ping is running under the cap-a shell' (Wait-Ping '303' $true)
+        Start-Sleep -Milliseconds 500
+
+        # -- the bare call: every real pane --
+        $raw = Cap @(); $r = ConvertFrom-Json $raw
+        $expectPanes = @(Nodes).Count + 1   # every visible session, plus cap-a's split
+        Check 'restore capture answers ok with an OBJECT: captured 1, replayOnRestore false, panes an array' `
+            ([bool]$r.ok -and [int]$r.result.captured -eq 1 -and $r.result.replayOnRestore -eq $false -and $r.result.panes -is [array]) "raw: $raw"
+        Check 'panes lists every real pane: each visible session and the one split, each with pane/session/captured' `
+            (@($r.result.panes).Count -eq $expectPanes -and -not ($r.result.panes | Where-Object { -not ($_.PSObject.Properties['pane'] -and $_.PSObject.Properties['session'] -and $_.PSObject.Properties['captured']) })) "panes: $(@($r.result.panes).Count), expected $expectPanes; raw: $raw"
+        $mine = $r.result.panes | Where-Object { [string]$_.pane -eq $capId }
+        Check 'the cap-a pane captured the ping command line, under its own session id' ([string]$mine.session -eq $capId -and [string]$mine.captured -match 'PING\.EXE" -n 303 127\.0\.0\.1$') "pane: $($mine | ConvertTo-Json -Compress)"
+        $sp = $r.result.panes | Where-Object { [string]$_.pane -eq $capSplit }
+        Check 'the split pane is listed under cap-a (session = the owner) with captured null' ([string]$sp.session -eq $capId -and $sp.PSObject.Properties['captured'] -and $null -eq $sp.captured) "pane: $($sp | ConvertTo-Json -Compress)"
+        Check 'every other pane is null (idle shells; the shells themselves are denylisted)' (-not ($r.result.panes | Where-Object { [string]$_.pane -ne $capId -and $null -ne $_.captured })) "raw: $raw"
+        Check 'tree --json reads it back as capturedCommands on the cap-a node, keyed by pane id, the idle split absent' ((CapsOf $capId) -match "^$([regex]::Escape($capId))=.*-n 303 127\.0\.0\.1$") "caps: $(CapsOf $capId)"
+        Check 'and no other node carries the key' (@(Nodes | Where-Object { $_.PSObject.Properties['capturedCommands'] }).Count -eq 1)
+        $k = @(KLines)
+        Check 'the state file has ONE K line: index, the pane-0 command, an empty pane-1 field' (@($k).Count -eq 1 -and $k[0] -match "^K`t\d+`t[^`t]*-n 303 127\.0\.0\.1`t$") "K: $($k -join ' / ')"
+
+        # -- one pane by id: the split --
+        Send-Ctl $s @('session', 'type', "ping -n 305 127.0.0.1`n", '--target', $capSplit) | Out-Null
+        Check 'setup: a second ping is running under the split shell' (Wait-Ping '305' $true)
+        Start-Sleep -Milliseconds 500
+        $raw = Cap @('--target', $capSplit); $r = ConvertFrom-Json $raw
+        Check 'restore capture --target <split id> captures that ONE pane: one entry, pane = the split, session = cap-a' `
+            ([bool]$r.ok -and @($r.result.panes).Count -eq 1 -and [string]$r.result.panes[0].pane -eq $capSplit -and [string]$r.result.panes[0].session -eq $capId -and [string]$r.result.panes[0].captured -match '-n 305 127\.0\.0\.1$' -and [int]$r.result.captured -eq 1) "raw: $raw"
+        Check 'and the tree now carries both pane keys on the cap-a node' ((CapsOf $capId) -match "^$([regex]::Escape($capId))=.*-n 303 .*;$([regex]::Escape($capSplit))=.*-n 305 ") "caps: $(CapsOf $capId)"
+        $k = @(KLines)
+        Check 'and the K line carries both fields' (@($k).Count -eq 1 -and $k[0] -match "^K`t\d+`t[^`t]*-n 303 127\.0\.0\.1`t[^`t]*-n 305 127\.0\.0\.1$") "K: $($k -join ' / ')"
+        # -- one pane by session NAME: the session's own shell --
+        $raw = Cap @('--target', 'cap-a'); $r = ConvertFrom-Json $raw
+        Check 'restore capture --target <session name> captures that session own shell only (pane 0)' `
+            ([bool]$r.ok -and @($r.result.panes).Count -eq 1 -and [string]$r.result.panes[0].pane -eq $capId -and [string]$r.result.panes[0].captured -match '-n 303 ') "raw: $raw"
+
+        # -- refusals: each leaves both slots and the file exactly as they are --
+        $capsBefore = CapsOf $capId; $kBefore = (KLines) -join "`n"
+        function World-Unchanged { ((CapsOf $capId) -eq $capsBefore) -and (((KLines) -join "`n") -eq $kBefore) }
+        $raw = Cap @('--target', 'no-such-pane-zz'); $r = ConvertFrom-Json $raw
+        Check 'an unknown target is refused in the verb own words, naming the target' `
+            (-not $r.ok -and [string]$r.error -eq "restore capture: no pane or session matches 'no-such-pane-zz'. Nothing captured, nothing saved.") "raw: $raw"
+        Check 'and no slot changed, no K line changed' (World-Unchanged) "caps: $(CapsOf $capId); K: $((KLines) -join ' / ')"
+        $raw = Send-Raw '{"cmd":"restore.capture","target":""}'; $r = ConvertFrom-Json $raw
+        Check 'a raw present-but-empty "target":"" is refused with EmptyTarget wording (not widened to every pane)' `
+            (-not $r.ok -and [string]$r.error -eq 'restore capture: the target is empty. Omit --target to capture every real pane, or name one pane or session. Nothing captured, nothing saved.') "raw: $raw"
+        Check 'and no slot changed, no K line changed' (World-Unchanged)
+        $raw = (& $ctl restore capture --target '' --pipe $s.Pipe --json 2>&1) -join ''
+        Check 'the CLI refuses an empty --target on its own side (nothing sent)' ($raw -match 'Nothing sent' -and $raw -notmatch '"ok"') "raw: $raw"
+        Check 'and no slot changed, no K line changed' (World-Unchanged)
+        # a cover pane: the scratch pad, hidden, no S line, no K slot; its id arrives as a created
+        # event. Scratch rather than quick: a dismissed scratch pad is torn down, so `on` always
+        # creates a fresh session and emits the event, while the quick session survives its own
+        # `off` and a later `on` re-shows it silently (the stdin section above may have made one).
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $qid = [string]($created | Select-Object -Last 1).session
+        Check 'setup: the scratch pad session id arrived as a session/created event, and it is hidden from tree' ([bool]$qid -and -not (CapNode $qid)) "events: $($created | ConvertTo-Json -Compress)"
+        $raw = Cap @('--target', $qid); $r = ConvertFrom-Json $raw
+        Check 'a scratch pane is refused with CoverPane wording (never restored, so no slot)' `
+            (-not $r.ok -and [string]$r.error -eq "restore capture: '$qid' is a scratch/overlay/quick pane, which is never restored, so it has no restore slot to capture into. Nothing captured, nothing saved.") "raw: $raw"
+        Check 'and no slot changed, no K line changed' (World-Unchanged)
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+        Start-Sleep -Milliseconds 500
+
+        # -- a fresh capture replaces the checkpoint, including with nothing --
+        Stop-Ping '303'
+        $raw = Cap @(); $r = ConvertFrom-Json $raw
+        $mine = $r.result.panes | Where-Object { [string]$_.pane -eq $capId }
+        Check 'with the ping gone, a bare capture writes null into the cap-a pane and counts only the split' `
+            ([bool]$r.ok -and $null -eq $mine.captured -and [int]$r.result.captured -eq 1) "raw: $raw"
+        Check 'the tree keeps only the split key' ((CapsOf $capId) -match "^$([regex]::Escape($capSplit))=.*-n 305 ") "caps: $(CapsOf $capId)"
+        $k = @(KLines)
+        Check 'and the K line has an empty pane-0 field and the split command' (@($k).Count -eq 1 -and $k[0] -match "^K`t\d+`t`t[^`t]*-n 305 127\.0\.0\.1$") "K: $($k -join ' / ')"
+        Stop-Ping '305'
+        $raw = Cap @('--target', $capSplit); $r = ConvertFrom-Json $raw
+        Check 'capturing the idle split by id writes null there too' ([bool]$r.ok -and $null -eq $r.result.panes[0].captured -and [int]$r.result.captured -eq 0) "raw: $raw"
+        Check 'and with both slots empty the node has no capturedCommands key and the file no K line' (-not (AnyCaps) -and @(KLines).Count -eq 0) "caps: $(CapsOf $capId); K: $((KLines) -join ' / ')"
+        Send-Ctl $s @('session', 'split', 'off') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Send-Ctl $s @('session', 'close', '--target', $capId) | Out-Null
+        Start-Sleep -Milliseconds 500
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 300
+    }
+
     # ---- #23: two persisted values that cannot coexist ------------------------------------------
     # SidebarW (one value for every instance) and WinW-<instance> are each valid on their own; a
     # sidebar saved at 900 from a wide monitor and a window rect saved at 700 on the laptop meet at
@@ -1296,6 +1449,10 @@ try {
 }
 finally {
     if ($s) { Stop-Sandbox $s }
+    # The capture block's pings (a check that threw leaves them running for minutes under a shell
+    # that is about to be killed); found by the marker argument, never by name alone.
+    Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n 30[35] 127\.0\.0\.1' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     # The second sandbox's geometry values are its own; they were seeded here, so they go.
     foreach ($n in 'WinX', 'WinY', 'WinW', 'WinH', 'WinMax') {
         if (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name "$n-ctlhonesty23" -ErrorAction SilentlyContinue }

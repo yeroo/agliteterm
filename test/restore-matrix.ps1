@@ -109,6 +109,10 @@ function Stop-Leftover($p) {
 # A session's context (P3) rides along as `name~context` when the node carries one — `tree --json`
 # emits the key only when set, so its absence is part of the fingerprint too. The assertion is then
 # on the WORLD after the restart, not on what the verb replied before it.
+# The captured-command slots (restore.capture, P3) ride along the same way, as `^cmd0;cmd1` — the
+# VALUES of the node's capturedCommands, the session's own pane first, then its split's. Values and
+# not keys: a graceful restart re-creates the sessions under new ids, and it is the slot that has
+# to survive, not the id it was keyed by.
 function Signature($inst) {
     $ws = Tree $inst
     if ($null -eq $ws) { return '' }
@@ -116,7 +120,13 @@ function Signature($inst) {
     foreach ($w in $ws) {
         $parts += "#$($w.name)"
         foreach ($s in @($w.sessions)) {
-            $parts += if ($s.PSObject.Properties['context']) { "$($s.name)~$($s.context)" } else { $s.name }
+            $entry = if ($s.PSObject.Properties['context']) { "$($s.name)~$($s.context)" } else { $s.name }
+            if ($s.PSObject.Properties['capturedCommands']) {
+                $own = [string]$s.id
+                $vals = @($s.capturedCommands.PSObject.Properties | Sort-Object { if ($_.Name -eq $own) { 0 } else { 1 } }, Name | ForEach-Object { $_.Value })
+                $entry += '^' + ($vals -join ';')
+            }
+            $parts += $entry
         }
     }
     ($parts -join '|')
@@ -938,6 +948,84 @@ if ($cliHasP3) {
 } else {
     if (-not $Only -or $Only -eq 'context-graceful') { Skip 'context-graceful' 'this agwintermctl predates agwinterm #233 and refuses `session context` client-side - set AGWINTERMCTL to a newer build' }
     if (-not $Only -or $Only -eq 'context-killed')   { Skip 'context-killed'   'same client - the seeded C-line cells still run' }
+}
+
+# --- P3: the K line (restore.capture) -------------------------------------------------------------
+# The captured-command slots, written as `K\t<S-index>\t<pane0>\t<pane1>` after the P lines and read
+# back onto the session (pane 0) and onto the split the P line rebuilds (pane 1). The Signature
+# carries them as `name^cmd0;cmd1`, so the assertion is on the tree after the restart. The foreground
+# child is a `ping` typed into the pane, found and stopped by its marker argument (`-n 31x`): a
+# graceful close kills the shell and can orphan the ping, so every cell stops its own on the way out.
+function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+function Wait-Ping([string]$n, [int]$ms = 8000) {
+    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Ping-Procs $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
+    return $false
+}
+function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+if ($cliHasP3) {
+    # Captured over the API, saved by the verb itself, back after a graceful close — and re-written
+    # by the build that loaded it (the file inspected AFTER the second run).
+    Cell -Name 'capture-graceful' -Setup {
+        param($i)
+        Stop-Ping '311'
+        $id = LastSessionId $i
+        & $ctl session rename cap-keeper --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 311 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '311')) { throw 'the ping never started under the pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '311'
+        if ($b -notmatch 'cap-keeper\^[^|;]*-n 311 127\.0\.0\.1') { return $false }   # the capture itself has to have landed
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 311 127\.0\.0\.1`t`r?$")
+    }
+    # The kill path: the file the verb wrote is the one loaded, and the session is ADOPTED from the
+    # host (the ping is still running in it) — the slot comes from the K line either way.
+    Cell -Name 'capture-killed' -Kill -Setup {
+        param($i)
+        Stop-Ping '312'
+        $id = LastSessionId $i
+        & $ctl session rename cap-survivor --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 312 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '312')) { throw 'the ping never started under the pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '312'
+        if ($b -notmatch 'cap-survivor\^[^|;]*-n 312 127\.0\.0\.1') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 312 127\.0\.0\.1`t`r?$")
+    }
+    # A session with a split, a ping in each pane: one K line with BOTH fields, and after a graceful
+    # restart the split rebuilt from the P line carries pane 1's slot (a fresh Session, re-attached).
+    Cell -Name 'capture-split' -Setup {
+        param($i)
+        Stop-Ping '313'; Stop-Ping '314'
+        $id = LastSessionId $i
+        & $ctl session rename cap-both --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --pipe $i --json 2>&1) -join ''
+        $split = [string](ConvertFrom-Json $sraw).result
+        if (-not $split) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+        & $ctl session type "ping -n 313 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 314 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw 'a ping never started under its pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '313'; Stop-Ping '314'
+        if ($b -notmatch 'cap-both\^[^|;]*-n 313 127\.0\.0\.1;[^|;]*-n 314 127\.0\.0\.1') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 313 127\.0\.0\.1`t[^`t]*-n 314 127\.0\.0\.1`r?$")
+    }
+} else {
+    if (-not $Only -or $Only -eq 'capture-graceful') { Skip 'capture-graceful' 'this agwintermctl predates agwinterm #233 and has no `restore capture` - set AGWINTERMCTL to a newer build' }
+    if (-not $Only -or $Only -eq 'capture-killed')   { Skip 'capture-killed'   'same client' }
+    if (-not $Only -or $Only -eq 'capture-split')    { Skip 'capture-split'    'same client' }
 }
 
 # A C line the verb would have refused (a control character): the session comes back, the context
