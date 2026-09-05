@@ -714,6 +714,30 @@ fix** and three Minors — fixed in the next commit).
   cannot-measure path: it is the value the verb POSTED, equal to the reported one only when
   `overlayMinPercentRaw()` could answer.
 
+**What revmux round 8 found** (`08-after-fix7`, scoped to the r7 fix commit: **no Major or
+Critical** — three comment Minors and two pre-existing, all fixed in the next commit).
+
+- Both pre-existing items were one root cause, and it is this batch's own defect class: **a real
+  layout event demoted to the retry timer lost the fact that it was real.** `kRelayoutTimer` has two
+  owners — the UI thread losing the try-lock, and a refusal backoff — and `OnTimer` passes
+  `fromRetry=true` for both, so a session that had given up skipped the very drag the timer was
+  carrying for it: no host request, no `emu_resize`, no log line, nothing re-armed. A milder variant
+  had a demoted event inherit the previous episode's spent budget. Fixed with a per-session
+  `resizeWanted`, set at the demotion point when the call was real and consumed by the attempt that
+  follows, so the sweep can tell its two owners apart.
+- Three comments that promised more than the code did: the `resizeRefusals` note said any real
+  layout request ends an episode (two paths did not reach the reset); `openOverlay`'s block ended
+  with the unconditional claim its own new opening had just qualified, and stated the
+  cannot-measure case twice.
+
+**Suite note.** The stress run FAILED once here — 26 of 80 sessions made, then the app died — with
+system commit at 50.3 of 61.2 GB and 0.4 GB of free RAM, and an orphaned `agwinterm-ptyhost` left
+over from the night's runs. Re-run alone against the same binary after clearing it: **all passed**,
+80 made and closed, 0 rolled-back resizes. That is the exhaustion trap recorded in P1-lite's r5
+(80 sessions plus a streaming pane plus other work exceeds the paging cap), not a defect in this
+commit — but it is written down here rather than quietly re-run, because a crash under load is
+exactly what this suite exists to catch and "it passed the second time" is not evidence on its own.
+
 ## Technical Details
 
 - **Why lite keeps its 70 % default.** agwinterm's overlay is a cover drawn inside the session's

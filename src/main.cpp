@@ -356,9 +356,16 @@ struct Session {
     // is armed from the rollback, and a host that keeps refusing would otherwise make that a 60 ms
     // forever-loop: a synchronous round trip per pane and popup sixteen times a second, each writing
     // a log line that opens, appends to and closes the file (revmux r5). An episode ends at an
-    // accepted resize OR at the next real layout request (hostResize's `fromRetry` is false there),
-    // so a drag after a give-up starts over and is heard again; only the automatic chasing stops.
+    // accepted resize, or at the next real layout request that REACHES the decide block — one that
+    // is demoted to the timer carries `resizeWanted` so it still counts as real. Only the automatic
+    // chasing stops; a drag after a give-up starts a new episode and is heard again.
     int resizeRefusals = 0;
+    // Set when the UI thread hands a REAL layout event (a drag, a select, a font change) to the
+    // relayout timer because g_resizeLock was busy. The timer cannot tell its two owners apart —
+    // lock contention and a refusal backoff both arm the same id — so without this the sweep looks
+    // like an automatic retry, and a session that had given up dropped the user's resize in silence
+    // (revmux r8). Consumed by the attempt that follows.
+    bool resizeWanted = false;
     // Restore placeholder: this spec's app would not start on THIS machine, so there is no shell
     // behind it. The entry is kept anyway (empty id, exited) so the name/workspace/cwd/args survive
     // instead of vanishing — a failed spec used to be dropped, and the user was never told.
@@ -1559,6 +1566,10 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
         // the queue is empty, and SetTimer with the same id just restarts the one timer, so there is
         // nothing to stack and nothing to leak (revmux r3).
         if (!TryEnterCriticalSection(&g_resizeLock)) {
+            // Remember WHAT was demoted, not just that something was: the timer's sweep passes
+            // fromRetry=true for both of its owners, and an exhausted session would otherwise skip
+            // the very layout event the timer is carrying for it.
+            if (!fromRetry) { LockG hold; s->resizeWanted = true; }
             SetTimer(g_hwnd, kRelayoutTimer, kRelayoutRetryMs, nullptr);
             return;
         }
@@ -1580,9 +1591,13 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
         // only diagnostic for. A timer sweep, conversely, must NOT re-ask a session that has already
         // given up — another session's SetTimer would otherwise retry it past its own cap.
         LockG hold;
-        if (s->cols == cols && s->rows == rows) return;                       // decided
-        if (fromRetry && s->resizeRefusals > kResizeRetryAttempts) return;    // decided
-        if (!fromRetry) s->resizeRefusals = 0;
+        if (s->cols == cols && s->rows == rows) return;                       // decided (nothing consumed)
+        // A timer sweep is only an automatic retry when it is not carrying a demoted real event for
+        // THIS session; resizeWanted is how that survives the hand-off, and this attempt consumes it.
+        bool real = !fromRetry || s->resizeWanted;
+        s->resizeWanted = false;
+        if (!real && s->resizeRefusals > kResizeRetryAttempts) return;        // decided
+        if (real) s->resizeRefusals = 0;
         hadCols = s->cols; hadRows = s->rows;                                 // committed
         s->cols = cols;
         s->rows = rows;
@@ -5426,18 +5441,15 @@ static void togglePopupTerminal(bool scratch) {
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
 // time; opening a new overlay replaces the previous.
 //
-// sizePct is the 1..100 the verb POSTED, and the popup is built from it. It equals the percentage
-// the caller was told whenever overlayMinPercentRaw() could answer (1..100); when it could not — the
-// window is minimised, or its client is under 30x8 cells — there is no percentage to report, the
-// reply says what it got and why instead, and the number arriving here is simply the request or the
-// default with the physical floor applied below. The verb raised the number — or lite's 70 %
-// default, when the flag was absent — to the 30x8-cell minimum and posts THAT, so the popup is
-// built from the number the caller was given. overlayFraction still has a 0 arm; nothing on this
-// path reaches it any more (revmux r4/r5), and it is kept only so a future caller cannot trip on
-// it. Nothing clamps the percentage here — 100 means the whole client area — but
-// createPopupWindowPx still applies the physical 30x8-cell floor to the PIXELS, which is what the
-// verb accounts for: when the window cannot be measured at all (minimised, or a client under 30x8
-// cells) there is no percentage to name and the reply says what it got and why instead. lite's 70 %
+// sizePct is the 1..100 the verb POSTED, and the popup is built from it. When
+// overlayMinPercentRaw() could answer, that is also the percentage the caller was told: the verb
+// raised the request — or lite's 70 % default, when the flag was absent — to the 30x8-cell minimum
+// and posted THAT. When it could not answer (the window is minimised, or its client is under 30x8
+// cells) there is no percentage to name, the reply says what it got and why, and the number arriving
+// here is just the request or the default, with createPopupWindowPx's physical floor applied to the
+// pixels below. Nothing clamps the PERCENTAGE here — 100 means the whole client area.
+// overlayFraction still has a 0 arm; nothing on this path reaches it any more (revmux r4/r5), and it
+// is kept only so a future caller cannot trip on it. lite's 70 %
 // default is its own and differs from agwinterm's (a cover over the full content region): the
 // shared contract pins the reply shape and the refusals, not the default geometry, and the skill
 // says which default each product has. An empty command is refused by the verb, and the verb is
