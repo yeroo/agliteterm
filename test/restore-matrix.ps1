@@ -30,6 +30,15 @@ $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
+$script:skipped = 0
+# The P3 cells that SET a context go through `session context`, which a pre-#233 agwintermctl refuses
+# client-side ("unknown session command"), before any pipe. Same probe as control-honesty.ps1: a
+# post-P3 client answers a bare `restore` with its usage line; an older one says `unknown command`.
+# Those cells SKIP on an old client (a fail there would say nothing about restore); the seeded
+# cells need no verb and always run. -Strict turns a skip into a failure, as the honesty suite does.
+$probe = (& $ctl restore --pipe 'rm-probe' --json 2>&1) -join ''
+$cliHasP3 = $probe -match 'usage: agwintermctl restore'
+function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  {0,-22} — {1}" -f $name, $why }
 
 function State($inst) { "$dir\sessions-$inst.tsv" }
 function Log($inst)   { "$dir\agliteterm-$inst.log" }
@@ -97,13 +106,18 @@ function Stop-Leftover($p) {
 # order. Names are what the user actually notices; the prefix keeps a workspace row from being
 # counted as a session (which let a "restored 2 sessions" assertion pass on one session + one
 # workspace, i.e. on a setup that had silently failed).
+# A session's context (P3) rides along as `name~context` when the node carries one — `tree --json`
+# emits the key only when set, so its absence is part of the fingerprint too. The assertion is then
+# on the WORLD after the restart, not on what the verb replied before it.
 function Signature($inst) {
     $ws = Tree $inst
     if ($null -eq $ws) { return '' }
     $parts = @()
     foreach ($w in $ws) {
         $parts += "#$($w.name)"
-        foreach ($s in @($w.sessions)) { $parts += $s.name }
+        foreach ($s in @($w.sessions)) {
+            $parts += if ($s.PSObject.Properties['context']) { "$($s.name)~$($s.context)" } else { $s.name }
+        }
     }
     ($parts -join '|')
 }
@@ -886,6 +900,82 @@ Seeded -Name 'short-id-line' `
     param($a, $i) ($a -match 'paired-one') -and ($a -match 'unpaired-two')
 }
 
+# --- P3: the C line (session.context) ------------------------------------------------------------
+# A context is one line of text per session, written as `C\t<S-index>\t<text>` after the S block and
+# read back through the SAME rules the verb applies. The Signature carries it as `name~context`, so
+# every assertion here is on the tree after the restart, never on the verb's reply.
+
+# Set over the API, saved by the refresh, back after a graceful close — and re-written by the build
+# that loaded it (the file inspected AFTER the second run, so a loader that kept the value in memory
+# but never wrote it back would fail here).
+if ($cliHasP3) {
+    Cell -Name 'context-graceful' -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename ctx-keeper --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session context 'reviewing the P3 diff' --target $id --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'ctx-keeper~reviewing the P3 diff') { return $false }   # the set itself has to have landed
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^C`t0`treviewing the P3 diff`r?$")
+    }
+    # The kill path: the file the crash left behind is the one loaded, and the session is ADOPTED from
+    # the host rather than created — the context comes from the C line either way.
+    Cell -Name 'context-killed' -Kill -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename ctx-survivor --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session context 'survives a kill' --target $id --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'ctx-survivor~survives a kill') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^C`t0`tsurvives a kill`r?$")
+    }
+} else {
+    if (-not $Only -or $Only -eq 'context-graceful') { Skip 'context-graceful' 'this agwintermctl predates agwinterm #233 and refuses `session context` client-side - set AGWINTERMCTL to a newer build' }
+    if (-not $Only -or $Only -eq 'context-killed')   { Skip 'context-killed'   'same client - the seeded C-line cells still run' }
+}
+
+# A C line the verb would have refused (a control character): the session comes back, the context
+# does not, and the log names the session and the rule. Not drawn, and — checked on the file the
+# second run wrote — not re-saved either.
+Seeded -Name 'context-bad-line' `
+    -Tsv "V1`nW`tws-c3`nS`t0`tctx-bad-host`t`t$cwd`nC`t0`tbad$([char]1)ctx`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'ctx-bad-host') -and ($a -notmatch '~') -and
+        (Log-Has $i "restore: context for session 'ctx-bad-host' dropped - session context: control character U\+0001 at offset 3") -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^C`t")
+}
+
+# The P guard, applied to C: a malformed S line means the indices no longer line up, so the whole C
+# set is refused rather than hung on the wrong sessions. Every parseable session still restores.
+Seeded -Name 'context-count-mismatch' `
+    -Tsv "V1`nW`tws-c4`nS`t0`tgood-one`t`t$cwd`nS`t0`tbroken`nC`t0`tnever-attached`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'good-one') -and ($a -notmatch '~') -and ($a -notmatch 'never-attached') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 context line\(s\)')
+}
+
+# ➕ An index past the S list (a hand-edited or shortened file): that one line is dropped and named;
+# the session it does not name restores untouched.
+Seeded -Name 'context-stray-index' `
+    -Tsv "V1`nW`tws-c5`nS`t0`tonly-one`t`t$cwd`nC`t5`tnowhere`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'only-one') -and ($a -notmatch '~') -and
+        (Log-Has $i 'state: context line names session index 5 but the file has 1 session\(s\) - dropped')
+}
+
+# A file written before P3 (no C, no K): restores exactly as it did, no context on any node, and
+# nothing about contexts in the log.
+Seeded -Name 'pre-p3-file' `
+    -Tsv "V1`nW`tws-c6`nS`t0`tpre-one`t`t$cwd`nS`t0`tpre-two`t`t$cwd`nF`t1`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'pre-one') -and ($a -match 'pre-two') -and ($a -notmatch '~') -and
+        -not (Log-Has $i 'context line|context for session|context\(s\) restored')
+}
+
 # --- malformed / future state files: degrade, never crash and never take the window down -------
 # Every one of these is a file the user can genuinely end up with: a save that never got any bytes,
 # a disk that filled mid-write, a downgrade after running a newer build, a hand-edited file.
@@ -1023,5 +1113,6 @@ if (-not $Only -or $Only -eq 'harness-selfcheck') {
 
 ""
 if ($script:failed.Count) { "restore-matrix: FAILED cells: $($script:failed -join ', ')"; exit 1 }
-"restore-matrix: all cells passed"
+if ($script:skipped -and $Strict) { "restore-matrix: $script:skipped cell(s) skipped under -Strict"; exit 1 }
+"restore-matrix: all cells passed$(if ($script:skipped) { " ($script:skipped skipped)" })"
 exit 0

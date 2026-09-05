@@ -2715,6 +2715,7 @@ static void saveSessionState() {
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
     std::string idLine;
+    std::string ctxLines;   // "C\t<i>\t<text>" per session with a context, in S-line order (see below)
     std::vector<const Session*> savedOrder;   // S-line order, so a split can name its owner by position
     int saved = 0;
     for (const Session* s : g_sessions) {
@@ -2730,6 +2731,14 @@ static void saveSessionState() {
         out += "\n";
         if (s->flagged) flagLine += "\t" + std::to_string(saved);
         idLine += "\t" + s->id;
+        // "C\t<idx>\t<context>" — one line per session WITH a context, indexed by S-line position like
+        // F and P (P3). No line for a session without one: an empty-field form could not tell "no
+        // context" from "a context that is empty", and tsvField cannot escape its way out of that.
+        // Additive line type, per the rule in parseStateFile: an older build ignores C and restores
+        // the sessions without their contexts — and drops them on its NEXT save, since it has
+        // nothing to write back (the write-back loss agwinterm documented for the same downgrade).
+        if (!s->context.empty())
+            ctxLines += "C\t" + std::to_string(saved) + "\t" + tsvField(narrow(s->context)) + "\n";
         savedOrder.push_back(s);
         saved++;
     }
@@ -2758,6 +2767,7 @@ static void saveSessionState() {
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
+    out += ctxLines;                         // C lines: session contexts, with F and D, before P
     out += splitLines;                       // P lines: each session's own right-hand shell
     out += "A\t" + std::to_string(g_activeWs) + "\n";
 
@@ -7987,6 +7997,9 @@ struct ParsedState {
     std::vector<std::wstring> wss;
     std::vector<RestoreSpec> specs;
     std::vector<SplitSpec> splits;       // from P lines; empty for any file written before 0.17.13
+    // From C lines (P3): (S-line index, raw text) per session that had a context. Raw here — the
+    // loader runs each one through contextRefusal, the verb's own rules, before it is set.
+    std::vector<std::pair<int, std::string>> contexts;
     int sLines = 0;                      // RAW S lines seen, valid or not - see the P-line guard
     std::vector<std::string> savedIds;   // from the D line; empty for a pre-0.17.3 file
     int activeWs = 0, focusWs = -1;
@@ -8032,6 +8045,10 @@ static ParsedState parseStateFile(const std::wstring& path) {
             SplitSpec sp; sp.owner = atoi(ff[1].c_str()); sp.spec.app = ff[2]; sp.spec.cwd = ff[3];
             for (size_t k = 4; k < ff.size(); k++) sp.spec.args.push_back(ff[k]);
             ps.splits.push_back(sp);
+        } else if (ff[0] == "C" && ff.size() >= 3) {   // a session's context: S-line index, text
+            // Kept as (index, text) rather than applied here: the index is checked against the
+            // spec list only after the whole file is read, under the same count guard as P below.
+            ps.contexts.push_back({ atoi(ff[1].c_str()), ff[2] });
         } else if (ff[0] == "F") {   // flagged indices, in S-line order
             for (size_t k = 1; k < ff.size(); k++) {
                 int fi = atoi(ff[k].c_str());
@@ -8055,6 +8072,23 @@ static ParsedState parseStateFile(const std::wstring& path) {
         logWarn("state: %d session line(s) but %zu parsed - refusing %zu split line(s) rather than "
                 "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.splits.size());
         ps.splits.clear();
+    }
+    // C lines are positional too (index = S-line position), so the same guard: a dropped S line
+    // would hang every later context on the wrong session, which is worse than losing them.
+    if (!ps.contexts.empty() && ps.sLines != (int)ps.specs.size()) {
+        logWarn("state: %d session line(s) but %zu parsed - refusing %zu context line(s) rather than "
+                "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.contexts.size());
+        ps.contexts.clear();
+    }
+    // An index past the S list (hand-edited, or a C line left over from a longer file) names no
+    // session; drop that one line and say so, keeping the rest.
+    for (size_t k = 0; k < ps.contexts.size();) {
+        int ci = ps.contexts[k].first;
+        if (ci < 0 || ci >= (int)ps.specs.size()) {
+            logWarn("state: context line names session index %d but the file has %zu session(s) - dropped",
+                    ci, ps.specs.size());
+            ps.contexts.erase(ps.contexts.begin() + k);
+        } else k++;
     }
     if (!ps.savedIds.empty() && ps.savedIds.size() != ps.specs.size()) {
         logWarn("state: %zu saved id(s) for %zu session line(s) — the file is inconsistent, so live "
@@ -8163,6 +8197,7 @@ static bool restoreSessions() {
     int cols, rows; newSessionGrid(0, &cols, &rows);
     int firstIdx = -1, built = 0, adopted = 0, dead = 0;
     std::vector<Session*> bySpec;   // spec index -> the session it produced (null if it could not start)
+    std::vector<Session*> byPos;    // spec index -> live OR dead entry (the C lines attach to either)
 
     // Sessions the host still holds (read at startup by scanHostSessions, which also reserved their
     // ids). lite was killed rather than closed if this is non-empty: the pty-host outlives the UI by
@@ -8216,16 +8251,40 @@ static bool restoreSessions() {
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;
             built++;
             bySpec.push_back(s);
+            byPos.push_back(s);
         } else {
             // A spec that won't start used to be invisible AND gone: the session didn't come back and
             // the next save rewrote the file without it. Keep it as a dead entry and name it in the log.
             logWarn("restore: session '%s' FAILED to start (app='%s' cwd='%s') — kept as a dead session",
                     sp.name.c_str(), sp.app.c_str(), sp.cwd.c_str());
-            failedSpecSession(sp, cols, rows);
+            byPos.push_back(failedSpecSession(sp, cols, rows));
             dead++;
             bySpec.push_back(nullptr);   // keep spec positions aligned for the P lines
         }
     }
+    // Each session gets its context back (the C lines, P3). The parser has already refused the set
+    // on a count mismatch and dropped any out-of-range index; what is left is held to the VERB's
+    // rules — contextRefusal, the same function session.context runs — so a value that would be
+    // refused over the pipe (a control character, over the ceiling, blank once trimmed: a
+    // hand-edited or damaged file) is not drawn and not re-saved, and the log says which rule and
+    // which session. Set here, before the first refreshTree, so the first paint of the row has it.
+    // A dead entry keeps its context like it keeps its name: the entry exists to be retried intact.
+    int ctxSet = 0;
+    for (const auto& c : ps.contexts) {
+        Session* s = (c.first >= 0 && c.first < (int)byPos.size()) ? byPos[c.first] : nullptr;
+        if (!s) continue;
+        std::string text;
+        std::string why = contextRefusal(c.second, &text);
+        if (!why.empty()) {
+            logWarn("restore: context for session '%s' dropped - %s", specs[c.first].name.c_str(), why.c_str());
+            continue;
+        }
+        LockG hold;
+        s->context = widen(text);
+        ctxSet++;
+    }
+    if (!ps.contexts.empty())
+        logInfo("restore: %d of %zu context(s) restored", ctxSet, ps.contexts.size());
     // Each session gets its own split shell back. A P line names its owner by position, and the
     // parser has already refused the whole set if the S lines it counts on did not all parse.
     // The shell is created fresh rather than adopted: only the S lines carry host ids (the D line),

@@ -235,27 +235,36 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       with this case; the restart case is task 6's
 
 ### Task 3: the `C` line — persistence, validated on load, restart cells
-- [ ] `saveSessionState()` (`:2675`): after the `S` block, inside the same walk that fills
+- [x] `saveSessionState()` (`:2675`): after the `S` block, inside the same walk that fills
       `savedOrder`, one `C\t<idx>\t<tsvField(context)>` line per session WITH a context (no line for
       none — an empty-field form would be ambiguous). Placed with `F`/`D`, before `P`, and the
       comment states the additive-line-type rule and that an older build ignores `C` and restores
       the sessions without contexts (and drops them on its next save — write-back loss, the same
       exposure agwinterm documented)
-- [ ] `parseStateFile()` (`:7812`): a `C` arm (`≥ 3` fields; idx + text into
+- [x] `parseStateFile()` (`:7812`): a `C` arm (`≥ 3` fields; idx + text into
       `ps.contexts[idx]`); after the loop the **same count-mismatch guard as `P`** (`:7866`) — a `C`
       set is refused wholesale when `sLines != specs.size()`, with the guard's wording adapted
       (`… refusing %zu context line(s) rather than attaching them to the wrong sessions`); an
-      out-of-range idx is dropped with a `logWarn`
-- [ ] `restoreSessions()`: each context runs through the Task 1 validator on load; a failing value
+      out-of-range idx is dropped with a `logWarn` — `ps.contexts` is a vector of (idx, raw text)
+      so the guard can count the lines it refuses; the range check runs after the guard
+- [x] `restoreSessions()`: each context runs through the Task 1 validator on load; a failing value
       is dropped with one `logWarn` naming the session and the rule (not drawn, not re-saved); a
-      passing one is set before the first `refreshTree`
-- [ ] `test/restore-matrix.ps1` cells (`Cell` `:129`): `context-graceful`, `context-killed`
+      passing one is set before the first `refreshTree` — set right after the `S` loop, before the
+      `P` loop, under `LockG`; a dead (failed-to-start) entry keeps its context like its name, via a
+      second `byPos` vector (`bySpec` stays null there so the `P` guard is untouched)
+- [x] `test/restore-matrix.ps1` cells (`Cell` `:129`): `context-graceful`, `context-killed`
       (`-Kill`), `context-bad-line` (seeded `C` with a `\x01` — restored session, no context, the
       warning in the log), `context-count-mismatch` (seeded `C` for a session count that disagrees
       — every session restored, no context, the guard's warning), `pre-p3-file` (no `C`/`K` —
       unchanged restore). Signatures extended to include the context so the assertion is on the
-      world, not the reply
-- [ ] run `restore-matrix -Strict` before task 4
+      world, not the reply — as `name~context`, only when the node carries the key. The two cells
+      that SET a context need the post-#233 client and SKIP on an older one (the `restore` usage
+      probe from the honesty suite; `-Strict` fails on a skip, as there); the seeded cells always run.
+      ➕ `context-stray-index` (a `C` index past the S list: dropped, named, session untouched)
+- [x] run `restore-matrix -Strict` before task 4 — 40/40 with the dev client; with the released
+      client the two verb cells SKIP (exit 0 plain, exit 1 under `-Strict`). `control-honesty -Strict`
+      run three times after the save-path change: one unidentified single failure on the first run
+      (output not captured), two clean runs after with output captured — ⚠️ not reproduced, not named
 
 ### Task 4: the capture path — children, command lines, newest, denylist
 - [ ] a new query beside `processCwd` (`:2572`): `captureForeground(const std::vector<DWORD>& shellPids,
