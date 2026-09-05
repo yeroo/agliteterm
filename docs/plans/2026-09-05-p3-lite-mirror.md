@@ -399,8 +399,19 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       and the contract PR #235)
 
 ### Task 7: [Final] Verify acceptance criteria
-- [ ] every Overview item implemented, with agwinterm's wording where the plan says verbatim
-- [ ] edge cases: a context on a session that is then renamed (both survive a restart); a context
+- [x] every Overview item implemented, with agwinterm's wording where the plan says verbatim
+      (verified against the CODE and agwinterm's sources side by side: `contextRefusal` runs
+      `SessionContexts`' order — control character on the text as given, trim with the .NET
+      `char.IsWhiteSpace` set, blank, the 200 ceiling — and its four strings plus `kContextNoSession`
+      are character-for-character `SessionContexts.cs`; the reply is built from `target->context`
+      under the lock, `"context":null` after a clear; `tree` emits `context` only when set; the `C`
+      line is written after the `S` block and validated on load through the same function; the
+      `ClosedSpec` carries the context and `reopenClosed` puts it back — now pinned by a check that
+      posts `IDM_REOPEN` to the sandbox's own window; a rename writes `name` only. `restore.capture`'s
+      four refusals are `RestoreCaptureReply.cs` verbatim, the reply is `{captured, replayOnRestore:
+      false, panes[{pane, session, captured|null}]}` in snapshot order, `capturedCommands` is keyed
+      by pane id, the `K` line follows the `P` lines. Both replies go through `ctlOk(rawJson)`)
+- [x] edge cases: a context on a session that is then renamed (both survive a restart); a context
       of exactly 200 accepted, 201 refused; a `` (decoded) refused naming offset 0; a
       context with a non-BMP character (surrogate pair decoded by `jsonParseString`) accepted and
       shown; `restore capture --target` naming a split's id (captures that one pane); naming a
@@ -408,12 +419,49 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       never a crash); two captures back to back; a session closed between snapshot and write
       (dropped from the reply); a seeded `K` line whose pane-1 field names a split that the `P`
       guard refused (slot dropped with the `P` set)
-- [ ] `test/run-all.ps1 -Strict` green with the dev `agwintermctl`; against the RELEASED client
+      (rename + restart: the matrix's `context-graceful` / `context-killed` cells rename first and
+      assert `name~context` after the restart; 200 / 201 / offset 0 / the surrogate-pair offset / the
+      non-BMP round trip / the split id: the honesty P3 blocks from tasks 1 and 5. ➕ Added here:
+      **a quick pane** refused with `CoverPane` wording, the world unchanged (the quick session's id
+      from its created event or the stdin section's record — it survives its own `off`); **a capture
+      loop across a child's exit** — a 4-count ping typed in and `restore capture --target` run as
+      fast as the pipe answers until the ping is gone: 9 replies carried the command, the last null,
+      no reply failed, the sandbox alive; **two captures back to back** — two `agwintermctl`
+      processes at once, both ok, ONE intact `K` line and no `.tmp` beside the file (`g_saveLock`);
+      **`capture-p-refused`** — a malformed `S` line makes the `P` guard refuse, the same count
+      guard refuses the `K` set and the log names both, no `K` re-saved; **`capture-split-failed`**
+      — the `P` line parses but its shell will not start: pane 0's slot lands (`cap-half^cmd-zero`),
+      pane 1's is dropped with `that split was not restored`, the second run's file has pane 0 only.
+      **A session closed between snapshot and write** is a microsecond window with no deterministic
+      driver, so it is verified in the code: the write loop re-checks `indexOfSession(p.s) >= 0 &&
+      p.s->id == p.id` under `g_lock` and skips the pane (dropped from the reply, nothing written
+      through a freed or reused pointer))
+- [x] `test/run-all.ps1 -Strict` green with the dev `agwintermctl`; against the RELEASED client
       the P3 checks SKIP (not fail) and everything else passes; `tools/check-contract.ps1` green;
       `tools/check-abi.ps1` v18
-- [ ] `test/stress.ps1` (80 sessions) run alone, green
-- [ ] mark P3-lite shipped in agwinterm's batch index and `docs/lite-parity.md` (in the agwinterm
+      (dev client — agwinterm `main` after #235, rebuilt: every suite green, 573 PASS, 0 SKIP, 0 FAIL,
+      exit 0. Released 0.17.x client: every suite green, 454 PASS, 21 SKIP — matrix 5 (the two
+      context and three capture verb cells; the seeded `C`/`K` cells run), conformance 7 (the two
+      `session context` steps, `restore capture`, the two P3 refusals, plus #226's two `sidebar
+      width` items), honesty 9 (#226's seven plus the two P3 blocks) — 0 FAIL, exit 0.
+      `check-contract`: in step. ABI: `kRequiredAbi = 18`, the pinned core's manifest `abiVersion
+      18`, and agwinterm's `tools/check-abi.ps1` (the script lives THERE — lite's pairing check is
+      `tools/fetch-native.ps1`, which the build ran) reports v18 with both declarations agreeing)
+- [x] `test/stress.ps1` (80 sessions) run alone, green
+      (dev client, nothing else on the desktop: 80 made, 80 closed while being made, 50 s of the
+      300 s budget, process alive, `ping` and `tree` answer, no pane under 20 columns, the stream
+      still streaming, 0 host-refused resizes rolled back)
+- [x] mark P3-lite shipped in agwinterm's batch index and `docs/lite-parity.md` (in the agwinterm
       docs PR), and in this repo's `docs/` wherever P2-lite recorded itself
+      (this branch is PR **#28**, opened 2026-09-05 — the P2-lite routine, so the agwinterm docs
+      could carry the number. agwinterm PR **#236** (branch `docs/p3-lite-parity`): `lite-parity.md`'s
+      P3 section is "Mirrored — P3-lite shipped" as agliteterm #28 with the three divergences; the
+      batch index's P3 entry says shipped as #28 naming the `C`/`K` lines, the in-process query,
+      the constant `replayOnRestore` and the hidden-pane refusal, and the P8 list moves
+      `session.context` · `restore.capture` to "P3-lite — shipped". In this repo P2-lite recorded
+      itself in the README (the verb count and the tests section's SKIP list — task 6 did the same
+      for P3) and by its plan moving to `docs/plans/completed/`, which happens when this plan
+      completes. PR #28's body carries the validation above; revmux rounds follow it)
 
 ## Technical Details
 

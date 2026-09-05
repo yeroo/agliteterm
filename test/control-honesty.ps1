@@ -66,6 +66,7 @@ public static class LiteHonesty {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
+    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -979,6 +980,7 @@ try {
         Start-Sleep -Milliseconds 2500
         $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
         $qid = [string]($created | Select-Object -Last 1).session
+        $quickSid = $qid   # the quick session outlives its `off`; the P3 capture block needs this id again
         Check 'its session id arrived as a session/created event' ([bool]$qid) "events since $cursor`: $($created | ConvertTo-Json -Compress)"
         Check 'and that session is not in tree (hidden)' ($qid -and -not (Nodes | Where-Object { [string]$_.id -eq $qid }))
         $marker = 'quick-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -1281,8 +1283,21 @@ try {
         Check 'and nothing appeared in the tree, and the owner kept its own context' (@(Nodes).Count -eq $before -and (CtxOf $cid) -eq 'by name')
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
         Start-Sleep -Milliseconds 300
+
+        # -- undo-close: the context rides on the ClosedSpec beside the name and comes back with it --
+        # Ctrl+Shift+T is IDM_REOPEN (122 in main.cpp's command table) and there is no control verb
+        # for it, so the WM_COMMAND is posted to the sandbox's OWN window handle - the message the
+        # accelerator and the File menu send, never global input.
         Send-Ctl $s @('session', 'close', '--target', $cid) | Out-Null
-        Start-Sleep -Milliseconds 500
+        $gone = $false
+        for ($i = 0; $i -lt 20; $i++) { if (-not (CtxNode $cid)) { $gone = $true; break }; Start-Sleep -Milliseconds 200 }
+        Check 'setup: the session carrying a context was closed (gone from the tree)' $gone
+        [void][LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]122, [IntPtr]::Zero)   # WM_COMMAND, IDM_REOPEN
+        $re = $null
+        for ($i = 0; $i -lt 25; $i++) { $re = Nodes | Where-Object { [string]$_.name -eq 'ctx-renamed' } | Select-Object -First 1; if ($re) { break }; Start-Sleep -Milliseconds 200 }
+        Check 'Reopen Closed Session (IDM_REOPEN) brings the session back under its name' ([bool]$re) "nodes: $((Nodes | ForEach-Object name) -join ', ')"
+        Check 'and with its context - the ClosedSpec carries both, so undo-close keeps what the row showed' ($re -and [string]$re.context -eq 'by name') "node: $($re | ConvertTo-Json -Compress)"
+        if ($re) { Send-Ctl $s @('session', 'close', '--target', ([string]$re.id)) | Out-Null; Start-Sleep -Milliseconds 500 }
         Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
         Start-Sleep -Milliseconds 300
     }
@@ -1353,6 +1368,21 @@ try {
         $k = @(KLines)
         Check 'the state file has ONE K line: index, the pane-0 command, an empty pane-1 field' (@($k).Count -eq 1 -and $k[0] -match "^K`t\d+`t[^`t]*-n 303 127\.0\.0\.1`t$") "K: $($k -join ' / ')"
 
+        # -- two captures back to back: two clients at once, each answered from what it wrote, one
+        # state file between them. The verb saves on the pipe thread, so two callers are two savers
+        # on the same .tmp - g_saveLock serializes them; without it one publish fails or the file
+        # interleaves, and the reply would describe a state that is not on disk. --
+        $outs = @((New-TemporaryFile).FullName, (New-TemporaryFile).FullName)
+        $procs = @(0, 1 | ForEach-Object { Start-Process -FilePath $ctl -ArgumentList @('restore', 'capture', '--pipe', $s.Pipe, '--json') -NoNewWindow -PassThru -RedirectStandardOutput $outs[$_] })
+        $procs | ForEach-Object { [void]$_.WaitForExit(15000) }
+        $both = @($outs | ForEach-Object { try { ConvertFrom-Json ((Get-Content $_ -Raw) -replace '\s+$', '') } catch { $null } })
+        Remove-Item $outs -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500   # the refresh each one posted saves once more on the UI thread
+        Check 'two concurrent captures both answer ok, each with the ping captured' (@($both).Count -eq 2 -and -not ($both | Where-Object { -not $_ -or -not $_.ok -or [int]$_.result.captured -ne 1 })) "replies: $($both | ConvertTo-Json -Compress -Depth 5)"
+        $k = @(KLines)
+        Check 'and the file has the one K line it had, intact, with no .tmp left beside it' (@($k).Count -eq 1 -and $k[0] -match "^K`t\d+`t[^`t]*-n 303 127\.0\.0\.1`t$" -and -not (Test-Path "$stateFile.tmp")) "K: $($k -join ' / '); tmp left: $(Test-Path "$stateFile.tmp")"
+        Check 'and the tree still reads the slot back' ((CapsOf $capId) -match "-n 303 127\.0\.0\.1$") "caps: $(CapsOf $capId)"
+
         # -- one pane by id: the split --
         Send-Ctl $s @('session', 'type', "ping -n 305 127.0.0.1`n", '--target', $capSplit) | Out-Null
         Check 'setup: a second ping is running under the split shell' (Wait-Ping '305' $true)
@@ -1398,6 +1428,21 @@ try {
         Check 'and no slot changed, no K line changed' (World-Unchanged)
         Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
         Start-Sleep -Milliseconds 500
+        # the quick terminal, the other cover: it survives its own `off`, so the stdin section's
+        # `quick on` may have made it already and a second `on` re-shows it without a created event -
+        # the id is the event's when one arrives, else the one that section recorded.
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        Send-Ctl $s @('quick', 'on') | Out-Null
+        Start-Sleep -Milliseconds 2000
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $quickId = if ($created) { [string]($created | Select-Object -Last 1).session } else { [string]$quickSid }
+        Check 'setup: the quick session id is known, and it is hidden from tree' ([bool]$quickId -and -not (CapNode $quickId)) "quick '$quickId'"
+        $raw = Cap @('--target', $quickId); $r = ConvertFrom-Json $raw
+        Check 'a quick pane is refused with CoverPane wording too (hidden, never restored, so no slot)' `
+            (-not $r.ok -and [string]$r.error -eq "restore capture: '$quickId' is a scratch/overlay/quick pane, which is never restored, so it has no restore slot to capture into. Nothing captured, nothing saved.") "raw: $raw"
+        Check 'and no slot changed, no K line changed' (World-Unchanged)
+        Send-Ctl $s @('quick', 'off') | Out-Null
+        Start-Sleep -Milliseconds 500
 
         # -- a fresh capture replaces the checkpoint, including with nothing --
         Stop-Ping '303'
@@ -1412,6 +1457,30 @@ try {
         $raw = Cap @('--target', $capSplit); $r = ConvertFrom-Json $raw
         Check 'capturing the idle split by id writes null there too' ([bool]$r.ok -and $null -eq $r.result.panes[0].captured -and [int]$r.result.captured -eq 0) "raw: $raw"
         Check 'and with both slots empty the node has no capturedCommands key and the file no K line' (-not (AnyCaps) -and @(KLines).Count -eq 0) "caps: $(CapsOf $capId); K: $((KLines) -join ' / ')"
+
+        # -- a capture while the pane's child is exiting: null or the command, never a crash --
+        # A short ping is typed in and the pane is captured as fast as the pipe answers until the
+        # ping is gone, and once more after. Every reply is ok, every value is one of the two truthful
+        # answers (the command while it runs, null once it has gone), and the sandbox is still there
+        # to say so - a pid that vanishes between the snapshot and the PEB read is the case.
+        Stop-Ping '4'
+        Send-Ctl $s @('session', 'type', "ping -n 4 127.0.0.1`n", '--target', $capId) | Out-Null
+        Check 'setup: a 4-count ping is running under the cap-a shell' (Wait-Ping '4' $true)
+        $replies = @(); $bad = @(); $sawCmd = 0; $sawNull = 0
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $deadline) {
+            $raw = Cap @('--target', $capId); $replies += $raw
+            $r = try { ConvertFrom-Json $raw } catch { $null }
+            if (-not $r -or -not $r.ok -or @($r.result.panes).Count -ne 1) { $bad += $raw }
+            elseif ($null -eq $r.result.panes[0].captured) { $sawNull++ }
+            elseif ([string]$r.result.panes[0].captured -match '-n 4 127\.0\.0\.1$') { $sawCmd++ }
+            else { $bad += $raw }
+            if (@(Ping-Procs '4').Count -eq 0 -and $sawNull -gt 0) { break }
+        }
+        Check "every capture across the child's exit answered ok with the command or null ($sawCmd command, $sawNull null, $(@($replies).Count) in all)" (@($bad).Count -eq 0 -and $sawCmd -ge 1 -and $sawNull -ge 1) "bad: $($bad -join ' / ')"
+        Check 'the ping ended on its own and the last capture read null' (@(Ping-Procs '4').Count -eq 0 -and $sawNull -gt 0) "null seen $sawNull"
+        Check 'and the sandbox is alive: ping answers and the process is running' ([bool](ConvertFrom-Json (Send-Ctl $s @('ping'))).ok -and -not $s.Proc.HasExited)
+        Check 'and with the child gone the slot is empty again (no K line)' (-not (AnyCaps) -and @(KLines).Count -eq 0) "caps: $(CapsOf $capId); K: $((KLines) -join ' / ')"
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
         Start-Sleep -Milliseconds 300
         Send-Ctl $s @('session', 'close', '--target', $capId) | Out-Null
@@ -1451,7 +1520,7 @@ finally {
     if ($s) { Stop-Sandbox $s }
     # The capture block's pings (a check that threw leaves them running for minutes under a shell
     # that is about to be killed); found by the marker argument, never by name alone.
-    Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n 30[35] 127\.0\.0\.1' } |
+    Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n (30[35]|4) 127\.0\.0\.1' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     # The second sandbox's geometry values are its own; they were seeded here, so they go.
     foreach ($n in 'WinX', 'WinY', 'WinW', 'WinH', 'WinMax') {

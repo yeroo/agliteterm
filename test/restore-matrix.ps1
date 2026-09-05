@@ -1066,6 +1066,28 @@ Seeded -Name 'pre-p3-file' `
         -not (Log-Has $i 'context line|context for session|context\(s\) restored')
 }
 
+# ➕ A K line's pane-1 slot needs the split the P line rebuilds. Two ways to lose that split, one
+# outcome each, and neither hangs a slot on a shell that does not exist:
+#   (a) the P set refused wholesale (a malformed S line) - K is positional too, so the same guard
+#       refuses the K set with it, the log names both, and the second run's file has no K line;
+#   (b) the P line parsed but its shell would not start - pane 0's slot lands on the session, pane
+#       1's is dropped and named, and the file the second run wrote carries pane 0 only.
+Seeded -Name 'capture-p-refused' `
+    -Tsv "V1`nW`tws-k1`nS`t0`tgood-k`t`t$cwd`nS`t0`tbroken`nP`t0`t`t$cwd`nK`t0`tcmd-zero`tcmd-one`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'good-k') -and ($a -notmatch '\^') -and ($a -notmatch 'cmd-') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 split line\(s\)') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 capture line\(s\)') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^K`t")
+}
+Seeded -Name 'capture-split-failed' `
+    -Tsv "V1`nW`tws-k2`nS`t0`tcap-half`t`t$cwd`nP`t0`tC:\no-such-dir\no-such-split-shell.exe`t$cwd`nK`t0`tcmd-zero`tcmd-one`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'cap-half\^cmd-zero(\||$)') -and ($a -notmatch 'cmd-one') -and
+        (Log-Has $i "restore: captured command for the split of session 'cap-half' dropped - that split was not restored") -and
+        ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`tcmd-zero`t`r?$")
+}
+
 # --- malformed / future state files: degrade, never crash and never take the window down -------
 # Every one of these is a file the user can genuinely end up with: a save that never got any bytes,
 # a disk that filled mid-write, a downgrade after running a newer build, a hand-edited file.
