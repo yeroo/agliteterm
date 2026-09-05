@@ -59,6 +59,15 @@ $skipped = 0
 # is a failure, which is the release gate until agwinterm tags the release that carries #226.
 $probe = (& $ctl sidebar width wide --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasSidebarWidth = $probe -match 'whole number'
+# And for P3 (`session context`, `restore capture`; agwinterm #233, contract #235): a post-#233
+# client answers `agwintermctl restore` with its usage line before any pipe is opened, while the
+# 0.17.x client has no `restore` command at all (`unknown command`) and refuses `session context`
+# on its own side the same way. On that client the three P3 steps (context set, context --clear,
+# restore capture) would fail on the CLIENT's refusal and the two P3 errors would PASS on it - a
+# refusal, but not the one the contract pins - so all five are skipped instead
+# (test/control-honesty.ps1 and test/restore-matrix.ps1 use this probe).
+$probe = (& $ctl restore --pipe 'conform-probe' --json 2>&1) -join ''
+$cliHasP3 = $probe -match 'usage: agwintermctl restore'
 
 # HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
 # `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
@@ -67,9 +76,17 @@ $cliHasSidebarWidth = $probe -match 'whole number'
 # and restored in `finally`, the rule ui-lib states for anything a case changes.
 $regKey = 'HKCU:\Software\agliteterm'
 $savedSidebar = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).SidebarW } else { $null }
+# The reason a step cannot be SENT by the client at hand, or $null when it can. A skip names the
+# client's shortfall, not the step's, so the fix (set AGWINTERMCTL) is in the message.
 function Needs-NewClient($argv) {
     $a = [string[]]@($argv)
-    return ($a.Count -eq 3 -and $a[0] -eq 'sidebar' -and $a[1] -eq 'width' -and $a[2] -match '^\d+$' -and -not $cliHasSidebarWidth)
+    if ($a.Count -eq 3 -and $a[0] -eq 'sidebar' -and $a[1] -eq 'width' -and $a[2] -match '^\d+$' -and -not $cliHasSidebarWidth) {
+        return 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'
+    }
+    if ($a.Count -ge 2 -and -not $cliHasP3 -and (($a[0] -eq 'session' -and $a[1] -eq 'context') -or ($a[0] -eq 'restore' -and $a[1] -eq 'capture'))) {
+        return 'this agwintermctl predates agwinterm #233 and refuses `session context` / `restore capture` on its own side - set AGWINTERMCTL to a newer build'
+    }
+    return $null
 }
 function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  $name — $why" }
 
@@ -142,7 +159,8 @@ try {
             if ($parts[0] -eq 'window.new') { Invoke-Ctl @('window', 'new', '--name', $parts[1]) | Out-Null; Start-Sleep -Seconds 6 }
         }
         $argv = Expand-Args $step.args
-        if (Needs-NewClient $argv) { Skip "$($step.verb) ($($argv -join ' '))" 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'; continue }
+        $why = Needs-NewClient $argv
+        if ($why) { Skip "$($step.verb) ($($argv -join ' '))" $why; continue }
         $resp = Invoke-Ctl $argv
         $why = Test-Shape $resp $step.result $step.fields
         Check $step.verb ($null -eq $why) $why
@@ -171,7 +189,8 @@ try {
     # A script branches on ok, so a bad target must come back as a refusal — not a crash, and not a
     # cheerful ok:true that did nothing.
     foreach ($e in $contract.errors) {
-        if (Needs-NewClient $e.args) { Skip "refuses: $($e.args -join ' ')" 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'; continue }
+        $why = Needs-NewClient $e.args
+        if ($why) { Skip "refuses: $($e.args -join ' ')" $why; continue }
         $resp = Invoke-Ctl (Expand-Args $e.args)
         $isRefusal = ($null -ne $resp) -and ($resp.PSObject.Properties.Name -notcontains '__raw') -and (-not $resp.ok) -and $resp.error
         Check "refuses: $($e.args -join ' ')" $isRefusal

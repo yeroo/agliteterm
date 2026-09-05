@@ -33,6 +33,8 @@
 #include <vector>
 #include <deque>
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
+#include <map>        // captureForeground: shell pid -> the newest non-denylisted child's command line
+#include <tlhelp32.h> // CreateToolhelp32Snapshot: the parent-pid walk behind restore.capture (P3)
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
 // Header-only over Win32: same window messages and the same native controls underneath, but with
@@ -124,6 +126,19 @@ static constexpr int kSidebarMinW = 90;   // the splitter will not shrink the le
 // the #23 trigger a setter would otherwise add (a pane at 2 columns).
 static constexpr int kSidebarMaxW = 900;
 static constexpr int kMinContentCols = 20;
+// Sidebar row badges, drawn in the tree's NM_CUSTOMDRAW post-paint pass after the label (the label
+// is the name plus its status suffix, nothing else). Measured from the row's RIGHT edge: the flag
+// pennant's staff stands kTreePennantInset in, the unread pill ends kTreePillInset in. The
+// session context (P3) is the third badge — a dimmed run in the theme's `dim` colour (secondary
+// text: light 110, dark 150, classic COLOR_GRAYTEXT — per theme, so it follows the palette like
+// every other secondary text) starting kTreeContextGap after the label's text rect and clipped
+// kTreeContextReserve short of the pill (or of where the pill would be), so neither badge moves
+// for it and it never runs under them. It is NOT part of the label string: a same-colour suffix
+// would be shown, not dimmed, and it would widen the treeview's own hit-test and rename EDIT.
+static constexpr int kTreePennantInset = 15;
+static constexpr int kTreePillInset = 20;
+static constexpr int kTreeContextGap = 8;
+static constexpr int kTreeContextReserve = 6;
 static int g_sidebarW = kSidebarW;     // sidebar width IN EFFECT (what the layout uses)
 // The width the user ASKED for. Only the splitter drag, `sidebar width` and the registry loader
 // write it; it is what gets persisted. fitSidebarToClient derives g_sidebarW from it on every
@@ -333,6 +348,11 @@ struct Session {
     // status directly (see the session.status verb for why every write, not every change).
     long long statusChangedAt = epochNow();
     std::wstring name;             // custom name (rename); empty = "session N"
+    // session.context (P3): one line of "what is this pane for", set over the API, drawn dimmed
+    // after the name in the sidebar row, carried by `tree --json` as "context" only when set,
+    // persisted as a `C` line. Empty = none. Separate from `name`: a rename leaves it alone and a
+    // context never enters the label. The rules are contextRefusal's (agwinterm's SessionContexts).
+    std::wstring context;
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
     // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
     // session, not to the window: switching sessions shows that session's split (or no split), the
@@ -346,6 +366,13 @@ struct Session {
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
+    // restore.capture (P3): the command line of the shell's foreground child as captured by the
+    // last `restore capture`, persisted as a `K` line and read back through `tree --json` as
+    // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
+    // capture replaces an older checkpoint). Pane 0 is the session itself; a split shell is its
+    // own Session and carries its own slot. NEVER replayed in lite (session.restore is P9): this
+    // is the durable slot and nothing more, so `replayOnRestore` answers false.
+    std::string capturedCmd;
     void* emu = nullptr;
     HANDLE data = INVALID_HANDLE_VALUE;
     HANDLE reader = nullptr;
@@ -992,6 +1019,24 @@ static CRITICAL_SECTION g_lock; // guards every session's emu + the session list
 // widened across the acquisition of g_resizeLock. (This sentence has gone stale twice by listing the
 // holds, so it no longer lists them.)
 static CRITICAL_SECTION g_resizeLock;
+// Serialises the state-file WRITE in saveSessionState: the .tmp write and the rename/ReplaceFileW
+// publish, and the "is a zero-session save safe" read that precedes them. Until restore.capture
+// (P3) the UI thread was the only saver — refreshTree and the quit path — so two savers could not
+// meet on the same .tmp. The capture verb saves from its pipe thread (the reply must describe a
+// state that is on disk, agwinterm's rule; see the verb), so from P3 on the rule is "any thread,
+// serialised": whoever saves, one write reaches the .tmp at a time, and the later of two
+// consistent snapshots wins. Ordering: acquired only AFTER g_lock has been released — the buffer
+// is built under g_lock, the I/O happens under g_saveLock, never both — so a UI-thread save that
+// blocks here is not holding the emulators while a pipe-thread save flushes to disk.
+//
+// "The later snapshot wins" is NOT what two locks in sequence give on their own: a saver that
+// built under g_lock, released it, and was then preempted before taking g_saveLock would publish
+// its OLDER buffer over a newer one that overtook it (revmux r1 of P3-lite). So every buffer is
+// stamped under g_lock (g_saveStamp), the last stamp published is remembered under g_saveLock, and
+// a buffer older than what is already on disk is dropped unwritten — the newer state is there.
+static CRITICAL_SECTION g_saveLock;
+static unsigned long long g_saveStamp = 0;      // bumped under g_lock as a buffer is built
+static unsigned long long g_savePublished = 0;  // the stamp of the last buffer published (under g_saveLock)
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
 struct LockG {
@@ -2176,7 +2221,10 @@ static void killSession(Session* s) {
     request(req, &rep);
 }
 
-struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; };
+// What undo-close (Ctrl+Shift+T) puts back: the launch spec plus the two per-session texts, name
+// and context — a reopened session that came back with its name but not its context would have
+// lost a value the user was told was set (P3).
+struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
 static void closeSessionAt(int idx) {
@@ -2199,7 +2247,7 @@ static void closeSessionAt(int idx) {
     for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
     if (!cs->hidden) {   // remember the launch spec so it can be reopened (skip transient split/popup shells)
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
-        g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args });
+        g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args, cs->context });
     }
     killSession(g_sessions[idx]);
     EnterCriticalSection(&g_lock);
@@ -2257,7 +2305,10 @@ static void reopenClosed() {
     int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
-    if (s) { s->name = sp.name; selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (s) {
+        { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
+        selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
 }
 static void toggleSplit();   // fwd
 static void closeFocused() {
@@ -2566,33 +2617,135 @@ static std::wstring stateFilePath() {
 // The session's LIVE working directory: the prompt wrap (and starship/omp shell integration) emits
 // OSC 7 file:// URLs, which the core emulator tracks. Convert "file://host/C:/dir%20x" -> "C:\dir x";
 // empty (no OSC 7 seen, or the dir vanished) means "fall back to the creation cwd". Call under g_lock.
+// Read one UNICODE_STRING field of a process's RTL_USER_PROCESS_PARAMETERS out of its PEB, by
+// offset (x64 layout): +0x38 = CurrentDirectory.DosPath, +0x70 = CommandLine. `h` needs
+// PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ. Returns false on any failure (a protected
+// or elevated process refuses the read; a process mid-exit has no parameters yet/any more). Shared
+// by processCwd and captureForeground so the two PEB walks cannot drift apart.
+static bool pebParamString(HANDLE h, size_t off, std::wstring* out) {
+    typedef LONG(WINAPI* fnQIP)(HANDLE, int, void*, ULONG, ULONG*);
+    static fnQIP qip = (fnQIP)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!qip || !h) return false;
+    struct { PVOID Reserved1; PVOID PebBaseAddress; PVOID Reserved2[2]; ULONG_PTR UniqueProcessId; PVOID Reserved3; } pbi{};
+    if (qip(h, 0 /*ProcessBasicInformation*/, &pbi, sizeof pbi, nullptr) != 0 || !pbi.PebBaseAddress) return false;
+    PVOID params = nullptr; SIZE_T rd = 0;
+    // PEB+0x20 = ProcessParameters (x64)
+    if (!ReadProcessMemory(h, (char*)pbi.PebBaseAddress + 0x20, &params, sizeof params, &rd) || !params) return false;
+    struct { USHORT Len, Max; PWSTR Buf; } us{};
+    if (!ReadProcessMemory(h, (char*)params + off, &us, sizeof us, &rd) || !us.Buf || !us.Len) return false;
+    std::wstring w(us.Len / 2, L'\0');
+    if (!ReadProcessMemory(h, us.Buf, &w[0], us.Len, &rd)) return false;
+    *out = std::move(w);
+    return true;
+}
+
 // Read a process's live current directory from its PEB (ProcessParameters.CurrentDirectory) —
 // conhost/ConPTY filters cwd OSC sequences out of the output stream, so asking the shell process
 // itself is the only reliable channel. Returns "" on any failure.
 static std::string processCwd(DWORD pid) {
-    typedef LONG(WINAPI* fnQIP)(HANDLE, int, void*, ULONG, ULONG*);
-    static fnQIP qip = (fnQIP)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
-    if (!qip || !pid) return "";
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!pid) return "";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!h) return "";
     std::string out;
-    struct { PVOID Reserved1; PVOID PebBaseAddress; PVOID Reserved2[2]; ULONG_PTR UniqueProcessId; PVOID Reserved3; } pbi{};
-    if (qip(h, 0 /*ProcessBasicInformation*/, &pbi, sizeof pbi, nullptr) == 0 && pbi.PebBaseAddress) {
-        PVOID params = nullptr; SIZE_T rd = 0;
-        // PEB+0x20 = ProcessParameters (x64); RTL_USER_PROCESS_PARAMETERS+0x38 = CurrentDirectory.DosPath (UNICODE_STRING)
-        if (ReadProcessMemory(h, (char*)pbi.PebBaseAddress + 0x20, &params, sizeof params, &rd) && params) {
-            struct { USHORT Len, Max; PWSTR Buf; } us{};
-            if (ReadProcessMemory(h, (char*)params + 0x38, &us, sizeof us, &rd) && us.Buf && us.Len) {
-                std::wstring w(us.Len / 2, L'\0');
-                if (ReadProcessMemory(h, us.Buf, &w[0], us.Len, &rd)) {
-                    while (!w.empty() && w.back() == L'\\' && w.size() > 3) w.pop_back();   // "C:\x\" -> "C:\x", keep "C:\"
-                    out = narrow(w);
-                }
-            }
-        }
+    std::wstring w;
+    if (pebParamString(h, 0x38 /*CurrentDirectory.DosPath*/, &w)) {
+        while (!w.empty() && w.back() == L'\\' && w.size() > 3) w.pop_back();   // "C:\x\" -> "C:\x", keep "C:\"
+        out = narrow(w);
     }
     CloseHandle(h);
     return out;
+}
+
+// ---- restore.capture: the foreground-command query (P3) ----
+
+// The shell pid a capture may ask about. Session::childPid is set once, from the attach reply, and
+// never cleared: after the shell exits the session stays in the tree as "(exited)" with the stale
+// pid, and Windows recycles pids — a later capture would read the newest child of whatever process
+// holds that number now and file it as this pane's command (revmux r1 of P3-lite). captureForeground's
+// own reuse guard cannot catch it (the child IS newer than the recycled parent), so the pid is
+// withheld here: an exited pane reads as null, the honest answer for a shell that is gone.
+static DWORD livePid(const Session* s) { return s->exited ? 0 : s->childPid; }
+// The exe names (no extension, case-insensitive) that never count as a pane's foreground command:
+// the shells themselves and the prompt helpers they spawn between commands. This is agwinterm's
+// DEFAULT list (Program.Services.cs LoadDenylist), frozen: agwinterm lets the user extend it
+// through %LOCALAPPDATA%\agwinterm\restore-denylist.conf, lite has no config file and ships the
+// same list as a constant. The list is consulted at capture only — lite never replays a slot
+// (session.restore is P9), so there is no replay-time check to keep in step with it.
+static const wchar_t* const kRestoreDenylist[] = {
+    L"powershell", L"pwsh", L"cmd", L"conhost", L"wsl", L"ssh", L"bash", L"oh-my-posh", L"git", L"windowsterminal",
+};
+// `exe` as Toolhelp32 reports it (szExeFile: the file name with extension, no directory).
+static bool restoreDenylisted(const wchar_t* exe) {
+    std::wstring n = exe;
+    size_t slash = n.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) n = n.substr(slash + 1);
+    if (n.size() > 4 && _wcsicmp(n.c_str() + n.size() - 4, L".exe") == 0) n.resize(n.size() - 4);
+    for (const wchar_t* d : kRestoreDenylist) if (_wcsicmp(n.c_str(), d) == 0) return true;
+    return false;
+}
+
+// For each shell pid, the command line of its NEWEST non-denylisted child, into `out` (a shell with
+// no such child gets no entry — that is the caller's `null`). The whole query is in-process: ONE
+// CreateToolhelp32Snapshot for every pane (the parent-pid walk), GetProcessTimes for the creation
+// time (newest wins, as agwinterm orders its CIM rows by CreationDate), and the command line from
+// the child's PEB through the read lite already does for the shell's cwd (CommandLine is 0x38 bytes
+// past CurrentDirectory in the same struct). Milliseconds, no child process spawned, so none of
+// agwinterm's timeout-and-kill semantics apply (agwinterm's docs/lite-parity.md, the P3 entry:
+// why lite does not port the CIM query). The restore.capture verb is the one caller.
+//
+// Returns false ONLY when the snapshot itself could not be taken — that is the caller's
+// QueryFailed refusal ("could not ask" is not "nothing running"). A child that cannot be opened or
+// whose PEB cannot be read (elevated, protected, exiting) is SKIPPED, exactly as agwinterm skips a
+// CIM row that came back with no CommandLine: the pane reads as having nothing captured rather than
+// failing everyone. A child whose creation time precedes its parent's is a pid-reuse ghost
+// (Toolhelp32 reports the parent pid the child was born with, even after that parent died and its
+// number was handed out again) and is skipped too.
+//
+// Runs with NO lock held and touches no UI: the caller snapshots the pids under g_lock, calls this
+// lock-free, and writes the results back under g_lock re-checking every Session still exists.
+static bool captureForeground(const std::vector<DWORD>& shellPids, std::map<DWORD, std::string>* out) {
+    out->clear();
+    if (shellPids.empty()) return true;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        logWarn("restore.capture: CreateToolhelp32Snapshot failed (err %lu)", GetLastError());
+        return false;
+    }
+    // The creation time of each shell, so a child born before its "parent" is recognised as a
+    // pid-reuse ghost. A shell that cannot be opened keeps 0, which disables that check for it.
+    std::map<DWORD, ULONGLONG> shellBorn;
+    for (DWORD pid : shellPids) {
+        if (!pid || shellBorn.count(pid)) continue;
+        ULONGLONG born = 0;
+        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+            FILETIME c{}, e{}, k{}, u{};
+            if (GetProcessTimes(h, &c, &e, &k, &u)) born = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+            CloseHandle(h);
+        }
+        shellBorn[pid] = born;
+    }
+    std::map<DWORD, ULONGLONG> newest;   // shell pid -> creation time of the child currently held in *out
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof pe;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        auto parent = shellBorn.find(pe.th32ParentProcessID);
+        if (parent == shellBorn.end() || pe.th32ProcessID == pe.th32ParentProcessID) continue;
+        if (restoreDenylisted(pe.szExeFile)) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+        if (!h) continue;                                        // elevated/protected/gone: skipped, not fatal
+        FILETIME c{}, e{}, k{}, u{};
+        ULONGLONG born = GetProcessTimes(h, &c, &e, &k, &u) ? (((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime) : 0;
+        std::wstring cmd;
+        bool read = pebParamString(h, 0x70 /*CommandLine*/, &cmd);
+        CloseHandle(h);
+        if (!read || cmd.empty()) continue;                      // no command line: skipped, like a CIM row without one
+        if (parent->second && born && born < parent->second) continue;   // older than its parent: a reused pid
+        auto held = newest.find(pe.th32ParentProcessID);
+        if (held != newest.end() && born <= held->second) continue;      // an older sibling loses to the one held
+        newest[pe.th32ParentProcessID] = born;
+        (*out)[pe.th32ParentProcessID] = narrow(cmd);
+    }
+    CloseHandle(snap);
+    return true;
 }
 
 static std::string sessionLiveCwd(const Session* s) {
@@ -2672,14 +2825,18 @@ static std::string tsvField(const std::string& s) {
 // sessions.tsv.bak and swaps the temp in as ONE operation. A crash, a full disk or a killed process
 // can therefore never leave a truncated file where a good one was — the old CREATE_ALWAYS wrote in
 // place, so the only copy was destroyed the instant the write began.
-static void saveSessionState() {
+// Returns whether THIS call published its snapshot (or a newer one was already on disk, which is
+// the same outcome for the caller). Every failure path logs and returns false; the UI-thread callers
+// ignore the value as they always have, restore.capture refuses on it — its reply claims a state on
+// disk, and "the slots are in memory, the file could not be written" is a refusal, not ok (revmux r1).
+static bool saveSessionState() {
     std::wstring path = stateFilePath();
     if (path.empty()) {
         // The last silent save failure left: no state directory means nothing is written and, before
         // this line, nothing said so — "restore doesn't work" with an empty log, on exactly the kind
         // of redirected/policy-locked profile the field reports come from.
         logWarn("save FAILED: no state directory (%%LOCALAPPDATA%% is not set) — nothing was saved");
-        return;
+        return false;
     }
     std::string out = "V1\n";
     // The hold starts BEFORE the workspace walk: g_workspaces is pushed/erased/reassigned under
@@ -2691,6 +2848,7 @@ static void saveSessionState() {
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
     std::string idLine;
+    std::string ctxLines;   // "C\t<i>\t<text>" per session with a context, in S-line order (see below)
     std::vector<const Session*> savedOrder;   // S-line order, so a split can name its owner by position
     int saved = 0;
     for (const Session* s : g_sessions) {
@@ -2706,6 +2864,14 @@ static void saveSessionState() {
         out += "\n";
         if (s->flagged) flagLine += "\t" + std::to_string(saved);
         idLine += "\t" + s->id;
+        // "C\t<idx>\t<context>" — one line per session WITH a context, indexed by S-line position like
+        // F and P (P3). No line for a session without one: an empty-field form could not tell "no
+        // context" from "a context that is empty", and tsvField cannot escape its way out of that.
+        // Additive line type, per the rule in parseStateFile: an older build ignores C and restores
+        // the sessions without their contexts — and drops them on its NEXT save, since it has
+        // nothing to write back (the write-back loss agwinterm documented for the same downgrade).
+        if (!s->context.empty())
+            ctxLines += "C\t" + std::to_string(saved) + "\t" + tsvField(narrow(s->context)) + "\n";
         savedOrder.push_back(s);
         saved++;
     }
@@ -2713,29 +2879,59 @@ static void saveSessionState() {
     // Written after them so a reader that stops at an unknown line type still gets every session,
     // and a build that does not know P ignores it and restores without the split.
     std::string splitLines;
+    // "K\t<idx>\t<pane0>\t<pane1>" — the restore.capture slots (P3), one line per session where at
+    // least one pane holds a captured command, indexed by S-line position like C and P. pane0 is the
+    // session's own shell, pane1 its split shell's (empty when there is no split, or nothing was
+    // captured there); an empty field is "none" — the slot is a plain string with no rules beyond
+    // tsvField, so unlike C the empty-field form is unambiguous here and one line carries both
+    // panes. Written after the P lines as a CONVENTION — K sits with the P lines it describes — not
+    // as a requirement: parseStateFile collects every line type in file order and restoreSessions
+    // applies them in its own fixed order, so a K above a P restores identically (revmux r1).
+    // Additive line type, per the rule in parseStateFile: an older build ignores K and restores
+    // the sessions without their slots — and drops them on its next save (the same write-back loss
+    // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
+    std::string capLines;
     const std::string tab(1, (char)9);       // the field separator, spelled without an escape
     for (size_t oi = 0; oi < savedOrder.size(); oi++) {
         const Session* owner = savedOrder[oi];
-        if (owner->splitId.empty()) continue;
         const Session* sh = nullptr;
-        for (const Session* c : g_sessions) if (c->id == owner->splitId) { sh = c; break; }
-        if (!sh) continue;                               // its shell is gone; nothing to restore
-        std::string scw = sessionLiveCwd(sh);
-        if (scw.size() >= sizeof agwinterm_ptyhost_Create::cwd) scw.clear();
-        splitLines += "P" + tab + std::to_string(oi) + tab + tsvField(sh->app)
-                    + tab + tsvField(scw.empty() ? sh->cwd : scw);
-        for (const auto& a : sh->args) splitLines += tab + tsvField(a);
-        splitLines += "\n";
+        if (!owner->splitId.empty())
+            for (const Session* c : g_sessions) if (c->id == owner->splitId) { sh = c; break; }
+        if (sh) {                                        // no shell = it is gone; nothing to restore
+            std::string scw = sessionLiveCwd(sh);
+            if (scw.size() >= sizeof agwinterm_ptyhost_Create::cwd) scw.clear();
+            splitLines += "P" + tab + std::to_string(oi) + tab + tsvField(sh->app)
+                        + tab + tsvField(scw.empty() ? sh->cwd : scw);
+            for (const auto& a : sh->args) splitLines += tab + tsvField(a);
+            splitLines += "\n";
+        }
+        const std::string& p1 = sh ? sh->capturedCmd : std::string();
+        if (!owner->capturedCmd.empty() || !p1.empty())
+            capLines += "K" + tab + std::to_string(oi) + tab + tsvField(owner->capturedCmd) + tab + tsvField(p1) + "\n";
     }
     // Read under the lock, with the session list it describes: the flag is written from the
     // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
     // zero-session refusal and the .bak delete — the two decisions that can cost saved sessions.
     bool userEmptied = g_userEmptied;
+    unsigned long long stamp = ++g_saveStamp;   // this buffer's place in the order of snapshots
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
+    out += ctxLines;                         // C lines: session contexts, with F and D, before P
     out += splitLines;                       // P lines: each session's own right-hand shell
+    out += capLines;                         // K lines: the captured-command slots, after the P they name
     out += "A\t" + std::to_string(g_activeWs) + "\n";
+
+    // From here on the file is touched: the zero-session read below, the .tmp write and the
+    // publish. One saver at a time (g_saveLock — see its declaration for the ordering rule: g_lock
+    // is already released above, and is not taken again in this function). The buffer above is
+    // this saver's own consistent snapshot, stamped; a newer snapshot that overtook this one while
+    // it waited here is already on disk, and publishing over it would be a step backwards.
+    struct LockSave {
+        LockSave() { EnterCriticalSection(&g_saveLock); }
+        ~LockSave() { LeaveCriticalSection(&g_saveLock); }
+    } saveHold;
+    if (stamp < g_savePublished) return true;   // overtaken: the file already holds a newer snapshot
 
     // Anything that rebuilds the tree while the session list is momentarily empty used to rewrite the
     // file with zero S lines — a good file replaced by a useless one, with nothing to fall back to.
@@ -2754,7 +2950,7 @@ static void saveSessionState() {
             else
                 logWarn("save SKIPPED: %s could not be read (err %lu), so a zero-session save might be "
                         "throwing sessions away — refusing", narrow(path).c_str(), hadErr);
-            return;
+            return false;
         }
     }
 
@@ -2788,7 +2984,7 @@ static void saveSessionState() {
             logWarn("save FAILED to open %s (err %lu) or %s (err %lu) — %d session(s) not saved "
                     "(is the state directory writable?)",
                     narrow(tmp).c_str(), terr, narrow(path).c_str(), GetLastError(), saved);
-            return;
+            return false;
         }
         DWORD wr2 = 0;
         BOOL ok2 = WriteFile(g, out.data(), (DWORD)out.size(), &wr2, nullptr);
@@ -2803,11 +2999,13 @@ static void saveSessionState() {
             logWarn("save ok (IN PLACE): %d session(s), %zu bytes -> %s — %s could not be created "
                     "(err %lu), so this save was not atomic",
                     saved, out.size(), narrow(path).c_str(), narrow(tmp).c_str(), terr);
-        } else
-            logWarn("save FAILED in place to %s: wrote %lu of %zu bytes (err %lu) after %s could not "
-                    "be created (err %lu)", narrow(path).c_str(), wr2, out.size(), werr2,
-                    narrow(tmp).c_str(), terr);
-        return;
+            g_savePublished = stamp;
+            return true;
+        }
+        logWarn("save FAILED in place to %s: wrote %lu of %zu bytes (err %lu) after %s could not "
+                "be created (err %lu)", narrow(path).c_str(), wr2, out.size(), werr2,
+                narrow(tmp).c_str(), terr);
+        return false;
     }
     DWORD wr = 0;
     BOOL ok = WriteFile(f, out.data(), (DWORD)out.size(), &wr, nullptr);
@@ -2818,7 +3016,7 @@ static void saveSessionState() {
         logWarn("save PARTIAL to %s: wrote %lu of %zu bytes (err %lu) — previous state left intact",
                 narrow(tmp).c_str(), wr, out.size(), werr);
         DeleteFileW(tmp.c_str());
-        return;
+        return false;
     }
     // Keep exactly one previous generation, but only rotate a file that is actually worth keeping, so
     // a good .bak is never overwritten by an empty primary. The user emptying the window ON PURPOSE is
@@ -2841,7 +3039,8 @@ static void saveSessionState() {
     if (rotate && ReplaceFileW(path.c_str(), tmp.c_str(), bak.c_str(),
                                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
         logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
-        return;
+        g_savePublished = stamp;
+        return true;
     }
     bool rotated = rotate && MoveFileExW(path.c_str(), bak.c_str(), MOVEFILE_REPLACE_EXISTING);
     if (rotate && !rotated)
@@ -2858,9 +3057,11 @@ static void saveSessionState() {
                 : rotated ? "the previous state is in the .bak"
                           : "the previous state is untouched");
         DeleteFileW(tmp.c_str());
-        return;
+        return false;
     }
     logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
+    g_savePublished = stamp;
+    return true;
 }
 
 // Select a face+size, apply it, and persist the choice (used by the Properties dialog).
@@ -4360,6 +4561,9 @@ static void refreshTree() {
             if (g_flagView && !s->flagged) continue;                         // flagged view filter
             // Agent status cue: name goes bold when the agent needs you (blocked), italic + "(working…)"
             // while it's busy (italic applied in the tree's NM_CUSTOMDRAW). Others show plain.
+            // The label is the name and its status suffix ONLY. The session context (P3) is not in
+            // it — it is drawn dimmed after the label in the post-paint pass (see the kTree*
+            // constants), so it neither changes colour with the row nor widens the rename EDIT.
             int cls = s->exited ? AGST_NONE : statusClass(statusOf(s).status);
             std::wstring label = s->name.empty() ? (L"session " + std::to_wstring(vis)) : s->name;
             if (s->failed) label += L"  (failed to start)";   // restored spec whose app won't run here
@@ -6201,19 +6405,55 @@ public:
                     SelectObject(cd->nmcd.hdc, g_treeItalic);
                     r = CDRF_NEWFONT;
                 }
-                if (p >= 0 && p < (LPARAM)g_sessions.size() && (g_sessions[p]->flagged || g_sessions[p]->unread > 0))
-                    r |= CDRF_NOTIFYPOSTPAINT;   // pennant / unread badge drawn after the row
+                // The post-paint pass is asked for only when the row has something to draw after
+                // its label: the pennant, the unread pill, or (P3) the dimmed context run. It is
+                // NOT requested for every row — a plain row costs nothing extra. `context` is a
+                // std::wstring a pipe thread reassigns under g_lock (session.context), so even
+                // empty() is read under the same hold — the post-paint below does, and one handler
+                // guarding a field the other reads bare was the gap revmux r1 found. The scalars
+                // ride along under the hold; it is recursive, so a paint reached from inside a hold
+                // (refreshTree's rebuild) is fine.
+                bool postPaint = false;
+                if (p >= 0 && p < (LPARAM)g_sessions.size()) {
+                    LockG hold;
+                    if (p < (LPARAM)g_sessions.size())
+                        postPaint = g_sessions[p]->flagged || g_sessions[p]->unread > 0 || !g_sessions[p]->context.empty();
+                }
+                if (postPaint) r |= CDRF_NOTIFYPOSTPAINT;
                 return r;
             }
             if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
                 LPARAM p = cd->nmcd.lItemlParam;
                 if (p >= 0 && p < (LPARAM)g_sessions.size()) {
+                    bool flagged = false; int unread = 0; std::wstring ctx;
+                    {   // session.context writes `context` on a pipe thread under g_lock; copy it
+                        // under the same hold and draw with nothing held. The section is recursive,
+                        // so a paint reached from inside a hold (refreshTree's rebuild) is fine.
+                        LockG hold;
+                        if (p < (LPARAM)g_sessions.size()) {
+                            flagged = g_sessions[p]->flagged;
+                            unread = g_sessions[p]->unread;
+                            ctx = g_sessions[p]->context;
+                        }
+                    }
                     RECT rr;
                     if (TreeView_GetItemRect(g_tree, (HTREEITEM)cd->nmcd.dwItemSpec, &rr, FALSE)) {
                         HDC dc = cd->nmcd.hdc;
                         int cy = (rr.top + rr.bottom) / 2;
-                        if (g_sessions[p]->flagged) {   // amber pennant (full app's flag marker)
-                            int x = rr.right - 15;
+                        HFONT bf = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                        // The pill is measured before anything is drawn: the context run's clip
+                        // edge depends on its width, and the pill must not move for the context.
+                        wchar_t bn[8] = L"";
+                        int pillW = 0;
+                        if (unread > 0) {
+                            wsprintfW(bn, L"%d", unread > 99 ? 99 : unread);
+                            HGDIOBJ of = SelectObject(dc, bf);
+                            SIZE sz{}; GetTextExtentPoint32W(dc, bn, lstrlenW(bn), &sz);
+                            SelectObject(dc, of);
+                            pillW = sz.cx + 10;
+                        }
+                        if (flagged) {   // amber pennant (full app's flag marker)
+                            int x = rr.right - kTreePennantInset;
                             COLORREF amber = RGB(245, 194, 66);
                             HPEN pen = CreatePen(PS_SOLID, 1, amber);
                             HBRUSH br = CreateSolidBrush(amber);
@@ -6224,13 +6464,9 @@ public:
                             SelectObject(dc, op); SelectObject(dc, ob);
                             DeleteObject(pen); DeleteObject(br);
                         }
-                        if (g_sessions[p]->unread > 0) {   // red count pill (full app's notification badge)
-                            wchar_t bn[8];
-                            wsprintfW(bn, L"%d", g_sessions[p]->unread > 99 ? 99 : g_sessions[p]->unread);
-                            HFONT bf = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                        if (unread > 0) {   // red count pill (full app's notification badge)
                             HGDIOBJ of = SelectObject(dc, bf);
-                            SIZE sz{}; GetTextExtentPoint32W(dc, bn, lstrlenW(bn), &sz);
-                            int w2 = sz.cx + 10, x1 = rr.right - 20, x0 = x1 - w2;
+                            int x1 = rr.right - kTreePillInset, x0 = x1 - pillW;
                             RECT pill{ x0, cy - 8, x1, cy + 8 };
                             HBRUSH rb = CreateSolidBrush(RGB(205, 72, 58));
                             HPEN rp = CreatePen(PS_SOLID, 1, RGB(205, 72, 58));
@@ -6242,6 +6478,28 @@ public:
                             SetTextColor(dc, RGB(255, 255, 255));
                             DrawTextW(dc, bn, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                             SelectObject(dc, of);
+                        }
+                        if (!ctx.empty()) {   // P3: the session context, dimmed, after the label
+                            // The text rect (wParam TRUE) ends where the tree drew the label — the
+                            // name plus its "(working…)" / "(exited)" suffix, whichever the row
+                            // has — so the run always sits after the whole label. It is clipped
+                            // short of the pill (or of the pill's place when there is none, which
+                            // also clears the pennant) so the badges never move for it; the row's
+                            // height is the tree's own and is not touched here.
+                            RECT tr;
+                            if (TreeView_GetItemRect(g_tree, (HTREEITEM)cd->nmcd.dwItemSpec, &tr, TRUE)) {
+                                int x0 = tr.right + kTreeContextGap;
+                                int x1 = rr.right - kTreePillInset - pillW - kTreeContextReserve;
+                                if (x1 > x0) {
+                                    RECT run{ x0, rr.top, x1, rr.bottom };
+                                    HGDIOBJ of = SelectObject(dc, g_treeFont ? g_treeFont : bf);
+                                    SetBkMode(dc, TRANSPARENT);
+                                    SetTextColor(dc, g_th.dim);
+                                    DrawTextW(dc, ctx.c_str(), (int)ctx.size(), &run,
+                                              DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                                    SelectObject(dc, of);
+                                }
+                            }
                         }
                     }
                 }
@@ -6461,6 +6719,84 @@ static void emitEvent(const char* type, const std::string& session, const std::s
     g_evtLog.push_back({ ++g_evtSeq, type, session, info });
     while (g_evtLog.size() > 1000) g_evtLog.pop_front();   // bounded history, oldest first
     LeaveCriticalSection(&g_evtLock);
+}
+
+// ---- session.context rules (P3) ----
+// The rules and the wording are agwinterm's SessionContexts (src/Agwinterm.Pty/SessionContexts.cs),
+// copied, not paraphrased: one API, one answer. Used by the verb AND by the state-file loader, so a
+// value read back from disk is held to exactly what the verb would have accepted.
+//
+// The ceiling, in UTF-16 code units (.NET string.Length — the unit agwinterm counts in, so the same
+// text is over or under the ceiling in both apps). This is a DISPLAY budget, not a storage limit:
+// the sidebar row draws the context as a dimmed run after the name, clipped to the row. Do not
+// raise it without widening that surface.
+static constexpr size_t kContextMaxLength = 200;
+static const char* const kContextBlank =
+    "session context: the text is blank; a context is one line of printable text, and `session context --clear` removes one. Nothing changed.";
+// Text and --clear together: two sources for one field, refused rather than ranked (the rule
+// `session type --stdin` set in P2).
+static const char* const kContextTextAndClear =
+    "session context: text and --clear cannot be combined (one says what the context is, the other that there is none). Nothing changed.";
+// The target resolves to no session — the same "session not found" session.rename answers, so a
+// script sees one wording for one condition.
+static const char* const kContextNoSession = "session not found; nothing changed";
+
+// ---- restore.capture refusals (P3) ----
+// agwinterm's RestoreCaptureReply (src/Agwinterm.Pty/RestoreCaptureReply.cs), verbatim. Each one
+// captures nothing for anyone and saves nothing — the verb returns before the process query.
+static std::string captureUnknownTarget(const std::string& target) {
+    return "restore capture: no pane or session matches '" + target + "'. Nothing captured, nothing saved.";
+}
+// A target that is PRESENT but empty. Omitting it is the documented "every real pane"; an empty one
+// is a caller that meant to name something and built the request wrong, and widening that to every
+// pane would clear the checkpoint of every idle pane in the window on a typo (agwinterm revmux r1).
+static const char* const kCaptureEmptyTarget =
+    "restore capture: the target is empty. Omit --target to capture every real pane, or name one pane or session. Nothing captured, nothing saved.";
+// A quick / scratch / overlay cover: hidden, never in the saved tree, so no `K` slot to capture into.
+static std::string captureCoverPane(const std::string& paneId) {
+    return "restore capture: '" + paneId + "' is a scratch/overlay/quick pane, which is never restored, so it has no restore slot to capture into. Nothing captured, nothing saved.";
+}
+// The process query did not run. Refused rather than reported as "nothing running" everywhere: an
+// empty answer from a dead query would write null into every slot and look exactly like a quiet desk.
+static const char* const kCaptureQueryFailed =
+    "restore capture: the process query failed or timed out, so what each shell is running is unknown. Nothing captured, nothing saved.";
+
+// The refusal for `decoded` (the JSON-decoded UTF-8 text as the caller sent it), or "" when it is
+// acceptable — in which case *normalized holds the value to store. Checks, in agwinterm's order:
+//   1. a control character (below U+0020, or U+007F..U+009F) anywhere in the text AS GIVEN, before
+//      trimming, naming the character and its OFFSET in UTF-16 code units of the decoded string —
+//      the index a caller finds in what they sent (jsonParseString has already turned \t, \n and
+//      \u0001 into the bytes themselves, so an escape in the request is a control character here);
+//      checking before trim also refuses a trailing tab or NEL instead of silently eating it;
+//   2. trim both ends (the .NET char.IsWhiteSpace set; the control range is already gone);
+//   3. blank after the trim — naming --clear as the way to remove a context;
+//   4. over kContextMaxLength code units — naming the ceiling.
+// A refusal changes nothing: the caller keeps the old context and nothing is saved.
+static std::string contextRefusal(const std::string& decoded, std::string* normalized) {
+    std::wstring w = widen(decoded);
+    for (size_t i = 0; i < w.size(); i++) {
+        unsigned c = (unsigned)w[i];
+        if (c < 0x20 || (c >= 0x7F && c <= 0x9F)) {
+            char b[200];
+            sprintf_s(b, "session context: control character U+%04X at offset %zu; a context is one line of printable text (no newline, tab or escape). Nothing changed.", c, i);
+            return b;
+        }
+    }
+    auto isWs = [](wchar_t c) {   // char.IsWhiteSpace, minus the control range refused above
+        return c == 0x20 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+               c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+    };
+    size_t b = 0, e = w.size();
+    while (b < e && isWs(w[b])) b++;
+    while (e > b && isWs(w[e - 1])) e--;
+    std::wstring t = w.substr(b, e - b);
+    if (t.empty()) return kContextBlank;
+    if (t.size() > kContextMaxLength)
+        return "session context: " + std::to_string(t.size()) + " characters is over the ceiling of " +
+               std::to_string(kContextMaxLength) +
+               "; the ceiling is a display budget (the title bar and the sidebar row draw the context beside the name). Nothing changed.";
+    if (normalized) *normalized = narrow(t);
+    return {};
 }
 
 static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
@@ -6749,6 +7085,50 @@ now - widen the window or ask for less. A set while the sidebar is hidden is rem
 `applied:false`, and takes effect on the next `show`. Any op not listed - `sideways`, a typo -
 is refused naming the five, and **nothing changes** (it used to toggle the sidebar).
 
+## What a pane is for, and what it was running
+
+```
+agwintermctl session context "reviewing the P3 diff" --target build
+agwintermctl session context --clear --target build
+agwintermctl restore capture [--target <id|name>]
+```
+
+`session context` keeps ONE line of free text per session - what the pane is for - shown dimmed
+after the name in its sidebar row and read back from `tree --json` as `context` on the session
+node (the key is there only when one is set). The reply is `{session, context}` with the value IN
+EFFECT after the write, `null` after `--clear`; it is read off the session, not echoed from the
+request. The rules and the wording are the full app's: the text is trimmed; blank is refused
+(`--clear` is the way to remove one); a control character - a newline, a tab, an escape - is
+refused naming its offset; more than 200 characters is refused naming the ceiling; text beside
+`--clear` is refused. A refusal leaves the old context in place. A rename leaves the context
+alone. A split, quick, scratch or overlay pane has no sidebar row and no session line in the state
+file, so a context on one is refused rather than accepted and shown nowhere. The context survives a restart (a `C` line
+in the state file) and an undo-close (Ctrl+Shift+T).
+
+`restore capture` reads what every real pane is running RIGHT NOW - the newest child of the pane's
+shell that is not itself a shell or a prompt helper (powershell, pwsh, cmd, conhost, wsl, ssh, bash,
+oh-my-posh, git, windowsterminal: the full app's default denylist, fixed here - lite has no
+denylist file) - into a durable per-pane slot, saves, and answers
+`{captured, replayOnRestore, panes:[{pane, session, captured}]}`. Per pane `captured` is the
+command line or `null` (the shell had nothing non-denylisted running; null is written too, so a
+fresh capture replaces an older checkpoint, including with nothing); the top-level `captured`
+counts the non-null ones. The slots read back from `tree --json` as `capturedCommands` on the
+owning session node, keyed by pane id - the session id for the left pane, the split's id for the
+right - and persist as a `K` line. `--target` names one session (its own left pane), a split's id
+(that one pane) or `active` (the focused pane). The reply describes a state that is already on
+disk when you read it.
+
+**`replayOnRestore` is always `false` here.** lite restores a session's LAUNCH spec at the next
+start and never types a slot back (`session restore` is not in lite), so a captured command is a
+checkpoint you read - from the reply, `tree` or the file - not a command that will run again.
+The field exists so one script reads one shape against both products; it starts reporting a
+toggle the day lite has a replay.
+
+Refusals, each with nothing written for ANY pane and nothing saved: a `--target` that matches no
+pane or session; a `--target` that is present but empty (omit it to mean every pane); a
+quick, scratch or overlay pane (never restored, so no slot); a process query that did not run
+(refused, never `null` written into every slot).
+
 ## Find out what happened
 
 Two ways, and prefer the first:
@@ -6808,8 +7188,9 @@ and still prints the `cli` half when nothing is listening, marking the app `unav
 
 ```
 agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
-agwintermctl session copy|paste|type|text|output|status
+agwintermctl session copy|paste|type|text|output|status|context
 agwintermctl surface cursor
+agwintermctl restore capture
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
 agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width | quick on|off|toggle
@@ -6918,7 +7299,36 @@ static std::string ctlDispatch(const std::string& line) {
                         // Beyond the contract (extra fields are allowed): the grid the session was
                         // last resized to. It is how a caller sees that `sidebar width` moved the
                         // content region, and the oracle #23 needs (a pane that collapsed to 2).
-                        ",\"cols\":" + std::to_string(s->cols) + ",\"rows\":" + std::to_string(s->rows) + "}";
+                        ",\"cols\":" + std::to_string(s->cols) + ",\"rows\":" + std::to_string(s->rows);
+                // "context" is emitted ONLY when one is set — deliberately agwinterm's rule
+                // (ControlServer.cs: `if (n.Context is not null)`), and deliberately unlike lite's
+                // always-emitted booleans above: a script tests PRESENCE of the key ("has this
+                // session a context?"), and absent is the one spelling of "none" both apps agree on.
+                // An always-present "context":"" would make a set-then-clear look like a set of "".
+                if (!s->context.empty()) sess += ",\"context\":\"" + jsonEscape(narrow(s->context)) + "\"";
+                // "capturedCommands": the restore.capture read-back (P3), an object keyed by PANE id
+                // listing only the panes that hold a captured command, emitted only when one does —
+                // AppendPaneMap's shape (ControlServer.cs), same presence rule as "context". Pane 0's
+                // id is the session's own; the split shell's id is the other key. The split has no
+                // node of its own in lite's tree (it is hidden), so this map is where its pane id
+                // reads back from until P9 adds `paneIds`; `session split` answered the same id.
+                {
+                    const Session* sh = nullptr;
+                    if (!s->splitId.empty())
+                        for (const Session* c : g_sessions) if (c->id == s->splitId) { sh = c; break; }
+                    if (!s->capturedCmd.empty() || (sh && !sh->capturedCmd.empty())) {
+                        sess += ",\"capturedCommands\":{";
+                        bool any = false;
+                        if (!s->capturedCmd.empty()) {
+                            sess += "\"" + jsonEscape(s->id) + "\":\"" + jsonEscape(s->capturedCmd) + "\"";
+                            any = true;
+                        }
+                        if (sh && !sh->capturedCmd.empty())
+                            sess += std::string(any ? "," : "") + "\"" + jsonEscape(sh->id) + "\":\"" + jsonEscape(sh->capturedCmd) + "\"";
+                        sess += "}";
+                    }
+                }
+                sess += "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +
                    "\",\"active\":" + (w == g_activeWs ? "true" : "false") +
@@ -7330,10 +7740,162 @@ static std::string ctlDispatch(const std::string& line) {
         {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
             // reassignment frees the old buffer once the name outgrows the small-string buffer)
             LockG hold;
+            // The name and the context (session.context, below) are two separate fields: a rename
+            // writes this one and leaves `context` exactly as it was, and neither is derived from
+            // the other.
             target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
         }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
+    }
+    if (cmd == "session.context") {   // P3: one line of "what is this pane for", per session
+        // The value is read from the field map, not from get(): get() answers "" for absent AND
+        // for a present empty string, and the two are different verbs here — absent with --clear is
+        // a clear, present-empty is the blank refusal, present beside --clear is TextAndClear.
+        // `--clear` arrives as the raw token `true` (the CLI sends a JSON boolean; the parser keeps
+        // a non-string as its text), so this is a comparison against that token, never against the
+        // value of some string field (agwinterm #234 item 6 is the bug that comparison makes).
+        auto cf = req.fields.find("args.context");
+        bool haveText = cf != req.fields.end();
+        bool clear = req.get("args.clear") == "true";
+        if (clear && haveText) return ctlErr(kContextTextAndClear);
+        std::string text;
+        if (!clear) {
+            // A missing text with no --clear is the blank refusal, with --clear named as the way
+            // to remove one (SessionContexts.TryNormalize: a null raw is "" and "" is blank).
+            std::string why = contextRefusal(haveText ? cf->second : std::string(), &text);
+            if (!why.empty()) return ctlErr(why);
+        }
+        // Target refusals come AFTER the text rules, as in agwinterm (the server validates before
+        // the host is reached), so a bad value on a bad target names the value.
+        if (!target) return ctlErr(targetWhy.empty() ? kContextNoSession : targetWhy);
+        {
+            LockG hold;
+            // resolveTarget handed back a pointer without a lock across the two calls: re-check the
+            // session is still in the list before writing through it (#21's defect class), and
+            // answer "not found" if it closed in between — exactly what agwinterm's in-hop lookup
+            // does.
+            if (indexOfSession(target) < 0) return ctlErr(kContextNoSession);
+            // A hidden session — a split shell, a quick, scratch or overlay cover — is reachable by
+            // id through resolveTarget, but it has no sidebar row to draw the context in, no `S` line
+            // and therefore no `C` slot to save it under: accepting would answer ok:true for a value
+            // that is shown nowhere and gone at the next start. Refused for the reason
+            // restore.capture refuses a cover pane (RestoreCaptureReply.CoverPane's rule), naming
+            // the id. The value is untouched (a hidden session never has one). The wording names
+            // the real reason — no row, no session line — not "never restored": a split IS restored
+            // (its P line), it just has nowhere to keep a context (revmux r1).
+            if (target->hidden)
+                return ctlErr("session context: '" + target->id + "' is a split, scratch, overlay or quick pane; "
+                              "it has no sidebar row and no session line in the state file, so it has no context to set. Nothing changed.");
+            target->context = clear ? std::wstring() : widen(text);
+            // The reply is read BACK from the session under the same hold — the value in effect,
+            // not an echo of the request (agwinterm's SessionContexts.Reply is built from ses.Context).
+            std::string reply = "{\"session\":\"" + jsonEscape(target->id) + "\",\"context\":" +
+                                (target->context.empty() ? std::string("null")
+                                                         : "\"" + jsonEscape(narrow(target->context)) + "\"") + "}";
+            PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // the row (task 2) and the save
+            return ctlOk(reply);
+        }
+    }
+    if (cmd == "restore.capture") {   // P3: capture each real pane's foreground command into its slot NOW
+        // Three phases, agwinterm's Program.ControlHost RestoreCapture shape: SNAPSHOT the panes and
+        // their shell pids under g_lock; QUERY the processes with NO lock held (captureForeground:
+        // one Toolhelp32 snapshot, milliseconds); WRITE the slots under g_lock re-checking that every
+        // session is still in the list, then save and answer from what landed. Every refusal returns
+        // before the query, with nothing written for anyone and nothing saved.
+        //
+        // The reply is agwinterm's RestoreCaptureReply, an object (ctlOk): `captured` = the panes
+        // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
+        // (the owner's id) and `captured` (string | null). `replayOnRestore` is a constant FALSE in
+        // lite: the field says whether the slot will be typed back at the next start, and lite never
+        // types anything back — it restores launch specs, and session.restore is P9. Answering the
+        // truth rather than a toggle with nothing behind it; when P9 lands the replay, the field
+        // starts reporting it and the shape does not change.
+        struct CapPane { Session* s; std::string id, owner; DWORD pid; };
+        std::vector<CapPane> snap;
+        // The target is read from the field map, not from get(): absent is the documented "every
+        // real pane", present-but-empty is a refusal (EmptyTarget), and get() answers "" for both.
+        // The CLI refuses an empty --target on its own side too; the raw line pins the server.
+        auto tf = req.fields.find("target");
+        bool haveTarget = tf != req.fields.end();
+        if (haveTarget && tf->second.empty()) return ctlErr(kCaptureEmptyTarget);
+        if (haveTarget) {
+            // One pane. resolveTarget is the same resolver every session verb uses (exact id, id
+            // prefix, unique visible name; `active` = the focused pane, which may be a split shell —
+            // agwinterm's "the active session's active pane"). A split shell resolves by its id and
+            // captures that ONE pane; a visible session captures its own shell, pane 0 (lite keeps
+            // no per-session focused pane, so the session's own shell is its pane). An ambiguous name
+            // is an unknown target, in the verb's own words.
+            if (!target)
+                return ctlErr(targetWhy.empty() ? captureUnknownTarget(tf->second)
+                                                : "restore capture: " + targetWhy + ". Nothing captured, nothing saved.");
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr(captureUnknownTarget(tf->second));   // closed since the resolve (#21's class)
+            std::string owner = target->id;
+            if (target->hidden) {
+                // Hidden is a split shell OR a quick/scratch/overlay cover, and the one discriminator
+                // is "some visible session's splitId names it" (closeSessionAt's walk). A cover has
+                // no S line and no K slot: refused rather than captured into nothing.
+                owner.clear();
+                for (Session* o : g_sessions) if (!o->hidden && o->splitId == target->id) { owner = o->id; break; }
+                if (owner.empty()) return ctlErr(captureCoverPane(target->id));
+            }
+            snap.push_back({ target, target->id, owner, livePid(target) });
+        } else {
+            // Every real pane: each visible session (the panes the S lines restore) followed by its
+            // split shell (the pane its P line restores), in list order — tree order.
+            LockG hold;
+            for (Session* s : g_sessions) {
+                if (s->hidden) continue;
+                snap.push_back({ s, s->id, s->id, livePid(s) });
+                if (s->splitId.empty()) continue;
+                for (Session* sh : g_sessions)
+                    if (sh->id == s->splitId) { snap.push_back({ sh, sh->id, s->id, livePid(sh) }); break; }
+            }
+        }
+        // The query, lock-free: a shell pid of 0 (a dead entry, a restore placeholder, an EXITED
+        // shell — livePid) is skipped by captureForeground and reads as null below.
+        std::vector<DWORD> pids;
+        for (const auto& p : snap) if (p.pid) pids.push_back(p.pid);
+        std::map<DWORD, std::string> found;
+        if (!captureForeground(pids, &found)) return ctlErr(kCaptureQueryFailed);
+        // The write. Null is written too (an empty slot): a fresh capture replaces the previous
+        // checkpoint, including with nothing — "the shell had no non-denylisted child" is an answer,
+        // and keeping a stale command under it would replay (in P9) something that is not running. A
+        // pane closed between the snapshot and here is dropped from the reply rather than written to;
+        // the id is re-checked as well as the pointer, since a freed Session's address can be reused.
+        std::string panes;
+        int captured = 0;
+        {
+            LockG hold;
+            for (const auto& p : snap) {
+                if (indexOfSession(p.s) < 0 || p.s->id != p.id) continue;
+                auto f = p.pid ? found.find(p.pid) : found.end();
+                p.s->capturedCmd = f != found.end() ? f->second : std::string();
+                if (!panes.empty()) panes += ",";
+                panes += "{\"pane\":\"" + jsonEscape(p.id) + "\",\"session\":\"" + jsonEscape(p.owner) + "\",\"captured\":";
+                if (p.s->capturedCmd.empty()) panes += "null";
+                else { panes += "\"" + jsonEscape(p.s->capturedCmd) + "\""; captured++; }
+                panes += "}";
+            }
+        }
+        // The first save from a pipe thread. The reply below describes a state that is ON DISK
+        // (agwinterm's rule): posting the refresh, which saves on the UI thread, would answer before
+        // the file is written, and a kill in that window loses a capture the caller was told it had.
+        // saveSessionState takes and releases g_lock itself and does its I/O under g_saveLock, so
+        // it cannot collide with a UI-thread save; the refresh is still posted for the tree. A save
+        // that did not publish (no state directory, an unwritable one, a full disk — each named in
+        // the log) is a REFUSAL: the slots are in memory and in tree --json, which is what the
+        // caller asked for, but the reply's claim is durability and that claim would be false. The
+        // slots are left as captured — rolling them back would make the tree disagree with a
+        // capture that read the processes correctly (revmux r1).
+        bool onDisk = saveSessionState();
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        if (!onDisk)
+            return ctlErr("restore capture: " + std::to_string(snap.size()) + " pane(s) were captured into memory but the state "
+                          "file could not be written (see the log) — the checkpoint is not on disk and will not survive a "
+                          "restart. tree --json still shows what was captured.");
+        return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":false,\"panes\":[" + panes + "]}");
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
@@ -7800,6 +8362,14 @@ struct ParsedState {
     std::vector<std::wstring> wss;
     std::vector<RestoreSpec> specs;
     std::vector<SplitSpec> splits;       // from P lines; empty for any file written before 0.17.13
+    // From C lines (P3): (S-line index, raw text) per session that had a context. Raw here — the
+    // loader runs each one through contextRefusal, the verb's own rules, before it is set.
+    std::vector<std::pair<int, std::string>> contexts;
+    // From K lines (P3): the restore.capture slots per session — (S-line index, pane 0's command,
+    // pane 1's command); "" = none. A slot is a plain string: nothing to validate on load beyond the
+    // index, and the split guard below (a pane-1 slot lands only on a split the P line rebuilt).
+    struct CaptureLine { int idx; std::string pane0, pane1; };
+    std::vector<CaptureLine> captures;
     int sLines = 0;                      // RAW S lines seen, valid or not - see the P-line guard
     std::vector<std::string> savedIds;   // from the D line; empty for a pre-0.17.3 file
     int activeWs = 0, focusWs = -1;
@@ -7845,6 +8415,15 @@ static ParsedState parseStateFile(const std::wstring& path) {
             SplitSpec sp; sp.owner = atoi(ff[1].c_str()); sp.spec.app = ff[2]; sp.spec.cwd = ff[3];
             for (size_t k = 4; k < ff.size(); k++) sp.spec.args.push_back(ff[k]);
             ps.splits.push_back(sp);
+        } else if (ff[0] == "C" && ff.size() >= 3) {   // a session's context: S-line index, text
+            // Kept as (index, text) rather than applied here: the index is checked against the
+            // spec list only after the whole file is read, under the same count guard as P below.
+            ps.contexts.push_back({ atoi(ff[1].c_str()), ff[2] });
+        } else if (ff[0] == "K" && ff.size() >= 3) {   // a session's captured commands: S-line index, pane 0, pane 1
+            // Same treatment as C: kept positional and checked against the spec list after the whole
+            // file is read, under the count guard below. The pane-1 field is optional on read (a
+            // hand-shortened line) and empty means none.
+            ps.captures.push_back({ atoi(ff[1].c_str()), ff[2], ff.size() >= 4 ? ff[3] : std::string() });
         } else if (ff[0] == "F") {   // flagged indices, in S-line order
             for (size_t k = 1; k < ff.size(); k++) {
                 int fi = atoi(ff[k].c_str());
@@ -7868,6 +8447,42 @@ static ParsedState parseStateFile(const std::wstring& path) {
         logWarn("state: %d session line(s) but %zu parsed - refusing %zu split line(s) rather than "
                 "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.splits.size());
         ps.splits.clear();
+    }
+    // C lines are positional too (index = S-line position), so the same guard: a dropped S line
+    // would hang every later context on the wrong session, which is worse than losing them.
+    if (!ps.contexts.empty() && ps.sLines != (int)ps.specs.size()) {
+        logWarn("state: %d session line(s) but %zu parsed - refusing %zu context line(s) rather than "
+                "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.contexts.size());
+        ps.contexts.clear();
+    }
+    // An index past the S list (hand-edited, or a C line left over from a longer file) names no
+    // session; drop that one line and say so, keeping the rest.
+    for (size_t k = 0; k < ps.contexts.size();) {
+        int ci = ps.contexts[k].first;
+        if (ci < 0 || ci >= (int)ps.specs.size()) {
+            logWarn("state: context line names session index %d but the file has %zu session(s) - dropped",
+                    ci, ps.specs.size());
+            ps.contexts.erase(ps.contexts.begin() + k);
+        } else k++;
+    }
+    // K lines: positional like C and P, so the same guard and the same range check — the SAME
+    // comparison as P's, so whenever the P set is refused the K set goes with it in this pass and
+    // no pane-1 slot is ever orphaned that way. (The pane-1 slot additionally needs its split:
+    // restoreSessions drops it when the split failed to start, or when a K line names a split the
+    // file has no P line for — a hand-edited or downgrade-written file; the slot is meaningless
+    // without the shell it describes.)
+    if (!ps.captures.empty() && ps.sLines != (int)ps.specs.size()) {
+        logWarn("state: %d session line(s) but %zu parsed - refusing %zu capture line(s) rather than "
+                "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.captures.size());
+        ps.captures.clear();
+    }
+    for (size_t k = 0; k < ps.captures.size();) {
+        int ci = ps.captures[k].idx;
+        if (ci < 0 || ci >= (int)ps.specs.size()) {
+            logWarn("state: capture line names session index %d but the file has %zu session(s) - dropped",
+                    ci, ps.specs.size());
+            ps.captures.erase(ps.captures.begin() + k);
+        } else k++;
     }
     if (!ps.savedIds.empty() && ps.savedIds.size() != ps.specs.size()) {
         logWarn("state: %zu saved id(s) for %zu session line(s) — the file is inconsistent, so live "
@@ -7976,6 +8591,7 @@ static bool restoreSessions() {
     int cols, rows; newSessionGrid(0, &cols, &rows);
     int firstIdx = -1, built = 0, adopted = 0, dead = 0;
     std::vector<Session*> bySpec;   // spec index -> the session it produced (null if it could not start)
+    std::vector<Session*> byPos;    // spec index -> live OR dead entry (the C lines attach to either)
 
     // Sessions the host still holds (read at startup by scanHostSessions, which also reserved their
     // ids). lite was killed rather than closed if this is non-empty: the pty-host outlives the UI by
@@ -8029,21 +8645,55 @@ static bool restoreSessions() {
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;
             built++;
             bySpec.push_back(s);
+            byPos.push_back(s);
         } else {
             // A spec that won't start used to be invisible AND gone: the session didn't come back and
             // the next save rewrote the file without it. Keep it as a dead entry and name it in the log.
             logWarn("restore: session '%s' FAILED to start (app='%s' cwd='%s') — kept as a dead session",
                     sp.name.c_str(), sp.app.c_str(), sp.cwd.c_str());
-            failedSpecSession(sp, cols, rows);
+            byPos.push_back(failedSpecSession(sp, cols, rows));
             dead++;
             bySpec.push_back(nullptr);   // keep spec positions aligned for the P lines
         }
+    }
+    // Each session gets its context back (the C lines, P3). The parser has already refused the set
+    // on a count mismatch and dropped any out-of-range index; what is left is held to the VERB's
+    // rules — contextRefusal, the same function session.context runs — so a value that would be
+    // refused over the pipe (a control character, over the ceiling, blank once trimmed: a
+    // hand-edited or damaged file) is not drawn and not re-saved, and the log says which rule and
+    // which session. Set here, before the first refreshTree, so the first paint of the row has it.
+    // A dead entry keeps its context like it keeps its name: the entry exists to be retried intact.
+    int ctxSet = 0;
+    for (const auto& c : ps.contexts) {
+        Session* s = (c.first >= 0 && c.first < (int)byPos.size()) ? byPos[c.first] : nullptr;
+        if (!s) continue;
+        std::string text;
+        std::string why = contextRefusal(c.second, &text);
+        if (!why.empty()) {
+            logWarn("restore: context for session '%s' dropped - %s", specs[c.first].name.c_str(), why.c_str());
+            continue;
+        }
+        LockG hold;
+        s->context = widen(text);
+        ctxSet++;
+    }
+    if (!ps.contexts.empty())
+        logInfo("restore: %d of %zu context(s) restored", ctxSet, ps.contexts.size());
+    // Pane 0's captured command (the K lines, P3) lands on the session itself — live or dead, like
+    // the context: the slot is a checkpoint the entry carries, and a dead entry is kept to be retried
+    // intact. Pane 1's waits for the split loop below, which creates the shell it belongs to.
+    for (const auto& k : ps.captures) {
+        Session* s = (k.idx >= 0 && k.idx < (int)byPos.size()) ? byPos[k.idx] : nullptr;
+        if (!s || k.pane0.empty()) continue;
+        LockG hold;
+        s->capturedCmd = k.pane0;
     }
     // Each session gets its own split shell back. A P line names its owner by position, and the
     // parser has already refused the whole set if the S lines it counts on did not all parse.
     // The shell is created fresh rather than adopted: only the S lines carry host ids (the D line),
     // so a killed lite leaves the old split shells to the reap, as it always did.
     int splitsBuilt = 0;
+    std::vector<Session*> splitOf(byPos.size(), nullptr);   // spec index -> the split shell rebuilt for it
     for (const auto& sp : ps.splits) {
         if (sp.owner < 0 || sp.owner >= (int)bySpec.size() || !bySpec[sp.owner]) continue;
         Session* sh = newSession(cols, rows, sp.spec.app.empty() ? nullptr : sp.spec.app.c_str(),
@@ -8053,10 +8703,32 @@ static bool restoreSessions() {
                            sp.spec.app.c_str(), sp.spec.cwd.c_str()); continue; }
         sh->hidden = true;                       // a split shell, not a tree session
         bySpec[sp.owner]->splitId = sh->id;
+        splitOf[sp.owner] = sh;
         splitsBuilt++;
     }
     if (!ps.splits.empty())
         logInfo("restore: %d of %zu split shell(s) rebuilt", splitsBuilt, ps.splits.size());
+    // Pane 1's slot goes onto the split the P line just rebuilt (a fresh Session, so the value has
+    // to be re-attached here). No split — the split failed to start, or a K line describes a split
+    // the file has no P line for (a P set refused wholesale takes the K set with it in
+    // parseStateFile, so that case never reaches here) — and the slot is dropped and named: it
+    // describes a shell that does not exist, and hanging it on the session's own pane would claim a
+    // command that pane never ran.
+    int capSet = 0, capDropped = 0;
+    for (const auto& k : ps.captures) {
+        if (k.idx < 0 || k.idx >= (int)byPos.size() || !byPos[k.idx]) continue;
+        if (!k.pane0.empty()) capSet++;
+        if (k.pane1.empty()) continue;
+        if (Session* sh = splitOf[k.idx]) { LockG hold; sh->capturedCmd = k.pane1; capSet++; }
+        else {
+            logWarn("restore: captured command for the split of session '%s' dropped - that split was not restored",
+                    specs[k.idx].name.c_str());
+            capDropped++;
+        }
+    }
+    if (!ps.captures.empty())
+        logInfo("restore: %d captured command slot(s) restored from %zu K line(s), %d dropped",
+                capSet, ps.captures.size(), capDropped);
     g_restoring = false;
     logInfo("restore: %d of %zu session(s) built (%d adopted live from the pty-host, %d kept as dead)",
             built, specs.size(), adopted, dead);
@@ -8146,6 +8818,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     migrateFromLegacy();
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_resizeLock);
+    InitializeCriticalSection(&g_saveLock);
     InitializeCriticalSection(&g_reqLock);
     InitializeCriticalSection(&g_evtLock);
     InitializeCriticalSection(&g_statusLock);

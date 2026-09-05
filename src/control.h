@@ -115,9 +115,26 @@ inline bool jsonParseObject(const std::string& s, size_t& i, const std::string& 
     }
 }
 
+// ASCII-SAFE output: every non-ASCII code point is written as \uXXXX (a surrogate pair above the
+// BMP), the way agwinterm's server escapes its JSON. Raw UTF-8 in a reply is valid JSON, but it
+// reaches most callers through agwintermctl's stdout and then a shell that decodes native output
+// with ITS console code page — a caller without a UTF-8 profile (pwsh -NoProfile, a CI runner)
+// read "café 🚀" back as "caf? ??" from `tree` while the raw pipe carried it intact (P3-lite,
+// the round-1 suite run). Escaped, the bytes on the wire are ASCII and no code page on either side
+// can change what the caller reads. A malformed UTF-8 byte is written as \ufffd rather than passed
+// through, so the reply stays valid JSON whatever a session's name was built from.
 inline std::string jsonEscape(const std::string& s) {
     std::string out;
-    for (char c : s) {
+    auto u16 = [&out](unsigned cp) {
+        char b[16];
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            sprintf_s(b, "\\u%04x\\u%04x", 0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+        } else sprintf_s(b, "\\u%04x", cp);
+        out += b;
+    };
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -125,8 +142,23 @@ inline std::string jsonEscape(const std::string& s) {
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
             default:
-                if ((unsigned char)c < 0x20) { char b[8]; sprintf_s(b, "\\u%04x", c); out += b; }
-                else out += c;
+                if (c < 0x20) { char b[8]; sprintf_s(b, "\\u%04x", c); out += b; }
+                else if (c < 0x80) out += (char)c;
+                else {
+                    // Decode one UTF-8 sequence; anything malformed becomes U+FFFD and consumes one byte.
+                    int len = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+                    unsigned cp = len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : len == 4 ? (c & 0x07) : 0;
+                    bool ok = len > 0 && i + len <= s.size();
+                    for (int k = 1; ok && k < len; ++k) {
+                        unsigned char cc = (unsigned char)s[i + k];
+                        if ((cc & 0xC0) != 0x80) ok = false; else cp = (cp << 6) | (cc & 0x3F);
+                    }
+                    if (ok && (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) ||
+                               (len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000)))
+                        ok = false;   // out of range, a surrogate, or an overlong encoding
+                    if (ok) { u16(cp); i += len - 1; }
+                    else u16(0xFFFD);
+                }
         }
     }
     return out;

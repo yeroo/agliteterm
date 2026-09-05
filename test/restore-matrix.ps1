@@ -30,6 +30,15 @@ $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
+$script:skipped = 0
+# The P3 cells that SET a context go through `session context`, which a pre-#233 agwintermctl refuses
+# client-side ("unknown session command"), before any pipe. Same probe as control-honesty.ps1: a
+# post-P3 client answers a bare `restore` with its usage line; an older one says `unknown command`.
+# Those cells SKIP on an old client (a fail there would say nothing about restore); the seeded
+# cells need no verb and always run. -Strict turns a skip into a failure, as the honesty suite does.
+$probe = (& $ctl restore --pipe 'rm-probe' --json 2>&1) -join ''
+$cliHasP3 = $probe -match 'usage: agwintermctl restore'
+function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  {0,-22} — {1}" -f $name, $why }
 
 function State($inst) { "$dir\sessions-$inst.tsv" }
 function Log($inst)   { "$dir\agliteterm-$inst.log" }
@@ -97,13 +106,28 @@ function Stop-Leftover($p) {
 # order. Names are what the user actually notices; the prefix keeps a workspace row from being
 # counted as a session (which let a "restored 2 sessions" assertion pass on one session + one
 # workspace, i.e. on a setup that had silently failed).
+# A session's context (P3) rides along as `name~context` when the node carries one — `tree --json`
+# emits the key only when set, so its absence is part of the fingerprint too. The assertion is then
+# on the WORLD after the restart, not on what the verb replied before it.
+# The captured-command slots (restore.capture, P3) ride along the same way, as `^cmd0;cmd1` — the
+# VALUES of the node's capturedCommands, the session's own pane first, then its split's. Values and
+# not keys: a graceful restart re-creates the sessions under new ids, and it is the slot that has
+# to survive, not the id it was keyed by.
 function Signature($inst) {
     $ws = Tree $inst
     if ($null -eq $ws) { return '' }
     $parts = @()
     foreach ($w in $ws) {
         $parts += "#$($w.name)"
-        foreach ($s in @($w.sessions)) { $parts += $s.name }
+        foreach ($s in @($w.sessions)) {
+            $entry = if ($s.PSObject.Properties['context']) { "$($s.name)~$($s.context)" } else { $s.name }
+            if ($s.PSObject.Properties['capturedCommands']) {
+                $own = [string]$s.id
+                $vals = @($s.capturedCommands.PSObject.Properties | Sort-Object { if ($_.Name -eq $own) { 0 } else { 1 } }, Name | ForEach-Object { $_.Value })
+                $entry += '^' + ($vals -join ';')
+            }
+            $parts += $entry
+        }
     }
     ($parts -join '|')
 }
@@ -540,7 +564,9 @@ if (-not $Only -or $Only -eq 'restart-cmdline') {
 if (-not $Only -or $Only -eq 'zero-guard') {
     $inst = 'rm-zero-guard'
     Reset-Cell $inst
-    $err = ''; $kept = $false; $skipped = $false; $after = ''
+    # No `$skipped` here: this cell runs at script scope, and a local of that name would overwrite
+    # the suite's `$script:skipped` counter (a Boolean cannot be ++'d — the Skip path crashed).
+    $err = ''; $kept = $false; $after = ''
     $p = $null; $p2 = $null
     try {
         $p = Start-Lite $inst
@@ -886,6 +912,182 @@ Seeded -Name 'short-id-line' `
     param($a, $i) ($a -match 'paired-one') -and ($a -match 'unpaired-two')
 }
 
+# --- P3: the C line (session.context) ------------------------------------------------------------
+# A context is one line of text per session, written as `C\t<S-index>\t<text>` after the S block and
+# read back through the SAME rules the verb applies. The Signature carries it as `name~context`, so
+# every assertion here is on the tree after the restart, never on the verb's reply.
+
+# Set over the API, saved by the refresh, back after a graceful close — and re-written by the build
+# that loaded it (the file inspected AFTER the second run, so a loader that kept the value in memory
+# but never wrote it back would fail here).
+if ($cliHasP3) {
+    Cell -Name 'context-graceful' -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename ctx-keeper --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session context 'reviewing the P3 diff' --target $id --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'ctx-keeper~reviewing the P3 diff') { return $false }   # the set itself has to have landed
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^C`t0`treviewing the P3 diff`r?$")
+    }
+    # The kill path: the file the crash left behind is the one loaded, and the session is ADOPTED from
+    # the host rather than created — the context comes from the C line either way.
+    Cell -Name 'context-killed' -Kill -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename ctx-survivor --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session context 'survives a kill' --target $id --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'ctx-survivor~survives a kill') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^C`t0`tsurvives a kill`r?$")
+    }
+} else {
+    if (-not $Only -or $Only -eq 'context-graceful') { Skip 'context-graceful' 'this agwintermctl predates agwinterm #233 and refuses `session context` client-side - set AGWINTERMCTL to a newer build' }
+    if (-not $Only -or $Only -eq 'context-killed')   { Skip 'context-killed'   'same client - the seeded C-line cells still run' }
+}
+
+# --- P3: the K line (restore.capture) -------------------------------------------------------------
+# The captured-command slots, written as `K\t<S-index>\t<pane0>\t<pane1>` after the P lines and read
+# back onto the session (pane 0) and onto the split the P line rebuilds (pane 1). The Signature
+# carries them as `name^cmd0;cmd1`, so the assertion is on the tree after the restart. The foreground
+# child is a `ping` typed into the pane, found and stopped by its marker argument (`-n 31x`): a
+# graceful close kills the shell and can orphan the ping, so every cell stops its own on the way out.
+function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+function Wait-Ping([string]$n, [int]$ms = 8000) {
+    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Ping-Procs $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
+    return $false
+}
+function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+if ($cliHasP3) {
+    # Captured over the API, saved by the verb itself, back after a graceful close — and re-written
+    # by the build that loaded it (the file inspected AFTER the second run).
+    Cell -Name 'capture-graceful' -Setup {
+        param($i)
+        Stop-Ping '311'
+        $id = LastSessionId $i
+        & $ctl session rename cap-keeper --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 311 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '311')) { throw 'the ping never started under the pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '311'
+        if ($b -notmatch 'cap-keeper\^[^|;]*-n 311 127\.0\.0\.1') { return $false }   # the capture itself has to have landed
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 311 127\.0\.0\.1`t`r?$")
+    }
+    # The kill path: the file the verb wrote is the one loaded, and the session is ADOPTED from the
+    # host (the ping is still running in it) — the slot comes from the K line either way.
+    Cell -Name 'capture-killed' -Kill -Setup {
+        param($i)
+        Stop-Ping '312'
+        $id = LastSessionId $i
+        & $ctl session rename cap-survivor --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 312 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '312')) { throw 'the ping never started under the pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '312'
+        if ($b -notmatch 'cap-survivor\^[^|;]*-n 312 127\.0\.0\.1') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 312 127\.0\.0\.1`t`r?$")
+    }
+    # A session with a split, a ping in each pane: one K line with BOTH fields, and after a graceful
+    # restart the split rebuilt from the P line carries pane 1's slot (a fresh Session, re-attached).
+    Cell -Name 'capture-split' -Setup {
+        param($i)
+        Stop-Ping '313'; Stop-Ping '314'
+        $id = LastSessionId $i
+        & $ctl session rename cap-both --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --pipe $i --json 2>&1) -join ''
+        $split = [string](ConvertFrom-Json $sraw).result
+        if (-not $split) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+        & $ctl session type "ping -n 313 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 314 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw 'a ping never started under its pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '313'; Stop-Ping '314'
+        if ($b -notmatch 'cap-both\^[^|;]*-n 313 127\.0\.0\.1;[^|;]*-n 314 127\.0\.0\.1') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 313 127\.0\.0\.1`t[^`t]*-n 314 127\.0\.0\.1`r?$")
+    }
+} else {
+    if (-not $Only -or $Only -eq 'capture-graceful') { Skip 'capture-graceful' 'this agwintermctl predates agwinterm #233 and has no `restore capture` - set AGWINTERMCTL to a newer build' }
+    if (-not $Only -or $Only -eq 'capture-killed')   { Skip 'capture-killed'   'same client' }
+    if (-not $Only -or $Only -eq 'capture-split')    { Skip 'capture-split'    'same client' }
+}
+
+# A C line the verb would have refused (a control character): the session comes back, the context
+# does not, and the log names the session and the rule. Not drawn, and — checked on the file the
+# second run wrote — not re-saved either.
+Seeded -Name 'context-bad-line' `
+    -Tsv "V1`nW`tws-c3`nS`t0`tctx-bad-host`t`t$cwd`nC`t0`tbad$([char]1)ctx`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'ctx-bad-host') -and ($a -notmatch '~') -and
+        (Log-Has $i "restore: context for session 'ctx-bad-host' dropped - session context: control character U\+0001 at offset 3") -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^C`t")
+}
+
+# The P guard, applied to C: a malformed S line means the indices no longer line up, so the whole C
+# set is refused rather than hung on the wrong sessions. Every parseable session still restores.
+Seeded -Name 'context-count-mismatch' `
+    -Tsv "V1`nW`tws-c4`nS`t0`tgood-one`t`t$cwd`nS`t0`tbroken`nC`t0`tnever-attached`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'good-one') -and ($a -notmatch '~') -and ($a -notmatch 'never-attached') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 context line\(s\)')
+}
+
+# ➕ An index past the S list (a hand-edited or shortened file): that one line is dropped and named;
+# the session it does not name restores untouched.
+Seeded -Name 'context-stray-index' `
+    -Tsv "V1`nW`tws-c5`nS`t0`tonly-one`t`t$cwd`nC`t5`tnowhere`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'only-one') -and ($a -notmatch '~') -and
+        (Log-Has $i 'state: context line names session index 5 but the file has 1 session\(s\) - dropped')
+}
+
+# A file written before P3 (no C, no K): restores exactly as it did, no context on any node, and
+# nothing about contexts in the log.
+Seeded -Name 'pre-p3-file' `
+    -Tsv "V1`nW`tws-c6`nS`t0`tpre-one`t`t$cwd`nS`t0`tpre-two`t`t$cwd`nF`t1`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'pre-one') -and ($a -match 'pre-two') -and ($a -notmatch '~') -and
+        -not (Log-Has $i 'context line|context for session|context\(s\) restored')
+}
+
+# ➕ A K line's pane-1 slot needs the split the P line rebuilds. Two ways to lose that split, one
+# outcome each, and neither hangs a slot on a shell that does not exist:
+#   (a) the P set refused wholesale (a malformed S line) - K is positional too, so the same guard
+#       refuses the K set with it, the log names both, and the second run's file has no K line;
+#   (b) the P line parsed but its shell would not start - pane 0's slot lands on the session, pane
+#       1's is dropped and named, and the file the second run wrote carries pane 0 only.
+Seeded -Name 'capture-p-refused' `
+    -Tsv "V1`nW`tws-k1`nS`t0`tgood-k`t`t$cwd`nS`t0`tbroken`nP`t0`t`t$cwd`nK`t0`tcmd-zero`tcmd-one`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'good-k') -and ($a -notmatch '\^') -and ($a -notmatch 'cmd-') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 split line\(s\)') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 capture line\(s\)') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^K`t")
+}
+Seeded -Name 'capture-split-failed' `
+    -Tsv "V1`nW`tws-k2`nS`t0`tcap-half`t`t$cwd`nP`t0`tC:\no-such-dir\no-such-split-shell.exe`t$cwd`nK`t0`tcmd-zero`tcmd-one`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'cap-half\^cmd-zero(\||$)') -and ($a -notmatch 'cmd-one') -and
+        (Log-Has $i "restore: captured command for the split of session 'cap-half' dropped - that split was not restored") -and
+        ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`tcmd-zero`t`r?$")
+}
+
 # --- malformed / future state files: degrade, never crash and never take the window down -------
 # Every one of these is a file the user can genuinely end up with: a save that never got any bytes,
 # a disk that filled mid-write, a downgrade after running a newer build, a hand-edited file.
@@ -1023,5 +1225,6 @@ if (-not $Only -or $Only -eq 'harness-selfcheck') {
 
 ""
 if ($script:failed.Count) { "restore-matrix: FAILED cells: $($script:failed -join ', ')"; exit 1 }
-"restore-matrix: all cells passed"
+if ($script:skipped -and $Strict) { "restore-matrix: $script:skipped cell(s) skipped under -Strict"; exit 1 }
+"restore-matrix: all cells passed$(if ($script:skipped) { " ($script:skipped skipped)" })"
 exit 0

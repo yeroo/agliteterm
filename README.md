@@ -63,7 +63,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   registry escape hatch is `RightClickPaste` / `CopyOnCtrlC` (DWORD `0`) under
   `HKCU\Software\agliteterm`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  43 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
+  45 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -91,7 +91,22 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   active one, and `--workspace` beside `--workspace-name` is refused; `window select` says
   `selected` only when the window really came to the front. No verb steals the foreground from
   the app you are typing in — a popup raises only when agliteterm already holds it, and flashes
-  the taskbar button otherwise.
+  the taskbar button otherwise. Parity batch P3 adds the two persistence verbs. `session context
+  <text> | --clear` keeps one line of free text per session — trimmed; blank, a control character
+  (naming its offset), more than 200 characters and text beside `--clear` refused with the full
+  app's wording and the old value kept — shown **dimmed after the name** in the sidebar row, read
+  back as `context` from `tree --json`, and kept across a restart (a `C` line in the state file)
+  and an undo-close; a rename leaves it alone, and a split, quick, scratch or overlay pane (no
+  row, no session line in the state file) is refused. `restore capture [--target ID]` captures the foreground command
+  of every real pane, or of the one named, into a per-pane slot (the newest child of the pane's
+  shell that is not a shell or prompt helper: the full app's default denylist, fixed in lite),
+  **saves before it answers**, and reports per pane — `null` when the shell had nothing but a
+  shell running, and null is written too, so a fresh capture replaces an older checkpoint. The
+  slots read back as `capturedCommands` from `tree --json`, keyed by pane id, and persist as a
+  `K` line. Its `replayOnRestore` is **always `false`** in lite: it restores launch specs and never
+  types a slot back (`session restore` is a later batch), so a captured command is a checkpoint to
+  read, not a command that will run. An unknown, empty or cover-pane target, or a process query
+  that did not run, is refused with nothing written for anyone.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's
@@ -141,14 +156,18 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
   `--pipe work` come back in `--pipe work`, never in the default window. That is the mundane
   reading of "my sessions are gone": right sessions, wrong window.
 - **Format**: tab-separated UTF-8 text, `V1` header, one record per line — `W` workspace, `S` session
-  (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `A` active
-  workspace. The format grows by *adding* line types, so a file written by an older build still
-  restores, a line type this build doesn't write is still honoured when it finds one (`O`, focused
-  workspace), and a file from a **newer** build is read for the lines this one knows rather than
-  thrown away.
+  (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `C` a
+  session's context, `P` a session's split shell, `K` a session's captured commands, `A` active
+  workspace; `C`, `P` and `K` name their session by its position among the `S` lines and are refused
+  wholesale when that count does not add up. The format grows by *adding* line types, so a file
+  written by an older build still restores, a line type this build doesn't write is still honoured
+  when it finds one (`O`, focused workspace), and a file from a **newer** build is read for the
+  lines this one knows rather than thrown away. Every line type, field by field, is in
+  [docs/state-file.md](docs/state-file.md).
 - **What is saved**: the visible sessions, each with its *live* working directory (read from the
-  shell process, so it follows you as you `cd`). Split-pane shells are hidden and deliberately not
-  persisted — the split comes back as a single pane.
+  shell process, so it follows you as you `cd`), its context and its captured command, and each
+  session's split shell (its own app, cwd and slot) so the split comes back with its owner. The
+  quick, scratch and overlay panes are hidden covers and are not persisted.
 - **Writes are atomic, and keep one generation.** The save writes `sessions.tsv.tmp`, rotates the
   current file to **`sessions.tsv.bak`**, then renames the temp over the target — a crash or a full
   disk mid-write can no longer leave a truncated file where a good one was. A zero-session save is
@@ -279,7 +298,8 @@ drive the control pipe need `agwintermctl` — from an installed agwinterm, from
 pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. They skip with a message
 when it is absent rather than failing obscurely. A check that needs a client newer than the
 fetched release — `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field, all
-agwinterm #226 — probes the client first and SKIPs on an older one (`-Strict` turns that into a
+agwinterm #226; `session context` and `restore capture`, agwinterm #233 — probes the client first
+(`agwintermctl restore` answers a usage line on a post-#233 client) and SKIPs on an older one (`-Strict` turns that into a
 failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
 dev build: `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
 
