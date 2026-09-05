@@ -31,6 +31,16 @@ task-2 commit), agwinterm dev `agwintermctl` (post-#233, `restore` answers its u
   the amber pennant and the red pill counted the same pixels (41 and 183) in both captures; the
   three rows stayed 18 px apart; `gamma`'s run ends in `…` before the pill's place. Capture:
   `docs/img/qa-p3-context-row.png`.
+- *The persisted half* (2026-09-05, task-6 build, dev `agwintermctl`): PASS both ways —
+  `qa/fixtures/persistence-restart.ps1` 19/19 after a graceful close and 19/19 after `-Kill`. The
+  file read between the windows had `C\t1\treviewing the P3 diff`, then `P\t1\t…`, then
+  `K\t1\t\t"C:\Windows\system32\PING.EXE" -n 311 127.0.0.1` and `K\t2\t"…PING.EXE" -n 311
+  127.0.0.1\t`, in that order; after the relaunch `alpha` carried its context and one
+  `capturedCommands` key (the rebuilt split's id, `qa-p3r-4` graceful / `qa-p3r-5` killed), `beta`
+  its own; the log said `1 of 1 context(s) restored` and `2 captured command slot(s) restored from
+  2 K line(s), 0 dropped`. Two things the first draft of the fixture got wrong, now in the case: the
+  slot is the command line as the process reports it, and the sandbox's default session makes three
+  listed sessions, not two.
 
 ---
 
@@ -74,3 +84,57 @@ pipe thread is read in the paint without `g_lock`.
 **Proven to discriminate:** yes — the first build of the run drew nothing for a context-only row
 (the notification was flag/unread-gated) and this case's diff came back "captures identical" for
 `gamma`; the run appeared once the gate included the context.
+---
+
+## The persisted half: a restart brings the context and the slot back, and the file says so
+
+**Guards:** the `C` and `K` lines are positional (the session's index among the `S` lines) and are
+refused wholesale when the `S` count does not add up, the `P` guard's rule; `K` is written AFTER
+`P` because its second field belongs to the split the `P` line rebuilds. A restore that put the
+slot on the wrong pane, or dropped it because the split came back a moment later, would answer a
+`tree` that disagrees with the reply the caller kept. `test/restore-matrix.ps1` pins the cells
+(`context-graceful`, `context-killed`, `capture-graceful`, `capture-killed`, `capture-split`, the
+seeded `context-bad-line`, `context-count-mismatch`, `context-stray-index`, `pre-p3-file`); this case
+is the same journey with the FILE read by a person between the two windows.
+
+**Setup:** `qa/fixtures/persistence-restart.ps1` drives it end to end (`-Kill` for the crash
+variant); by hand, the steps are below. Two sessions `alpha` and `beta`, `alpha` split; a context
+on `alpha`; a marker command (`ping -n 311 127.0.0.1`) typed into `alpha`'s split pane and into
+`beta`, so one session has a slot on pane 1 only and the other on pane 0 only.
+
+**Steps:**
+1. `session context "reviewing the P3 diff" --target <alpha>`; type the marker into the split and
+   into `beta`; wait ~3 s; `restore capture`. Expect `captured: 2`, `replayOnRestore: false`, and
+   every pane listed — the sandbox's default session, `alpha`, its split and `beta` — with the split
+   and `beta` holding the marker and the other two `null`. The slot is the command line as the
+   PROCESS reports it (`"C:\Windows\system32\PING.EXE" -n 311 127.0.0.1`), not the text typed.
+2. Open `<sandbox LOCALAPPDATA>\agliteterm\sessions-<pipe>.tsv` (the reply was written after the
+   save, so the file already has it). Expect, after the `S` lines: `C\t<alpha idx>\treviewing the P3
+   diff`, then `P\t<alpha idx>\t…` for the split, then `K\t<alpha idx>\t\tping -n 311 127.0.0.1`
+   (pane 0 empty, pane 1 the marker) and `K\t<beta idx>\tping -n 311 127.0.0.1\t` (the reverse).
+3. Close the window (File → Exit, or `CloseMainWindow`; with `-Kill`, end the process instead).
+   Relaunch the same instance: same `--pipe`, same `LOCALAPPDATA`, **without** `--no-restore`.
+4. `tree --json`. Expect `alpha` with `"context":"reviewing the P3 diff"` and one
+   `capturedCommands` key that is NOT `alpha`'s new id (it is the rebuilt split's) holding the marker;
+   `beta` with no `context` key and `capturedCommands` keyed by its own new id; three sessions
+   listed (the default one, `alpha`, `beta`), not four (the split is a pane).
+5. Read the file again after the restart's own save: the same `C` line and both `K` lines, re-written
+   against the new `S` order with the same fields.
+
+**Expect:** every line of step 2 present in the order `C`, `P`, `K`; every key of step 4 back on
+the right session and the right pane after the restart; `agliteterm-<pipe>.log` naming the
+context and the slots it restored, and nothing about a dropped line.
+
+**Fails when:** the `K` line is written before `P` and pane 1 is dropped as "split not restored";
+the split's slot lands on the owner's own pane (one `capturedCommands` key, but it is the session's
+id); a context is appended to the label and comes back as part of the name; the reply is written
+before the save (kill the window right after `restore capture` with `-Kill`: the file must already
+hold the `K` lines); an older file with no `C`/`K` stops restoring (`pre-p3-file` in the matrix).
+
+**Proven to discriminate:** not by a failing build yet — the matrix cells were written beside the
+code and were green on their first run against it. The seeded cells discriminate by construction:
+`context-bad-line` feeds a `C` line holding U+0001 and demands the session WITHOUT a context plus
+the drop in the log, which a build that skipped load-time validation cannot satisfy;
+`context-count-mismatch` feeds a broken `S` line and demands no context on the surviving session,
+which a build without the count guard hangs on it. Fill this in the first time the case catches
+something.

@@ -7047,6 +7047,50 @@ now - widen the window or ask for less. A set while the sidebar is hidden is rem
 `applied:false`, and takes effect on the next `show`. Any op not listed - `sideways`, a typo -
 is refused naming the five, and **nothing changes** (it used to toggle the sidebar).
 
+## What a pane is for, and what it was running
+
+```
+agwintermctl session context "reviewing the P3 diff" --target build
+agwintermctl session context --clear --target build
+agwintermctl restore capture [--target <id|name>]
+```
+
+`session context` keeps ONE line of free text per session - what the pane is for - shown dimmed
+after the name in its sidebar row and read back from `tree --json` as `context` on the session
+node (the key is there only when one is set). The reply is `{session, context}` with the value IN
+EFFECT after the write, `null` after `--clear`; it is read off the session, not echoed from the
+request. The rules and the wording are the full app's: the text is trimmed; blank is refused
+(`--clear` is the way to remove one); a control character - a newline, a tab, an escape - is
+refused naming its offset; more than 200 characters is refused naming the ceiling; text beside
+`--clear` is refused. A refusal leaves the old context in place. A rename leaves the context
+alone. A split, quick, scratch or overlay pane has no row and is never restored, so a context on
+one is refused rather than accepted and shown nowhere. The context survives a restart (a `C` line
+in the state file) and an undo-close (Ctrl+Shift+T).
+
+`restore capture` reads what every real pane is running RIGHT NOW - the newest child of the pane's
+shell that is not itself a shell or a prompt helper (powershell, pwsh, cmd, conhost, wsl, ssh, bash,
+oh-my-posh, git, windowsterminal: the full app's default denylist, fixed here - lite has no
+denylist file) - into a durable per-pane slot, saves, and answers
+`{captured, replayOnRestore, panes:[{pane, session, captured}]}`. Per pane `captured` is the
+command line or `null` (the shell had nothing non-denylisted running; null is written too, so a
+fresh capture replaces an older checkpoint, including with nothing); the top-level `captured`
+counts the non-null ones. The slots read back from `tree --json` as `capturedCommands` on the
+owning session node, keyed by pane id - the session id for the left pane, the split's id for the
+right - and persist as a `K` line. `--target` names one session (its own left pane), a split's id
+(that one pane) or `active` (the focused pane). The reply describes a state that is already on
+disk when you read it.
+
+**`replayOnRestore` is always `false` here.** lite restores a session's LAUNCH spec at the next
+start and never types a slot back (`session restore` is not in lite), so a captured command is a
+checkpoint you read - from the reply, `tree` or the file - not a command that will run again.
+The field exists so one script reads one shape against both products; it starts reporting a
+toggle the day lite has a replay.
+
+Refusals, each with nothing written for ANY pane and nothing saved: a `--target` that matches no
+pane or session; a `--target` that is present but empty (omit it to mean every pane); a
+quick, scratch or overlay pane (never restored, so no slot); a process query that did not run
+(refused, never `null` written into every slot).
+
 ## Find out what happened
 
 Two ways, and prefer the first:
@@ -7106,8 +7150,9 @@ and still prints the `cli` half when nothing is listening, marking the app `unav
 
 ```
 agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
-agwintermctl session copy|paste|type|text|output|status
+agwintermctl session copy|paste|type|text|output|status|context
 agwintermctl surface cursor
+agwintermctl restore capture
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
 agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width | quick on|off|toggle

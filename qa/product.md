@@ -100,7 +100,9 @@ the read-only control verbs (`surface cursor` against the painted caret, `status
 real clock, `agwintermctl version` against the sandbox's pipe), and `qa/control-honesty.md` the
 verbs that used to answer `ok` while doing something else (the overlay popup is the size asked
 for, `sidebar width` moves the divider, and an agent loop of `quick on`/`session overlay open`
-does not bring the window over the app you are working in). **Clipboard and host actions stay in
+does not bring the window over the app you are working in), and `qa/persistence.md` the P3 verbs (the
+context drawn dimmed after the name without moving the badges; a restart bringing the context and
+the captured slot back, with the state file read between the two windows). **Clipboard and host actions stay in
 `test/clipboard.ps1`** — OSC 52 writes, query replies, right-click paste while a TUI holds the mouse
 — because CI runs `test/run-all.ps1 -Strict` and those checks would lose their only automated home
 until the markdown cases have a CI story. Port them when that exists, not before: coverage that runs

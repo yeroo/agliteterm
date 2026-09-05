@@ -364,17 +364,39 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       cursor position is READ, never moved
 
 ### Task 6: docs, contract, trackers
-- [ ] `tools/check-contract.ps1 -Update` → `test/control-api.json`; `test/conformance.ps1 -Strict`
+- [x] `tools/check-contract.ps1 -Update` → `test/control-api.json`; `test/conformance.ps1 -Strict`
       green (49 steps, 9 errors)
-- [ ] `README.md` / the control-verb table and the skill text lite ships (wherever `sidebar width`
+      (agwinterm #235's file, `check-contract` in step; dev client `-Strict`: every step and every
+      refusal PASS, 49 + 9. ➕ the runner's client probe gained the P3 case — `agwintermctl restore`
+      answers a usage line on a post-#233 client, the honesty/matrix probe — so the released client
+      SKIPs the two `session context` steps, the `restore capture` step and the two P3 refusals
+      instead of failing the steps on the CLIENT's refusal and passing the refusals for the wrong
+      reason: 7 SKIPs with it, exit 0 plain, and `Needs-NewClient` now returns the reason so each
+      skip names the build that lacks it)
+- [x] `README.md` / the control-verb table and the skill text lite ships (wherever `sidebar width`
       was documented in P2-lite): `session context` (rules, `--clear`, the row, the `C` line, the
       restart) and `restore capture` (the reply, `replayOnRestore` **always false in lite and why**,
       the `K` line, no denylist file); `docs/` entry for the state-file format naming `C` and `K`
       beside `P`
-- [ ] `qa/persistence.md` (the row capture case; a restart case with the file inspected)
-- [ ] agwinterm-side follow-up noted for the sibling docs PR there: `docs/lite-parity.md` P3-lite
+      (README: 45 verbs, the P3 paragraph in the agwintermctl bullet, the Format bullet naming
+      `C`/`P`/`K` and their count guard, the stale "splits are not persisted" sentence corrected,
+      the tests section's SKIP list; `kSkillMarkdown`: a "What a pane is for, and what it was
+      running" section with both verbs, the frozen denylist, the pane-id keys and the
+      `replayOnRestore` paragraph, `context` and `restore capture` in the verb summary,
+      `session restore` / `restore clear` still in the does-NOT-have list; new `docs/state-file.md`
+      with every line type field by field, the write order, an example file and the load rules)
+- [x] `qa/persistence.md` (the row capture case; a restart case with the file inspected)
+      (the row case was Task 2's; added "The persisted half" with `qa/fixtures/persistence-restart.ps1`
+      driving it — context + split + two marker pings, one capture, the file read between the
+      windows, a relaunch without `--no-restore`, the tree and the file again: 19/19 graceful and
+      19/19 `-Kill` with the dev client, SKIP on a pre-P3 one; `qa/product.md` lists the file)
+- [x] agwinterm-side follow-up noted for the sibling docs PR there: `docs/lite-parity.md` P3-lite
       entry → shipped, with the three deliberate divergences (no title-bar surface; `replayOnRestore`
       constant false; hidden-pane context refused)
+      (edited on agwinterm branch `docs/p3-lite-parity`, commit 0ea4d62, local only — NOT pushed;
+      the PR number is `#TBD` there until this PR opens, Task 7 fills it and pushes, the P2-lite
+      routine; the entry also names the in-process capture, the frozen denylist, the `C`/`K` lines
+      and the contract PR #235)
 
 ### Task 7: [Final] Verify acceptance criteria
 - [ ] every Overview item implemented, with agwinterm's wording where the plan says verbatim
