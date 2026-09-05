@@ -267,7 +267,7 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       (output not captured), two clean runs after with output captured — ⚠️ not reproduced, not named
 
 ### Task 4: the capture path — children, command lines, newest, denylist
-- [ ] a new query beside `processCwd` (`:2572`): `captureForeground(const std::vector<DWORD>& shellPids,
+- [x] a new query beside `processCwd` (`:2572`): `captureForeground(const std::vector<DWORD>& shellPids,
       std::map<DWORD,std::string>* out) -> bool` — ONE `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`;
       for each entry whose `th32ParentProcessID` is a shell pid: `OpenProcess` (`PROCESS_QUERY_LIMITED_INFORMATION
       | PROCESS_VM_READ`), `GetProcessTimes` for the creation time, the command line via the PEB
@@ -277,14 +277,28 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       (elevated, protected) is skipped exactly as agwinterm skips a CIM row with no command line —
       say so in the comment. No lock held, no UI, milliseconds, no timeout needed (no child process
       is spawned — the reason lite does not port the CIM query; `docs/lite-parity.md:158`)
-- [ ] the denylist is agwinterm's DEFAULT list as a constant (`powershell pwsh cmd conhost wsl ssh
+- [x] the denylist is agwinterm's DEFAULT list as a constant (`powershell pwsh cmd conhost wsl ssh
       bash oh-my-posh git windowsterminal`, matched on the exe name without extension, case-
       insensitive); lite has no config file, so there is no `restore-denylist.conf` — the comment
       says where agwinterm's lives and that lite's is the same list frozen
-- [ ] `Session` gains `std::string capturedCmd;` (pane 0 = the session itself; a split shell is its
+- [x] `Session` gains `std::string capturedCmd;` (pane 0 = the session itself; a split shell is its
       own `Session` and carries its own)
-- [ ] build; a throwaway `main.cpp` log line or the honesty suite proves the query finds a `ping -n
-      300 127.0.0.1` child of a sandbox pane's shell before task 5
+- [x] build; a throwaway `main.cpp` log line or the honesty suite proves the query finds a `ping -n
+      300 127.0.0.1` child of a sandbox pane's shell before task 5 — a throwaway log line in `tree`
+      (removed again) showed `ran=1 shells=2 found=1` and `"C:\Windows\system32\PING.EXE" -n 300
+      127.0.0.1` under the pane's shell, the idle shell reporting no child
+      ➕ the PEB walk is one shared helper (`pebParamString(h, off)`), `processCwd` reads `+0x38`
+      through it and the capture reads `+0x70`, so the two cannot drift; `processCwd` now opens with
+      `PROCESS_QUERY_LIMITED_INFORMATION` like the capture (restore-matrix's live-cwd cells still pass)
+      ➕ a child whose creation time precedes its parent's is skipped as a pid-reuse ghost (Toolhelp32
+      reports the parent pid a child was born with, even after that number was handed out again)
+      ➕ `test/restore-matrix.ps1`: the zero-guard cell's script-scope `$skipped = $false` overwrote
+      the `$script:skipped` counter Task 3 added, so any SKIP crashed (`++` on a Boolean) — the
+      released-client path claimed in Task 3 never actually ran; the local is gone, and the
+      released client now gives exit 0 plain / exit 1 under `-Strict` on the two verb cells
+      ⚠️ Task 3's unnamed honesty flake is named: `setup: a splitter drag is in progress (the tree
+      followed the mouse to 340)` — the mouse-driven splitter setup, 1 of 262; clean on the re-run
+      (restore-matrix `-Strict` 40/40 and control-honesty `-Strict` 262/262 with the dev client)
 
 ### Task 5: `restore.capture` — the verb, the `K` line, the read-back
 - [ ] `restore.capture` in `ctlDispatch`: **snapshot** under `LockG` — for a bare call every

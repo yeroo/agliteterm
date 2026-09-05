@@ -33,6 +33,8 @@
 #include <vector>
 #include <deque>
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
+#include <map>        // captureForeground: shell pid -> the newest non-denylisted child's command line
+#include <tlhelp32.h> // CreateToolhelp32Snapshot: the parent-pid walk behind restore.capture (P3)
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
 // Header-only over Win32: same window messages and the same native controls underneath, but with
@@ -364,6 +366,13 @@ struct Session {
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
+    // restore.capture (P3): the command line of the shell's foreground child as captured by the
+    // last `restore capture`, persisted as a `K` line and read back through `tree --json` as
+    // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
+    // capture replaces an older checkpoint). Pane 0 is the session itself; a split shell is its
+    // own Session and carries its own slot. NEVER replayed in lite (session.restore is P9): this
+    // is the durable slot and nothing more, so `replayOnRestore` answers false.
+    std::string capturedCmd;
     void* emu = nullptr;
     HANDLE data = INVALID_HANDLE_VALUE;
     HANDLE reader = nullptr;
@@ -2590,33 +2599,128 @@ static std::wstring stateFilePath() {
 // The session's LIVE working directory: the prompt wrap (and starship/omp shell integration) emits
 // OSC 7 file:// URLs, which the core emulator tracks. Convert "file://host/C:/dir%20x" -> "C:\dir x";
 // empty (no OSC 7 seen, or the dir vanished) means "fall back to the creation cwd". Call under g_lock.
+// Read one UNICODE_STRING field of a process's RTL_USER_PROCESS_PARAMETERS out of its PEB, by
+// offset (x64 layout): +0x38 = CurrentDirectory.DosPath, +0x70 = CommandLine. `h` needs
+// PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ. Returns false on any failure (a protected
+// or elevated process refuses the read; a process mid-exit has no parameters yet/any more). Shared
+// by processCwd and captureForeground so the two PEB walks cannot drift apart.
+static bool pebParamString(HANDLE h, size_t off, std::wstring* out) {
+    typedef LONG(WINAPI* fnQIP)(HANDLE, int, void*, ULONG, ULONG*);
+    static fnQIP qip = (fnQIP)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!qip || !h) return false;
+    struct { PVOID Reserved1; PVOID PebBaseAddress; PVOID Reserved2[2]; ULONG_PTR UniqueProcessId; PVOID Reserved3; } pbi{};
+    if (qip(h, 0 /*ProcessBasicInformation*/, &pbi, sizeof pbi, nullptr) != 0 || !pbi.PebBaseAddress) return false;
+    PVOID params = nullptr; SIZE_T rd = 0;
+    // PEB+0x20 = ProcessParameters (x64)
+    if (!ReadProcessMemory(h, (char*)pbi.PebBaseAddress + 0x20, &params, sizeof params, &rd) || !params) return false;
+    struct { USHORT Len, Max; PWSTR Buf; } us{};
+    if (!ReadProcessMemory(h, (char*)params + off, &us, sizeof us, &rd) || !us.Buf || !us.Len) return false;
+    std::wstring w(us.Len / 2, L'\0');
+    if (!ReadProcessMemory(h, us.Buf, &w[0], us.Len, &rd)) return false;
+    *out = std::move(w);
+    return true;
+}
+
 // Read a process's live current directory from its PEB (ProcessParameters.CurrentDirectory) —
 // conhost/ConPTY filters cwd OSC sequences out of the output stream, so asking the shell process
 // itself is the only reliable channel. Returns "" on any failure.
 static std::string processCwd(DWORD pid) {
-    typedef LONG(WINAPI* fnQIP)(HANDLE, int, void*, ULONG, ULONG*);
-    static fnQIP qip = (fnQIP)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
-    if (!qip || !pid) return "";
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!pid) return "";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!h) return "";
     std::string out;
-    struct { PVOID Reserved1; PVOID PebBaseAddress; PVOID Reserved2[2]; ULONG_PTR UniqueProcessId; PVOID Reserved3; } pbi{};
-    if (qip(h, 0 /*ProcessBasicInformation*/, &pbi, sizeof pbi, nullptr) == 0 && pbi.PebBaseAddress) {
-        PVOID params = nullptr; SIZE_T rd = 0;
-        // PEB+0x20 = ProcessParameters (x64); RTL_USER_PROCESS_PARAMETERS+0x38 = CurrentDirectory.DosPath (UNICODE_STRING)
-        if (ReadProcessMemory(h, (char*)pbi.PebBaseAddress + 0x20, &params, sizeof params, &rd) && params) {
-            struct { USHORT Len, Max; PWSTR Buf; } us{};
-            if (ReadProcessMemory(h, (char*)params + 0x38, &us, sizeof us, &rd) && us.Buf && us.Len) {
-                std::wstring w(us.Len / 2, L'\0');
-                if (ReadProcessMemory(h, us.Buf, &w[0], us.Len, &rd)) {
-                    while (!w.empty() && w.back() == L'\\' && w.size() > 3) w.pop_back();   // "C:\x\" -> "C:\x", keep "C:\"
-                    out = narrow(w);
-                }
-            }
-        }
+    std::wstring w;
+    if (pebParamString(h, 0x38 /*CurrentDirectory.DosPath*/, &w)) {
+        while (!w.empty() && w.back() == L'\\' && w.size() > 3) w.pop_back();   // "C:\x\" -> "C:\x", keep "C:\"
+        out = narrow(w);
     }
     CloseHandle(h);
     return out;
+}
+
+// ---- restore.capture: the foreground-command query (P3) ----
+// The exe names (no extension, case-insensitive) that never count as a pane's foreground command:
+// the shells themselves and the prompt helpers they spawn between commands. This is agwinterm's
+// DEFAULT list (Program.Services.cs LoadDenylist), frozen: agwinterm lets the user extend it
+// through %LOCALAPPDATA%\agwinterm\restore-denylist.conf, lite has no config file and ships the
+// same list as a constant. The list is consulted at capture only — lite never replays a slot
+// (session.restore is P9), so there is no replay-time check to keep in step with it.
+static const wchar_t* const kRestoreDenylist[] = {
+    L"powershell", L"pwsh", L"cmd", L"conhost", L"wsl", L"ssh", L"bash", L"oh-my-posh", L"git", L"windowsterminal",
+};
+// `exe` as Toolhelp32 reports it (szExeFile: the file name with extension, no directory).
+static bool restoreDenylisted(const wchar_t* exe) {
+    std::wstring n = exe;
+    size_t slash = n.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) n = n.substr(slash + 1);
+    if (n.size() > 4 && _wcsicmp(n.c_str() + n.size() - 4, L".exe") == 0) n.resize(n.size() - 4);
+    for (const wchar_t* d : kRestoreDenylist) if (_wcsicmp(n.c_str(), d) == 0) return true;
+    return false;
+}
+
+// For each shell pid, the command line of its NEWEST non-denylisted child, into `out` (a shell with
+// no such child gets no entry — that is the caller's `null`). The whole query is in-process: ONE
+// CreateToolhelp32Snapshot for every pane (the parent-pid walk), GetProcessTimes for the creation
+// time (newest wins, as agwinterm orders its CIM rows by CreationDate), and the command line from
+// the child's PEB through the read lite already does for the shell's cwd (CommandLine is 0x38 bytes
+// past CurrentDirectory in the same struct). Milliseconds, no child process spawned, so none of
+// agwinterm's timeout-and-kill semantics apply (agwinterm's docs/lite-parity.md, the P3 entry:
+// why lite does not port the CIM query). Unused until restore.capture lands (task 5), so it is
+// referenced from nowhere yet — the pipe verb is the one caller.
+//
+// Returns false ONLY when the snapshot itself could not be taken — that is the caller's
+// QueryFailed refusal ("could not ask" is not "nothing running"). A child that cannot be opened or
+// whose PEB cannot be read (elevated, protected, exiting) is SKIPPED, exactly as agwinterm skips a
+// CIM row that came back with no CommandLine: the pane reads as having nothing captured rather than
+// failing everyone. A child whose creation time precedes its parent's is a pid-reuse ghost
+// (Toolhelp32 reports the parent pid the child was born with, even after that parent died and its
+// number was handed out again) and is skipped too.
+//
+// Runs with NO lock held and touches no UI: the caller snapshots the pids under g_lock, calls this
+// lock-free, and writes the results back under g_lock re-checking every Session still exists.
+static bool captureForeground(const std::vector<DWORD>& shellPids, std::map<DWORD, std::string>* out) {
+    out->clear();
+    if (shellPids.empty()) return true;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        logWarn("restore.capture: CreateToolhelp32Snapshot failed (err %lu)", GetLastError());
+        return false;
+    }
+    // The creation time of each shell, so a child born before its "parent" is recognised as a
+    // pid-reuse ghost. A shell that cannot be opened keeps 0, which disables that check for it.
+    std::map<DWORD, ULONGLONG> shellBorn;
+    for (DWORD pid : shellPids) {
+        if (!pid || shellBorn.count(pid)) continue;
+        ULONGLONG born = 0;
+        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+            FILETIME c{}, e{}, k{}, u{};
+            if (GetProcessTimes(h, &c, &e, &k, &u)) born = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+            CloseHandle(h);
+        }
+        shellBorn[pid] = born;
+    }
+    std::map<DWORD, ULONGLONG> newest;   // shell pid -> creation time of the child currently held in *out
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof pe;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        auto parent = shellBorn.find(pe.th32ParentProcessID);
+        if (parent == shellBorn.end() || pe.th32ProcessID == pe.th32ParentProcessID) continue;
+        if (restoreDenylisted(pe.szExeFile)) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+        if (!h) continue;                                        // elevated/protected/gone: skipped, not fatal
+        FILETIME c{}, e{}, k{}, u{};
+        ULONGLONG born = GetProcessTimes(h, &c, &e, &k, &u) ? (((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime) : 0;
+        std::wstring cmd;
+        bool read = pebParamString(h, 0x70 /*CommandLine*/, &cmd);
+        CloseHandle(h);
+        if (!read || cmd.empty()) continue;                      // no command line: skipped, like a CIM row without one
+        if (parent->second && born && born < parent->second) continue;   // older than its parent: a reused pid
+        auto held = newest.find(pe.th32ParentProcessID);
+        if (held != newest.end() && born <= held->second) continue;      // an older sibling loses to the one held
+        newest[pe.th32ParentProcessID] = born;
+        (*out)[pe.th32ParentProcessID] = narrow(cmd);
+    }
+    CloseHandle(snap);
+    return true;
 }
 
 static std::string sessionLiveCwd(const Session* s) {

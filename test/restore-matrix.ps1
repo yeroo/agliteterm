@@ -554,7 +554,9 @@ if (-not $Only -or $Only -eq 'restart-cmdline') {
 if (-not $Only -or $Only -eq 'zero-guard') {
     $inst = 'rm-zero-guard'
     Reset-Cell $inst
-    $err = ''; $kept = $false; $skipped = $false; $after = ''
+    # No `$skipped` here: this cell runs at script scope, and a local of that name would overwrite
+    # the suite's `$script:skipped` counter (a Boolean cannot be ++'d — the Skip path crashed).
+    $err = ''; $kept = $false; $after = ''
     $p = $null; $p2 = $null
     try {
         $p = Start-Lite $inst
