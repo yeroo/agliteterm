@@ -201,21 +201,38 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       checks were already passing
 
 ### Task 2: the dimmed run in the sidebar row
-- [ ] `refreshTree()` leaves the LABEL as the name (the context is not part of the label string —
+- [x] `refreshTree()` leaves the LABEL as the name (the context is not part of the label string —
       a same-colour suffix would be "shown", not "shown dimmed", and it would enter the treeview's
       own hit-testing/rename EDIT width); in `CDDS_ITEMPOSTPAINT` (`:6208-6248`), for a session
       item with a context: get the text rect (`TVM_GETITEMRECT`, `wParam = TRUE`), draw ` — <context>`
       (or the context alone with an 8 px gap) in the theme's dim colour with the tree font, starting
       at `text.right + gap`, clipped to `min(rr.right - 20 - unreadPillW - 6, …)` so the pennant and
       the pill never move and never overlap it; `DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER |
-      DT_NOPREFIX`
-- [ ] the dim colour and the gap are named constants beside the badge constants; `ItemPrepaint`'s
+      DT_NOPREFIX` — the context alone after an 8 px gap (no dash); the flag/unread/context values
+      are copied under `LockG` (recursive, so a paint inside a hold is fine) and drawn unlocked; the
+      clip edge is `rr.right - pillInset - pillW - reserve` with the pill measured FIRST, and the
+      same edge when there is no pill (which also clears the pennant), so the run ends at one x
+      whether or not the badges are there
+- [x] the dim colour and the gap are named constants beside the badge constants; `ItemPrepaint`'s
       `CDRF_NOTIFYPOSTPAINT` already fires for every item — confirm, and confirm the row height does
-      not change
-- [ ] the working/exited suffixes still come first (they are part of the label); the context sits
-      after whatever the label is
-- [ ] a sandbox `PrintWindow` capture with a context set, attached to the task note, and the
-      `qa/persistence.md` case for it (format as `qa/control-honesty.md`)
+      not change — `kTreePennantInset` 15, `kTreePillInset` 20, `kTreeContextGap` 8,
+      `kTreeContextReserve` 6 (new, beside `kSidebarW`; the two badge insets were bare numbers).
+      The colour is the theme's `dim` field (light 110, dark 150, classic `COLOR_GRAYTEXT`) — named
+      per theme rather than one constant, so it follows the palette like every other secondary
+      text. **Confirmed NOT the case**: the post-paint notification was requested only for flagged or
+      unread rows (`:6215`), so a context-only row drew nothing (the fixture's first run: "captures
+      identical" for `gamma`); the gate now includes a non-empty context. Row height unchanged: the
+      three rows are 18 px apart in both captures, nothing sets the item height
+- [x] the working/exited suffixes still come first (they are part of the label); the context sits
+      after whatever the label is — the run starts at the TEXT rect's right (`TVM_GETITEMRECT`,
+      `TRUE`), which is where the tree drew the whole label, suffix included
+- [x] a sandbox `PrintWindow` capture with a context set, attached to the task note, and the
+      `qa/persistence.md` case for it (format as `qa/control-honesty.md`) —
+      `docs/img/qa-p3-context-row.png` (alpha flagged + unread 1 + `reviewing the P3 diff`; gamma a
+      96-char context cut with `…`; beta plain), driven by `qa/fixtures/context-row.ps1`: the
+      before/after diff bbox lay inside the two rows to the right of their labels, the amber and
+      red badge pixel counts were identical (41 / 183) in both captures. `qa/persistence.md` written
+      with this case; the restart case is task 6's
 
 ### Task 3: the `C` line — persistence, validated on load, restart cells
 - [ ] `saveSessionState()` (`:2675`): after the `S` block, inside the same walk that fills

@@ -124,6 +124,19 @@ static constexpr int kSidebarMinW = 90;   // the splitter will not shrink the le
 // the #23 trigger a setter would otherwise add (a pane at 2 columns).
 static constexpr int kSidebarMaxW = 900;
 static constexpr int kMinContentCols = 20;
+// Sidebar row badges, drawn in the tree's NM_CUSTOMDRAW post-paint pass after the label (the label
+// is the name plus its status suffix, nothing else). Measured from the row's RIGHT edge: the flag
+// pennant's staff stands kTreePennantInset in, the unread pill ends kTreePillInset in. The
+// session context (P3) is the third badge — a dimmed run in the theme's `dim` colour (secondary
+// text: light 110, dark 150, classic COLOR_GRAYTEXT — per theme, so it follows the palette like
+// every other secondary text) starting kTreeContextGap after the label's text rect and clipped
+// kTreeContextReserve short of the pill (or of where the pill would be), so neither badge moves
+// for it and it never runs under them. It is NOT part of the label string: a same-colour suffix
+// would be shown, not dimmed, and it would widen the treeview's own hit-test and rename EDIT.
+static constexpr int kTreePennantInset = 15;
+static constexpr int kTreePillInset = 20;
+static constexpr int kTreeContextGap = 8;
+static constexpr int kTreeContextReserve = 6;
 static int g_sidebarW = kSidebarW;     // sidebar width IN EFFECT (what the layout uses)
 // The width the user ASKED for. Only the splitter drag, `sidebar width` and the registry loader
 // write it; it is what gets persisted. fitSidebarToClient derives g_sidebarW from it on every
@@ -4371,6 +4384,9 @@ static void refreshTree() {
             if (g_flagView && !s->flagged) continue;                         // flagged view filter
             // Agent status cue: name goes bold when the agent needs you (blocked), italic + "(working…)"
             // while it's busy (italic applied in the tree's NM_CUSTOMDRAW). Others show plain.
+            // The label is the name and its status suffix ONLY. The session context (P3) is not in
+            // it — it is drawn dimmed after the label in the post-paint pass (see the kTree*
+            // constants), so it neither changes colour with the row nor widens the rename EDIT.
             int cls = s->exited ? AGST_NONE : statusClass(statusOf(s).status);
             std::wstring label = s->name.empty() ? (L"session " + std::to_wstring(vis)) : s->name;
             if (s->failed) label += L"  (failed to start)";   // restored spec whose app won't run here
@@ -6212,19 +6228,46 @@ public:
                     SelectObject(cd->nmcd.hdc, g_treeItalic);
                     r = CDRF_NEWFONT;
                 }
-                if (p >= 0 && p < (LPARAM)g_sessions.size() && (g_sessions[p]->flagged || g_sessions[p]->unread > 0))
-                    r |= CDRF_NOTIFYPOSTPAINT;   // pennant / unread badge drawn after the row
+                // The post-paint pass is asked for only when the row has something to draw after
+                // its label: the pennant, the unread pill, or (P3) the dimmed context run. It is
+                // NOT requested for every row — a plain row costs nothing extra.
+                if (p >= 0 && p < (LPARAM)g_sessions.size() &&
+                    (g_sessions[p]->flagged || g_sessions[p]->unread > 0 || !g_sessions[p]->context.empty()))
+                    r |= CDRF_NOTIFYPOSTPAINT;
                 return r;
             }
             if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
                 LPARAM p = cd->nmcd.lItemlParam;
                 if (p >= 0 && p < (LPARAM)g_sessions.size()) {
+                    bool flagged = false; int unread = 0; std::wstring ctx;
+                    {   // session.context writes `context` on a pipe thread under g_lock; copy it
+                        // under the same hold and draw with nothing held. The section is recursive,
+                        // so a paint reached from inside a hold (refreshTree's rebuild) is fine.
+                        LockG hold;
+                        if (p < (LPARAM)g_sessions.size()) {
+                            flagged = g_sessions[p]->flagged;
+                            unread = g_sessions[p]->unread;
+                            ctx = g_sessions[p]->context;
+                        }
+                    }
                     RECT rr;
                     if (TreeView_GetItemRect(g_tree, (HTREEITEM)cd->nmcd.dwItemSpec, &rr, FALSE)) {
                         HDC dc = cd->nmcd.hdc;
                         int cy = (rr.top + rr.bottom) / 2;
-                        if (g_sessions[p]->flagged) {   // amber pennant (full app's flag marker)
-                            int x = rr.right - 15;
+                        HFONT bf = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                        // The pill is measured before anything is drawn: the context run's clip
+                        // edge depends on its width, and the pill must not move for the context.
+                        wchar_t bn[8] = L"";
+                        int pillW = 0;
+                        if (unread > 0) {
+                            wsprintfW(bn, L"%d", unread > 99 ? 99 : unread);
+                            HGDIOBJ of = SelectObject(dc, bf);
+                            SIZE sz{}; GetTextExtentPoint32W(dc, bn, lstrlenW(bn), &sz);
+                            SelectObject(dc, of);
+                            pillW = sz.cx + 10;
+                        }
+                        if (flagged) {   // amber pennant (full app's flag marker)
+                            int x = rr.right - kTreePennantInset;
                             COLORREF amber = RGB(245, 194, 66);
                             HPEN pen = CreatePen(PS_SOLID, 1, amber);
                             HBRUSH br = CreateSolidBrush(amber);
@@ -6235,13 +6278,9 @@ public:
                             SelectObject(dc, op); SelectObject(dc, ob);
                             DeleteObject(pen); DeleteObject(br);
                         }
-                        if (g_sessions[p]->unread > 0) {   // red count pill (full app's notification badge)
-                            wchar_t bn[8];
-                            wsprintfW(bn, L"%d", g_sessions[p]->unread > 99 ? 99 : g_sessions[p]->unread);
-                            HFONT bf = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                        if (unread > 0) {   // red count pill (full app's notification badge)
                             HGDIOBJ of = SelectObject(dc, bf);
-                            SIZE sz{}; GetTextExtentPoint32W(dc, bn, lstrlenW(bn), &sz);
-                            int w2 = sz.cx + 10, x1 = rr.right - 20, x0 = x1 - w2;
+                            int x1 = rr.right - kTreePillInset, x0 = x1 - pillW;
                             RECT pill{ x0, cy - 8, x1, cy + 8 };
                             HBRUSH rb = CreateSolidBrush(RGB(205, 72, 58));
                             HPEN rp = CreatePen(PS_SOLID, 1, RGB(205, 72, 58));
@@ -6253,6 +6292,28 @@ public:
                             SetTextColor(dc, RGB(255, 255, 255));
                             DrawTextW(dc, bn, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                             SelectObject(dc, of);
+                        }
+                        if (!ctx.empty()) {   // P3: the session context, dimmed, after the label
+                            // The text rect (wParam TRUE) ends where the tree drew the label — the
+                            // name plus its "(working…)" / "(exited)" suffix, whichever the row
+                            // has — so the run always sits after the whole label. It is clipped
+                            // short of the pill (or of the pill's place when there is none, which
+                            // also clears the pennant) so the badges never move for it; the row's
+                            // height is the tree's own and is not touched here.
+                            RECT tr;
+                            if (TreeView_GetItemRect(g_tree, (HTREEITEM)cd->nmcd.dwItemSpec, &tr, TRUE)) {
+                                int x0 = tr.right + kTreeContextGap;
+                                int x1 = rr.right - kTreePillInset - pillW - kTreeContextReserve;
+                                if (x1 > x0) {
+                                    RECT run{ x0, rr.top, x1, rr.bottom };
+                                    HGDIOBJ of = SelectObject(dc, g_treeFont ? g_treeFont : bf);
+                                    SetBkMode(dc, TRANSPARENT);
+                                    SetTextColor(dc, g_th.dim);
+                                    DrawTextW(dc, ctx.c_str(), (int)ctx.size(), &run,
+                                              DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                                    SelectObject(dc, of);
+                                }
+                            }
                         }
                     }
                 }
