@@ -1028,7 +1028,15 @@ static CRITICAL_SECTION g_resizeLock;
 // consistent snapshots wins. Ordering: acquired only AFTER g_lock has been released — the buffer
 // is built under g_lock, the I/O happens under g_saveLock, never both — so a UI-thread save that
 // blocks here is not holding the emulators while a pipe-thread save flushes to disk.
+//
+// "The later snapshot wins" is NOT what two locks in sequence give on their own: a saver that
+// built under g_lock, released it, and was then preempted before taking g_saveLock would publish
+// its OLDER buffer over a newer one that overtook it (revmux r1 of P3-lite). So every buffer is
+// stamped under g_lock (g_saveStamp), the last stamp published is remembered under g_saveLock, and
+// a buffer older than what is already on disk is dropped unwritten — the newer state is there.
 static CRITICAL_SECTION g_saveLock;
+static unsigned long long g_saveStamp = 0;      // bumped under g_lock as a buffer is built
+static unsigned long long g_savePublished = 0;  // the stamp of the last buffer published (under g_saveLock)
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
 struct LockG {
@@ -2649,6 +2657,14 @@ static std::string processCwd(DWORD pid) {
 }
 
 // ---- restore.capture: the foreground-command query (P3) ----
+
+// The shell pid a capture may ask about. Session::childPid is set once, from the attach reply, and
+// never cleared: after the shell exits the session stays in the tree as "(exited)" with the stale
+// pid, and Windows recycles pids — a later capture would read the newest child of whatever process
+// holds that number now and file it as this pane's command (revmux r1 of P3-lite). captureForeground's
+// own reuse guard cannot catch it (the child IS newer than the recycled parent), so the pid is
+// withheld here: an exited pane reads as null, the honest answer for a shell that is gone.
+static DWORD livePid(const Session* s) { return s->exited ? 0 : s->childPid; }
 // The exe names (no extension, case-insensitive) that never count as a pane's foreground command:
 // the shells themselves and the prompt helpers they spawn between commands. This is agwinterm's
 // DEFAULT list (Program.Services.cs LoadDenylist), frozen: agwinterm lets the user extend it
@@ -2809,14 +2825,18 @@ static std::string tsvField(const std::string& s) {
 // sessions.tsv.bak and swaps the temp in as ONE operation. A crash, a full disk or a killed process
 // can therefore never leave a truncated file where a good one was — the old CREATE_ALWAYS wrote in
 // place, so the only copy was destroyed the instant the write began.
-static void saveSessionState() {
+// Returns whether THIS call published its snapshot (or a newer one was already on disk, which is
+// the same outcome for the caller). Every failure path logs and returns false; the UI-thread callers
+// ignore the value as they always have, restore.capture refuses on it — its reply claims a state on
+// disk, and "the slots are in memory, the file could not be written" is a refusal, not ok (revmux r1).
+static bool saveSessionState() {
     std::wstring path = stateFilePath();
     if (path.empty()) {
         // The last silent save failure left: no state directory means nothing is written and, before
         // this line, nothing said so — "restore doesn't work" with an empty log, on exactly the kind
         // of redirected/policy-locked profile the field reports come from.
         logWarn("save FAILED: no state directory (%%LOCALAPPDATA%% is not set) — nothing was saved");
-        return;
+        return false;
     }
     std::string out = "V1\n";
     // The hold starts BEFORE the workspace walk: g_workspaces is pushed/erased/reassigned under
@@ -2864,7 +2884,9 @@ static void saveSessionState() {
     // session's own shell, pane1 its split shell's (empty when there is no split, or nothing was
     // captured there); an empty field is "none" — the slot is a plain string with no rules beyond
     // tsvField, so unlike C the empty-field form is unambiguous here and one line carries both
-    // panes. Written AFTER the P lines because pane1 names the split the P line restores.
+    // panes. Written after the P lines as a CONVENTION — K sits with the P lines it describes — not
+    // as a requirement: parseStateFile collects every line type in file order and restoreSessions
+    // applies them in its own fixed order, so a K above a P restores identically (revmux r1).
     // Additive line type, per the rule in parseStateFile: an older build ignores K and restores
     // the sessions without their slots — and drops them on its next save (the same write-back loss
     // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
@@ -2891,6 +2913,7 @@ static void saveSessionState() {
     // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
     // zero-session refusal and the .bak delete — the two decisions that can cost saved sessions.
     bool userEmptied = g_userEmptied;
+    unsigned long long stamp = ++g_saveStamp;   // this buffer's place in the order of snapshots
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
@@ -2902,12 +2925,13 @@ static void saveSessionState() {
     // From here on the file is touched: the zero-session read below, the .tmp write and the
     // publish. One saver at a time (g_saveLock — see its declaration for the ordering rule: g_lock
     // is already released above, and is not taken again in this function). The buffer above is
-    // this saver's own consistent snapshot; the later of two serialised saves wins, which is the
-    // newer state either way.
+    // this saver's own consistent snapshot, stamped; a newer snapshot that overtook this one while
+    // it waited here is already on disk, and publishing over it would be a step backwards.
     struct LockSave {
         LockSave() { EnterCriticalSection(&g_saveLock); }
         ~LockSave() { LeaveCriticalSection(&g_saveLock); }
     } saveHold;
+    if (stamp < g_savePublished) return true;   // overtaken: the file already holds a newer snapshot
 
     // Anything that rebuilds the tree while the session list is momentarily empty used to rewrite the
     // file with zero S lines — a good file replaced by a useless one, with nothing to fall back to.
@@ -2926,7 +2950,7 @@ static void saveSessionState() {
             else
                 logWarn("save SKIPPED: %s could not be read (err %lu), so a zero-session save might be "
                         "throwing sessions away — refusing", narrow(path).c_str(), hadErr);
-            return;
+            return false;
         }
     }
 
@@ -2960,7 +2984,7 @@ static void saveSessionState() {
             logWarn("save FAILED to open %s (err %lu) or %s (err %lu) — %d session(s) not saved "
                     "(is the state directory writable?)",
                     narrow(tmp).c_str(), terr, narrow(path).c_str(), GetLastError(), saved);
-            return;
+            return false;
         }
         DWORD wr2 = 0;
         BOOL ok2 = WriteFile(g, out.data(), (DWORD)out.size(), &wr2, nullptr);
@@ -2975,11 +2999,13 @@ static void saveSessionState() {
             logWarn("save ok (IN PLACE): %d session(s), %zu bytes -> %s — %s could not be created "
                     "(err %lu), so this save was not atomic",
                     saved, out.size(), narrow(path).c_str(), narrow(tmp).c_str(), terr);
-        } else
-            logWarn("save FAILED in place to %s: wrote %lu of %zu bytes (err %lu) after %s could not "
-                    "be created (err %lu)", narrow(path).c_str(), wr2, out.size(), werr2,
-                    narrow(tmp).c_str(), terr);
-        return;
+            g_savePublished = stamp;
+            return true;
+        }
+        logWarn("save FAILED in place to %s: wrote %lu of %zu bytes (err %lu) after %s could not "
+                "be created (err %lu)", narrow(path).c_str(), wr2, out.size(), werr2,
+                narrow(tmp).c_str(), terr);
+        return false;
     }
     DWORD wr = 0;
     BOOL ok = WriteFile(f, out.data(), (DWORD)out.size(), &wr, nullptr);
@@ -2990,7 +3016,7 @@ static void saveSessionState() {
         logWarn("save PARTIAL to %s: wrote %lu of %zu bytes (err %lu) — previous state left intact",
                 narrow(tmp).c_str(), wr, out.size(), werr);
         DeleteFileW(tmp.c_str());
-        return;
+        return false;
     }
     // Keep exactly one previous generation, but only rotate a file that is actually worth keeping, so
     // a good .bak is never overwritten by an empty primary. The user emptying the window ON PURPOSE is
@@ -3013,7 +3039,8 @@ static void saveSessionState() {
     if (rotate && ReplaceFileW(path.c_str(), tmp.c_str(), bak.c_str(),
                                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
         logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
-        return;
+        g_savePublished = stamp;
+        return true;
     }
     bool rotated = rotate && MoveFileExW(path.c_str(), bak.c_str(), MOVEFILE_REPLACE_EXISTING);
     if (rotate && !rotated)
@@ -3030,9 +3057,11 @@ static void saveSessionState() {
                 : rotated ? "the previous state is in the .bak"
                           : "the previous state is untouched");
         DeleteFileW(tmp.c_str());
-        return;
+        return false;
     }
     logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
+    g_savePublished = stamp;
+    return true;
 }
 
 // Select a face+size, apply it, and persist the choice (used by the Properties dialog).
@@ -6378,10 +6407,19 @@ public:
                 }
                 // The post-paint pass is asked for only when the row has something to draw after
                 // its label: the pennant, the unread pill, or (P3) the dimmed context run. It is
-                // NOT requested for every row — a plain row costs nothing extra.
-                if (p >= 0 && p < (LPARAM)g_sessions.size() &&
-                    (g_sessions[p]->flagged || g_sessions[p]->unread > 0 || !g_sessions[p]->context.empty()))
-                    r |= CDRF_NOTIFYPOSTPAINT;
+                // NOT requested for every row — a plain row costs nothing extra. `context` is a
+                // std::wstring a pipe thread reassigns under g_lock (session.context), so even
+                // empty() is read under the same hold — the post-paint below does, and one handler
+                // guarding a field the other reads bare was the gap revmux r1 found. The scalars
+                // ride along under the hold; it is recursive, so a paint reached from inside a hold
+                // (refreshTree's rebuild) is fine.
+                bool postPaint = false;
+                if (p >= 0 && p < (LPARAM)g_sessions.size()) {
+                    LockG hold;
+                    if (p < (LPARAM)g_sessions.size())
+                        postPaint = g_sessions[p]->flagged || g_sessions[p]->unread > 0 || !g_sessions[p]->context.empty();
+                }
+                if (postPaint) r |= CDRF_NOTIFYPOSTPAINT;
                 return r;
             }
             if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
@@ -7063,8 +7101,8 @@ request. The rules and the wording are the full app's: the text is trimmed; blan
 (`--clear` is the way to remove one); a control character - a newline, a tab, an escape - is
 refused naming its offset; more than 200 characters is refused naming the ceiling; text beside
 `--clear` is refused. A refusal leaves the old context in place. A rename leaves the context
-alone. A split, quick, scratch or overlay pane has no row and is never restored, so a context on
-one is refused rather than accepted and shown nowhere. The context survives a restart (a `C` line
+alone. A split, quick, scratch or overlay pane has no sidebar row and no session line in the state
+file, so a context on one is refused rather than accepted and shown nowhere. The context survives a restart (a `C` line
 in the state file) and an undo-close (Ctrl+Shift+T).
 
 `restore capture` reads what every real pane is running RIGHT NOW - the newest child of the pane's
@@ -7743,10 +7781,12 @@ static std::string ctlDispatch(const std::string& line) {
             // and therefore no `C` slot to save it under: accepting would answer ok:true for a value
             // that is shown nowhere and gone at the next start. Refused for the reason
             // restore.capture refuses a cover pane (RestoreCaptureReply.CoverPane's rule), naming
-            // the id. The value is untouched (a hidden session never has one).
+            // the id. The value is untouched (a hidden session never has one). The wording names
+            // the real reason — no row, no session line — not "never restored": a split IS restored
+            // (its P line), it just has nowhere to keep a context (revmux r1).
             if (target->hidden)
-                return ctlErr("session context: '" + target->id + "' is a split, scratch, overlay or quick pane, "
-                              "which has no sidebar row and is never restored, so it has no context to set. Nothing changed.");
+                return ctlErr("session context: '" + target->id + "' is a split, scratch, overlay or quick pane; "
+                              "it has no sidebar row and no session line in the state file, so it has no context to set. Nothing changed.");
             target->context = clear ? std::wstring() : widen(text);
             // The reply is read BACK from the session under the same hold — the value in effect,
             // not an echo of the request (agwinterm's SessionContexts.Reply is built from ses.Context).
@@ -7800,21 +7840,21 @@ static std::string ctlDispatch(const std::string& line) {
                 for (Session* o : g_sessions) if (!o->hidden && o->splitId == target->id) { owner = o->id; break; }
                 if (owner.empty()) return ctlErr(captureCoverPane(target->id));
             }
-            snap.push_back({ target, target->id, owner, target->childPid });
+            snap.push_back({ target, target->id, owner, livePid(target) });
         } else {
             // Every real pane: each visible session (the panes the S lines restore) followed by its
             // split shell (the pane its P line restores), in list order — tree order.
             LockG hold;
             for (Session* s : g_sessions) {
                 if (s->hidden) continue;
-                snap.push_back({ s, s->id, s->id, s->childPid });
+                snap.push_back({ s, s->id, s->id, livePid(s) });
                 if (s->splitId.empty()) continue;
                 for (Session* sh : g_sessions)
-                    if (sh->id == s->splitId) { snap.push_back({ sh, sh->id, s->id, sh->childPid }); break; }
+                    if (sh->id == s->splitId) { snap.push_back({ sh, sh->id, s->id, livePid(sh) }); break; }
             }
         }
-        // The query, lock-free: a shell pid of 0 (a dead entry, a restore placeholder) is skipped by
-        // captureForeground and reads as null below.
+        // The query, lock-free: a shell pid of 0 (a dead entry, a restore placeholder, an EXITED
+        // shell — livePid) is skipped by captureForeground and reads as null below.
         std::vector<DWORD> pids;
         for (const auto& p : snap) if (p.pid) pids.push_back(p.pid);
         std::map<DWORD, std::string> found;
@@ -7843,9 +7883,18 @@ static std::string ctlDispatch(const std::string& line) {
         // (agwinterm's rule): posting the refresh, which saves on the UI thread, would answer before
         // the file is written, and a kill in that window loses a capture the caller was told it had.
         // saveSessionState takes and releases g_lock itself and does its I/O under g_saveLock, so
-        // it cannot collide with a UI-thread save; the refresh is still posted for the tree.
-        saveSessionState();
+        // it cannot collide with a UI-thread save; the refresh is still posted for the tree. A save
+        // that did not publish (no state directory, an unwritable one, a full disk — each named in
+        // the log) is a REFUSAL: the slots are in memory and in tree --json, which is what the
+        // caller asked for, but the reply's claim is durability and that claim would be false. The
+        // slots are left as captured — rolling them back would make the tree disagree with a
+        // capture that read the processes correctly (revmux r1).
+        bool onDisk = saveSessionState();
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        if (!onDisk)
+            return ctlErr("restore capture: " + std::to_string(snap.size()) + " pane(s) were captured into memory but the state "
+                          "file could not be written (see the log) — the checkpoint is not on disk and will not survive a "
+                          "restart. tree --json still shows what was captured.");
         return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":false,\"panes\":[" + panes + "]}");
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
@@ -8416,9 +8465,12 @@ static ParsedState parseStateFile(const std::wstring& path) {
             ps.contexts.erase(ps.contexts.begin() + k);
         } else k++;
     }
-    // K lines: positional like C and P, so the same guard and the same range check. (The pane-1
-    // slot additionally needs its split — restoreSessions drops it when the P set was refused or
-    // the split failed to start; the slot is meaningless without the shell it describes.)
+    // K lines: positional like C and P, so the same guard and the same range check — the SAME
+    // comparison as P's, so whenever the P set is refused the K set goes with it in this pass and
+    // no pane-1 slot is ever orphaned that way. (The pane-1 slot additionally needs its split:
+    // restoreSessions drops it when the split failed to start, or when a K line names a split the
+    // file has no P line for — a hand-edited or downgrade-written file; the slot is meaningless
+    // without the shell it describes.)
     if (!ps.captures.empty() && ps.sLines != (int)ps.specs.size()) {
         logWarn("state: %d session line(s) but %zu parsed - refusing %zu capture line(s) rather than "
                 "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.captures.size());
@@ -8657,8 +8709,9 @@ static bool restoreSessions() {
     if (!ps.splits.empty())
         logInfo("restore: %d of %zu split shell(s) rebuilt", splitsBuilt, ps.splits.size());
     // Pane 1's slot goes onto the split the P line just rebuilt (a fresh Session, so the value has
-    // to be re-attached here). No split — the P set refused wholesale, the split failed to start, or
-    // a K line describing a split the file no longer has — and the slot is dropped and named: it
+    // to be re-attached here). No split — the split failed to start, or a K line describes a split
+    // the file has no P line for (a P set refused wholesale takes the K set with it in
+    // parseStateFile, so that case never reaches here) — and the slot is dropped and named: it
     // describes a shell that does not exist, and hanging it on the session's own pane would claim a
     // command that pane never ran.
     int capSet = 0, capDropped = 0;

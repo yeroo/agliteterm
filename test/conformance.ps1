@@ -62,9 +62,10 @@ $cliHasSidebarWidth = $probe -match 'whole number'
 # And for P3 (`session context`, `restore capture`; agwinterm #233, contract #235): a post-#233
 # client answers `agwintermctl restore` with its usage line before any pipe is opened, while the
 # 0.17.x client has no `restore` command at all (`unknown command`) and refuses `session context`
-# on its own side the same way. On that client the two P3 steps would fail on the CLIENT's refusal
-# and the two P3 errors would PASS on it - a refusal, but not the one the contract pins - so all
-# four are skipped instead (test/control-honesty.ps1 and test/restore-matrix.ps1 use this probe).
+# on its own side the same way. On that client the three P3 steps (context set, context --clear,
+# restore capture) would fail on the CLIENT's refusal and the two P3 errors would PASS on it - a
+# refusal, but not the one the contract pins - so all five are skipped instead
+# (test/control-honesty.ps1 and test/restore-matrix.ps1 use this probe).
 $probe = (& $ctl restore --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasP3 = $probe -match 'usage: agwintermctl restore'
 

@@ -110,8 +110,10 @@ on `alpha`; a marker command (`ping -n 311 127.0.0.1`) typed into `alpha`'s spli
    PROCESS reports it (`"C:\Windows\system32\PING.EXE" -n 311 127.0.0.1`), not the text typed.
 2. Open `<sandbox LOCALAPPDATA>\agliteterm\sessions-<pipe>.tsv` (the reply was written after the
    save, so the file already has it). Expect, after the `S` lines: `C\t<alpha idx>\treviewing the P3
-   diff`, then `P\t<alpha idx>\t…` for the split, then `K\t<alpha idx>\t\tping -n 311 127.0.0.1`
-   (pane 0 empty, pane 1 the marker) and `K\t<beta idx>\tping -n 311 127.0.0.1\t` (the reverse).
+   diff`, then `P\t<alpha idx>\t…` for the split, then `K\t<alpha idx>\t\t"C:\Windows\system32\PING.EXE" -n 311 127.0.0.1`
+   (pane 0 empty, pane 1 the marker — the command line as the PROCESS reports it, as step 1 says,
+   never the text typed) and `K\t<beta idx>\t"C:\Windows\system32\PING.EXE" -n 311 127.0.0.1\t`
+   (the reverse). Match on the argument tail (`-n 311 127.0.0.1`), which is what the fixture does.
 3. Close the window (File → Exit, or `CloseMainWindow`; with `-Kill`, end the process instead).
    Relaunch the same instance: same `--pipe`, same `LOCALAPPDATA`, **without** `--no-restore`.
 4. `tree --json`. Expect `alpha` with `"context":"reviewing the P3 diff"` and one
@@ -125,7 +127,9 @@ on `alpha`; a marker command (`ping -n 311 127.0.0.1`) typed into `alpha`'s spli
 the right session and the right pane after the restart; `agliteterm-<pipe>.log` naming the
 context and the slots it restored, and nothing about a dropped line.
 
-**Fails when:** the `K` line is written before `P` and pane 1 is dropped as "split not restored";
+**Fails when:** a `K` line whose pane-1 field names a split the file has no `P` line for is hung
+on the owner's own pane instead of dropped with the warning; the `C` or `K` set survives a session
+count that disagrees with the `S` lines (the `P` guard's rule);
 the split's slot lands on the owner's own pane (one `capturedCommands` key, but it is the session's
 id); a context is appended to the label and comes back as part of the name; the reply is written
 before the save (kill the window right after `restore capture` with `-Kill`: the file must already

@@ -97,7 +97,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   app's wording and the old value kept — shown **dimmed after the name** in the sidebar row, read
   back as `context` from `tree --json`, and kept across a restart (a `C` line in the state file)
   and an undo-close; a rename leaves it alone, and a split, quick, scratch or overlay pane (no
-  row, never restored) is refused. `restore capture [--target ID]` captures the foreground command
+  row, no session line in the state file) is refused. `restore capture [--target ID]` captures the foreground command
   of every real pane, or of the one named, into a per-pane slot (the newest child of the pane's
   shell that is not a shell or prompt helper: the full app's default denylist, fixed in lite),
   **saves before it answers**, and reports per pane — `null` when the shell had nothing but a

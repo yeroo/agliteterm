@@ -22,7 +22,7 @@ an "empty field" is a real value and an absent line is the only way to say "none
 | `D` | `id`… | The pty-host session id of every `S` line, in order. Lets a relaunch after a kill **adopt** a shell the host still holds instead of starting a new one. Absent in files from before 0.17.x builds that wrote it; the count must equal the `S` count or the whole line is ignored. |
 | `C` | `i` `text` | The **context** of the session at `S` index `i` (parity batch P3, `session context`). One line per session that has one; no line for a session without one, because an empty field could not tell "no context" from a context that is empty. Written after `D`, before `P`. |
 | `P` | `owner` `app` `cwd` `arg`… | The **split shell** of the session at `S` index `owner`: its own launch spec. One line per session that has a split. |
-| `K` | `i` `pane0` `pane1` | The **captured commands** of the session at `S` index `i` (parity batch P3, `restore capture`): `pane0` is the slot of the session's own shell, `pane1` the slot of its split shell (empty when there is no split, or nothing was captured there). An empty field is "none"; a slot is a plain string with no rules of its own, so unlike `C` one line carries both panes. One line per session with at least one slot. Written **after** the `P` lines, because `pane1` belongs to the split the `P` line rebuilds. A slot is a checkpoint a caller reads back (`tree --json`, `capturedCommands`); lite never types it into the shell. |
+| `K` | `i` `pane0` `pane1` | The **captured commands** of the session at `S` index `i` (parity batch P3, `restore capture`): `pane0` is the slot of the session's own shell, `pane1` the slot of its split shell (empty when there is no split, or nothing was captured there). An empty field is "none"; a slot is a plain string with no rules of its own, so unlike `C` one line carries both panes. One line per session with at least one slot. Written after the `P` lines by convention — `K` sits with the `P` lines it describes — not by requirement: the reader collects every line type in file order and applies them in its own fixed order, so a `K` above a `P` restores identically. A slot is a checkpoint a caller reads back (`tree --json`, `capturedCommands`); lite never types it into the shell. |
 | `A` | `ws` | The active workspace. Clamped on load to the workspaces the file has. |
 | `O` | `ws` | The focused workspace. Read when present; this build does not write it. |
 
@@ -62,9 +62,11 @@ A	0
   and the refusal (`restore: context for session 'x' dropped - session context: control character
   U+0001 at offset 3 …`); the session restores without it and nothing is drawn.
 - **A `K` slot lands on the session the restore creates**: `pane0` on the session, `pane1` on the
-  split the matching `P` line rebuilds. When that split did not come back — the `P` set was refused,
-  or the split failed to start — the `pane1` slot has no pane to belong to and is dropped with a
-  `logWarn` naming the session. A session whose app failed to start keeps its `pane0` slot the way it
+  split the matching `P` line rebuilds. When that split did not come back — the split failed to
+  start, or the `K` line names a split the file has no `P` line for (a hand-edited or
+  downgrade-written file) — the `pane1` slot has no pane to belong to and is dropped with a
+  `logWarn` naming the session. (A `P` set refused by the count guard takes the `K` set with it —
+  the same comparison — so that case never reaches the per-session drop.) A session whose app failed to start keeps its `pane0` slot the way it
   keeps its name, and re-saves both.
 - **`.tmp`, then rename, one `.bak`.** The save writes `sessions.tsv.tmp`, rotates the current file
   to `sessions.tsv.bak` and renames the temp over the target. A zero-session save over a populated

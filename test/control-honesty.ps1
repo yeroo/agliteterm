@@ -1278,8 +1278,8 @@ try {
         Check 'setup: session split answers the split shell id, which is not in the tree' ([bool]$splitId -and -not (CtxNode $splitId)) "split '$splitId'"
         $before = @(Nodes).Count
         $raw = Ctx @('hidden', '--target', $splitId); $r = ConvertFrom-Json $raw
-        Check 'session context on the split shell is refused, naming the id and why (no row, never restored)' `
-            (-not $r.ok -and [string]$r.error -eq "session context: '$splitId' is a split, scratch, overlay or quick pane, which has no sidebar row and is never restored, so it has no context to set. Nothing changed.") "raw: $raw"
+        Check 'session context on the split shell is refused, naming the id and why (no row, no session line)' `
+            (-not $r.ok -and [string]$r.error -eq "session context: '$splitId' is a split, scratch, overlay or quick pane; it has no sidebar row and no session line in the state file, so it has no context to set. Nothing changed.") "raw: $raw"
         Check 'and nothing appeared in the tree, and the owner kept its own context' (@(Nodes).Count -eq $before -and (CtxOf $cid) -eq 'by name')
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
         Start-Sleep -Milliseconds 300
