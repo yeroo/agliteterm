@@ -168,14 +168,14 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
 ## Implementation Steps
 
 ### Task 1: `session.context` — rules, verb, tree, undo-close
-- [ ] `Session` gains `std::wstring context;` beside `name` (`main.cpp:325`); `ClosedSpec` gains
+- [x] `Session` gains `std::wstring context;` beside `name` (`main.cpp:325`); `ClosedSpec` gains
       `context` and `reopenClosed` restores it (`:2179`, `:2259`)
-- [ ] a small validator beside the verb — `contextRefusal(const std::string& decoded, std::string*
+- [x] a small validator beside the verb — `contextRefusal(const std::string& decoded, std::string*
       normalized)` — implementing the four rules with agwinterm's exact wording from
       `SessionContexts.cs` (`MaxLength` 200 with its "display budget, not a storage limit" comment;
       the control-character refusal names the OFFSET in the decoded string; blank names `--clear`;
       trim both ends). Used by the verb AND by the state-file loader
-- [ ] `session.context` in `ctlDispatch` beside `session.rename`: presence via
+- [x] `session.context` in `ctlDispatch` beside `session.rename`: presence via
       `req.fields.find("args.context")`, `--clear` via `args.clear == "true"`, text+clear refused
       with agwinterm's `TextAndClear`; unknown target → `SessionContexts.NoSession` wording (`session
       not found; nothing changed`) — resolution is `resolveTarget`'s, the same as rename; **a hidden
@@ -184,11 +184,21 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       naming the id); write under `LockG` (re-check the pointer is in `g_sessions`), post
       `WM_APP_REFRESHTREE`, reply `ctlOk` with `{"session":…,"context":…|null}` read back from the
       session under the same hold — the value in effect
-- [ ] `tree --json` (`:6906-6919`) emits `"context":"…"` **only when set** — a comment saying this
+- [x] `tree --json` (`:6906-6919`) emits `"context":"…"` **only when set** — a comment saying this
       is deliberately the agwinterm rule (`ControlServer.cs:431`), unlike lite's always-emitted
       booleans, because a script tests presence
-- [ ] `session rename` is untouched except that its comment states the two fields are separate
-- [ ] build; `agwintermctl session context` round-trips against a sandbox before task 2
+- [x] `session rename` is untouched except that its comment states the two fields are separate
+- [x] build; `agwintermctl session context` round-trips against a sandbox before task 2
+- ➕ [x] `test/control-honesty.ps1` P3 block, session.context half (35 checks: set / read-back / trim /
+      200 accepted / every refusal twice with agwinterm's verbatim wording, incl. raw-JSON lines for
+      `""`, a decoded tab, a decoded U+0001, a trailing NEL, a UTF-16 offset after a surrogate pair, text+clear /
+      clear / rename-leaves-context / split-shell refusal), SKIP on a pre-P3 client (`restore` probe).
+      The capture half lands with task 5. Green under `-Strict` with the dev `agwintermctl`
+- ➕ [x] pre-existing suite race fixed on the way: the mid-drag `sidebar width` setup posted the first
+      WM_MOUSEMOVE straight after WM_LBUTTONDOWN, and SetCapture's synthetic move (at the PHYSICAL
+      cursor) overwrote it — the tree landed wherever the real mouse sat over the window (441 here).
+      A 300 ms pause after the button-down lets the synthetic move land first; the drag's later
+      checks were already passing
 
 ### Task 2: the dimmed run in the sidebar row
 - [ ] `refreshTree()` leaves the LABEL as the name (the context is not part of the label string —

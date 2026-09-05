@@ -333,6 +333,11 @@ struct Session {
     // status directly (see the session.status verb for why every write, not every change).
     long long statusChangedAt = epochNow();
     std::wstring name;             // custom name (rename); empty = "session N"
+    // session.context (P3): one line of "what is this pane for", set over the API, drawn dimmed
+    // after the name in the sidebar row, carried by `tree --json` as "context" only when set,
+    // persisted as a `C` line. Empty = none. Separate from `name`: a rename leaves it alone and a
+    // context never enters the label. The rules are contextRefusal's (agwinterm's SessionContexts).
+    std::wstring context;
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
     // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
     // session, not to the window: switching sessions shows that session's split (or no split), the
@@ -2176,7 +2181,10 @@ static void killSession(Session* s) {
     request(req, &rep);
 }
 
-struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; };
+// What undo-close (Ctrl+Shift+T) puts back: the launch spec plus the two per-session texts, name
+// and context — a reopened session that came back with its name but not its context would have
+// lost a value the user was told was set (P3).
+struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
 static void closeSessionAt(int idx) {
@@ -2199,7 +2207,7 @@ static void closeSessionAt(int idx) {
     for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
     if (!cs->hidden) {   // remember the launch spec so it can be reopened (skip transient split/popup shells)
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
-        g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args });
+        g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args, cs->context });
     }
     killSession(g_sessions[idx]);
     EnterCriticalSection(&g_lock);
@@ -2257,7 +2265,10 @@ static void reopenClosed() {
     int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
-    if (s) { s->name = sp.name; selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (s) {
+        { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
+        selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
 }
 static void toggleSplit();   // fwd
 static void closeFocused() {
@@ -6463,6 +6474,64 @@ static void emitEvent(const char* type, const std::string& session, const std::s
     LeaveCriticalSection(&g_evtLock);
 }
 
+// ---- session.context rules (P3) ----
+// The rules and the wording are agwinterm's SessionContexts (src/Agwinterm.Pty/SessionContexts.cs),
+// copied, not paraphrased: one API, one answer. Used by the verb AND by the state-file loader, so a
+// value read back from disk is held to exactly what the verb would have accepted.
+//
+// The ceiling, in UTF-16 code units (.NET string.Length — the unit agwinterm counts in, so the same
+// text is over or under the ceiling in both apps). This is a DISPLAY budget, not a storage limit:
+// the sidebar row draws the context as a dimmed run after the name, clipped to the row. Do not
+// raise it without widening that surface.
+static constexpr size_t kContextMaxLength = 200;
+static const char* const kContextBlank =
+    "session context: the text is blank; a context is one line of printable text, and `session context --clear` removes one. Nothing changed.";
+// Text and --clear together: two sources for one field, refused rather than ranked (the rule
+// `session type --stdin` set in P2).
+static const char* const kContextTextAndClear =
+    "session context: text and --clear cannot be combined (one says what the context is, the other that there is none). Nothing changed.";
+// The target resolves to no session — the same "session not found" session.rename answers, so a
+// script sees one wording for one condition.
+static const char* const kContextNoSession = "session not found; nothing changed";
+
+// The refusal for `decoded` (the JSON-decoded UTF-8 text as the caller sent it), or "" when it is
+// acceptable — in which case *normalized holds the value to store. Checks, in agwinterm's order:
+//   1. a control character (below U+0020, or U+007F..U+009F) anywhere in the text AS GIVEN, before
+//      trimming, naming the character and its OFFSET in UTF-16 code units of the decoded string —
+//      the index a caller finds in what they sent (jsonParseString has already turned \t, \n and
+//      \u0001 into the bytes themselves, so an escape in the request is a control character here);
+//      checking before trim also refuses a trailing tab or NEL instead of silently eating it;
+//   2. trim both ends (the .NET char.IsWhiteSpace set; the control range is already gone);
+//   3. blank after the trim — naming --clear as the way to remove a context;
+//   4. over kContextMaxLength code units — naming the ceiling.
+// A refusal changes nothing: the caller keeps the old context and nothing is saved.
+static std::string contextRefusal(const std::string& decoded, std::string* normalized) {
+    std::wstring w = widen(decoded);
+    for (size_t i = 0; i < w.size(); i++) {
+        unsigned c = (unsigned)w[i];
+        if (c < 0x20 || (c >= 0x7F && c <= 0x9F)) {
+            char b[200];
+            sprintf_s(b, "session context: control character U+%04X at offset %zu; a context is one line of printable text (no newline, tab or escape). Nothing changed.", c, i);
+            return b;
+        }
+    }
+    auto isWs = [](wchar_t c) {   // char.IsWhiteSpace, minus the control range refused above
+        return c == 0x20 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+               c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+    };
+    size_t b = 0, e = w.size();
+    while (b < e && isWs(w[b])) b++;
+    while (e > b && isWs(w[e - 1])) e--;
+    std::wstring t = w.substr(b, e - b);
+    if (t.empty()) return kContextBlank;
+    if (t.size() > kContextMaxLength)
+        return "session context: " + std::to_string(t.size()) + " characters is over the ceiling of " +
+               std::to_string(kContextMaxLength) +
+               "; the ceiling is a display budget (the title bar and the sidebar row draw the context beside the name). Nothing changed.";
+    if (normalized) *normalized = narrow(t);
+    return {};
+}
+
 static Session* resolveTarget(const std::string& target, std::string* why = nullptr) {
     if (target.empty() || target == "active") return focusedSession();
     LockG hold;   // the list shape and the names change under g_lock on other threads (see `tree`)
@@ -6918,7 +6987,14 @@ static std::string ctlDispatch(const std::string& line) {
                         // Beyond the contract (extra fields are allowed): the grid the session was
                         // last resized to. It is how a caller sees that `sidebar width` moved the
                         // content region, and the oracle #23 needs (a pane that collapsed to 2).
-                        ",\"cols\":" + std::to_string(s->cols) + ",\"rows\":" + std::to_string(s->rows) + "}";
+                        ",\"cols\":" + std::to_string(s->cols) + ",\"rows\":" + std::to_string(s->rows);
+                // "context" is emitted ONLY when one is set — deliberately agwinterm's rule
+                // (ControlServer.cs: `if (n.Context is not null)`), and deliberately unlike lite's
+                // always-emitted booleans above: a script tests PRESENCE of the key ("has this
+                // session a context?"), and absent is the one spelling of "none" both apps agree on.
+                // An always-present "context":"" would make a set-then-clear look like a set of "".
+                if (!s->context.empty()) sess += ",\"context\":\"" + jsonEscape(narrow(s->context)) + "\"";
+                sess += "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +
                    "\",\"active\":" + (w == g_activeWs ? "true" : "false") +
@@ -7330,10 +7406,60 @@ static std::string ctlDispatch(const std::string& line) {
         {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
             // reassignment frees the old buffer once the name outgrows the small-string buffer)
             LockG hold;
+            // The name and the context (session.context, below) are two separate fields: a rename
+            // writes this one and leaves `context` exactly as it was, and neither is derived from
+            // the other.
             target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
         }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("renamed");
+    }
+    if (cmd == "session.context") {   // P3: one line of "what is this pane for", per session
+        // The value is read from the field map, not from get(): get() answers "" for absent AND
+        // for a present empty string, and the two are different verbs here — absent with --clear is
+        // a clear, present-empty is the blank refusal, present beside --clear is TextAndClear.
+        // `--clear` arrives as the raw token `true` (the CLI sends a JSON boolean; the parser keeps
+        // a non-string as its text), so this is a comparison against that token, never against the
+        // value of some string field (agwinterm #234 item 6 is the bug that comparison makes).
+        auto cf = req.fields.find("args.context");
+        bool haveText = cf != req.fields.end();
+        bool clear = req.get("args.clear") == "true";
+        if (clear && haveText) return ctlErr(kContextTextAndClear);
+        std::string text;
+        if (!clear) {
+            // A missing text with no --clear is the blank refusal, with --clear named as the way
+            // to remove one (SessionContexts.TryNormalize: a null raw is "" and "" is blank).
+            std::string why = contextRefusal(haveText ? cf->second : std::string(), &text);
+            if (!why.empty()) return ctlErr(why);
+        }
+        // Target refusals come AFTER the text rules, as in agwinterm (the server validates before
+        // the host is reached), so a bad value on a bad target names the value.
+        if (!target) return ctlErr(targetWhy.empty() ? kContextNoSession : targetWhy);
+        {
+            LockG hold;
+            // resolveTarget handed back a pointer without a lock across the two calls: re-check the
+            // session is still in the list before writing through it (#21's defect class), and
+            // answer "not found" if it closed in between — exactly what agwinterm's in-hop lookup
+            // does.
+            if (indexOfSession(target) < 0) return ctlErr(kContextNoSession);
+            // A hidden session — a split shell, a quick, scratch or overlay cover — is reachable by
+            // id through resolveTarget, but it has no sidebar row to draw the context in, no `S` line
+            // and therefore no `C` slot to save it under: accepting would answer ok:true for a value
+            // that is shown nowhere and gone at the next start. Refused for the reason
+            // restore.capture refuses a cover pane (RestoreCaptureReply.CoverPane's rule), naming
+            // the id. The value is untouched (a hidden session never has one).
+            if (target->hidden)
+                return ctlErr("session context: '" + target->id + "' is a split, scratch, overlay or quick pane, "
+                              "which has no sidebar row and is never restored, so it has no context to set. Nothing changed.");
+            target->context = clear ? std::wstring() : widen(text);
+            // The reply is read BACK from the session under the same hold — the value in effect,
+            // not an echo of the request (agwinterm's SessionContexts.Reply is built from ses.Context).
+            std::string reply = "{\"session\":\"" + jsonEscape(target->id) + "\",\"context\":" +
+                                (target->context.empty() ? std::string("null")
+                                                         : "\"" + jsonEscape(narrow(target->context)) + "\"") + "}";
+            PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // the row (task 2) and the save
+            return ctlOk(reply);
+        }
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);

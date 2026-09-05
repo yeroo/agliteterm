@@ -52,6 +52,12 @@ $cliHasSidebarWidth = $probe -match 'whole number'
 # flag, takes it as a boolean and goes to the pipe with the positional.
 $probe = ('x' | & $ctl session type --stdin positional --pipe 'honesty-probe' --json 2>&1) -join ''
 $cliHasStdin = $probe -match 'one source'
+# And for P3 (`session context`, `restore capture`): a post-#233 client answers `agwintermctl restore`
+# with its usage line before any pipe; the 0.17.x client has no `restore` command at all and says
+# `unknown command`. A pre-P3 client would send `session context` as an unknown session command
+# client-side too, so the whole P3 block SKIPs on it rather than fail on the client's own refusal.
+$probe = (& $ctl restore --pipe 'honesty-probe' --json 2>&1) -join ''
+$cliHasP3 = $probe -match 'usage: agwintermctl restore'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -673,6 +679,12 @@ try {
     $midY = [int]((ClientSize $s.Hwnd)[1] / 2)
     function Pt([int]$x, [int]$y) { [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
     [void][LiteUi]::PostMessageW($s.Hwnd, 0x0201, [IntPtr]1, (Pt ((TreeWidth) + 2) $midY))   # WM_LBUTTONDOWN on the splitter
+    # SetCapture (inside the button-down) makes Windows queue a synthetic WM_MOUSEMOVE at the REAL
+    # cursor's position. Posted straight after the button-down, the 340 move would be processed
+    # first and then overwritten by that synthetic move - the tree ends wherever the physical
+    # mouse happens to sit over the window (441 with the mouse at screen x 599). Let the synthetic
+    # move land first, then drag.
+    Start-Sleep -Milliseconds 300
     [void][LiteUi]::PostMessageW($s.Hwnd, 0x0200, [IntPtr]1, (Pt 340 $midY))                 # WM_MOUSEMOVE, button held
     Check 'setup: a splitter drag is in progress (the tree followed the mouse to 340)' ((Wait-TreeWidth 340) -eq 340) "tree width $(TreeWidth)"
     $raw = SidebarWidthSet '400'
@@ -1142,6 +1154,118 @@ try {
     Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
     Start-Sleep -Milliseconds 500
     Check 'unsplit again, the pane is back at its full grid' ((ColsOf $aid) -eq $c0) "cols $(ColsOf $aid), expected $c0"
+
+    # ---- P3: session.context ----------------------------------------------------------------------
+    # One line of free text per session. The rules and the refusal wording are agwinterm's
+    # SessionContexts, verbatim; every refusal is asserted twice (the reply, then the world through
+    # `tree --json`), and the presence oracle is proved first: the key is ABSENT before a set, so
+    # "absent after a clear" means something. The control-character and text+clear refusals go to
+    # the pipe as raw JSON: the CLI refuses text beside --clear on its own side, and a tab inside a
+    # command-line argument is a quoting accident waiting to happen, while a raw `\t` is exactly the
+    # byte the decoder hands the verb.
+    "-- P3: session.context --"
+    if (-not $cliHasP3) {
+        Skip 'session.context (the whole block)' "the client at $ctl predates P3 (no `restore` command)"
+    } else {
+        function Ctx([string[]]$rest) { Send-Ctl $s (@('session', 'context') + $rest) }
+        function CtxNode([string]$id) { Nodes | Where-Object { [string]$_.id -eq $id } | Select-Object -First 1 }
+        function HasCtx([string]$id) { $n = CtxNode $id; [bool]($n -and $n.PSObject.Properties['context']) }
+        function CtxOf([string]$id) { [string](CtxNode $id).context }
+        $cid = [string](Get-CtlResult $s @('session', 'new', '--name', 'ctx-a'))
+        Start-Sleep -Milliseconds 800
+        Check 'setup: a fresh session for the context checks' ([bool]$cid -and [bool](CtxNode $cid)) "id '$cid'"
+        Check 'before any set, the tree node has NO context key (absent = none, the presence oracle)' (-not (HasCtx $cid))
+
+        # -- set / read-back --
+        $raw = Ctx @('build pane', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'session context "build pane" answers ok with an OBJECT naming the session and the value in effect' `
+            ([bool]$r.ok -and [string]$r.result.session -eq $cid -and [string]$r.result.context -eq 'build pane') "raw: $raw"
+        Check 'and tree --json carries it as "context" on that node' ((CtxOf $cid) -eq 'build pane') "tree: $(CtxOf $cid)"
+        $raw = Ctx @('  padded  ', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'leading and trailing whitespace is trimmed, and the reply is the trimmed value' ([bool]$r.ok -and [string]$r.result.context -eq 'padded') "raw: $raw"
+        Check 'and the tree has the trimmed value' ((CtxOf $cid) -eq 'padded')
+        $raw = Ctx @(('x' * 200), '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'exactly 200 characters is accepted (the ceiling is inclusive)' ([bool]$r.ok -and ([string]$r.result.context).Length -eq 200) "raw: $($raw.Substring(0, [math]::Min(80, $raw.Length)))"
+
+        # -- refusals: each leaves the 200 x's in place --
+        $x200 = 'x' * 200
+        $raw = Ctx @(('x' * 201), '--target', $cid); $r = ConvertFrom-Json $raw
+        Check '201 characters is refused naming the count and the ceiling' `
+            (-not $r.ok -and [string]$r.error -eq 'session context: 201 characters is over the ceiling of 200; the ceiling is a display budget (the title bar and the sidebar row draw the context beside the name). Nothing changed.') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Ctx @(' ', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'a whitespace-only value is refused as blank, naming --clear as the way to remove one' `
+            (-not $r.ok -and [string]$r.error -eq 'session context: the text is blank; a context is one line of printable text, and `session context --clear` removes one. Nothing changed.') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":""}}'); $r = ConvertFrom-Json $raw
+        Check 'a raw present-but-empty "context":"" is the blank refusal, not a clear' (-not $r.ok -and [string]$r.error -match '^session context: the text is blank') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{}}'); $r = ConvertFrom-Json $raw
+        Check 'a raw request with neither text nor --clear is the blank refusal' (-not $r.ok -and [string]$r.error -match '^session context: the text is blank') "raw: $raw"
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"a\tb"}}'); $r = ConvertFrom-Json $raw
+        Check 'a decoded tab is refused as a control character, naming U+0009 and offset 1' `
+            (-not $r.ok -and [string]$r.error -eq 'session context: control character U+0009 at offset 1; a context is one line of printable text (no newline, tab or escape). Nothing changed.') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"\u0001abc"}}'); $r = ConvertFrom-Json $raw
+        Check 'a \u0001 at the start is refused naming U+0001 at offset 0' (-not $r.ok -and [string]$r.error -match 'U\+0001 at offset 0;') "raw: $raw"
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"  x\u0085"}}'); $r = ConvertFrom-Json $raw
+        Check 'a trailing NEL (U+0085) is refused as a control character, not trimmed away (offset counts the untrimmed text)' `
+            (-not $r.ok -and [string]$r.error -match 'U\+0085 at offset 3;') "raw: $raw"
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"ab\ud83d\ude80\tc"}}'); $r = ConvertFrom-Json $raw
+        Check 'the offset is in UTF-16 code units (agwinterm string.Length): a tab after a surrogate pair is at offset 4' `
+            (-not $r.ok -and [string]$r.error -match 'U\+0009 at offset 4;') "raw: $raw"
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"x","clear":true}}'); $r = ConvertFrom-Json $raw
+        Check 'text beside --clear is refused with agwinterm TextAndClear wording' `
+            (-not $r.ok -and [string]$r.error -eq 'session context: text and --clear cannot be combined (one says what the context is, the other that there is none). Nothing changed.') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Ctx @('x', '--target', 'no-such-session-zzz'); $r = ConvertFrom-Json $raw
+        Check 'an unknown target is refused with SessionContexts.NoSession wording' (-not $r.ok -and [string]$r.error -eq 'session not found; nothing changed') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+        $raw = Ctx @('x', '--clear', '--target', $cid)   # not JSON: the CLI refuses before any pipe
+        Check 'the CLI refuses text beside --clear on its own side (nothing sent)' ($raw -match 'cannot be combined' -and $raw -notmatch '"ok"') "raw: $raw"
+        Check 'and the tree still has the 200' ((CtxOf $cid) -eq $x200)
+
+        # -- a non-BMP character round-trips (jsonParseString recombines the surrogate pair) --
+        $raw = Send-Raw ('{"cmd":"session.context","target":"' + $cid + '","args":{"context":"caf\u00e9 \ud83d\ude80 go"}}'); $r = ConvertFrom-Json $raw
+        $rocket = 'caf' + [char]0xE9 + ' ' + [char]::ConvertFromUtf32(0x1F680) + ' go'
+        Check 'a context with an accent and a non-BMP character is accepted and read back intact' ([bool]$r.ok -and [string]$r.result.context -eq $rocket) "raw: $raw"
+        Check 'and the tree carries it intact' ((CtxOf $cid) -eq $rocket) "tree: $(CtxOf $cid)"
+
+        # -- clear --
+        $raw = Ctx @('--clear', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'session context --clear answers ok with "context":null (the key present, the value null)' `
+            ([bool]$r.ok -and [string]$r.result.session -eq $cid -and $r.result.PSObject.Properties['context'] -and $null -eq $r.result.context) "raw: $raw"
+        Check 'and the tree node has no context key any more' (-not (HasCtx $cid))
+        $raw = Ctx @('--clear', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check '--clear on a session with no context is ok and null (idempotent)' ([bool]$r.ok -and $null -eq $r.result.context) "raw: $raw"
+
+        # -- a rename leaves the context alone (two fields) --
+        Ctx @('after rename', '--target', $cid) | Out-Null
+        Send-Ctl $s @('session', 'rename', 'ctx-renamed', '--target', $cid) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $n = CtxNode $cid
+        Check 'session rename changes the name and leaves the context exactly as it was' ([string]$n.name -eq 'ctx-renamed' -and [string]$n.context -eq 'after rename') "node: $($n | ConvertTo-Json -Compress)"
+        $raw = Ctx @('by name', '--target', 'ctx-renamed'); $r = ConvertFrom-Json $raw
+        Check 'and the target resolves by the NEW name, the same resolution rename uses' ([bool]$r.ok -and [string]$r.result.session -eq $cid -and (CtxOf $cid) -eq 'by name') "raw: $raw"
+
+        # -- a hidden session (a split shell) is refused: no row, no S line, no C slot --
+        Send-Ctl $s @('session', 'select', '--target', $cid) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $splitId = [string](Get-CtlResult $s @('session', 'split', 'on'))
+        Start-Sleep -Milliseconds 800
+        Check 'setup: session split answers the split shell id, which is not in the tree' ([bool]$splitId -and -not (CtxNode $splitId)) "split '$splitId'"
+        $before = @(Nodes).Count
+        $raw = Ctx @('hidden', '--target', $splitId); $r = ConvertFrom-Json $raw
+        Check 'session context on the split shell is refused, naming the id and why (no row, never restored)' `
+            (-not $r.ok -and [string]$r.error -eq "session context: '$splitId' is a split, scratch, overlay or quick pane, which has no sidebar row and is never restored, so it has no context to set. Nothing changed.") "raw: $raw"
+        Check 'and nothing appeared in the tree, and the owner kept its own context' (@(Nodes).Count -eq $before -and (CtxOf $cid) -eq 'by name')
+        Send-Ctl $s @('session', 'split', 'off') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Send-Ctl $s @('session', 'close', '--target', $cid) | Out-Null
+        Start-Sleep -Milliseconds 500
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 300
+    }
 
     # ---- #23: two persisted values that cannot coexist ------------------------------------------
     # SidebarW (one value for every instance) and WinW-<instance> are each valid on their own; a
