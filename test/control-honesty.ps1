@@ -879,7 +879,12 @@ try {
         ($in | & $ctl @argv --pipe $s.Pipe --json 2>&1) -join ''
     }
     $line1 = 'echo --lead "quoted"  two-spaces'     # a leading --word, a quote, two consecutive spaces
-    $line2 = 'tail  --end "q"'                     # after the newline: another run of spaces, no Enter
+    # A name nothing can resolve. `tail` was here, and it IS a real program on a GitHub runner
+    # (Git for Windows puts tail.exe on PATH), so cmd ran it instead of answering "is not
+    # recognized" and the oracle below tested the runner's PATH rather than the product
+    # (found by CI on the first run that could execute these checks, after 0.17.11 shipped).
+    $absent = 'zzz-no-such-cmd-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $line2 = "$absent  --end ""q"""                # after the newline: another run of spaces, no Enter
     $text = $line1 + "`n" + $line2
     $echoed = $line1.Substring(5)                  # what cmd's echo prints: everything after `echo `
 
@@ -905,10 +910,10 @@ try {
         Check 'session type --stdin with a quote, a newline, two spaces and a leading -- answers ok "typed"' ([bool]$r.ok -and [string]$r.result -eq 'typed') "exit $LASTEXITCODE, raw: $raw"
         Check "the first line ran and cmd echoed its argument byte for byte: [$echoed]" (Wait-Row { $_ -eq $echoed }) "rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
         Check "the second line sits at the prompt as typed: [$line2]" (Wait-Row { $_.Contains($line2) }) "rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
-        Check 'and was NOT submitted (one trailing newline stripped, none invented)' (-not (OracleRows | Where-Object { $_ -match "'tail' is not recognized" }))
+        Check 'and was NOT submitted (one trailing newline stripped, none invented)' (-not (OracleRows | Where-Object { $_ -match 'is not recognized' }))
         # A second newline at the end IS the Enter: the draft runs, and cmd says so.
         $raw = Invoke-CtlStdin "`n" @('session', 'type', '--stdin', '--target', $oid)
-        Check 'a text of two newlines (one stripped, one kept) presses Enter' ([bool](ConvertFrom-Json $raw).ok -and (Wait-Row { $_ -match "'tail' is not recognized" })) "raw: $raw, rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
+        Check 'a text of two newlines (one stripped, one kept) presses Enter' ([bool](ConvertFrom-Json $raw).ok -and (Wait-Row { $_ -match 'is not recognized' })) "raw: $raw, rows: $((OracleRows | Where-Object { $_ }) -join ' | ')"
 
         # --- invalid UTF-8 from a file: refused by the CLI, and the pane received NOTHING ---------
         # `echo <marker> ` then a lone 0x80 then LF. The refusal is client-side (StdinText, agwinterm
