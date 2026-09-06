@@ -1992,6 +1992,11 @@ try {
     # stack overflow (0xC0000409) AFTER `workspace new` had answered ok, and the dark status
     # painter's wchar_t[256] read of part 0 (the active workspace's name) was the second. This
     # sandbox is dark (seeded above), so both painters run; the name is long enough for both.
+    # Only the length half of #22 is pinned here. The delete half (the verb answered "deleted"
+    # when the guard erased nothing) needs two deletes to pass the verb's own size check before
+    # one takes the lock — not stageable from a script; the last-workspace refusal below is the
+    # verb's pre-existing pre-check, asserted by its exact text so a re-route through the new
+    # index-gone message is caught.
     "-- #22: a 299-character workspace name, in the tree and on the status bar --"
     $longName = ('long-workspace-name-' * 15).TrimEnd('-')
     Check 'setup: the name is 299 characters' ($longName.Length -eq 299)
@@ -2004,7 +2009,9 @@ try {
     Check 'setup: the status bar child was found' ($bar -ne [IntPtr]::Zero)
     # `workspace new` made it active, so part 0 now carries the name; paint the bar now rather
     # than waiting for a natural repaint of an occluded window.
-    [void][LiteHonesty]::InvalidateRect($bar, [IntPtr]::Zero, $true); [void][LiteHonesty]::UpdateWindow($bar)
+    # Guarded: InvalidateRect(NULL) redraws every window on the desktop, and a dead sandbox (the
+    # pre-fix state this block exists to catch) has no status bar to find.
+    if ($bar -ne [IntPtr]::Zero) { [void][LiteHonesty]::InvalidateRect($bar, [IntPtr]::Zero, $true); [void][LiteHonesty]::UpdateWindow($bar) }
     Start-Sleep -Milliseconds 300
     # A crashed sandbox answers `ping` with nothing, which ConvertFrom-Json throws on; that is the
     # FAIL this block exists for, so it is caught and counted rather than aborting the suite.
@@ -2019,7 +2026,7 @@ try {
     Check 'and `tree` no longer lists it' (-not ((Tree).workspaces | Where-Object { [string]$_.name -eq $longName }))
     $raw = Send-Ctl $s @('workspace', 'delete', '--target', '0')
     $r = ConvertFrom-Json $raw
-    Check 'deleting the last workspace is refused, not answered deleted' (-not $r.ok -and [string]$r.error -match 'last workspace') "raw: $raw"
+    Check 'deleting the last workspace is refused, not answered deleted' (-not $r.ok -and [string]$r.error -eq 'cannot delete the last workspace') "raw: $raw"
     Check 'and the sandbox is still alive' (Alive)
 }
 finally {
