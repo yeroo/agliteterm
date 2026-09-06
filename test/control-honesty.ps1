@@ -58,6 +58,13 @@ $cliHasStdin = $probe -match 'one source'
 # client-side too, so the whole P3 block SKIPs on it rather than fail on the client's own refusal.
 $probe = (& $ctl restore --pipe 'honesty-probe' --json 2>&1) -join ''
 $cliHasP3 = $probe -match 'usage: agwintermctl restore'
+# And for P4 (`session split --axis`, `session split close`, `session swap`, `session focus`;
+# agwinterm #238, contract #240): a post-#238 client refuses `session swap <positional>` on its own
+# side ("Nothing sent") before any pipe is opened; the 0.17.12 client has no `swap` at all and says
+# `unknown session command`. A pre-P4 client would drop --axis and send `session focus` as an
+# unknown command client-side, so the whole P4 block SKIPs on it rather than fail on the client.
+$probe = (& $ctl session swap x --pipe 'honesty-probe' --json 2>&1) -join ''
+$cliHasP4 = $probe -match 'Nothing sent'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -168,18 +175,22 @@ function Send-Raw([string]$json) {
 # and put back in `finally`, whatever the checks did with them — and a value that was absent is
 # removed again, not written as a default.
 $regKey = 'HKCU:\Software\agliteterm'
+# Key_Close too (P4): the close-chord checks bind it to Ctrl+Shift+W for this run only — keys are
+# read once at launch, so it is seeded before the sandbox starts and put back (or removed) after.
 $regSaved = @{}
-foreach ($n in 'SidebarW', 'ShowSidebar') {
+foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close') {
     $regSaved[$n] = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue).$n } else { $null }
 }
 function Restore-Reg {
-    foreach ($n in 'SidebarW', 'ShowSidebar') {
+    foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close') {
         if ($null -ne $regSaved[$n]) { New-ItemProperty -Path $regKey -Name $n -Value ([int]$regSaved[$n]) -PropertyType DWord -Force | Out-Null }
         elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue }
     }
 }
 
 try {
+    if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
+    New-ItemProperty -Path $regKey -Name Key_Close -Value 0x0357 -PropertyType DWord -Force | Out-Null   # 'W' | (CONTROL|SHIFT) << 8
     $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe 'ctlhonesty'
     $sid = [string](Nodes | Select-Object -First 1).id
     if (-not $sid) { throw 'the sandbox has no session' }
@@ -1487,6 +1498,437 @@ try {
         Start-Sleep -Milliseconds 500
         Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
         Start-Sleep -Milliseconds 300
+    }
+
+    # ---- P4: splits — the axis, the target, the tree's split block, `session focus` ----------------
+    # The axis is provable from the grid, no capture: a horizontal split gives each pane about half
+    # the single-pane ROWS at the full COLUMN count, a vertical one half the columns at the full
+    # rows. Every `session split` reply is a pane id read off state that exists (a bare string);
+    # every refusal is agwinterm's sentence (SplitAxes.cs) and is asserted twice — the reply, then
+    # the world through `tree --json`. `session focus` is judged by SLOT against the axis: the pair
+    # that does not exist on the axis is refused naming it. A session not on screen can be split
+    # without moving focus or selection (#230). Task 2 adds `split close` and the promotion, Task 3
+    # `session swap`, to this block.
+    "-- P4: splits --"
+    if (-not $cliHasP4) {
+        Skip 'P4 splits (the whole block)' "the client at $ctl predates P4 (no `session swap`)"
+    } else {
+        function Node([string]$id) { Nodes | Where-Object { [string]$_.id -eq $id } | Select-Object -First 1 }
+        function SplitBlock([string]$id) {   # "paneCount|paneIds|focusedPane|axis", or '' when the node has no split block
+            $n = Node $id
+            if (-not $n -or -not $n.PSObject.Properties['paneCount']) { return '' }
+            "$($n.paneCount)|$(@($n.paneIds) -join ',')|$($n.focusedPane)|$($n.axis)"
+        }
+        function Cursor { [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor }
+        function EvSince([long]$cursor, [string]$type) { @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cursor"))).result.events | Where-Object { $_.type -eq $type }).Count }
+        function HalfOf([int]$n, [int]$whole) { $n -le [math]::Floor($whole / 2) -and $n -ge [math]::Floor($whole / 2) - 2 }
+        Send-Ctl $s @('session', 'split', 'off') | Out-Null
+        Start-Sleep -Milliseconds 400
+        $aid = [string](Nodes | Where-Object { $_.active } | Select-Object -First 1).id
+        $n0 = Node $aid
+        $c0 = [int]$n0.cols; $r0 = [int]$n0.rows
+        Check 'setup: one active single-pane session with a real grid, and no split block on it' ([bool]$aid -and $c0 -ge 20 -and $r0 -ge 10 -and (SplitBlock $aid) -eq '') "active $aid ${c0}x${r0} block '$(SplitBlock $aid)'"
+        Check 'and no paneIds either: a single session whose pane id IS its id names no pane' (-not (Node $aid).PSObject.Properties['paneIds'])
+        # Validation before anything happens: the axis, the op (raw — the CLI refuses it first), the target.
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--axis', 'diagonal', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'split on --axis diagonal is refused naming both words' (-not $r.ok -and [string]$r.error -eq "axis 'diagonal' is not one of vertical (left/right panes) or horizontal (top/bottom panes); nothing was split") "raw: $raw"
+        Check 'and nothing was split: no split block, the grid unchanged' ((SplitBlock $aid) -eq '' -and [int](Node $aid).cols -eq $c0) "block '$(SplitBlock $aid)' cols $((Node $aid).cols)"
+        $raw = Send-Raw ('{"cmd":"session.split","target":"' + $aid + '","args":{"op":"Close"}}')
+        $r = ConvertFrom-Json $raw
+        Check 'a raw op outside on/off/toggle is refused, not treated as a toggle' (-not $r.ok -and [string]$r.error -match '^session split: unknown op Close ' -and [string]$r.error -match 'an unknown op is not a toggle') "raw: $raw"
+        Check 'and nothing was split' ((SplitBlock $aid) -eq '') "block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', 'no-such-session-9999')
+        Check 'split on an unknown target is refused' (-not (ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq '') "raw: $raw"
+        # A cover is no session to split (the scratch pad: created fresh by `on`, its id arrives as an event).
+        $cur = Cursor
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cur"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $covId = [string]($created | Select-Object -Last 1).session
+        Check 'setup: the scratch pad session id arrived as a session/created event' ([bool]$covId) "events: $($created | ConvertTo-Json -Compress)"
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $covId)
+        $r = ConvertFrom-Json $raw
+        Check 'split on a scratch cover is refused as no session, naming its dismissing verb' (-not $r.ok -and [string]$r.error -eq "session split: '$covId' is a scratch/overlay/quick pane, not a session; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing was split.") "raw: $raw"
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+        Start-Sleep -Milliseconds 500
+        Check 'and no session gained a split block' (@(Nodes | Where-Object { $_.PSObject.Properties['paneCount'] }).Count -eq 0)
+        # A horizontal split: rows halve, cols stay; the node gains the split block; `tree` fires.
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--axis', 'horizontal', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        $sid = [string]$r.result
+        Check 'split on --axis horizontal answers ok with the split pane id, a bare string' ([bool]$r.ok -and $sid -and $sid -ne $aid -and $sid -ne 'ok') "raw: $raw"
+        Start-Sleep -Milliseconds 800
+        $n1 = Node $aid
+        Check 'the node gains the split block: paneCount 2, paneIds [session, split], focusedPane 0, axis horizontal' ((SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "block '$(SplitBlock $aid)'"
+        Check 'and its pane has about half the rows at the full width: the axis, read off the grid' ([int]$n1.cols -eq $c0 -and (HalfOf ([int]$n1.rows) $r0)) "grid $($n1.cols)x$($n1.rows), single was ${c0}x${r0}"
+        Check 'the split emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        Check 'the split shell has no node of its own' ($null -eq (Node $sid))
+        # ... and the axis was SAVED: a horizontal split writes an L line (vertical unswapped is the
+        # default and writes none). Asserted present here so the "gone" check after the live
+        # re-orientation below is a change, not a starting state (revmux r2).
+        $p4State = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
+        function LLines { @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "L`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
+        $lHoriz = $false
+        foreach ($i in 1..20) { if (@(LLines | Where-Object { $_ -match "^L`t\d+`thorizontal`t0$" }).Count -eq 1) { $lHoriz = $true; break }; Start-Sleep -Milliseconds 250 }
+        Check 'the horizontal split was saved: one L line, horizontal, unswapped' $lHoriz "L lines: $((LLines) -join ' / ')"
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $aid)
+        Check 'split on when already split answers the slot-1 pane id and changes nothing' ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "raw: $raw, block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $sid)
+        Check "split on targeting the split shell's own id lands on its owner" ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "raw: $raw"
+        # focus: each word by slot, judged against the axis.
+        foreach ($w in @('right', 'left')) {
+            $raw = Send-Ctl $s @('session', 'focus', $w)
+            $r = ConvertFrom-Json $raw
+            Check "focus $w on a horizontal split is refused naming the axis" (-not $r.ok -and [string]$r.error -eq "'$w' names no pane on a horizontal split (top/bottom panes); use top, bottom, primary, split or other") "raw: $raw"
+        }
+        Check 'and the focus did not move' ((SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'focus', 'bottom')
+        Start-Sleep -Milliseconds 300
+        Check 'focus bottom moves the focus to slot 1' ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq "2|$aid,$sid|1|horizontal") "raw: $raw, block '$(SplitBlock $aid)'"
+        Check 'and the session node stays active with its split pane focused (no node was, before P4)' ([bool](Node $aid).active)
+        $raw = Send-Ctl $s @('session', 'focus')
+        Start-Sleep -Milliseconds 300
+        Check 'focus with no word is `other`: back to slot 0' ((SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "raw: $raw, block '$(SplitBlock $aid)'"
+        foreach ($pair in @(@('split', 1), @('primary', 0), @('top', 0))) {
+            Send-Ctl $s @('session', 'focus', $pair[0]) | Out-Null
+            Start-Sleep -Milliseconds 200
+            Check "focus $($pair[0]) lands on slot $($pair[1])" ((SplitBlock $aid) -eq "2|$aid,$sid|$($pair[1])|horizontal") "block '$(SplitBlock $aid)'"
+        }
+        $raw = Send-Ctl $s @('session', 'focus', 'sideways')
+        Check 'focus with a word outside the list is refused naming the list' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "focus 'sideways' is not one of primary, split, left, right, top, bottom or other") "raw: $raw"
+        # Re-orient live: cols halve, rows come back, `tree` fires; the other pair is refused now.
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--axis', 'vertical', '--target', $aid)
+        Start-Sleep -Milliseconds 800
+        $n2 = Node $aid
+        Check 'split on --axis vertical on the split session re-orients it live and answers the slot-1 id' ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        Check 'and now the pane has about half the columns at the full height' ([int]$n2.rows -eq $r0 -and (HalfOf ([int]$n2.cols) $c0)) "grid $($n2.cols)x$($n2.rows), single was ${c0}x${r0}"
+        Check 'the re-orientation emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        # ... and SAVED (revmux r1: the re-orient arm changed the field and emitted, but never
+        # scheduled the save every other split mutation schedules, so a kill lost the new axis).
+        # Horizontal wrote an L line (asserted present above); vertical unswapped is the default and writes none.
+        $gone = $false
+        foreach ($i in 1..20) { if (@(LLines).Count -eq 0) { $gone = $true; break }; Start-Sleep -Milliseconds 250 }
+        Check 'the re-orientation was saved: the horizontal L line is gone from the state file' $gone "L lines: $((LLines) -join ' / ')"
+        $raw = Send-Ctl $s @('session', 'focus', 'top')
+        Check 'focus top on a vertical split is refused naming the axis' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "'top' names no pane on a vertical split (left/right panes); use left, right, primary, split or other") "raw: $raw"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 200
+        Check 'focus right on a vertical split lands on slot 1' ((SplitBlock $aid) -eq "2|$aid,$sid|1|vertical") "block '$(SplitBlock $aid)'"
+        # A session NOT on screen can be split; the displayed session, its focus and the selection stay.
+        $raw = Send-Ctl $s @('session', 'new', '--name', 'p4-offscreen')
+        $oid = [string](ConvertFrom-Json $raw).result
+        Check 'setup: a second session' ((Wait-Node $oid)) "raw: $raw"
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', 'p4-offscreen')
+        $osid = [string](ConvertFrom-Json $raw).result
+        Start-Sleep -Milliseconds 500
+        Check 'split on a session not on screen, by name, answers its split pane id' ([bool](ConvertFrom-Json $raw).ok -and $osid -and $osid -ne $oid) "raw: $raw"
+        Check 'and its node carries the split block: vertical by default, focusedPane 0' ((SplitBlock $oid) -eq "2|$oid,$osid|0|vertical") "block '$(SplitBlock $oid)'"
+        Check 'while the displayed session, its focus and the selection did not move (#230)' ([bool](Node $aid).active -and -not [bool](Node $oid).active -and (SplitBlock $aid) -eq "2|$aid,$sid|1|vertical") "a '$(SplitBlock $aid)' active $((Node $aid).active), offscreen active $((Node $oid).active)"
+        Send-Ctl $s @('session', 'select', '--target', $oid) | Out-Null
+        Start-Sleep -Milliseconds 800
+        $n3 = Node $oid
+        Check 'selecting it shows its split: half the columns, its own shell focused' ([bool]$n3.active -and (HalfOf ([int]$n3.cols) $c0) -and (SplitBlock $oid) -eq "2|$oid,$osid|0|vertical") "grid $($n3.cols)x$($n3.rows) block '$(SplitBlock $oid)'"
+        # off: the survivor's id; a tree event and NO session event (the split shell was never a session).
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'off', '--target', $osid)
+        Start-Sleep -Milliseconds 600
+        Check "split off by the split shell's id answers the survivor's pane id (the session's)" ([string](ConvertFrom-Json $raw).result -eq $oid) "raw: $raw"
+        Check 'and the split block is gone, the pane back at the full width' ((SplitBlock $oid) -eq '' -and [int](Node $oid).cols -eq $c0) "block '$(SplitBlock $oid)' cols $((Node $oid).cols)"
+        Check 'the unsplit emitted a tree event (it emitted nothing before P4)' ((EvSince $cur 'tree') -ge 1)
+        Check 'and no session event: the split shell was never a session' ((EvSince $cur 'session') -eq 0)
+        $raw = Send-Ctl $s @('session', 'split', 'off', '--target', $oid)
+        Check 'split off when already single still answers the pane id' ([string](ConvertFrom-Json $raw).result -eq $oid) "raw: $raw"
+        $raw = Send-Ctl $s @('session', 'focus')
+        Check 'focus on a one-pane session is refused' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq 'session is not split (one pane); nothing to focus') "raw: $raw"
+        # Hand the world back the way the blocks below expect it.
+        Send-Ctl $s @('session', 'close', '--target', $oid) | Out-Null
+        Start-Sleep -Milliseconds 400
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Send-Ctl $s @('session', 'split', 'off', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
+        # ---- Task 2: `session split close`, the promotion, and every route into the primitive ----
+        # THE SESSION-ID RULE: a session id names the session's OWN shell; closing that shell — by
+        # `split close` on it, by the close chord on it while focused, or by its process exiting —
+        # PROMOTES the survivor: the session keeps its id, name and row, and both the session id and
+        # the survivor's own pane id reach the surviving shell. A promotion is not a session close:
+        # `tree` fires, `session closed` does not. Each refusal is agwinterm's sentence
+        # (SplitCloseReply.cs) and closes nothing.
+        function Wait-PaneText([string]$id, [string]$needle, [int]$ms = 12000) {
+            $deadline = [DateTime]::Now.AddMilliseconds($ms)
+            do { if (([string](Get-PaneText $s $id)) -match [regex]::Escape($needle)) { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
+            $false
+        }
+        function Wait-Single([string]$id, [int]$ms = 8000) {   # the node is there and its split block is gone
+            $deadline = [DateTime]::Now.AddMilliseconds($ms)
+            do { if ((Node $id) -and (SplitBlock $id) -eq '') { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
+            $false
+        }
+        function Mark([string]$id, [string]$marker) {   # a comment line typed and entered: visible in the pane, runs nothing
+            Send-Ctl $s @('session', 'type', "# $marker", '--target', $id) | Out-Null
+            Send-Ctl $s @('session', 'type', "`n", '--target', $id) | Out-Null
+            Wait-PaneText $id $marker
+        }
+        function SplitOn { $r = ConvertFrom-Json (Send-Ctl $s @('session', 'split', 'on', '--target', $aid)); Start-Sleep -Milliseconds 800; [string]$r.result }
+        $before = NodeCount
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'split close on a one-pane session is refused naming `session close`' (-not $r.ok -and [string]$r.error -eq "split close: session '$aid' has one pane, so there is no split to close; ``session close`` closes the session. Nothing closed.") "raw: $raw"
+        Check 'and nothing closed: the session is there, single' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and (NodeCount) -eq $before)
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', 'no-such-session-9999')
+        Check 'split close on an unknown target is refused naming it' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "split close: no pane or session matches 'no-such-session-9999'. Nothing closed.") "raw: $raw"
+        $cur = Cursor
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cur"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $covId = [string]($created | Select-Object -Last 1).session
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $covId)
+        Check 'split close on a scratch cover is refused as no side of a split, naming its dismissing verb' ([bool]$covId -and -not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "split close: '$covId' is a scratch/overlay/quick pane, not a side of a split; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing closed.") "raw: $raw"
+        Check 'and nothing closed: no session event beyond the created one, the node count unchanged' ((EvSince $cur 'session') -eq 1 -and (NodeCount) -eq $before)
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+        Start-Sleep -Milliseconds 500
+        # The promotion: close the session's OWN shell by the session id.
+        $sid = SplitOn
+        Check 'setup: split again, focus on slot 0' ([bool]$sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|vertical") "block '$(SplitBlock $aid)'"
+        Check 'setup: a marker typed into each shell reads back under its own id' ((Mark $aid 'p4-mk-owner-1') -and (Mark $sid 'p4-mk-split-1')) "owner: $(Get-PaneText $s $aid)`nsplit: $(Get-PaneText $s $sid)"
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $aid)
+        Start-Sleep -Milliseconds 800
+        Check "split close --target <session id> closes the session's OWN shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid) "raw: $raw"
+        Check 'the promotion: the node keeps the session id, its split block is gone, the pane is at the full width' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and $null -eq (Node $sid) -and [int](Node $aid).cols -eq $c0 -and (NodeCount) -eq $before) "block '$(SplitBlock $aid)' cols $((Node $aid).cols) nodes $(NodeCount)"
+        Check 'the survivor answers session text under the session id AND under its own pane id' (((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $sid) -match 'p4-mk-split-1')) "by session id: $(Get-PaneText $s $aid)"
+        # The one single node whose pane id is not its `id`: it carries paneIds alone, so the
+        # survivor's own agent can find its session (the skill's env-ids recipe; revmux r2).
+        Check "the promoted node names its shell: paneIds [the survivor's pane id], and no paneCount" ((@((Node $aid).paneIds) -join ',') -eq $sid -and -not (Node $aid).PSObject.Properties['paneCount']) "node: $((Node $aid) | ConvertTo-Json -Compress)"
+        Check "and the closed shell is gone: its marker is nowhere" (-not ((Get-PaneText $s $aid) -match 'p4-mk-owner-1'))
+        Check 'a promotion is not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0) "tree $(EvSince $cur 'tree') session $(EvSince $cur 'session')"
+        Check 'the node is active, its survivor focused, not marked exited' ([bool](Node $aid).active -and -not [bool](Node $aid).exited)
+        Check 'session type by the session id reaches the survivor' ((Mark $aid 'p4-typed-after') -and (Wait-PaneText $sid 'p4-typed-after' 2000))
+        # A later `split on` mints a fresh pane id beside the survivor's own: paneIds [survivor, new].
+        $sid2 = SplitOn
+        Check "a later split on mints a fresh pane id: paneIds [the survivor's own, new], focus on slot 0" ([bool]$sid2 -and $sid2 -ne $sid -and $sid2 -ne $aid -and (SplitBlock $aid) -eq "2|$sid,$sid2|0|vertical") "block '$(SplitBlock $aid)'"
+        # The caller of `session new` is a SHELL's id (its env, stamped at birth): a split shell's,
+        # which is hidden, and a promoted survivor's, which is no node's `id`. Both used to fall
+        # through to the active workspace (revmux r2, pre-existing); both resolve to the session's.
+        if ($cliSendsCaller) {
+            $homeWs = WsOf $aid
+            $otherWs = [string]((Tree).workspaces | Where-Object { [string]$_.id -ne $homeWs } | Select-Object -First 1).id
+            Send-Ctl $s @('workspace', 'select', '--target', $otherWs) | Out-Null
+            Start-Sleep -Milliseconds 500
+            Check 'setup: another workspace is active, the split session is not in it' ([bool]$otherWs -and (ActiveWs) -eq $otherWs -and $homeWs -ne $otherWs) "active $(ActiveWs), home $homeWs"
+            $raw = Send-CtlAs $sid2 @('session', 'new', '--name', 'from-split-shell')
+            $cs = [string](ConvertFrom-Json $raw).result
+            Check "a bare session new from the SPLIT shell lands in its owner's workspace, not the active one" ([bool]$cs -and (Wait-Node $cs) -and (WsOf $cs) -eq $homeWs) "raw: $raw, ws $(WsOf $cs), wanted $homeWs"
+            $raw = Send-CtlAs $sid @('session', 'new', '--name', 'from-promoted-shell')
+            $cp = [string](ConvertFrom-Json $raw).result
+            Check "a bare session new from the PROMOTED survivor (its env holds its pane id, no node's id) lands in its session's workspace" ([bool]$cp -and (Wait-Node $cp) -and (WsOf $cp) -eq $homeWs) "raw: $raw, ws $(WsOf $cp), wanted $homeWs"
+            foreach ($c in @($cs, $cp)) { if ($c) { Send-Ctl $s @('session', 'close', '--target', $c) | Out-Null } }
+            # `session select` shows a session; it never moves "active" (selectPrimary sets the
+            # displayed slot, not g_ws), so the workspace is put back explicitly, as the caller
+            # section above does.
+            Send-Ctl $s @('workspace', 'select', '--target', $homeWs) | Out-Null
+            Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+            Start-Sleep -Milliseconds 800
+            Check 'setup: back on the split session, its workspace active, the node count as before' ((ActiveWs) -eq $homeWs -and [bool](Node $aid).active -and (NodeCount) -eq $before) "active $(ActiveWs) (home $homeWs), node active $((Node $aid).active), nodes $(NodeCount) vs $before"
+        } else {
+            Skip 'a bare `session new` from a split shell / a promoted survivor lands in its session''s workspace' 'this agwintermctl predates agwinterm #226 and never sends `caller`'
+        }
+        # The symmetric close: the split shell by its own id; the promoted shell survives again.
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $sid2)
+        Start-Sleep -Milliseconds 800
+        Check "split close --target <split shell id> closes that shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq '' -and [bool](Node $aid)) "raw: $raw, block '$(SplitBlock $aid)'"
+        Check 'the survivor still answers under both ids; tree fired, no session event' (((Get-PaneText $s $sid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        # A promoted session is the one whose `id` and `paneId` differ, and two pre-P4 sites compared
+        # or wrote the session id where the shell's id was meant (revmux r1, both Majors):
+        #   - restore capture's stale-entry re-check rejected the promoted pane, so a targeted capture
+        #     answered ok with captured 0 and panes [] and an untargeted one omitted the session;
+        #   - the D line carried the session id, so a relaunch after a kill could not adopt the
+        #     survivor's shell (restore-matrix `promote-killed` proves the adoption end to end).
+        if ($cliHasP3) {
+            $raw = Cap @('--target', $aid)
+            $o = ConvertFrom-Json $raw
+            Check "restore capture --target <promoted session id> reports its ONE pane: the survivor under its own pane id, the session id beside it" ([bool]$o.ok -and @($o.result.panes).Count -eq 1 -and [string]$o.result.panes[0].pane -eq $sid -and [string]$o.result.panes[0].session -eq $aid) "raw: $raw"
+            $raw = Cap @()
+            $o = ConvertFrom-Json $raw
+            Check "an untargeted restore capture lists the promoted session's pane too, under the survivor's pane id" ([bool]$o.ok -and @($o.result.panes | Where-Object { [string]$_.pane -eq $sid }).Count -eq 1) "raw: $raw"
+            $dline = @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "D`t*" } | ForEach-Object { $_.TrimEnd("`r") })
+            Check "the D line names the survivor's SHELL (its pane id), not the session id the promotion moved onto it" (@($dline).Count -eq 1 -and $dline[0] -match "`t$([regex]::Escape($sid))(`t|$)" -and $dline[0] -notmatch "`t$([regex]::Escape($aid))(`t|$)") "D: $($dline -join ' / ')"
+        } else {
+            Skip 'restore capture on a promoted session' 'needs a P3 client'
+        }
+        # No target: the focused pane of the displayed session, what the close chord closes.
+        $sid3 = SplitOn
+        Send-Ctl $s @('session', 'focus', 'split') | Out-Null
+        Start-Sleep -Milliseconds 400
+        $raw = Send-Ctl $s @('session', 'split', 'close')
+        Start-Sleep -Milliseconds 800
+        Check 'split close with no target closes the FOCUSED pane (slot 1 here) and answers the survivor' ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq '') "raw: $raw, block '$(SplitBlock $aid)'"
+        $sid4 = SplitOn
+        Send-Ctl $s @('session', 'focus', 'primary') | Out-Null
+        Start-Sleep -Milliseconds 400
+        $raw = Send-Ctl $s @('session', 'split', 'close')
+        Start-Sleep -Milliseconds 800
+        Check "split close with no target and slot 0 focused closes the session's own shell: a promotion, the split shell survives" ([string](ConvertFrom-Json $raw).result -eq $sid4 -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)'"
+        # The close chord (Key_Close = Ctrl+Shift+W, seeded before launch) closes the FOCUSED pane only.
+        $sid5 = SplitOn
+        Send-Ctl $s @('session', 'focus', 'split') | Out-Null
+        Start-Sleep -Milliseconds 400
+        $cur = Cursor
+        [LiteUi]::Chord($s.Hwnd, 0x57, $true)
+        Check 'the close chord on the focused split shell closes that pane only: the session stays, single, no session event' ((Wait-Single $aid) -and (NodeCount) -eq $before -and (EvSince $cur 'session') -eq 0 -and (EvSince $cur 'tree') -ge 1) "block '$(SplitBlock $aid)' nodes $(NodeCount)"
+        $sid6 = SplitOn
+        Send-Ctl $s @('session', 'focus', 'primary') | Out-Null
+        Start-Sleep -Milliseconds 400
+        $cur = Cursor
+        [LiteUi]::Chord($s.Hwnd, 0x57, $true)
+        Check "the close chord on the focused OWN shell of a split closes that pane only: the session keeps its id, the split shell survives" ((Wait-Single $aid) -and (NodeCount) -eq $before -and (EvSince $cur 'session') -eq 0 -and [bool](ConvertFrom-Json (Send-Ctl $s @('session', 'text', '--target', $sid6))).ok) "block '$(SplitBlock $aid)' nodes $(NodeCount)"
+        Check 'and the next split lists the survivor first' ((SplitOn) -and (SplitBlock $aid) -match "^2\|$sid6,")
+        Send-Ctl $s @('session', 'split', 'off', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 500
+        # A split side whose shell EXITS collapses to the survivor within the settle (agwinterm collapses too).
+        $sid7 = SplitOn
+        Check 'setup: the split shell is up' (Mark $sid7 'p4-mk-split-7')
+        $cur = Cursor
+        Send-Ctl $s @('session', 'type', 'exit', '--target', $sid7) | Out-Null
+        Send-Ctl $s @('session', 'type', "`n", '--target', $sid7) | Out-Null
+        Check 'a split shell whose process exits collapses to the survivor: the session, single; tree fired, no session event' ((Wait-Single $aid) -and (NodeCount) -eq $before -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0) "block '$(SplitBlock $aid)' nodes $(NodeCount)"
+        $sid8 = SplitOn
+        Check 'setup: a marker in the split shell' (Mark $sid8 'p4-mk-split-8')
+        $cur = Cursor
+        Send-Ctl $s @('session', 'type', 'exit', '--target', $aid) | Out-Null
+        Send-Ctl $s @('session', 'type', "`n", '--target', $aid) | Out-Null
+        Check "the session's OWN shell exiting promotes the survivor: the node keeps its id, session text by it reaches the survivor, not exited" ((Wait-Single $aid) -and ((Get-PaneText $s $aid) -match 'p4-mk-split-8') -and -not [bool](Node $aid).exited -and (EvSince $cur 'session') -eq 0) "text: $(Get-PaneText $s $aid)"
+        # `session close` on the split shell's id: that shell, an unsplit (its pre-P4 meaning), now with `tree`.
+        $sid9 = SplitOn
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'close', '--target', $sid9)
+        Start-Sleep -Milliseconds 800
+        Check "session close --target <split shell id> closes that shell: the session stays, single" ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)'"
+        Check 'and it emitted tree, not session closed: the split shell was never a session' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        # A session NOT on screen: its own shell closed by split close promotes it there; nothing moves (#230).
+        $o2 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'new', '--name', 'p4-offscreen2'))).result
+        Check 'setup: a second session' (Wait-Node $o2)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $os2 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'split', 'on', '--target', $o2))).result
+        Start-Sleep -Milliseconds 500
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', 'p4-offscreen2')
+        Start-Sleep -Milliseconds 800
+        Check 'split close by NAME on a session not on screen promotes it there: its node keeps its id, single, the survivor answered' ([string](ConvertFrom-Json $raw).result -eq $os2 -and (SplitBlock $o2) -eq '' -and [bool](Node $o2)) "raw: $raw, block '$(SplitBlock $o2)'"
+        Check 'while the displayed session and the selection did not move (#230)' ([bool](Node $aid).active -and -not [bool](Node $o2).active)
+        Send-Ctl $s @('session', 'select', '--target', $o2) | Out-Null
+        Start-Sleep -Milliseconds 800
+        Check 'selecting it shows the survivor at the full width, its name kept' ([bool](Node $o2).active -and [int](Node $o2).cols -eq $c0 -and [string](Node $o2).name -eq 'p4-offscreen2') "grid $((Node $o2).cols) name '$((Node $o2).name)'"
+        $cur = Cursor
+        Send-Ctl $s @('session', 'close', '--target', $o2) | Out-Null
+        Start-Sleep -Milliseconds 500
+        Check 'session close on the promoted session closes it (the survivor shell, by its own host id): session closed fired' ($null -eq (Node $o2) -and (EvSince $cur 'session') -ge 1 -and (NodeCount) -eq $before)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
+        # ---- Task 3: `session swap` — the slots exchange, the ids stay, the focus follows ----------
+        # A SWAP MOVES PANES, NEVER IDS (SwapReply.cs): `paneIds` reverses, `focusedPane` follows the
+        # pane, `axis` is kept, and each id reaches the shell it reached before — proved by a marker
+        # typed under an id before the swap and read back under the same id after it. The reply is
+        # the one object among the split verbs: the node's split block after the flip. Every refusal
+        # is agwinterm's sentence and moves nothing. The slot-based verbs follow by construction —
+        # `focus left` is slot 0 whichever shell sits there, `split on` when split answers slot 1's
+        # id, `split off` closes slot 1 — and each is checked here on a swapped session.
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'swap on a one-pane session is refused naming `session split on`' (-not $r.ok -and [string]$r.error -eq "swap: session '$aid' has one pane, so there is nothing to exchange; ``session split on`` makes a split. Nothing moved.") "raw: $raw"
+        Check 'and nothing moved: the session is there, single' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and (NodeCount) -eq $before)
+        $raw = Send-Ctl $s @('session', 'swap', '--target', 'no-such-session-9999')
+        Check 'swap on an unknown target is refused naming it' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "swap: no pane or session matches 'no-such-session-9999'. Nothing moved.") "raw: $raw"
+        $cur = Cursor
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cur"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $covId = [string]($created | Select-Object -Last 1).session
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $covId)
+        Check 'swap on a scratch cover is refused as no side of a split' ([bool]$covId -and -not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "swap: '$covId' is a scratch/overlay/quick pane, not a side of a split. Nothing moved.") "raw: $raw"
+        Check 'and nothing moved: no session event beyond the created one, no split block anywhere' ((EvSince $cur 'session') -eq 1 -and @(Nodes | Where-Object { $_.PSObject.Properties['paneCount'] }).Count -eq 0)
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+        Start-Sleep -Milliseconds 500
+        # The swap itself: a marker in each shell first, then the reply, the tree, the grid and the ids.
+        # The session's OWN pane id is read off the tree: the promotions above moved the session id
+        # onto a shell whose pane id is not the session id (pane ids never move), and `paneIds`
+        # reports panes. `--target $aid` still reaches that shell — the session-id rule.
+        $sw = SplitOn
+        $own = [string]@((Node $aid).paneIds)[0]
+        Check 'setup: split, focus on slot 0, a marker in each shell' ([bool]$sw -and [bool]$own -and $own -ne $sw -and (SplitBlock $aid) -eq "2|$own,$sw|0|vertical" -and (Mark $aid 'p4-mk-owner-s') -and (Mark $sw 'p4-mk-split-s')) "block '$(SplitBlock $aid)'"
+        $nOwn = Node $aid; $cOwn = [int]$nOwn.cols; $rOwn = [int]$nOwn.rows
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $aid)
+        Start-Sleep -Milliseconds 600
+        $r = ConvertFrom-Json $raw
+        Check 'swap answers the split block after the flip: session, paneIds reversed, focusedPane 1 (the focus followed the pane), axis kept' ([bool]$r.ok -and [string]$r.result.session -eq $aid -and (@($r.result.paneIds) -join ',') -eq "$sw,$own" -and [int]$r.result.focusedPane -eq 1 -and [string]$r.result.axis -eq 'vertical') "raw: $raw"
+        Check 'and the tree agrees: paneIds [split, session], focusedPane 1, axis vertical' ((SplitBlock $aid) -eq "2|$sw,$own|1|vertical") "block '$(SplitBlock $aid)'"
+        Check 'the swap emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        Check "the session's own shell kept its grid within a column: the two halves, not a new layout" ([math]::Abs([int](Node $aid).cols - $cOwn) -le 1 -and [int](Node $aid).rows -eq $rOwn) "grid $((Node $aid).cols)x$((Node $aid).rows), was ${cOwn}x${rOwn}"
+        Check 'a swap moves panes, never ids: each marker reads back under the id it was typed under' (((Get-PaneText $s $aid) -match 'p4-mk-owner-s') -and ((Get-PaneText $s $sw) -match 'p4-mk-split-s') -and -not ((Get-PaneText $s $aid) -match 'p4-mk-split-s')) "by session id: $(Get-PaneText $s $aid)`nby split id: $(Get-PaneText $s $sw)"
+        Check 'and session type by each id still reaches the same shell after the swap' ((Mark $aid 'p4-typed-owner-s') -and (Mark $sw 'p4-typed-split-s') -and -not ((Get-PaneText $s $sw) -match 'p4-typed-owner-s')) "by split id: $(Get-PaneText $s $sw)"
+        Check "and the node keeps its name, its row and its id: still active, not exited" ([bool](Node $aid).active -and -not [bool](Node $aid).exited -and (NodeCount) -eq $before)
+        # `on` when split answers slot 1's id: after the swap, the session's own pane id.
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $aid)
+        Check "split on when split, after a swap, answers slot 1's id — the session's own pane — and changes nothing" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq "2|$sw,$own|1|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # The focus words are slots: `left` / `primary` land on slot 0, which is the split shell now.
+        foreach ($pair in @(@('left', 0), @('right', 1), @('primary', 0), @('split', 1), @('other', 0), @('other', 1))) {
+            $raw = Send-Ctl $s @('session', 'focus', $pair[0])
+            Start-Sleep -Milliseconds 200
+            Check "focus $($pair[0]) on the swapped session lands on slot $($pair[1])" ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq "2|$sw,$own|$($pair[1])|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        }
+        # A swap by the split shell's id acts on its session: the order comes back, the focus follows again.
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $sw)
+        Start-Sleep -Milliseconds 600
+        $r = ConvertFrom-Json $raw
+        Check "swap by the split shell's id acts on its session: the order back to [session, split], the focus followed to slot 0" ([bool]$r.ok -and (@($r.result.paneIds) -join ',') -eq "$own,$sw" -and [int]$r.result.focusedPane -eq 0 -and (SplitBlock $aid) -eq "2|$own,$sw|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # No target: the displayed session, through whichever of its panes is focused — the split shell here.
+        Send-Ctl $s @('session', 'focus', 'split') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $raw = Send-Ctl $s @('session', 'swap')
+        Start-Sleep -Milliseconds 600
+        Check 'swap with no target acts on the displayed session with its split shell focused: reversed, the focus followed to slot 0' ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq "2|$sw,$own|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # `split close` with no target closes the FOCUSED pane: the split shell, in slot 0 now — no promotion.
+        $raw = Send-Ctl $s @('session', 'split', 'close')
+        Start-Sleep -Milliseconds 800
+        Check "split close with no target on the swapped session closes the focused split shell (slot 0): the session's own shell survives" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq '' -and ((Get-PaneText $s $aid) -match 'p4-mk-owner-s')) "raw: $raw, block '$(SplitBlock $aid)'"
+        # `split off` after a swap closes SLOT 1: the session's own shell — a promotion; the session keeps its id.
+        $sw2 = SplitOn
+        Check 'setup: split again, a marker in the split shell' ([bool]$sw2 -and (Mark $sw2 'p4-mk-split-s2'))
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 500
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'off', '--target', $aid)
+        Start-Sleep -Milliseconds 800
+        Check "split off after a swap closes slot 1 — the session's own shell: a promotion, the survivor's pane id answered, the session keeps its id" ([string](ConvertFrom-Json $raw).result -eq $sw2 -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and ((Get-PaneText $s $aid) -match 'p4-mk-split-s2') -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', text: $(Get-PaneText $s $aid)"
+        Check 'and it was a promotion, not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        Check 'the promoted session is single again, so a swap is refused as before' (-not (ConvertFrom-Json (Send-Ctl $s @('session', 'swap', '--target', $aid))).ok -and (SplitBlock $aid) -eq '')
+        # A session NOT on screen can be swapped; nothing moves (#230); selecting it shows the swapped pair.
+        $o3 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'new', '--name', 'p4-offscreen3'))).result
+        Check 'setup: a second session' (Wait-Node $o3)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $os3 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'split', 'on', '--target', $o3))).result
+        Start-Sleep -Milliseconds 500
+        $raw = Send-Ctl $s @('session', 'swap', '--target', 'p4-offscreen3')
+        Start-Sleep -Milliseconds 500
+        $r = ConvertFrom-Json $raw
+        Check 'swap by NAME on a session not on screen reverses its order; focusedPane 1, the slot its own shell now sits in' ([bool]$r.ok -and [string]$r.result.session -eq $o3 -and (@($r.result.paneIds) -join ',') -eq "$os3,$o3" -and [int]$r.result.focusedPane -eq 1 -and (SplitBlock $o3) -eq "2|$os3,$o3|1|vertical") "raw: $raw, block '$(SplitBlock $o3)'"
+        Check 'while the displayed session and the selection did not move (#230)' ([bool](Node $aid).active -and -not [bool](Node $o3).active)
+        Send-Ctl $s @('session', 'select', '--target', $o3) | Out-Null
+        Start-Sleep -Milliseconds 800
+        Check 'selecting it shows the swapped pair, its own shell focused on slot 1, at half the columns' ([bool](Node $o3).active -and (SplitBlock $o3) -eq "2|$os3,$o3|1|vertical" -and (HalfOf ([int](Node $o3).cols) $c0)) "block '$(SplitBlock $o3)' cols $((Node $o3).cols)"
+        Send-Ctl $s @('session', 'close', '--target', $o3) | Out-Null
+        Start-Sleep -Milliseconds 500
+        Check 'setup: the second session is gone' ($null -eq (Node $o3) -and (NodeCount) -eq $before)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
     }
 
     # ---- #23: two persisted values that cannot coexist ------------------------------------------

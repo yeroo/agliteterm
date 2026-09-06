@@ -28,6 +28,14 @@ $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
+# agwintermctl defaults its target to $AGWINTERM_SESSION_ID when none is given (conformance.ps1 says
+# why that is a trap): this runner is itself launched from a terminal session, so every untargeted
+# `& $ctl` below — the `session split on` of the split cells first of all — would aim at the
+# DEVELOPER's pane id, which the cell's instance has never heard of ("session not found"). Found
+# by the P4-lite run from inside an agwinterm pane; scrubbed the way the other suites scrub.
+$env:AGWINTERM_SESSION_ID = $null
+$env:AGWINTERM_PANE_ID = $null
+$env:AGWINTERM_PIPE = $null
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
 $script:skipped = 0
@@ -38,6 +46,12 @@ $script:skipped = 0
 # cells need no verb and always run. -Strict turns a skip into a failure, as the honesty suite does.
 $probe = (& $ctl restore --pipe 'rm-probe' --json 2>&1) -join ''
 $cliHasP3 = $probe -match 'usage: agwintermctl restore'
+# And P4 (`session split --axis`, `session swap`; agwinterm #238): the same probe as
+# control-honesty.ps1 — a post-#238 client refuses `session swap <positional>` on its own side
+# ("Nothing sent") before any pipe; the 0.17.12 client has no `swap` and says `unknown session
+# command`. The L-line cells that need a verb SKIP on an old client; the seeded ones always run.
+$probe = (& $ctl session swap x --pipe 'rm-probe' --json 2>&1) -join ''
+$cliHasP4 = $probe -match 'Nothing sent'
 function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  {0,-22} — {1}" -f $name, $why }
 
 function State($inst) { "$dir\sessions-$inst.tsv" }
@@ -113,6 +127,12 @@ function Stop-Leftover($p) {
 # VALUES of the node's capturedCommands, the session's own pane first, then its split's. Values and
 # not keys: a graceful restart re-creates the sessions under new ids, and it is the slot that has
 # to survive, not the id it was keyed by.
+# A split's layout (the L line, P4) rides along as `%axis:order` when the node carries the split
+# block — the axis word as the tree spells it, and the order as 0 when the session's own pane sits
+# in slot 0 (paneIds[0] is the session's id) or 1 after a swap. Derived from the id and not compared
+# as a pane id for the same reason as the K values: ids are fresh after a graceful restart. (After a
+# promotion the session's own pane id is not its session id, so this reads 1 for an unswapped
+# promoted session — no cell here promotes; the honesty suite is where promotions are proved.)
 function Signature($inst) {
     $ws = Tree $inst
     if ($null -eq $ws) { return '' }
@@ -125,6 +145,10 @@ function Signature($inst) {
                 $own = [string]$s.id
                 $vals = @($s.capturedCommands.PSObject.Properties | Sort-Object { if ($_.Name -eq $own) { 0 } else { 1 } }, Name | ForEach-Object { $_.Value })
                 $entry += '^' + ($vals -join ';')
+            }
+            if ($s.PSObject.Properties['paneCount']) {
+                $order = if ([string]$s.paneIds[0] -eq [string]$s.id) { 0 } else { 1 }
+                $entry += "%$($s.axis):$order"
             }
             $parts += $entry
         }
@@ -1028,6 +1052,154 @@ if ($cliHasP3) {
     if (-not $Only -or $Only -eq 'capture-split')    { Skip 'capture-split'    'same client' }
 }
 
+# --- P4: the L line (a split's layout) -----------------------------------------------------------
+# The axis and the slot order, written as `L\t<S-index>\t<axis>\t<0|1>` after the P line and ONLY
+# when the layout is not the default (vertical, unswapped) — a default tree writes the bytes it
+# always wrote (layout-default-no-l, below). Read back onto the owner whose split the P line
+# rebuilt. The Signature carries the block as `%axis:order`, so the assertion is on the tree after
+# the restart; the file is inspected too, AFTER the second run, so a build that loaded the line
+# but forgot to write it back would fail here.
+if ($cliHasP4) {
+    # A horizontal split, graceful close: the L line is written, the split comes back stacked.
+    Cell -Name 'axis-graceful' -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename axis-keeper --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --axis horizontal --target $id --pipe $i --json 2>&1) -join ''
+        if (-not [string](ConvertFrom-Json $sraw).result) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'axis-keeper%horizontal:0') { return $false }   # the axis has to have landed
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^L`t0`thorizontal`t0`r?$")
+    }
+    # The kill path: the L line was checkpointed by the save the split itself triggered, not by the
+    # close — there is no close. The owner is adopted from the host, the split rebuilt, the layout
+    # read off the line.
+    Cell -Name 'axis-killed' -Kill -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename axis-survivor --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --axis horizontal --target $id --pipe $i --json 2>&1) -join ''
+        if (-not [string](ConvertFrom-Json $sraw).result) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'axis-survivor%horizontal:0') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^L`t0`thorizontal`t0`r?$")
+    }
+    # A swapped split with a ping in each pane, killed: the order survives (the session's own shell
+    # comes back in slot 1) AND the K slots survive BY ROLE — field 2 is still the session's own
+    # shell's command, field 3 the split's, whatever the order on screen; the Signature reads them
+    # own-first, so `^cmd0;cmd1` is unchanged while `%vertical:1` says the slots are exchanged.
+    Cell -Name 'swap-killed' -Kill -Setup {
+        param($i)
+        Stop-Ping '315'; Stop-Ping '316'
+        $id = LastSessionId $i
+        & $ctl session rename swap-keeper --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --target $id --pipe $i --json 2>&1) -join ''
+        $split = [string](ConvertFrom-Json $sraw).result
+        if (-not $split) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+        & $ctl session type "ping -n 315 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+        & $ctl session type "ping -n 316 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
+        if (-not (Wait-Ping '315') -or -not (Wait-Ping '316')) { throw 'a ping never started under its pane shell' }
+        Start-Sleep -Milliseconds 500
+        & $ctl restore capture --pipe $i 2>&1 | Out-Null
+        Start-Sleep -Seconds 1
+        $wraw = (& $ctl session swap --target $id --pipe $i --json 2>&1) -join ''
+        if ($wraw -notmatch '"ok":true') { throw "session swap refused: $wraw" }
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        Stop-Ping '315'; Stop-Ping '316'
+        if ($b -notmatch 'swap-keeper\^[^|;%]*-n 315 127\.0\.0\.1;[^|;%]*-n 316 127\.0\.0\.1%vertical:1') { return $false }
+        $tsv = Get-Content (State $i) -Raw
+        ($a -eq $b) -and ($tsv -match "(?m)^L`t0`tvertical`t1`r?$") -and
+            ($tsv -match "(?m)^K`t0`t[^`t]*-n 315 127\.0\.0\.1`t[^`t]*-n 316 127\.0\.0\.1`r?$")
+    }
+    # A split re-oriented LIVE (`--axis` on an already split session), killed: the re-orient arm
+    # has to schedule the save the other split mutations schedule, or the L line keeps the old
+    # axis until some unrelated save (revmux r1). The split is made vertical first — no L line —
+    # so the horizontal line the assertion finds can only have come from the re-orientation.
+    Cell -Name 'axis-relive-killed' -Kill -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename axis-relive --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --target $id --pipe $i --json 2>&1) -join ''
+        if (-not [string](ConvertFrom-Json $sraw).result) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+        if ((Get-Content (State $i) -Raw) -match "(?m)^L`t") { throw 'a vertical unswapped split wrote an L line' }
+        $rraw = (& $ctl session split on --axis horizontal --target $id --pipe $i --json 2>&1) -join ''
+        if ($rraw -notmatch '"ok":true') { throw "re-orientation refused: $rraw" }
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'axis-relive%horizontal:0') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^L`t0`thorizontal`t0`r?$")
+    }
+    # A PROMOTED session (its own shell closed, the split shell became the session), killed: the D
+    # line has to carry the shell's id — the host knows the survivor by its pane id, and a D line
+    # written with the session id adopted nothing and left the live shell orphaned in the host
+    # (revmux r1). Proved the way killed-repaint proves adoption: a marker on the survivor's screen
+    # before the kill, the adoption in the log, the marker back after it — and the session comes
+    # back under its shell's id (the file records shells, not promotions; docs/state-file.md).
+    if (-not $Only -or $Only -eq 'promote-killed') {
+        $inst = 'rm-promote-killed'
+        Reset-Cell $inst
+        $err = ''; $seenBefore = $false; $promoted = $false; $adopted = $false; $seenAfter = $false; $idAfter = ''; $split = ''; $textAfter = ''
+        $p = $null; $p2 = $null
+        try {
+            $p = Start-Lite $inst
+            $id = LastSessionId $inst
+            & $ctl session rename promote-keeper --target $id --pipe $inst 2>&1 | Out-Null
+            $sraw = (& $ctl session split on --target $id --pipe $inst --json 2>&1) -join ''
+            $split = [string](ConvertFrom-Json $sraw).result
+            if (-not $split) { throw "session split answered no id: $sraw" }
+            Start-Sleep -Seconds 2
+            & $ctl session type "echo PROMOTED-MARKER`n" --target $split --pipe $inst 2>&1 | Out-Null
+            Start-Sleep -Seconds 3
+            $seenBefore = ((& $ctl session text --target $split --pipe $inst 2>&1) -join "`n") -match 'PROMOTED-MARKER'
+            $craw = (& $ctl session split close --target $id --pipe $inst --json 2>&1) -join ''
+            if ($craw -notmatch '"ok":true') { throw "split close on the session's own shell refused: $craw" }
+            Start-Sleep -Seconds 2
+            $node = @(SessionsOf $inst | Where-Object { $_.name -eq 'promote-keeper' })[0]
+            $promoted = $node -and ([string]$node.id -eq $id) -and -not $node.PSObject.Properties['paneCount']
+            Stop-Lite $p -Kill; $p = $null
+
+            $p2 = Start-Lite $inst
+            Start-Sleep -Seconds 4
+            $adopted = Log-Has $inst "adopted live session '$([regex]::Escape($split))'"
+            $node2 = @(SessionsOf $inst | Where-Object { $_.name -eq 'promote-keeper' })[0]
+            $idAfter = [string]$node2.id
+            $textAfter = (& $ctl session text --target $idAfter --pipe $inst 2>&1) -join "`n"
+            $seenAfter = $textAfter -match 'PROMOTED-MARKER'
+            Stop-Lite $p2; $p2 = $null
+        } catch { $err = $_.Exception.Message }
+        finally { Stop-Leftover $p; Stop-Leftover $p2 }
+        if (-not $err -and $seenBefore -and $promoted -and $adopted -and $seenAfter -and $idAfter -eq $split) {
+            "  PASS  {0,-22} (a promoted session is adopted by its shell's id and comes back with its screen)" -f 'promote-killed'
+        } else {
+            $script:failed += 'promote-killed'
+            "  FAIL  promote-killed"
+            if ($err) { "        error:  $err" }
+            "        marker on the survivor before the kill: $seenBefore"
+            "        the promotion happened (id kept, single): $promoted"
+            "        the survivor's shell was adopted:         $adopted"
+            "        marker back after adoption:               $seenAfter"
+            "        id after (expected the shell's, $split): $idAfter"
+            "        after: [$(($textAfter -replace '\s+', ' ').Trim())]"
+            "        log:   $(Restore-Verdict $inst)"
+        }
+    }
+} else {
+    if (-not $Only -or $Only -eq 'axis-graceful') { Skip 'axis-graceful' 'this agwintermctl predates agwinterm #238 and has no `session split --axis` / `session swap` - set AGWINTERMCTL to a newer build' }
+    if (-not $Only -or $Only -eq 'axis-killed')   { Skip 'axis-killed'   'same client' }
+    if (-not $Only -or $Only -eq 'swap-killed')   { Skip 'swap-killed'   'same client - the seeded L-line cells still run' }
+    if (-not $Only -or $Only -eq 'axis-relive-killed') { Skip 'axis-relive-killed' 'same client' }
+    if (-not $Only -or $Only -eq 'promote-killed')     { Skip 'promote-killed'     'same client' }
+}
+
 # A C line the verb would have refused (a control character): the session comes back, the context
 # does not, and the log names the session and the rule. Not drawn, and — checked on the file the
 # second run wrote — not re-saved either.
@@ -1086,6 +1258,72 @@ Seeded -Name 'capture-split-failed' `
     ($a -match 'cap-half\^cmd-zero(\||$)') -and ($a -notmatch 'cmd-one') -and
         (Log-Has $i "restore: captured command for the split of session 'cap-half' dropped - that split was not restored") -and
         ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`tcmd-zero`t`r?$")
+}
+
+# ➕ The L line (P4), seeded. Each field is validated on its own: a bad axis word or a bad order digit
+# loses THAT field to its default, named in the log, and the split still comes back with the other
+# field honoured; the file the second run wrote carries the validated line.
+Seeded -Name 'layout-bad-words' `
+    -Tsv "V1`nW`tws-l1`nS`t0`tbad-axis`t`t$cwd`nS`t0`tbad-order`t`t$cwd`nP`t0`t`t$cwd`nP`t1`t`t$cwd`nL`t0`tdiagonal`t1`nL`t1`thorizontal`t7`nA`t0`n" -Assert {
+    param($a, $i)
+    $tsv = Get-Content (State $i) -Raw
+    ($a -match 'bad-axis%vertical:1') -and ($a -match 'bad-order%horizontal:0') -and
+        (Log-Has $i "state: layout line for session index 0 has axis 'diagonal' \(not vertical / horizontal\) - restoring vertical") -and
+        (Log-Has $i "state: layout line for session index 1 has order '7' \(not 0 / 1\) - restoring 0") -and
+        ($tsv -match "(?m)^L`t0`tvertical`t1`r?$") -and ($tsv -match "(?m)^L`t1`thorizontal`t0`r?$")
+}
+
+# An L for an owner with no P line describes no pair: dropped and named, the session comes back
+# single (no split block), and the second run's file has no L line.
+Seeded -Name 'layout-no-p' `
+    -Tsv "V1`nW`tws-l2`nS`t0`tlone-layout`t`t$cwd`nL`t0`thorizontal`t0`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'lone-layout(\||$)') -and ($a -notmatch '%') -and
+        (Log-Has $i 'state: layout line for session index 0 has no split \(P\) line to describe - dropped') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^L`t")
+}
+
+# An index past the S list: that one line is dropped and named; the session restores untouched.
+Seeded -Name 'layout-stray-index' `
+    -Tsv "V1`nW`tws-l3`nS`t0`tlayout-only-one`t`t$cwd`nL`t5`thorizontal`t1`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'layout-only-one(\||$)') -and ($a -notmatch '%') -and
+        (Log-Has $i 'state: layout line names session index 5 but the file has 1 session\(s\) - dropped')
+}
+
+# The P guard, applied to L: a malformed S line refuses the whole L set (and the P set, the same
+# comparison) with the guard's sentence; the parseable session restores single.
+Seeded -Name 'layout-count-mismatch' `
+    -Tsv "V1`nW`tws-l4`nS`t0`tgood-l`t`t$cwd`nS`t0`tbroken`nP`t0`t`t$cwd`nL`t0`thorizontal`t1`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'good-l(\||$)') -and ($a -notmatch '%') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 split line\(s\)') -and
+        (Log-Has $i 'state: 2 session line\(s\) but 1 parsed - refusing 1 layout line\(s\)') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^L`t")
+}
+
+# The P line parsed but its shell would not start: the layout has no pair to land on and is dropped
+# and named on the restore side (the parser saw a P line for it), not left on the lone session where
+# the next `split on` would silently pick it up; the second run's file has no L line.
+Seeded -Name 'layout-split-failed' `
+    -Tsv "V1`nW`tws-l5`nS`t0`tlayout-half`t`t$cwd`nP`t0`tC:\no-such-dir\no-such-split-shell.exe`t$cwd`nL`t0`thorizontal`t1`nA`t0`n" -Assert {
+    param($a, $i)
+    ($a -match 'layout-half(\||$)') -and ($a -notmatch '%') -and
+        (Log-Has $i "restore: layout for session 'layout-half' dropped - its split was not restored") -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^L`t")
+}
+
+# A default split (vertical, unswapped) writes NO L line: the file the second run wrote has exactly
+# the line types, in the order, that the P3-lite build wrote for the same tree — V1 W S D P A — so
+# a downgrade reads the same bytes it always did and a byte-for-byte fixture from before P4 is still
+# what this build produces. (The values differ run to run — the D line's ids, the live cwd — which
+# is why the shape is compared, not the bytes.)
+Seeded -Name 'layout-default-no-l' `
+    -Tsv "V1`nW`tws-l6`nS`t0`tplain-split`t`t$cwd`nP`t0`t`t$cwd`nA`t0`n" -Assert {
+    param($a, $i)
+    if ($a -notmatch 'plain-split%vertical:0') { return $false }
+    $types = @(Get-Content (State $i) | Where-Object { $_ } | ForEach-Object { ($_ -split "`t")[0] })
+    ($types -join ' ') -eq 'V1 W S D P A'
 }
 
 # --- malformed / future state files: degrade, never crash and never take the window down -------

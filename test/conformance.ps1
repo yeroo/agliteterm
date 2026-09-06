@@ -68,6 +68,15 @@ $cliHasSidebarWidth = $probe -match 'whole number'
 # (test/control-honesty.ps1 and test/restore-matrix.ps1 use this probe).
 $probe = (& $ctl restore --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasP3 = $probe -match 'usage: agwintermctl restore'
+# And for P4 (`session split --axis`, `session split close`, `session swap`, `session focus`;
+# agwinterm #238, contract #240): a post-#238 client refuses `session swap <positional>` on its own
+# side ("Nothing sent") before any pipe is opened; the 0.17.12 client has no `swap` at all and says
+# `unknown session command`. A pre-P4 client drops `--axis` on the floor (so the `--axis diagonal`
+# refusal would PASS as a plain split and the horizontal step would split vertical), and sends
+# `split close` as a bad op - a refusal, but the client's, not the one the contract pins - so the
+# P4 steps and errors are skipped on it instead (test/control-honesty.ps1 uses this probe).
+$probe = (& $ctl session swap x --pipe 'conform-probe' --json 2>&1) -join ''
+$cliHasP4 = $probe -match 'Nothing sent'
 
 # HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
 # `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
@@ -85,6 +94,10 @@ function Needs-NewClient($argv) {
     }
     if ($a.Count -ge 2 -and -not $cliHasP3 -and (($a[0] -eq 'session' -and $a[1] -eq 'context') -or ($a[0] -eq 'restore' -and $a[1] -eq 'capture'))) {
         return 'this agwintermctl predates agwinterm #233 and refuses `session context` / `restore capture` on its own side - set AGWINTERMCTL to a newer build'
+    }
+    if ($a.Count -ge 2 -and -not $cliHasP4 -and $a[0] -eq 'session' -and
+        (($a[1] -eq 'split' -and ($a -contains '--axis' -or ($a.Count -ge 3 -and $a[2] -eq 'close'))) -or $a[1] -eq 'swap' -or $a[1] -eq 'focus')) {
+        return 'this agwintermctl predates agwinterm #238 and drops `--axis` / refuses `split close`, `swap`, `focus` on its own side - set AGWINTERMCTL to a newer build'
     }
     return $null
 }

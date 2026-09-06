@@ -47,12 +47,15 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   **attention bell** that lights amber and jumps to the next blocked session, **flagged
   sessions** with a flagged-only view, **unread badges** (commands finished while a session was
   off-screen), workspace focus, sidebar **drag & drop**.
-- **Terminals**: workspaces + sessions with restore, a 2-pane split, quick / scratch / overlay
+- **Terminals**: workspaces + sessions with restore, a 2-pane split (left/right or top/bottom,
+  either side closable, the two swappable), quick / scratch / overlay
   popup terminals, font catalog (incl. bundled Cozette, Tamzen, Terminus, Spleen, UNSCII &
   GNU Unifont bitmap fonts) — face and size are chosen once in Properties; there is deliberately
   **no zoom**, because a raster face only exists at the strike sizes its pack ships,
   MS-DOS/EGA palette, cmd.exe-style Properties dialog, fully rebindable keys (all unbound by
-  default — keystrokes belong to your shell). The **sidebar text size** is set separately
+  default — keystrokes belong to your shell; the two pane-focus rows are by **slot** — *Focus Left /
+  Top Pane* is slot 0 and *Focus Right / Bottom Pane* slot 1, whichever shell a `session swap` put
+  there, and the same two rows serve both axes). The **sidebar text size** is set separately
   (*Properties → Sidebar text*), because wanting a bigger session list is not wanting a
   bigger terminal.
 - **Clipboard**: select with the mouse and it is copied on release; **Ctrl+C copies a selection**
@@ -63,7 +66,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   registry escape hatch is `RightClickPaste` / `CopyOnCtrlC` (DWORD `0`) under
   `HKCU\Software\agliteterm`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  45 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
+  48 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -106,7 +109,29 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   `K` line. Its `replayOnRestore` is **always `false`** in lite: it restores launch specs and never
   types a slot back (`session restore` is a later batch), so a captured command is a checkpoint to
   read, not a command that will run. An unknown, empty or cover-pane target, or a process query
-  that did not run, is refused with nothing written for anyone.
+  that did not run, is refused with nothing written for anyone. Parity batch P4 gives a split its
+  full shape, in agterm's words: `vertical` = left/right panes (the default), `horizontal` =
+  top/bottom — the axis names the arrangement, never the divider. `session split [on|off|toggle]
+  [--axis ..] [--target ID]` **answers a pane id** (a bare string) whichever way it went — `on`
+  the right/bottom pane's, also when already split; `off` the survivor's, also when already
+  single — honours its target (a session, either pane, a prefix, a name; a cover refused with
+  nothing split; a session off-screen split without moving focus), and re-orients a split session
+  live. `session split close --target ID` closes **either** side — which `off` cannot (it takes slot 1), and which no verb or key could before P4 — and answers the survivor's id; a one-pane session is refused naming `session close`.
+  `session swap` exchanges the two slots and nothing else — the focus follows its pane, the axis
+  stays, **no id moves** — and answers the tree's split block. `session focus
+  [primary|split|left|right|top|bottom|other]` moves between the panes, the pair that does not
+  exist on the axis refused naming it. A split session's `tree` node carries the block —
+  `paneCount`, `paneIds` in slot order, `focusedPane`, `axis` — and a single one carries none of
+  it, except that a promoted session's node carries `paneIds` alone (`[<its shell's id>]` — the
+  one single session whose pane id is not its `id`); every structural change emits `tree`. The session-id rule: a session id names the session's
+  own shell while it exists; **whenever that shell is the one that closes** — whatever closed it:
+  `split close` on it, the close chord on it, `split off` / `toggle` / the Split key or menu row
+  after a swap (slot 1 is the owner then), or its process exiting — the survivor **becomes the
+  session** — same id, name, flag, context, sidebar row, its own pane id kept — and a split side
+  whose shell exits collapses to the survivor on its own. After a kill-and-relaunch a promoted
+  session is adopted by its shell's id and comes back under it (the file records shells, not
+  promotions). The close chord and File ▸ Close Pane / Session close the focused **pane** on a split
+  session; the sidebar row's Close Session closes the whole session.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's
@@ -157,17 +182,21 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
   reading of "my sessions are gone": right sessions, wrong window.
 - **Format**: tab-separated UTF-8 text, `V1` header, one record per line — `W` workspace, `S` session
   (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `C` a
-  session's context, `P` a session's split shell, `K` a session's captured commands, `A` active
-  workspace; `C`, `P` and `K` name their session by its position among the `S` lines and are refused
-  wholesale when that count does not add up. The format grows by *adding* line types, so a file
-  written by an older build still restores, a line type this build doesn't write is still honoured
-  when it finds one (`O`, focused workspace), and a file from a **newer** build is read for the
-  lines this one knows rather than thrown away. Every line type, field by field, is in
-  [docs/state-file.md](docs/state-file.md).
+  session's context, `P` a session's split shell, `L` a split's layout (its axis and slot order,
+  written only when it is not the default left/right unswapped), `K` a session's captured commands,
+  `A` active workspace; `C`, `P`, `L` and `K` name their session by its position among the `S` lines
+  and are refused wholesale when that count does not add up. The format grows by *adding* line
+  types, so a file written by an older build still restores, a line type this build doesn't write
+  is still honoured when it finds one (`O`, focused workspace), and a file from a **newer** build is
+  read for the lines this one knows rather than thrown away (a build before P4 restores an
+  `L`-carrying split left/right, unswapped — the layout is lost, never the split). Every line type,
+  field by field, is in [docs/state-file.md](docs/state-file.md).
 - **What is saved**: the visible sessions, each with its *live* working directory (read from the
   shell process, so it follows you as you `cd`), its context and its captured command, and each
-  session's split shell (its own app, cwd and slot) so the split comes back with its owner. The
-  quick, scratch and overlay panes are hidden covers and are not persisted.
+  session's split shell (its own app, cwd and slot) with its layout — top/bottom or left/right,
+  and which side the session's own shell sits on after a `session swap` — so the split comes back
+  with its owner the way it was. The quick, scratch and overlay panes are hidden covers and are not
+  persisted.
 - **Writes are atomic, and keep one generation.** The save writes `sessions.tsv.tmp`, rotates the
   current file to **`sessions.tsv.bak`**, then renames the temp over the target — a crash or a full
   disk mid-write can no longer leave a truncated file where a good one was. A zero-session save is
@@ -298,8 +327,10 @@ drive the control pipe need `agwintermctl` — from an installed agwinterm, from
 pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. They skip with a message
 when it is absent rather than failing obscurely. A check that needs a client newer than the
 fetched release — `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field, all
-agwinterm #226; `session context` and `restore capture`, agwinterm #233 — probes the client first
-(`agwintermctl restore` answers a usage line on a post-#233 client) and SKIPs on an older one (`-Strict` turns that into a
-failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
+agwinterm #226; `session context` and `restore capture`, agwinterm #233; `session split --axis`,
+`split close`, `swap` and `focus`, agwinterm #238 — probes the client first
+(`agwintermctl restore` answers a usage line on a post-#233 client; `session swap x` is refused
+with "Nothing sent" by a post-#238 one, before any pipe is opened) and SKIPs on an older one
+(`-Strict` turns that into a failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
 dev build: `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
 
