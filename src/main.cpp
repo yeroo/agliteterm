@@ -869,12 +869,18 @@ static LRESULT CALLBACK statusProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR 
             HFONT of = g_uiFont ? (HFONT)SelectObject(dc, g_uiFont) : nullptr;
             SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_th.text);
             for (int i = 0; i < n; i++) {
-                wchar_t buf[256]{};
-                SendMessageW(h, SB_GETTEXTW, i, (LPARAM)buf);
+                // Sized from the part's own length (LOWORD of SB_GETTEXTLENGTH): part 0 carries the
+                // workspace name, which has no limit — a fixed wchar_t[256] was the second sink a
+                // long name overflowed (lite #22). LOWORD is the length modulo 65536, so updateStatus
+                // caps what it STORES in part 0 (512 characters) and this read is exact; the
+                // ellipsis handles what does not fit the part.
+                int len = LOWORD(SendMessageW(h, SB_GETTEXTLENGTHW, i, 0));
+                std::wstring buf(len + 1, L'\0');
+                SendMessageW(h, SB_GETTEXTW, i, (LPARAM)buf.data());
                 int x0 = i ? edges[i - 1] : 0, x1 = edges[i];
                 if (x1 < 0 || x1 > rc.right) x1 = rc.right;
                 RECT tr{ x0 + 7, rc.top + 2, x1 - 4, rc.bottom };
-                DrawTextW(dc, buf, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc, buf.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                 if (i < n - 1) { RECT sep{ x1, rc.top + 4, x1 + 1, rc.bottom - 3 }; FillRect(dc, &sep, border); }
             }
             if (of) SelectObject(dc, of);
@@ -4690,6 +4696,11 @@ static void updateStatus() {
     LockG hold;
     const std::wstring& ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_workspaces[g_activeWs] : g_workspaces[0];
     std::wstring ws0 = (g_focusWs >= 0) ? ws + L"  (focused)" : ws;
+    // The stored part is capped, the name is not: the dark painter sizes its read from
+    // SB_GETTEXTLENGTHW, whose LOWORD is the length modulo 65536, so a part that long cannot be
+    // read back accurately (lite #22, round 1). 512 characters is a few times what the 120-px part
+    // can show before DrawTextW's ellipsis; the tree label and `tree` carry the whole name.
+    if (ws0.size() > 512) ws0 = ws0.substr(0, 511) + L"\x2026";
     SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)ws0.c_str());
     int n = 0; for (auto* s : g_sessions) if (!s->hidden) n++;
     wsprintfW(buf, L"%d session%s  \x00B7  Rust pty-host", n, n == 1 ? L"" : L"s");
@@ -4738,13 +4749,16 @@ static void refreshTree() {
         int count = 0, flaggedCount = 0;
         for (auto* s : g_sessions) if (s->ws == w && !s->hidden) { count++; if (s->flagged) flaggedCount++; }
         if (g_flagView && flaggedCount == 0) continue;   // flagged view: only workspaces with flagged sessions
-        wchar_t wlabel[96];
-        wsprintfW(wlabel, L"%s  (%d)", g_workspaces[w].c_str(), g_flagView ? flaggedCount : count);
+        // A std::wstring, not a fixed buffer: the name arrives unbounded from workspace.new /
+        // workspace.rename, the inline label edit and the state file, and neither product limits
+        // it (agwinterm's is a C# string) — a ~100-character name through a wchar_t[96] was a
+        // stack overflow the API had answered ok to (lite #22).
+        std::wstring wlabel = g_workspaces[w] + L"  (" + std::to_wstring(g_flagView ? flaggedCount : count) + L")";
         TVINSERTSTRUCTW wt{};
         wt.hParent = TVI_ROOT;
         wt.hInsertAfter = TVI_LAST;
         wt.item.mask = TVIF_TEXT | TVIF_PARAM;
-        wt.item.pszText = wlabel;
+        wt.item.pszText = (LPWSTR)wlabel.c_str();
         wt.item.lParam = -(w + 1);
         HTREEITEM wh = TreeView_InsertItem(g_tree, &wt);
         anyShown = true;
@@ -4793,12 +4807,18 @@ static void refreshTree() {
 }
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
-static void deleteWorkspace(int w) {
+// The result says which guard fired, and only that — the guard sees an index and a size, not
+// why the index is past the list (the verb resolved it outside the lock, so the list may have
+// shrunk under it, #21; which workspace went is not known here). The caller must not say
+// "deleted" for either refusal (lite #22).
+enum class WsDelete { Deleted, LastOne, NoSuchIndex };
+static WsDelete deleteWorkspace(int w) {
     {   // under g_lock: reached from workspace.delete on a pipe thread while `tree` (another pipe
         // thread) and refreshTree index this vector under the lock; the erase moves every later
         // name down and destroys the last, and the ws fixups must land with it
         LockG hold;
-        if ((int)g_workspaces.size() <= 1 || w < 0 || w >= (int)g_workspaces.size()) return;
+        if ((int)g_workspaces.size() <= 1) return WsDelete::LastOne;
+        if (w < 0 || w >= (int)g_workspaces.size()) return WsDelete::NoSuchIndex;
         g_workspaces.erase(g_workspaces.begin() + w);
         for (auto* s : g_sessions) {
             if (s->ws == w) s->ws = 0;
@@ -4810,6 +4830,7 @@ static void deleteWorkspace(int w) {
         else if (g_focusWs > w) g_focusWs--;
     }
     refreshTree();
+    return WsDelete::Deleted;
 }
 
 // Right-click menu on a tree node — session or workspace, mirroring the full app's sidebar menus.
@@ -8674,7 +8695,18 @@ static std::string ctlDispatch(const std::string& line) {
         int w = wsResolve(req.get("target"), true);
         if (w < 0) return ctlErr("workspace not found");
         if ((int)g_workspaces.size() <= 1) return ctlErr("cannot delete the last workspace");
-        deleteWorkspace(w);
+        // The guard inside deleteWorkspace is the one that counts (it runs under g_lock; the check
+        // above and wsResolve did not): two deletes racing on a two-workspace window both pass the
+        // line above, and the second erases nothing — it must not be told "deleted" (lite #22).
+        // Each refusal says what that guard established and no more: the list is down to one, or
+        // the index names no workspace NOW (the list changed under this request; which one went,
+        // and whether it was the one asked for, the guard cannot tell — #21).
+        switch (deleteWorkspace(w)) {
+            case WsDelete::LastOne: return ctlErr("cannot delete the last workspace");
+            case WsDelete::NoSuchIndex: return ctlErr("nothing deleted: the workspace list changed under this request and index "
+                                                      + std::to_string(w) + " names no workspace now");
+            case WsDelete::Deleted: break;
+        }
         return ctlOkStr("deleted");
     }
     if (cmd == "workspace.select") {

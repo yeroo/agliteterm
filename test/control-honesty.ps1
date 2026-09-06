@@ -74,6 +74,8 @@ public static class LiteHonesty {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll")] public static extern bool InvalidateRect(IntPtr h, IntPtr rc, bool erase);
+    [DllImport("user32.dll")] public static extern bool UpdateWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -177,12 +179,13 @@ function Send-Raw([string]$json) {
 $regKey = 'HKCU:\Software\agliteterm'
 # Key_Close too (P4): the close-chord checks bind it to Ctrl+Shift+W for this run only — keys are
 # read once at launch, so it is seeded before the sandbox starts and put back (or removed) after.
+# Theme too (#22): the second sandbox is seeded dark so the subclassed status painter runs.
 $regSaved = @{}
-foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close') {
+foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close', 'Theme') {
     $regSaved[$n] = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue).$n } else { $null }
 }
 function Restore-Reg {
-    foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close') {
+    foreach ($n in 'SidebarW', 'ShowSidebar', 'Key_Close', 'Theme') {
         if ($null -ne $regSaved[$n]) { New-ItemProperty -Path $regKey -Name $n -Value ([int]$regSaved[$n]) -PropertyType DWord -Force | Out-Null }
         elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name $n -ErrorAction SilentlyContinue }
     }
@@ -1965,7 +1968,9 @@ try {
     Stop-Sandbox $s; $s = $null
     $pipe23 = 'ctlhonesty23'
     if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
-    foreach ($kv in @(@('SidebarW', 900), @('ShowSidebar', 1), @("WinX-$pipe23", 150), @("WinY-$pipe23", 100), @("WinW-$pipe23", 600), @("WinH-$pipe23", 600), @("WinMax-$pipe23", 0))) {
+    # Theme 1 = dark, for the #22 block below: the status bar is then painted by lite's own
+    # subclass, which reads each part's text back — that read was the second sink.
+    foreach ($kv in @(@('SidebarW', 900), @('ShowSidebar', 1), @('Theme', 1), @("WinX-$pipe23", 150), @("WinY-$pipe23", 100), @("WinW-$pipe23", 600), @("WinH-$pipe23", 600), @("WinMax-$pipe23", 0))) {
         New-ItemProperty -Path $regKey -Name $kv[0] -Value ([int]$kv[1]) -PropertyType DWord -Force | Out-Null
     }
     $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe $pipe23 -Width 600 -Height 600
@@ -1980,6 +1985,49 @@ try {
     $logLine = if (Test-Path $log23) { Get-Content $log23 | Where-Object { $_ -match 'sidebar width 900 leaves under 20 columns' } | Select-Object -First 1 }
     Check 'and the log says which value gave way, and that it was not saved' ([bool]$logLine -and $logLine -match 'not saved') "log: $log23`n$logLine"
     Check 'HKCU SidebarW is still 900: a narrow window does not overwrite the preference' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 900)
+
+    # ---- #22: a workspace name has no length limit, and `workspace delete` says what it did -----
+    # Neither product bounds a workspace name (agwinterm's is a C# string), so every sink must take
+    # what the API accepted: a ~100-character name through the tree label's wchar_t[96] was a
+    # stack overflow (0xC0000409) AFTER `workspace new` had answered ok, and the dark status
+    # painter's wchar_t[256] read of part 0 (the active workspace's name) was the second. This
+    # sandbox is dark (seeded above), so both painters run; the name is long enough for both.
+    # Only the length half of #22 is pinned here. The delete half (the verb answered "deleted"
+    # when the guard erased nothing) needs two deletes to pass the verb's own size check before
+    # one takes the lock — not stageable from a script; the last-workspace refusal below is the
+    # verb's pre-existing pre-check, asserted by its exact text so a re-route through the new
+    # index-gone message is caught.
+    "-- #22: a 299-character workspace name, in the tree and on the status bar --"
+    $longName = ('long-workspace-name-' * 15).TrimEnd('-')
+    Check 'setup: the name is 299 characters' ($longName.Length -eq 299)
+    $raw = Send-Ctl $s @('workspace', 'new', $longName)
+    $r = ConvertFrom-Json $raw
+    $wsL = [string]$r.result
+    Check 'workspace new with a 299-character name answers ok with an index' ([bool]$r.ok -and $wsL -match '^\d+$') "raw: $raw"
+    Start-Sleep -Milliseconds 800    # the posted tree refresh is where the old label buffer overflowed
+    $bar = [LiteHonesty]::FindWindowExW($s.Hwnd, [IntPtr]::Zero, 'msctls_statusbar32', $null)
+    Check 'setup: the status bar child was found' ($bar -ne [IntPtr]::Zero)
+    # `workspace new` made it active, so part 0 now carries the name; paint the bar now rather
+    # than waiting for a natural repaint of an occluded window.
+    # Guarded: InvalidateRect(NULL) redraws every window on the desktop, and a dead sandbox (the
+    # pre-fix state this block exists to catch) has no status bar to find.
+    if ($bar -ne [IntPtr]::Zero) { [void][LiteHonesty]::InvalidateRect($bar, [IntPtr]::Zero, $true); [void][LiteHonesty]::UpdateWindow($bar) }
+    Start-Sleep -Milliseconds 300
+    # A crashed sandbox answers `ping` with nothing, which ConvertFrom-Json throws on; that is the
+    # FAIL this block exists for, so it is caught and counted rather than aborting the suite.
+    function Alive { $pong = try { [bool](ConvertFrom-Json (Send-Ctl $s @('ping'))).ok } catch { $false }; return ($pong -and -not $s.Proc.HasExited) }
+    Check 'and the sandbox is alive after the tree refresh and a status-bar paint: ping answers and the process is running' (Alive) "exited: $($s.Proc.HasExited), exit code: $(if ($s.Proc.HasExited) { '0x{0:X8}' -f $s.Proc.ExitCode })"
+    $wsNode = (Tree).workspaces | Where-Object { [string]$_.id -eq $wsL } | Select-Object -First 1
+    Check 'and `tree` carries the whole name, untruncated' ($null -ne $wsNode -and [string]$wsNode.name -eq $longName) "name: $([string]$wsNode.name)"
+    $raw = Send-Ctl $s @('workspace', 'delete', '--target', $wsL)
+    $r = ConvertFrom-Json $raw
+    Check 'workspace delete of the long-named workspace answers deleted' ([bool]$r.ok -and [string]$r.result -eq 'deleted') "raw: $raw"
+    Start-Sleep -Milliseconds 500
+    Check 'and `tree` no longer lists it' (-not ((Tree).workspaces | Where-Object { [string]$_.name -eq $longName }))
+    $raw = Send-Ctl $s @('workspace', 'delete', '--target', '0')
+    $r = ConvertFrom-Json $raw
+    Check 'deleting the last workspace is refused, not answered deleted' (-not $r.ok -and [string]$r.error -eq 'cannot delete the last workspace') "raw: $raw"
+    Check 'and the sandbox is still alive' (Alive)
 }
 finally {
     if ($s) { Stop-Sandbox $s }
