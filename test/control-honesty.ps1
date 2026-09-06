@@ -115,6 +115,34 @@ public static class LiteHonesty {
         finally { if (attached) AttachThreadInput(me, fgThread, false); }
         return GetForegroundWindow() == h;
     }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr addr, UIntPtr size, uint type, uint prot);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool VirtualFreeEx(IntPtr p, IntPtr addr, UIntPtr size, uint type);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr p, IntPtr addr, byte[] buf, UIntPtr size, out UIntPtr read);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    // The text of one part of a status bar in ANOTHER process. SB_GETTEXTW writes into a buffer
+    // the bar's process can address, so one is allocated there for the call and read back; the
+    // length comes from SB_GETTEXTLENGTHW (LOWORD), which needs no buffer. Null when the process
+    // could not be opened or the allocation failed - a check reading null fails, it does not pass.
+    public static string StatusPart(IntPtr bar, int part) {
+        uint pid = PidOf(bar);
+        if (pid == 0) return null;
+        IntPtr p = OpenProcess(0x0038 /* VM_OPERATION | VM_READ | VM_WRITE */, false, pid);
+        if (p == IntPtr.Zero) return null;
+        try {
+            int len = (int)(SendMessageW(bar, 0x040C /* SB_GETTEXTLENGTHW */, (IntPtr)part, IntPtr.Zero).ToInt64() & 0xFFFF);
+            UIntPtr size = (UIntPtr)(uint)((len + 1) * 2);
+            IntPtr mem = VirtualAllocEx(p, IntPtr.Zero, size, 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 0x04 /* PAGE_READWRITE */);
+            if (mem == IntPtr.Zero) return null;
+            try {
+                SendMessageW(bar, 0x040D /* SB_GETTEXTW */, (IntPtr)part, mem);
+                byte[] buf = new byte[len * 2]; UIntPtr got;
+                if (len > 0 && !ReadProcessMemory(p, mem, buf, (UIntPtr)(uint)buf.Length, out got)) return null;
+                return System.Text.Encoding.Unicode.GetString(buf);
+            } finally { VirtualFreeEx(p, mem, UIntPtr.Zero, 0x8000 /* MEM_RELEASE */); }
+        } finally { CloseHandle(p); }
+    }
 }
 '@
 
@@ -573,6 +601,12 @@ try {
     $cols1 = ActiveCols
     $wantCols = [math]::Floor(($mainClient[0] - 300 - 5) / $cw)
     Check "and the content region moved: the active session's cols shrank by ~120/cw" ($cols1 -lt $cols0 -and [math]::Abs($cols1 - $wantCols) -le 1) "cols $cols0 -> $cols1, cell ~$cw px, want ~$wantCols"
+    # #25: the status bar's third part is "cols x rows" of the active pane, and it used to be
+    # rewritten only by a tree refresh - a layout change (this one, a splitter drag, WM_SIZE) left
+    # the number of the LAST refresh on the bar. Read cross-process from the bar itself.
+    $bar = [LiteHonesty]::FindWindowExW($s.Hwnd, [IntPtr]::Zero, 'msctls_statusbar32', $null)
+    $part2 = [LiteHonesty]::StatusPart($bar, 2)
+    Check "and the status bar's cols x rows follows the new grid (#25)" ($null -ne $part2 -and $part2 -match "^$cols1 \S+ \d+$") "part 2: '$part2', tree cols $cols1"
     Check 'and HKCU SidebarW was persisted' ((Get-ItemProperty -Path $regKey -Name SidebarW).SidebarW -eq 300)
 
     # --- out of range is refused naming the range, and the divider did not move -----------------
@@ -593,6 +627,9 @@ try {
     Start-Sleep -Milliseconds 1200
     $narrow = ClientSize $s.Hwnd
     Check 'setup: the window is ~700 px wide' ($narrow[0] -lt 720 -and $narrow[0] -gt 600) "client $($narrow -join 'x')"
+    $colsN = ActiveCols
+    $part2 = [LiteHonesty]::StatusPart($bar, 2)
+    Check "and after the window resize the status bar's cols x rows is the new grid, not 300-sidebar's (#25)" ($colsN -lt $cols1 -and $null -ne $part2 -and $part2 -match "^$colsN \S+ \d+$") "part 2: '$part2', tree cols $cols1 -> $colsN"
     $raw = SidebarWidthSet '600'
     $r = ConvertFrom-Json $raw
     Check 'sidebar width 600 in a 700-px window is refused for the content minimum' (-not $r.ok -and [string]$r.error -match '600' -and [string]$r.error -match '20-column' -and [string]$r.error -match 'Nothing changed') "raw: $raw"

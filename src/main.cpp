@@ -1020,6 +1020,7 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
 #define WM_APP_PANEEXIT    (WM_APP + 10)  // reader thread -> UI thread: a shell hit EOF (lParam = Session*); a split side collapses to its survivor (P4)
+#define WM_APP_UPDATESTATUS (WM_APP + 11) // any thread -> UI thread: a pane's grid changed; redraw the status bar's cols x rows (lite #25)
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
@@ -1761,9 +1762,19 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
             return;
         }
     }
-    LockG hold;
-    s->resizeRefusals = 0;   // the host took it: the next refusal starts its own backoff
-    emu_resize(s->emu, cols, rows);
+    {
+        LockG hold;
+        s->resizeRefusals = 0;   // the host took it: the next refusal starts its own backoff
+        emu_resize(s->emu, cols, rows);
+    }
+    // The status bar's "cols x rows" is written by updateStatus, whose only other caller is
+    // refreshTree — nothing on the layout path (WM_SIZE, a splitter drag, `sidebar width`) rebuilt
+    // the tree, so the number stayed the grid of the last tree refresh (lite #25). Posted, not
+    // called: this runs on pipe threads too (syncPaneSizes from session.select / split), and
+    // updateStatus sends to the status bar and takes g_lock — UI thread only, like refreshTree.
+    // One post per grid change that the host accepted; the no-change and refused paths above
+    // never reach here, so a drag that lands on the same grid posts nothing.
+    PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
 
 // Fit each shown pane's session to its rect. A pane with no viable rect (paneGridSize) is left
@@ -6151,6 +6162,7 @@ public:
         MESSAGE_HANDLER(WM_SYSKEYDOWN, OnKey)
         MESSAGE_HANDLER(WM_SETCURSOR, OnSetCursor)
         MESSAGE_HANDLER(WM_APP_REFRESHTREE, OnRefreshTree)
+        MESSAGE_HANDLER(WM_APP_UPDATESTATUS, OnUpdateStatus)
         MESSAGE_HANDLER(WM_APP_TRAY, OnTray)
         MESSAGE_HANDLER(WM_APP_OVERLAY, OnOverlay)
         MESSAGE_HANDLER(WM_APP_UPDATE, OnAppUpdate)
@@ -6483,6 +6495,7 @@ public:
         if (g_toolbar) ::InvalidateRect(g_toolbar, nullptr, FALSE);   // bell re-reads anyBlocked()
         return 0;
     }
+    LRESULT OnUpdateStatus(UINT, WPARAM, LPARAM, BOOL&) { updateStatus(); return 0; }   // hostResize's post (lite #25)
     LRESULT OnTray(UINT, WPARAM, LPARAM lp, BOOL&) {
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) showTrayMenu();
         else if (LOWORD(lp) == WM_LBUTTONDBLCLK) showMainWindow();
