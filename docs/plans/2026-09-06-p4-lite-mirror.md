@@ -264,24 +264,30 @@ Copied, not re-decided, from the agwinterm plan:
 ## Implementation Steps
 
 ### Task 1: the two fields, the slot map, and `session split` that honours its target
-- [ ] `Session::paneId` (set in `newSession` beside `id`, never written again), `Session::horizontal`
+- [x] `Session::paneId` (set in `newSession` beside `id`, never written again), `Session::horizontal`
       (bool; the two words at the wire through two helpers `axisWord(const Session*)` /
       `parseAxis(const std::string&, bool* out)`), `Session::swapped` (bool). A comment beside
       `horizontal` states the vocabulary once (the sentence in this plan's vocabulary section).
-- [ ] `slotOf(pane)` / `paneOfSlot(slot)` on the displayed owner: `swapped ? 1 - x : x`. `paneRect`
+- [x] `slotOf(pane)` / `paneOfSlot(slot)` on the displayed owner: `swapped ? 1 - x : x`. `paneRect`
       takes a PANE (owner = 0, split = 1) as today and computes the rect of its SLOT on the owner's
       axis; the divider in `paint` is drawn on the axis; `hitTest` maps a point to the pane in that
       slot. Everything else follows through `paneRect`.
-- [ ] `session split`: resolve `--target` (a hidden shell → its owner via the `splitId` walk; a
+- [x] `session split`: resolve `--target` (a hidden shell → its owner via the `splitId` walk; a
       cover refused with the `restore.capture` wording; unknown refused); `--axis` parsed before
       anything happens (refused naming both words, nothing split); `op` validated (`on|off|toggle`
       exact — an unknown op is refused, not a toggle, agwinterm's `OpRefusal` sentence); `on` on a
       split session with `--axis` re-orients live; the unsplit runs inline on the UI thread through
       the Task 2 primitive and answers the survivor's `paneId`; `on` answers slot 1's `paneId`.
-- [ ] `tree`: the split block (`paneCount`, `paneIds` in slot order, `focusedPane` as a slot,
+- [x] `tree`: the split block (`paneCount`, `paneIds` in slot order, `focusedPane` as a slot,
       `axis`), `active` and the sidebar highlight fixed for a focused split; `session closed` /
       `tree` events as the constraints say.
-- [ ] `session focus` (new verb) + the two keybindings / palette rows slot-based.
+- [x] `session focus` (new verb) + the two keybindings / palette rows slot-based.
+      ➕ Task 1 notes: the two rows are KEPT (Key_FocusL / Key_FocusR unchanged, so bindings survive),
+      relabelled "Focus Left / Top Pane" (slot 0) and "Focus Right / Bottom Pane" (slot 1) — named
+      for both axes rather than relabelled live; the README sentence lands with Task 5. The unsplit
+      is `unsplitSession(owner)` (a `tree` event, no `ClosedSpec`, no `session closed`), which Task 2
+      folds into `closeSplitSide`. The honesty block `-- P4: splits --` and the `$cliHasP4` probe
+      (`session swap x` → "Nothing sent") are in; Tasks 2/3/5 extend the block.
 
 ### Task 2: one primitive closes either side
 - [ ] `closeSplitSide(Session* owner, bool closeOwner)` on the UI thread: `closeOwner == false` is
