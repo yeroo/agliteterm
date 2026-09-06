@@ -9,8 +9,10 @@ its owner, and it comes back with its owner after a restart, on the same axis an
 
 **The words:** a SLOT is a position (slot 0 = left/top, slot 1 = right/bottom), an ID is a shell.
 `session swap` exchanges the slots and nothing else. A session id names the session's own shell
-while it exists; when that shell is closed the survivor becomes the session (same id, name, flag,
-context, sidebar row) and keeps its own pane id.
+while it exists; whenever that shell is the one that closes the survivor becomes the session (same
+id, name, flag, context, sidebar row) and keeps its own pane id — the rule in full, with its one
+exception (a kill-and-relaunch brings a promoted session back under its shell's id), is the
+plan's vocabulary section (`docs/plans/completed/2026-09-06-p4-lite-mirror.md`).
 
 Setup for every case: sandbox instance per `qa/product.md`.
 

@@ -2459,10 +2459,12 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         victim->splitId.clear();
         int vi = indexOfSession(victim);
         g_sessions.erase(g_sessions.begin() + vi);
-        if (displayed) {
-            g_pane[1] = -1; g_focus = 0;
-            if (g_sel.sess == survivor) g_sel.pane = 0;   // a promoted survivor's selection was in pane 1, which is gone (killSession clears the victim's)
-        }
+        // A promoted survivor's selection was in pane 1, which is gone: it comes back at pane 0 or it
+        // never shows again (killSession clears the victim's). Keyed on the pointer, NOT on `displayed`:
+        // g_sel is per-session and survives a switch, so an off-screen promotion over the pipe has the
+        // same stale slot to fix (revmux r2).
+        if (g_sel.sess == survivor) g_sel.pane = 0;
+        if (displayed) { g_pane[1] = -1; g_focus = 0; }
         for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
         emitEvent("tree");
     }
@@ -7135,18 +7137,27 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
 //
 // -1 when nothing resolves — a closed pane, a script run from an unrelated shell, the conformance
 // runner (which scrubs the env) — and the verb falls back rather than refusing: a working script
-// must not break to fix a preference. A hidden session (quick / scratch / overlay) also answers -1:
+// must not break to fix a preference. A hidden cover (quick / scratch / overlay) also answers -1:
 // lite gives those the workspace that happened to be active when they were made, which is not a
 // workspace the caller can see in `tree`, so "the caller's workspace" has no honest answer there.
+//
+// The caller is a SHELL's id — the env is stamped once, at the shell's birth — so it is matched
+// like resolveTarget's id arm: by `id`, then by `paneId`. Two shells hold an id that is no node's
+// `id` (revmux r2): a split shell (hidden, its owner's row is the one the caller sees — the owner's
+// workspace is the answer, not -1) and a promoted survivor (its `id` is the closed shell's; its env
+// holds its pane id, which only the `paneId` arm finds).
 static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nullptr) {
     if (caller.empty() || caller == "active") return -1;   // "active" is a target word, never an id
     LockG hold;   // the list and s->ws change under g_lock on other threads (see `tree`)
     Session* hit = nullptr;
     for (Session* s : g_sessions)
-        if (s->id == caller) { hit = s; break; }
+        if (s->id == caller || s->paneId == caller) { hit = s; break; }
     if (!hit && caller.size() >= 4)
         for (Session* s : g_sessions)
-            if (s->id.compare(0, caller.size(), caller) == 0) { hit = s; break; }
+            if (s->id.compare(0, caller.size(), caller) == 0 ||
+                s->paneId.compare(0, caller.size(), caller) == 0) { hit = s; break; }
+    if (hit && hit->hidden)   // a split shell answers with its owner; a cover has no owner and stays -1
+        for (Session* o : g_sessions) if (!o->hidden && o->splitId == hit->id) { hit = o; break; }
     if (!hit || hit->hidden) return -1;
     if (hit->ws < 0 || hit->ws >= (int)g_workspaces.size()) return -1;
     if (nameOut) *nameOut = g_workspaces[hit->ws];   // the identity, for the re-find after the create
@@ -7255,7 +7266,8 @@ You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteter
   keeps the id of the shell that closed, so in the surviving shell `AGWINTERM_SESSION_ID` names
   the SHELL, not the session - `tree --json` has no node with that `id`. `--target` accepts it
   either way (a pane id reaches its session). An agent that needs its own session id reads the
-  `tree` node whose `paneIds` contains `$AGWINTERM_PANE_ID`, or whose `id` equals it
+  `tree` node whose `id` equals `$AGWINTERM_PANE_ID` or whose `paneIds` contains it - a promoted
+  session's node carries `paneIds` (`[<its shell's id>]`) for exactly this lookup
 - `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
 
 The variables keep the `AGWINTERM_` prefix on purpose: the same hooks and scripts work in both
@@ -7337,8 +7349,10 @@ all for sending keys.
 A session has at most TWO panes, and in lite each pane is a shell with its own id. The split shell
 is hidden: it has no node of its own in `tree`, no sidebar row and no name, so its id is the only
 handle on it. A split session's node carries the split block - `paneCount: 2`, `paneIds` (slot
-order), `focusedPane` (a slot) and `axis` - and a single session carries none of the four. The
-split belongs to that session: switch to another session and the second pane shows that one's
+order), `focusedPane` (a slot) and `axis` - and a single session carries none of the four, with
+one exception: a promoted session (its own shell closed, the survivor became it) is single but
+its pane id is not its `id`, so its node carries `paneIds` alone - `[<its shell's id>]`, the
+one id `--target` reaches it by besides the session id. The split belongs to that session: switch to another session and the second pane shows that one's
 split, or none at all. It closes with its owner and comes back with it after a restart.
 
 The words (agterm's): **`vertical` = left/right panes** - the default of a session never split -
@@ -7719,6 +7733,15 @@ static std::string ctlDispatch(const std::string& line) {
                 // focusedPane. A session not on screen has no live focus in lite, and selecting it
                 // focuses its own shell (selectPrimary), so that is the slot reported for it.
                 if (sh) sess += ",\"paneCount\":2," + splitBlockFields(s, sh, i2);
+                // A PROMOTED single session (its own shell closed; the survivor became it, keeping
+                // its own pane id) is the one node whose pane id is not its `id`: it carries
+                // `paneIds` alone — `[<its shell's id>]`, no paneCount / focusedPane / axis, there
+                // is no split — so the shell's own agent can find its session (the skill's env-ids
+                // bullet: the node whose `paneIds` contains $AGWINTERM_PANE_ID). Lite-only state,
+                // lite-only key: agwinterm has no promotion, and in every state it can be in the node
+                // shape is agwinterm's. `paneIds` is present exactly when the session's pane ids are
+                // not simply [id] (revmux r2).
+                else if (s->paneId != s->id) sess += ",\"paneIds\":[\"" + jsonEscape(s->paneId) + "\"]";
                 sess += "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +

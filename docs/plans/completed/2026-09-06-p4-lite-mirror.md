@@ -139,7 +139,8 @@ Copied, not re-decided, from the agwinterm plan:
   hidden target explicitly.
 - Ids: minted in `newSession` `:1980-1985` (`<prefix>-<seq>`); the shell env sets
   `AGWINTERM_SESSION_ID` AND `AGWINTERM_PANE_ID` to the same value (`:2050-2051`, re-stamped on
-  adoption `:2066-2067`; the skill says so `:6944-6947`). Ids are NOT stable across a graceful
+  the id-collision retry inside `newSession` `:2066-2067` — never on adoption: an adopted shell is
+  a running process whose environment is never rewritten; the skill says so `:6944-6947`). Ids are NOT stable across a graceful
   restart (`test/restore-matrix.ps1:117-121`); the `P` line carries no id (`:8414`); split shells
   are recreated, never adopted (`:8691-8710`).
 - `tree` `:7270-7338`: hidden skipped `:7282`; `active` = `g_pane[g_focus] == i2` (`:7288` — with
@@ -470,7 +471,7 @@ shell orphaned in the host). Both fixed by using `paneId` — and the second one
 consequence now: after a kill-restart a promoted session comes back under its shell's id (the
 rule above, `docs/state-file.md`, the skill). The Constraints' site list said "every site that
 hands a shell's identity to the pty-host" and the audit missed the two that do it indirectly
-(through the state file, and through a snapshot). Nine Minors, seven fixed: the live
+(through the state file, and through a snapshot). Eight Minors, all fixed: the live
 re-orientation never scheduled a save (a kill lost the new axis); a promotion left `g_sel.pane`
 at 1 (the survivor's selection invisible and its cursor suppressed); the skill's env-ids bullet
 said the two variables "part" after a promotion — nothing rewrites a shell's environment, they
@@ -480,13 +481,37 @@ rule stated by a list of four paths in the skill / README / this plan where `tog
 now by condition everywhere); "Close Session" on the close chord, palette and File menu when it
 closes a PANE on a split (agwinterm's "Close Pane / Session"; the sidebar row keeps "Close
 Session" and closes the session); README's "which `off` and the close chord could not" (the
-chord can, since P4); "set once in `newSession`" → `attachSession`. Left as recorded: the
-concurrent-`split on` race on `splitId` (pre-existing, both paths take the same shape as
-before); `atoi` on the `L` owner index (the file's convention for every positional line —
-P, C, K, O, A — not new). New checks: honesty — the re-orientation is saved (the `L` line gone
+chord can, since P4); "set once in `newSession`" → `attachSession`. Left as the round filed
+them, neither a Minor: the concurrent-`split on` race on `splitId` (Pre-existing — both paths
+take the same shape as before); `atoi` on the `L` owner index (Immaterial — the file's
+convention for every positional line, P, C, K, O, A). New checks: honesty — the re-orientation is saved (the `L` line gone
 after a return to vertical), `restore capture` on a promoted session (targeted and untargeted,
 the pane under its own id), the `D` line names the survivor's shell; matrix — `axis-relive-killed`
 and `promote-killed` (adopted by the shell's id, the marker back, the id after = the shell's).
+
+**What revmux round 2 found** (`02-after-fix`, the r1 fix commit `bfcf671`): no Major. Five
+Minors, two Pre-existing, all fixed. The one worth the next batch's attention: the skill's new
+lookup recipe ("the node whose `paneIds` contains `$AGWINTERM_PANE_ID`, or whose `id` equals it")
+could not work for the promoted session it was written for — a promoted session is single, so its
+node carried no `paneIds`, and its `id` is the closed shell's. The r1 fix stated a recipe without
+running it. Fixed at the source, not in the prose: a promoted session's node now carries `paneIds`
+alone (`[<its shell's id>]`, no `paneCount`) — `paneIds` is present exactly when the session's pane
+ids are not simply `[id]`; a lite-only key in a lite-only state, so in every state agwinterm can be
+in the node shape is still agwinterm's. The same shape once more, in `callerWorkspace`
+(pre-existing since P2's caller rule): the caller of `session new` is a SHELL's id, and two shells
+hold an id that is no node's `id` — a split shell (hidden; it now answers with its owner's
+workspace) and a promoted survivor (found by the `paneId` arm now) — both used to fall through to
+the active workspace. The rest: the `g_sel.pane` reset sat inside `if (displayed)` — the selection
+is per-session and survives a switch, so an off-screen promotion over the pipe still stranded it
+(moved out, keyed on the survivor pointer); the r1 note above said "nine Minors, seven fixed" for
+eight and eight; the PR body still carried the four-path rule and `newSession`; `qa/panes.md`'s
+rule sentence now points at the vocabulary section for the exception; the Constraints' "re-stamped
+on adoption" named the id-collision retry (nothing rewrites a running shell's environment); the
+re-orientation honesty check asserted only that the `L` line was gone, never that it had been there
+(present asserted after the horizontal split now). New checks: a plain single node has no
+`paneIds`; the promoted node's `paneIds` is `[survivor]` with no `paneCount`; a bare `session new`
+from the split shell and from the promoted survivor lands in the session's workspace with another
+one active.
 
 ## Technical Details
 

@@ -122,7 +122,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   [primary|split|left|right|top|bottom|other]` moves between the panes, the pair that does not
   exist on the axis refused naming it. A split session's `tree` node carries the block —
   `paneCount`, `paneIds` in slot order, `focusedPane`, `axis` — and a single one carries none of
-  it; every structural change emits `tree`. The session-id rule: a session id names the session's
+  it, except that a promoted session's node carries `paneIds` alone (`[<its shell's id>]` — the
+  one single session whose pane id is not its `id`); every structural change emits `tree`. The session-id rule: a session id names the session's
   own shell while it exists; **whenever that shell is the one that closes** — whatever closed it:
   `split close` on it, the close chord on it, `split off` / `toggle` / the Split key or menu row
   after a swap (slot 1 is the owner then), or its process exiting — the survivor **becomes the

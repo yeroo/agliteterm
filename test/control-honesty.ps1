@@ -1528,6 +1528,7 @@ try {
         $n0 = Node $aid
         $c0 = [int]$n0.cols; $r0 = [int]$n0.rows
         Check 'setup: one active single-pane session with a real grid, and no split block on it' ([bool]$aid -and $c0 -ge 20 -and $r0 -ge 10 -and (SplitBlock $aid) -eq '') "active $aid ${c0}x${r0} block '$(SplitBlock $aid)'"
+        Check 'and no paneIds either: a single session whose pane id IS its id names no pane' (-not (Node $aid).PSObject.Properties['paneIds'])
         # Validation before anything happens: the axis, the op (raw — the CLI refuses it first), the target.
         $raw = Send-Ctl $s @('session', 'split', 'on', '--axis', 'diagonal', '--target', $aid)
         $r = ConvertFrom-Json $raw
@@ -1564,6 +1565,14 @@ try {
         Check 'and its pane has about half the rows at the full width: the axis, read off the grid' ([int]$n1.cols -eq $c0 -and (HalfOf ([int]$n1.rows) $r0)) "grid $($n1.cols)x$($n1.rows), single was ${c0}x${r0}"
         Check 'the split emitted a tree event' ((EvSince $cur 'tree') -ge 1)
         Check 'the split shell has no node of its own' ($null -eq (Node $sid))
+        # ... and the axis was SAVED: a horizontal split writes an L line (vertical unswapped is the
+        # default and writes none). Asserted present here so the "gone" check after the live
+        # re-orientation below is a change, not a starting state (revmux r2).
+        $p4State = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
+        function LLines { @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "L`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
+        $lHoriz = $false
+        foreach ($i in 1..20) { if (@(LLines | Where-Object { $_ -match "^L`t\d+`thorizontal`t0$" }).Count -eq 1) { $lHoriz = $true; break }; Start-Sleep -Milliseconds 250 }
+        Check 'the horizontal split was saved: one L line, horizontal, unswapped' $lHoriz "L lines: $((LLines) -join ' / ')"
         $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $aid)
         Check 'split on when already split answers the slot-1 pane id and changes nothing' ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|horizontal") "raw: $raw, block '$(SplitBlock $aid)'"
         $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $sid)
@@ -1599,9 +1608,7 @@ try {
         Check 'the re-orientation emitted a tree event' ((EvSince $cur 'tree') -ge 1)
         # ... and SAVED (revmux r1: the re-orient arm changed the field and emitted, but never
         # scheduled the save every other split mutation schedules, so a kill lost the new axis).
-        # Horizontal wrote an L line; vertical unswapped is the default and writes none.
-        $p4State = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
-        function LLines { @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "L`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
+        # Horizontal wrote an L line (asserted present above); vertical unswapped is the default and writes none.
         $gone = $false
         foreach ($i in 1..20) { if (@(LLines).Count -eq 0) { $gone = $true; break }; Start-Sleep -Milliseconds 250 }
         Check 'the re-orientation was saved: the horizontal L line is gone from the state file' $gone "L lines: $((LLines) -join ' / ')"
@@ -1695,6 +1702,9 @@ try {
         Check "split close --target <session id> closes the session's OWN shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid) "raw: $raw"
         Check 'the promotion: the node keeps the session id, its split block is gone, the pane is at the full width' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and $null -eq (Node $sid) -and [int](Node $aid).cols -eq $c0 -and (NodeCount) -eq $before) "block '$(SplitBlock $aid)' cols $((Node $aid).cols) nodes $(NodeCount)"
         Check 'the survivor answers session text under the session id AND under its own pane id' (((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $sid) -match 'p4-mk-split-1')) "by session id: $(Get-PaneText $s $aid)"
+        # The one single node whose pane id is not its `id`: it carries paneIds alone, so the
+        # survivor's own agent can find its session (the skill's env-ids recipe; revmux r2).
+        Check "the promoted node names its shell: paneIds [the survivor's pane id], and no paneCount" ((@((Node $aid).paneIds) -join ',') -eq $sid -and -not (Node $aid).PSObject.Properties['paneCount']) "node: $((Node $aid) | ConvertTo-Json -Compress)"
         Check "and the closed shell is gone: its marker is nowhere" (-not ((Get-PaneText $s $aid) -match 'p4-mk-owner-1'))
         Check 'a promotion is not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0) "tree $(EvSince $cur 'tree') session $(EvSince $cur 'session')"
         Check 'the node is active, its survivor focused, not marked exited' ([bool](Node $aid).active -and -not [bool](Node $aid).exited)
@@ -1702,6 +1712,32 @@ try {
         # A later `split on` mints a fresh pane id beside the survivor's own: paneIds [survivor, new].
         $sid2 = SplitOn
         Check "a later split on mints a fresh pane id: paneIds [the survivor's own, new], focus on slot 0" ([bool]$sid2 -and $sid2 -ne $sid -and $sid2 -ne $aid -and (SplitBlock $aid) -eq "2|$sid,$sid2|0|vertical") "block '$(SplitBlock $aid)'"
+        # The caller of `session new` is a SHELL's id (its env, stamped at birth): a split shell's,
+        # which is hidden, and a promoted survivor's, which is no node's `id`. Both used to fall
+        # through to the active workspace (revmux r2, pre-existing); both resolve to the session's.
+        if ($cliSendsCaller) {
+            $homeWs = WsOf $aid
+            $otherWs = [string]((Tree).workspaces | Where-Object { [string]$_.id -ne $homeWs } | Select-Object -First 1).id
+            Send-Ctl $s @('workspace', 'select', '--target', $otherWs) | Out-Null
+            Start-Sleep -Milliseconds 500
+            Check 'setup: another workspace is active, the split session is not in it' ([bool]$otherWs -and (ActiveWs) -eq $otherWs -and $homeWs -ne $otherWs) "active $(ActiveWs), home $homeWs"
+            $raw = Send-CtlAs $sid2 @('session', 'new', '--name', 'from-split-shell')
+            $cs = [string](ConvertFrom-Json $raw).result
+            Check "a bare session new from the SPLIT shell lands in its owner's workspace, not the active one" ([bool]$cs -and (Wait-Node $cs) -and (WsOf $cs) -eq $homeWs) "raw: $raw, ws $(WsOf $cs), wanted $homeWs"
+            $raw = Send-CtlAs $sid @('session', 'new', '--name', 'from-promoted-shell')
+            $cp = [string](ConvertFrom-Json $raw).result
+            Check "a bare session new from the PROMOTED survivor (its env holds its pane id, no node's id) lands in its session's workspace" ([bool]$cp -and (Wait-Node $cp) -and (WsOf $cp) -eq $homeWs) "raw: $raw, ws $(WsOf $cp), wanted $homeWs"
+            foreach ($c in @($cs, $cp)) { if ($c) { Send-Ctl $s @('session', 'close', '--target', $c) | Out-Null } }
+            # `session select` shows a session; it never moves "active" (selectPrimary sets the
+            # displayed slot, not g_ws), so the workspace is put back explicitly, as the caller
+            # section above does.
+            Send-Ctl $s @('workspace', 'select', '--target', $homeWs) | Out-Null
+            Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+            Start-Sleep -Milliseconds 800
+            Check 'setup: back on the split session, its workspace active, the node count as before' ((ActiveWs) -eq $homeWs -and [bool](Node $aid).active -and (NodeCount) -eq $before) "active $(ActiveWs) (home $homeWs), node active $((Node $aid).active), nodes $(NodeCount) vs $before"
+        } else {
+            Skip 'a bare `session new` from a split shell / a promoted survivor lands in its session''s workspace' 'this agwintermctl predates agwinterm #226 and never sends `caller`'
+        }
         # The symmetric close: the split shell by its own id; the promoted shell survives again.
         $cur = Cursor
         $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $sid2)
