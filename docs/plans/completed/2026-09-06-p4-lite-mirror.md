@@ -40,10 +40,14 @@ Copied, not re-decided, from the agwinterm plan:
 - **THE SESSION-ID RULE, by condition** (agwinterm `ISessionHost.SplitClose`, quoted here in
   lite's terms and nowhere else in full — every other site points here): a session id names the
   session's own shell (the owner's — pane 0 of a fresh session; after a swap, whichever slot it sits
-  in) while that shell exists; when that shell is closed — by `split close` on it, by the close
-  chord on it while focused, by `split off` after a swap (slot 1 is the owner then), or by its
-  process exiting — the surviving shell becomes the session (it keeps the session id, name,
-  workspace, flag, context and sidebar row; it keeps ITS OWN pane id) and the session id names it.
+  in) while that shell exists; WHENEVER that shell is the one that closes — whatever closed it:
+  `split close` on it, the close chord on it while focused, any slot-1 close after a swap (`split
+  off`, `toggle`, a bare `session split`, the Split / Unsplit key, menu and palette rows — slot 1
+  is the owner then), or its process exiting — the surviving shell becomes the session (it keeps
+  the session id, name, workspace, flag, context and sidebar row; it keeps ITS OWN pane id) and the
+  session id names it. The one thing a promotion does not survive is a KILL-and-relaunch: the `D`
+  line records shells (`paneId`), the survivor is adopted by its shell's id and comes back under
+  it (revmux r1).
   A later `split on` mints a fresh pane id for the new hidden shell. **Lite's one difference from
   agwinterm's sentence**: agwinterm's session id names the FOCUSED pane while no pane carries it;
   lite has no per-session pane resolution — a session id always names the session's own shell, the
@@ -187,7 +191,7 @@ Copied, not re-decided, from the agwinterm plan:
   `1`, anything else → 0; an `L` for an owner with no `P` line is dropped (named in the log); the
   wholesale count guard cloned once more.
 - **Pane ids never move** — by a split, a close, a swap, or a promotion. `Session::paneId` is set
-  once in `newSession` (= `id`) and never written again; a promotion writes `id`, never `paneId`.
+  once in `attachSession` (= `id`; `newSession` reaches it by create-then-attach, restore's adoption calls it directly — a failed-spec placeholder has neither) and never written again; a promotion writes `id`, never `paneId`.
   Sites that report a PANE (the split reply, `restore.capture`'s `panes[].pane`, `capturedCommands`
   keys, `paneIds`, the events that name a pane) use `paneId`; sites that report a SESSION (the tree
   node's `id`, `session` in replies, `session closed` events) use `id`. `resolveTarget` matches
@@ -264,7 +268,7 @@ Copied, not re-decided, from the agwinterm plan:
 ## Implementation Steps
 
 ### Task 1: the two fields, the slot map, and `session split` that honours its target
-- [x] `Session::paneId` (set in `newSession` beside `id`, never written again), `Session::horizontal`
+- [x] `Session::paneId` (set in `attachSession` beside `id`, never written again), `Session::horizontal`
       (bool; the two words at the wire through two helpers `axisWord(const Session*)` /
       `parseAxis(const std::string&, bool* out)`), `Session::swapped` (bool). A comment beside
       `horizontal` states the vocabulary once (the sentence in this plan's vocabulary section).
@@ -454,6 +458,35 @@ Copied, not re-decided, from the agwinterm plan:
       `docs/plans/completed/2026-09-05-p3-lite-mirror.md` carries its two. No round has run yet at
       the time of this line — the item is satisfied by that routine, not by a round that already
       happened.)
+
+**What revmux round 1 found** (`.revmux/tasks/p4-lite-mirror/01-initial`, full branch at
+`57d4abc`): two Majors, both the same shape — a pre-P4 site that used `id` where the shell's id
+was meant, harmless while the two were equal and wrong for a promoted session, the one object
+whose `id` and `paneId` differ: (1) `restore capture`'s stale-entry re-check compared the
+snapshot's pane id against `s->id`, so every promoted session was silently dropped (a targeted
+capture answered `captured 0, panes []`); (2) the `D` line wrote `s->id`, so a relaunch after a
+kill could not adopt a promoted session's shell (it relaunched a fresh one and left the live
+shell orphaned in the host). Both fixed by using `paneId` — and the second one is a documented
+consequence now: after a kill-restart a promoted session comes back under its shell's id (the
+rule above, `docs/state-file.md`, the skill). The Constraints' site list said "every site that
+hands a shell's identity to the pty-host" and the audit missed the two that do it indirectly
+(through the state file, and through a snapshot). Nine Minors, seven fixed: the live
+re-orientation never scheduled a save (a kill lost the new axis); a promotion left `g_sel.pane`
+at 1 (the survivor's selection invisible and its cursor suppressed); the skill's env-ids bullet
+said the two variables "part" after a promotion — nothing rewrites a shell's environment, they
+stay equal and `AGWINTERM_SESSION_ID` names the shell then; three "right-hand" comments; the
+rule stated by a list of four paths in the skill / README / this plan where `toggle`, a bare
+`session split` and the Split key reach the same state (agwinterm r3's Major, the same class —
+now by condition everywhere); "Close Session" on the close chord, palette and File menu when it
+closes a PANE on a split (agwinterm's "Close Pane / Session"; the sidebar row keeps "Close
+Session" and closes the session); README's "which `off` and the close chord could not" (the
+chord can, since P4); "set once in `newSession`" → `attachSession`. Left as recorded: the
+concurrent-`split on` race on `splitId` (pre-existing, both paths take the same shape as
+before); `atoi` on the `L` owner index (the file's convention for every positional line —
+P, C, K, O, A — not new). New checks: honesty — the re-orientation is saved (the `L` line gone
+after a return to vertical), `restore capture` on a promoted session (targeted and untargeted,
+the pane under its own id), the `D` line names the survivor's shell; matrix — `axis-relive-killed`
+and `promote-killed` (adopted by the shell's id, the marker back, the id after = the shell's).
 
 ## Technical Details
 

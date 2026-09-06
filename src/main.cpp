@@ -354,7 +354,7 @@ struct Session {
     // context never enters the label. The rules are contextRefusal's (agwinterm's SessionContexts).
     std::wstring context;
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
-    // The id of THIS session's right-hand terminal, empty when it has none. A split belongs to the
+    // The id of THIS session's split shell (slot 0 or 1 by its layout, see paneRect), empty when it has none. A split belongs to the
     // session, not to the window: switching sessions shows that session's split (or no split), the
     // way panes work in the full app. Held by id rather than index because g_sessions shifts under
     // every close. Only a visible session owns one; the shell it names is hidden.
@@ -957,7 +957,7 @@ enum { KB_NEW, KB_NEWWS, KB_CLOSE, KB_SPLIT, KB_NEXT, KB_PREV, KB_COPY, KB_PASTE
 struct KbInfo { const wchar_t* label; const wchar_t* reg; };
 static const KbInfo kKbInfo[KB_COUNT] = {
     { L"New Session",      L"Key_New" },     { L"New Workspace",    L"Key_NewWs" },
-    { L"Close Session",    L"Key_Close" },   { L"Split / Unsplit",  L"Key_Split" },
+    { L"Close Pane / Session", L"Key_Close" }, { L"Split / Unsplit",  L"Key_Split" },
     { L"Next Session",     L"Key_Next" },    { L"Previous Session", L"Key_Prev" },
     { L"Copy",             L"Key_Copy" },    { L"Paste",            L"Key_Paste" },
     { L"Command Palette",  L"Key_Palette" }, { L"Focus Left / Top Pane",  L"Key_FocusL" },
@@ -1125,7 +1125,7 @@ struct PalAction {
 static const PalAction kPalActions[] = {
     { L"New Session",              IDM_NEW,        KB_NEW,       -1 },
     { L"New Workspace",            IDM_NEWWS,      KB_NEWWS,     -1 },
-    { L"Close Session",            IDM_CLOSE,      KB_CLOSE,     -1 },
+    { L"Close Pane / Session",     IDM_CLOSE,      KB_CLOSE,     -1 },   // the focused PANE on a split session (P4), else the session
     { L"Duplicate Session",        IDM_DUP,        -1,           -1 },
     { L"Rename",                   IDM_RENAME,     -1,           -1 },
     { L"Reopen Closed Session",    IDM_REOPEN,     KB_REOPEN,    -1 },
@@ -2306,7 +2306,7 @@ static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for
 static void closeSessionAt(int idx) {
     if (idx < 0 || idx >= (int)g_sessions.size()) return;
     Session* cs = g_sessions[idx];
-    // A split shell exists only to be one session's right-hand pane, so it dies with that session -
+    // A split shell exists only to be one session's second pane, so it dies with that session -
     // otherwise closing the owner would strand a running shell nothing can reach: it is hidden, so
     // it is in no tree and no sidebar. One level of recursion only; a split owns no split of its own.
     if (!cs->splitId.empty()) {
@@ -2459,7 +2459,10 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         victim->splitId.clear();
         int vi = indexOfSession(victim);
         g_sessions.erase(g_sessions.begin() + vi);
-        if (displayed) { g_pane[1] = -1; g_focus = 0; }
+        if (displayed) {
+            g_pane[1] = -1; g_focus = 0;
+            if (g_sel.sess == survivor) g_sel.pane = 0;   // a promoted survivor's selection was in pane 1, which is gone (killSession clears the victim's)
+        }
         for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
         emitEvent("tree");
     }
@@ -3014,7 +3017,13 @@ static bool saveSessionState() {
         for (const auto& a : s->args) out += "\t" + tsvField(a);
         out += "\n";
         if (s->flagged) flagLine += "\t" + std::to_string(saved);
-        idLine += "\t" + s->id;
+        // The D line is what a relaunch after a kill ADOPTS by, and the host knows the shell by its
+        // paneId — `id` is the same string until a promotion (closeSplitSide) moves it onto the
+        // survivor; written as `id`, a promoted session was never adoptable and its live shell leaked
+        // (revmux r1). attachSession re-mints id = paneId from this field, so after a kill-restart a
+        // promoted session's id is its shell's id again — the one id change a kill-restart makes,
+        // stated in docs/state-file.md and the skill.
+        idLine += "\t" + s->paneId;
         // "C\t<idx>\t<context>" — one line per session WITH a context, indexed by S-line position like
         // F and P (P3). No line for a session without one: an empty-field form could not tell "no
         // context" from "a context that is empty", and tsvField cannot escape its way out of that.
@@ -4877,7 +4886,7 @@ static HMENU buildMenuBar() {
     AppendMenuW(file, MF_STRING, IDM_NEW, L"&New Session…");
     AppendMenuW(file, MF_STRING, IDM_NEWWS, L"New &Workspace");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, IDM_CLOSE, L"&Close Session");
+    AppendMenuW(file, MF_STRING, IDM_CLOSE, L"&Close Pane / Session");   // the sidebar row's "Close Session" closes the whole session
     AppendMenuW(file, MF_STRING, IDM_REOPEN, L"Reop&en Closed Session");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_KEYBOARD, L"&Keyboard…");
@@ -7240,9 +7249,13 @@ You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteter
 - `AGWINTERM_SESSION_ID` - your session id, and the default target when you pass none. Read
   that twice: a command with no `--target` goes to YOUR OWN pane. Pass `--target` whenever you
   mean a different one, or you will type into your own prompt
-- `AGWINTERM_PANE_ID` - the same value when the shell is born; use it when you specifically mean
-  the pane. The two part after a promotion (the splits section): the session id moves to the
-  surviving shell, the pane id stays on it, and `--target` accepts either
+- `AGWINTERM_PANE_ID` - the same value; use it when you specifically mean the pane. Both are
+  fixed at the shell's birth and are ALWAYS equal - nothing rewrites a running shell's environment.
+  What changes is what the session id names: after a promotion (the splits section) the session
+  keeps the id of the shell that closed, so in the surviving shell `AGWINTERM_SESSION_ID` names
+  the SHELL, not the session - `tree --json` has no node with that `id`. `--target` accepts it
+  either way (a pane id reaches its session). An agent that needs its own session id reads the
+  `tree` node whose `paneIds` contains `$AGWINTERM_PANE_ID`, or whose `id` equals it
 - `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
 
 The variables keep the `AGWINTERM_` prefix on purpose: the same hooks and scripts work in both
@@ -7337,11 +7350,15 @@ top/bottom on a horizontal one). Fresh from `split on`, slot 0 holds the session
 slot 1 the split shell; **a swap exchanges the slots and nothing else**.
 
 **THE SESSION-ID RULE, by condition.** A session id names the session's own shell (pane 0 of a
-fresh session; after a swap, whichever slot it sits in) while that shell exists. When that shell is
-closed - by `split close` on it, by the close chord on it while focused, by `split off` after a
-swap (slot 1 is the owner then), or by its process exiting - the surviving shell becomes the
-session: it keeps the session id, name, workspace, flag, context and sidebar row, and it keeps ITS
-OWN pane id. After such a promotion `--target <session id>` and `--target <that shell's pane id>`
+fresh session; after a swap, whichever slot it sits in) while that shell exists. WHENEVER that
+shell is the one that closes - whatever closed it: `split close` on it, the close chord on it
+while focused, `split off` / `toggle` / a bare `session split` / the Split key or menu row after a
+swap (slot 1 is the owner then), `session close` never (that closes the session), or its process
+exiting - the surviving shell becomes the session: it keeps the session id, name, workspace, flag,
+context and sidebar row, and it keeps ITS OWN pane id. One exception to "keeps the session id":
+after the window is KILLED and relaunched, a promoted session is adopted by its shell's id and
+comes back under that id (the state file records shells, not promotions); a graceful restart
+mints fresh ids for everything anyway. After such a promotion `--target <session id>` and `--target <that shell's pane id>`
 reach the same shell, and the next `split on` mints a fresh pane id for the new hidden shell, so
 `paneIds` reads `[<survivor's id>, <fresh id>]`. Lite's one difference from the full app: a session
 id ALWAYS names the session's own shell - the split's shell is reached only by its own id (the full
@@ -8249,12 +8266,15 @@ static std::string ctlDispatch(const std::string& line) {
         // and keeping a stale command under it would replay (in P9) something that is not running. A
         // pane closed between the snapshot and here is dropped from the reply rather than written to;
         // the id is re-checked as well as the pointer, since a freed Session's address can be reused.
+        // The id compared is the PANE id the snapshot recorded: paneId is written once and never
+        // rewritten, while `id` moves onto a promoted survivor (closeSplitSide) and would reject the
+        // very pane this was meant to validate (revmux r1: every promoted session silently dropped).
         std::string panes;
         int captured = 0;
         {
             LockG hold;
             for (const auto& p : snap) {
-                if (indexOfSession(p.s) < 0 || p.s->id != p.id) continue;
+                if (indexOfSession(p.s) < 0 || p.s->paneId != p.id) continue;
                 auto f = p.pid ? found.find(p.pid) : found.end();
                 p.s->capturedCmd = f != found.end() ? f->second : std::string();
                 if (!panes.empty()) panes += ",";
@@ -8376,6 +8396,7 @@ static std::string ctlDispatch(const std::string& line) {
                 paneId = owner->swapped ? owner->paneId : g_sessions[si]->paneId;
             }
             if (changed && displayed) { syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+            if (changed) PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // rebuilds the tree, and SAVES the new L line (refreshTree) — displayed or not
             return ctlOkStr(paneId);
         }
         if (!want && cur) {   // off closes SLOT 1: the split shell, or after a swap the owner's own shell (a promotion)
@@ -8910,7 +8931,7 @@ static DWORD WINAPI ctlServerThreadFor(void* arg) {
 // two used to look identical from outside, which is half of why the field report was unanswerable.
 struct RestoreSpec { int ws; std::string name, app, cwd; std::vector<std::string> args; bool flagged = false; };
 // A split shell, and which S line owns it. It has no name and no workspace of its own - it is one
-// session's right-hand pane, so it is restored only if that session was.
+// session's split shell, so it is restored only if that session was.
 struct SplitSpec { int owner = -1; RestoreSpec spec; };
 // A split's layout (the L line, P4): which S line owns it, the axis and the slot order. Validated
 // in parseStateFile — the axis is exactly one of the two words (anything else restores vertical),

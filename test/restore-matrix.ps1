@@ -1118,10 +1118,86 @@ if ($cliHasP4) {
         ($a -eq $b) -and ($tsv -match "(?m)^L`t0`tvertical`t1`r?$") -and
             ($tsv -match "(?m)^K`t0`t[^`t]*-n 315 127\.0\.0\.1`t[^`t]*-n 316 127\.0\.0\.1`r?$")
     }
+    # A split re-oriented LIVE (`--axis` on an already split session), killed: the re-orient arm
+    # has to schedule the save the other split mutations schedule, or the L line keeps the old
+    # axis until some unrelated save (revmux r1). The split is made vertical first — no L line —
+    # so the horizontal line the assertion finds can only have come from the re-orientation.
+    Cell -Name 'axis-relive-killed' -Kill -Setup {
+        param($i)
+        $id = LastSessionId $i
+        & $ctl session rename axis-relive --target $id --pipe $i 2>&1 | Out-Null
+        $sraw = (& $ctl session split on --target $id --pipe $i --json 2>&1) -join ''
+        if (-not [string](ConvertFrom-Json $sraw).result) { throw "session split answered no id: $sraw" }
+        Start-Sleep -Seconds 2
+        if ((Get-Content (State $i) -Raw) -match "(?m)^L`t") { throw 'a vertical unswapped split wrote an L line' }
+        $rraw = (& $ctl session split on --axis horizontal --target $id --pipe $i --json 2>&1) -join ''
+        if ($rraw -notmatch '"ok":true') { throw "re-orientation refused: $rraw" }
+        Start-Sleep -Seconds 2
+    } -Assert {
+        param($b, $a, $i)
+        if ($b -notmatch 'axis-relive%horizontal:0') { return $false }
+        ($a -eq $b) -and ((Get-Content (State $i) -Raw) -match "(?m)^L`t0`thorizontal`t0`r?$")
+    }
+    # A PROMOTED session (its own shell closed, the split shell became the session), killed: the D
+    # line has to carry the shell's id — the host knows the survivor by its pane id, and a D line
+    # written with the session id adopted nothing and left the live shell orphaned in the host
+    # (revmux r1). Proved the way killed-repaint proves adoption: a marker on the survivor's screen
+    # before the kill, the adoption in the log, the marker back after it — and the session comes
+    # back under its shell's id (the file records shells, not promotions; docs/state-file.md).
+    if (-not $Only -or $Only -eq 'promote-killed') {
+        $inst = 'rm-promote-killed'
+        Reset-Cell $inst
+        $err = ''; $seenBefore = $false; $promoted = $false; $adopted = $false; $seenAfter = $false; $idAfter = ''; $split = ''; $textAfter = ''
+        $p = $null; $p2 = $null
+        try {
+            $p = Start-Lite $inst
+            $id = LastSessionId $inst
+            & $ctl session rename promote-keeper --target $id --pipe $inst 2>&1 | Out-Null
+            $sraw = (& $ctl session split on --target $id --pipe $inst --json 2>&1) -join ''
+            $split = [string](ConvertFrom-Json $sraw).result
+            if (-not $split) { throw "session split answered no id: $sraw" }
+            Start-Sleep -Seconds 2
+            & $ctl session type "echo PROMOTED-MARKER`n" --target $split --pipe $inst 2>&1 | Out-Null
+            Start-Sleep -Seconds 3
+            $seenBefore = ((& $ctl session text --target $split --pipe $inst 2>&1) -join "`n") -match 'PROMOTED-MARKER'
+            $craw = (& $ctl session split close --target $id --pipe $inst --json 2>&1) -join ''
+            if ($craw -notmatch '"ok":true') { throw "split close on the session's own shell refused: $craw" }
+            Start-Sleep -Seconds 2
+            $node = @(SessionsOf $inst | Where-Object { $_.name -eq 'promote-keeper' })[0]
+            $promoted = $node -and ([string]$node.id -eq $id) -and -not $node.PSObject.Properties['paneCount']
+            Stop-Lite $p -Kill; $p = $null
+
+            $p2 = Start-Lite $inst
+            Start-Sleep -Seconds 4
+            $adopted = Log-Has $inst "adopted live session '$([regex]::Escape($split))'"
+            $node2 = @(SessionsOf $inst | Where-Object { $_.name -eq 'promote-keeper' })[0]
+            $idAfter = [string]$node2.id
+            $textAfter = (& $ctl session text --target $idAfter --pipe $inst 2>&1) -join "`n"
+            $seenAfter = $textAfter -match 'PROMOTED-MARKER'
+            Stop-Lite $p2; $p2 = $null
+        } catch { $err = $_.Exception.Message }
+        finally { Stop-Leftover $p; Stop-Leftover $p2 }
+        if (-not $err -and $seenBefore -and $promoted -and $adopted -and $seenAfter -and $idAfter -eq $split) {
+            "  PASS  {0,-22} (a promoted session is adopted by its shell's id and comes back with its screen)" -f 'promote-killed'
+        } else {
+            $script:failed += 'promote-killed'
+            "  FAIL  promote-killed"
+            if ($err) { "        error:  $err" }
+            "        marker on the survivor before the kill: $seenBefore"
+            "        the promotion happened (id kept, single): $promoted"
+            "        the survivor's shell was adopted:         $adopted"
+            "        marker back after adoption:               $seenAfter"
+            "        id after (expected the shell's, $split): $idAfter"
+            "        after: [$(($textAfter -replace '\s+', ' ').Trim())]"
+            "        log:   $(Restore-Verdict $inst)"
+        }
+    }
 } else {
     if (-not $Only -or $Only -eq 'axis-graceful') { Skip 'axis-graceful' 'this agwintermctl predates agwinterm #238 and has no `session split --axis` / `session swap` - set AGWINTERMCTL to a newer build' }
     if (-not $Only -or $Only -eq 'axis-killed')   { Skip 'axis-killed'   'same client' }
     if (-not $Only -or $Only -eq 'swap-killed')   { Skip 'swap-killed'   'same client - the seeded L-line cells still run' }
+    if (-not $Only -or $Only -eq 'axis-relive-killed') { Skip 'axis-relive-killed' 'same client' }
+    if (-not $Only -or $Only -eq 'promote-killed')     { Skip 'promote-killed'     'same client' }
 }
 
 # A C line the verb would have refused (a control character): the session comes back, the context

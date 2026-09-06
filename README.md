@@ -116,18 +116,21 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   the right/bottom pane's, also when already split; `off` the survivor's, also when already
   single — honours its target (a session, either pane, a prefix, a name; a cover refused with
   nothing split; a session off-screen split without moving focus), and re-orients a split session
-  live. `session split close --target ID` closes **either** side — which `off` and the close chord
-  could not — and answers the survivor's id; a one-pane session is refused naming `session close`.
+  live. `session split close --target ID` closes **either** side — which `off` cannot (it takes slot 1), and which no verb or key could before P4 — and answers the survivor's id; a one-pane session is refused naming `session close`.
   `session swap` exchanges the two slots and nothing else — the focus follows its pane, the axis
   stays, **no id moves** — and answers the tree's split block. `session focus
   [primary|split|left|right|top|bottom|other]` moves between the panes, the pair that does not
   exist on the axis refused naming it. A split session's `tree` node carries the block —
   `paneCount`, `paneIds` in slot order, `focusedPane`, `axis` — and a single one carries none of
   it; every structural change emits `tree`. The session-id rule: a session id names the session's
-  own shell while it exists; when that shell closes (by `split close`, the close chord, `split off`
-  after a swap, or its process exiting) the survivor **becomes the session** — same id, name,
-  flag, context, sidebar row, its own pane id kept — and a split side whose shell exits collapses
-  to the survivor on its own.
+  own shell while it exists; **whenever that shell is the one that closes** — whatever closed it:
+  `split close` on it, the close chord on it, `split off` / `toggle` / the Split key or menu row
+  after a swap (slot 1 is the owner then), or its process exiting — the survivor **becomes the
+  session** — same id, name, flag, context, sidebar row, its own pane id kept — and a split side
+  whose shell exits collapses to the survivor on its own. After a kill-and-relaunch a promoted
+  session is adopted by its shell's id and comes back under it (the file records shells, not
+  promotions). The close chord and File ▸ Close Pane / Session close the focused **pane** on a split
+  session; the sidebar row's Close Session closes the whole session.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's

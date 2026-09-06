@@ -1597,6 +1597,14 @@ try {
         Check 'split on --axis vertical on the split session re-orients it live and answers the slot-1 id' ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq "2|$aid,$sid|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
         Check 'and now the pane has about half the columns at the full height' ([int]$n2.rows -eq $r0 -and (HalfOf ([int]$n2.cols) $c0)) "grid $($n2.cols)x$($n2.rows), single was ${c0}x${r0}"
         Check 'the re-orientation emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        # ... and SAVED (revmux r1: the re-orient arm changed the field and emitted, but never
+        # scheduled the save every other split mutation schedules, so a kill lost the new axis).
+        # Horizontal wrote an L line; vertical unswapped is the default and writes none.
+        $p4State = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
+        function LLines { @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "L`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
+        $gone = $false
+        foreach ($i in 1..20) { if (@(LLines).Count -eq 0) { $gone = $true; break }; Start-Sleep -Milliseconds 250 }
+        Check 'the re-orientation was saved: the horizontal L line is gone from the state file' $gone "L lines: $((LLines) -join ' / ')"
         $raw = Send-Ctl $s @('session', 'focus', 'top')
         Check 'focus top on a vertical split is refused naming the axis' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "'top' names no pane on a vertical split (left/right panes); use left, right, primary, split or other") "raw: $raw"
         Send-Ctl $s @('session', 'focus', 'right') | Out-Null
@@ -1700,6 +1708,24 @@ try {
         Start-Sleep -Milliseconds 800
         Check "split close --target <split shell id> closes that shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq '' -and [bool](Node $aid)) "raw: $raw, block '$(SplitBlock $aid)'"
         Check 'the survivor still answers under both ids; tree fired, no session event' (((Get-PaneText $s $sid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        # A promoted session is the one whose `id` and `paneId` differ, and two pre-P4 sites compared
+        # or wrote the session id where the shell's id was meant (revmux r1, both Majors):
+        #   - restore capture's stale-entry re-check rejected the promoted pane, so a targeted capture
+        #     answered ok with captured 0 and panes [] and an untargeted one omitted the session;
+        #   - the D line carried the session id, so a relaunch after a kill could not adopt the
+        #     survivor's shell (restore-matrix `promote-killed` proves the adoption end to end).
+        if ($cliHasP3) {
+            $raw = Cap @('--target', $aid)
+            $o = ConvertFrom-Json $raw
+            Check "restore capture --target <promoted session id> reports its ONE pane: the survivor under its own pane id, the session id beside it" ([bool]$o.ok -and @($o.result.panes).Count -eq 1 -and [string]$o.result.panes[0].pane -eq $sid -and [string]$o.result.panes[0].session -eq $aid) "raw: $raw"
+            $raw = Cap @()
+            $o = ConvertFrom-Json $raw
+            Check "an untargeted restore capture lists the promoted session's pane too, under the survivor's pane id" ([bool]$o.ok -and @($o.result.panes | Where-Object { [string]$_.pane -eq $sid }).Count -eq 1) "raw: $raw"
+            $dline = @((Get-Content $p4State -Raw) -split "`n" | Where-Object { $_ -like "D`t*" } | ForEach-Object { $_.TrimEnd("`r") })
+            Check "the D line names the survivor's SHELL (its pane id), not the session id the promotion moved onto it" (@($dline).Count -eq 1 -and $dline[0] -match "`t$([regex]::Escape($sid))(`t|$)" -and $dline[0] -notmatch "`t$([regex]::Escape($aid))(`t|$)") "D: $($dline -join ' / ')"
+        } else {
+            Skip 'restore capture on a promoted session' 'needs a P3 client'
+        }
         # No target: the focused pane of the displayed session, what the close chord closes.
         $sid3 = SplitOn
         Send-Ctl $s @('session', 'focus', 'split') | Out-Null
