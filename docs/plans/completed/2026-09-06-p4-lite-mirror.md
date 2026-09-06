@@ -81,8 +81,12 @@ Copied, not re-decided, from the agwinterm plan:
   split, like `focusedPane`.
 - **The tree gains the split block.** A split session's node emits `paneCount: 2`,
   `paneIds: [slot 0 id, slot 1 id]`, `focusedPane: <slot>` and `axis` — agwinterm's keys, its
-  spellings, present exactly when the session is split (a single session emits none of them, as
-  agwinterm's does not). The hidden shell stays skipped as a node (`:7282`). `capturedCommands`
+  spellings. `paneCount`, `focusedPane` and `axis` are present exactly when the session is split
+  (a single session emits none of them, as agwinterm's does not); `paneIds` is present exactly
+  when the session's pane ids are not simply `[id]` — split, or a promoted single session, whose
+  node carries `paneIds` alone (`[<its shell's id>]`; revmux r2, a deliberate divergence: agwinterm
+  emits nothing in that state — the Design Decisions below). The hidden shell stays skipped as a
+  node (`:7282`). `capturedCommands`
   stays keyed by pane id, which is what it was — the comment at `:7309-7314` that promised
   `paneIds` "in P9" is rewritten: it arrived here.
 - **`session split close [--target <id>]`** — close the targeted pane, EITHER side; the survivor
@@ -237,8 +241,8 @@ Copied, not re-decided, from the agwinterm plan:
   `session type --target <id>` + `session text --target <id>` proves each id still reaches the
   same shell (a marker typed before the swap is read back after it under the same id); `swap` on a
   single session refused; `split close --target <owner's id>` → the session's node keeps its id,
-  `paneIds` gone, the survivor answers `session text` under BOTH the session id and its own pane
-  id, `session closed` NOT in `events`, `tree` is; `split close --target <split's id>` symmetric;
+  the split block gone and `paneIds` now the survivor's shell alone, the survivor answers `session
+  text` under BOTH the session id and its own pane id, `session closed` NOT in `events`, `tree` is; `split close --target <split's id>` symmetric;
   `split close` on a single session refused naming `session close`; `focus` — each word, the wrong
   pair refused naming the axis, one-pane refused; `session split off` after a swap closes the
   owner's shell and the session keeps its id; the close chord on the focused pane of a split
@@ -417,7 +421,13 @@ Copied, not re-decided, from the agwinterm plan:
       moves, no id moves, the `K` line stays by role. `session split close` on the session's own
       shell promotes the hidden session's object into the session's place (same id, name,
       workspace, flag, context, sidebar row; its own pane id kept — `Session::paneId`, set once and
-      never written), with a `tree` event and no `session closed` — agwinterm's `[B]` picture. The
+      never written), with a `tree` event and no `session closed` — agwinterm's `[B]` picture. One
+      node shape agwinterm never emits: that promoted session's node carries `paneIds` alone
+      (`[<its shell's id>]`, no `paneCount`), so in lite the presence of `paneIds` does not imply a
+      split — `paneCount` is the split discriminator in both products. agwinterm reaches the same
+      state (its env vars are per pane too) and emits nothing for it; lite's key exists so the
+      survivor's own agent, whose `AGWINTERM_SESSION_ID` is no node's `id`, can find its session's
+      node — a gap agwinterm's own skill has no recipe for. The
       one sentence the session-id rule differs by: agwinterm's session id names the FOCUSED pane
       while no pane carries it; lite's always names the session's own shell, and the split's shell
       is reached only by its own id (no per-session pane resolution). `session close <split
@@ -513,13 +523,32 @@ re-orientation honesty check asserted only that the `L` line was gone, never tha
 from the split shell and from the promoted survivor lands in the session's workspace with another
 one active.
 
+**What revmux round 3 found** (`03-after-fix2`, the r2 fix commit `5089ae9`): no Major. Eight
+Minors, all prose but one, all fixed. The prose ones were one finding filed from seven angles: the
+r2 fix stated the new `paneIds` rule in the skill, README and the r2 note, and left the plan's own
+design statement (the "single session emits none of them" sentence above), the promotion check's
+description, the `lite-parity.md` draft paragraph, the PR body's "What changed" bullet and
+`qa/panes.md`'s promotion case saying the old rule — five copies of a rule, two updated. The
+lesson for the next batch, in one line: **a rule changed at the source is changed at every copy the
+same commit, and the copies are found by grepping the OLD wording, not by remembering where the
+rule lives.** The round also caught the emitter comment's justification: "lite-only state, lite-only
+key" was false — agwinterm reaches the state (its env vars are per pane; closing the carrier pane
+keeps the session) and emits nothing for it — so the key is a deliberate node-shape divergence and
+is recorded as one (the comment, the design note, the `lite-parity.md` paragraph, the PR's
+divergences list). The code one: `callerWorkspace`'s hidden-to-owner walk was `splitOwnerOf`
+written out (a sixth copy of a walk with one owner) — replaced by the call, with the null guard
+the helper's contract requires.
+
 ## Technical Details
 
 - **Why `paneId` and not "the promoted session takes the survivor's id".** The alternative renames
   the session under every agent holding it (`session close S` stops working after a `split close`
-  on S's own shell) and diverges from agwinterm, where the session keeps S and `paneIds` becomes
-  `[B]`. With `paneId`, the tree shows S with `paneIds:[B]`, `--target S` and `--target B` both
-  reach the surviving shell, and a later `split on` gives `[B, C]` — agwinterm's picture exactly.
+  on S's own shell) and diverges from agwinterm, where the session keeps S and its pane list
+  becomes `[B]` (internally — agwinterm's tree emits `paneIds` only under `paneCount > 1`, so its
+  node shows nothing for that state). With `paneId`, the tree shows S with `paneIds:[B]` (lite's
+  one node-shape divergence, since revmux r2; the emitter says why), `--target S` and `--target B`
+  both reach the surviving shell, and a later `split on` gives `[B, C]` — agwinterm's picture
+  exactly.
   The cost is one field and the site list in Constraints; the risk is a site that reports a pane
   through `id` — the honesty checks that read the survivor under both ids are the guard.
 - **Why an `L` line and not a fifth `P` field.** `P`'s tail is `args...` (`:8416`): a 0.17.14

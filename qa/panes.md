@@ -162,7 +162,9 @@ printed in the split shell.
 
 **Expect:** the reply of step 2 is the split shell's id. The window shows ONE pane at the full width
 with the marker still in it. The tree node keeps the session id, `keeper`, its flag and context,
-and carries no split block; the sidebar row is unchanged (name, flag, dimmed context). The events
+carries no `paneCount`, `focusedPane` or `axis`, and carries `paneIds` holding the split shell's id
+alone (the survivor's own pane id — the one single node whose pane id is not its `id`); the
+sidebar row is unchanged (name, flag, dimmed context). The events
 hold `tree` and NOT `session`/`closed`. `session text --target <session id>` and `session text
 --target <split shell's id>` both read the marker. The Reopen Closed Session row (bind it in the sandbox profile) reopens nothing.
 

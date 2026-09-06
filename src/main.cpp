@@ -7156,8 +7156,7 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
         for (Session* s : g_sessions)
             if (s->id.compare(0, caller.size(), caller) == 0 ||
                 s->paneId.compare(0, caller.size(), caller) == 0) { hit = s; break; }
-    if (hit && hit->hidden)   // a split shell answers with its owner; a cover has no owner and stays -1
-        for (Session* o : g_sessions) if (!o->hidden && o->splitId == hit->id) { hit = o; break; }
+    if (hit) hit = splitOwnerOf(hit);   // a split shell answers with its owner; a cover has no owner: nullptr
     if (!hit || hit->hidden) return -1;
     if (hit->ws < 0 || hit->ws >= (int)g_workspaces.size()) return -1;
     if (nameOut) *nameOut = g_workspaces[hit->ws];   // the identity, for the re-find after the create
@@ -7728,7 +7727,8 @@ static std::string ctlDispatch(const std::string& line) {
                 }
                 // The split block (P4): agwinterm's keys and spellings, present exactly when the
                 // session is split — a single session emits none of them (the orientation of a split
-                // that does not exist is not a fact about the session). `paneIds` is in SLOT order
+                // that does not exist is not a fact about the session), with the one exception for
+                // `paneIds` in the arm below. `paneIds` is in SLOT order
                 // (slot 0 = left/top), `focusedPane` a slot; `axis` always while split, like
                 // focusedPane. A session not on screen has no live focus in lite, and selecting it
                 // focuses its own shell (selectPrimary), so that is the slot reported for it.
@@ -7737,9 +7737,13 @@ static std::string ctlDispatch(const std::string& line) {
                 // its own pane id) is the one node whose pane id is not its `id`: it carries
                 // `paneIds` alone — `[<its shell's id>]`, no paneCount / focusedPane / axis, there
                 // is no split — so the shell's own agent can find its session (the skill's env-ids
-                // bullet: the node whose `paneIds` contains $AGWINTERM_PANE_ID). Lite-only state,
-                // lite-only key: agwinterm has no promotion, and in every state it can be in the node
-                // shape is agwinterm's. `paneIds` is present exactly when the session's pane ids are
+                // bullet: the node whose `paneIds` contains $AGWINTERM_PANE_ID). A DELIBERATE
+                // node-shape divergence (revmux r3; recorded in agwinterm's lite-parity.md):
+                // agwinterm reaches the same state — closing the pane that carries the session id
+                // keeps the session, and its env vars are per pane there too — and emits nothing for
+                // it (its paneIds sits under `paneCount > 1`), so an agwinterm agent in that pane has
+                // no lookup; lite's skill gives its agent one. `paneCount` marks a split in both
+                // products; `paneIds` is present, in lite, exactly when the session's pane ids are
                 // not simply [id] (revmux r2).
                 else if (s->paneId != s->id) sess += ",\"paneIds\":[\"" + jsonEscape(s->paneId) + "\"]";
                 sess += "}";
