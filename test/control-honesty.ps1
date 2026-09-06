@@ -1669,7 +1669,22 @@ try {
             do { if ((Node $id) -and (SplitBlock $id) -eq '') { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
             $false
         }
+        function Wait-Shell([string]$id, [int]$ms = 15000) {   # the shell is up: the pane has drawn something
+            # Keystrokes typed before the shell attaches to its console are dropped, not queued: on the
+            # GitHub runner a fresh split takes seconds to show its prompt, and a marker typed into it
+            # 800 ms after `split on` never arrived (every readback of that marker then failed). The
+            # pane is blank until the shell draws, and the first thing it draws is the prompt — any
+            # non-blank text is "type now". Not a prompt-shape match: the sandbox runs the developer's
+            # profile, whose prompt glyph is not `>`.
+            $deadline = [DateTime]::Now.AddMilliseconds($ms)
+            do {
+                if (([string](Get-PaneText $s $id)).Trim() -ne '') { return $true }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::Now -lt $deadline)
+            $false
+        }
         function Mark([string]$id, [string]$marker) {   # a comment line typed and entered: visible in the pane, runs nothing
+            Wait-Shell $id | Out-Null
             Send-Ctl $s @('session', 'type', "# $marker", '--target', $id) | Out-Null
             Send-Ctl $s @('session', 'type', "`n", '--target', $id) | Out-Null
             Wait-PaneText $id $marker
