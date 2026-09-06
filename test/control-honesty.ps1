@@ -1659,9 +1659,17 @@ try {
         # the survivor's own pane id reach the surviving shell. A promotion is not a session close:
         # `tree` fires, `session closed` does not. Each refusal is agwinterm's sentence
         # (SplitCloseReply.cs) and closes nothing.
+        function PaneFlat([string]$id) {   # the pane's text with its row breaks removed: a marker read back whole where the pane wrapped it
+            # A split pane on the GitHub runner is ~36 columns, and its PowerShell prompt (`PS D:\a\agliteterm\agliteterm>`)
+            # 30 of them: every `# p4-mk-…` marker typed there wraps onto the next row, and a `-match` on the
+            # text as rows saw `# p4-` and `mk-owner-s` on two rows and failed. The markers have no spaces and
+            # `session text` right-trims each row, so with the breaks gone a marker is contiguous wherever the
+            # wrap fell.
+            ([string](Get-PaneText $s $id)) -replace "`n", ''
+        }
         function Wait-PaneText([string]$id, [string]$needle, [int]$ms = 12000) {
             $deadline = [DateTime]::Now.AddMilliseconds($ms)
-            do { if (([string](Get-PaneText $s $id)) -match [regex]::Escape($needle)) { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
+            do { if ((PaneFlat $id) -match [regex]::Escape($needle)) { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
             $false
         }
         function Wait-Single([string]$id, [int]$ms = 8000) {   # the node is there and its split block is gone
@@ -1669,7 +1677,22 @@ try {
             do { if ((Node $id) -and (SplitBlock $id) -eq '') { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
             $false
         }
+        function Wait-Shell([string]$id, [int]$ms = 15000) {   # the shell is up: the pane has drawn something
+            # Keystrokes typed before the shell attaches to its console are dropped, not queued: on the
+            # GitHub runner a fresh split takes seconds to show its prompt, and a marker typed into it
+            # 800 ms after `split on` never arrived (every readback of that marker then failed). The
+            # pane is blank until the shell draws, and the first thing it draws is the prompt — any
+            # non-blank text is "type now". Not a prompt-shape match: the sandbox runs the developer's
+            # profile, whose prompt glyph is not `>`.
+            $deadline = [DateTime]::Now.AddMilliseconds($ms)
+            do {
+                if (([string](Get-PaneText $s $id)).Trim() -ne '') { return $true }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::Now -lt $deadline)
+            $false
+        }
         function Mark([string]$id, [string]$marker) {   # a comment line typed and entered: visible in the pane, runs nothing
+            Wait-Shell $id | Out-Null
             Send-Ctl $s @('session', 'type', "# $marker", '--target', $id) | Out-Null
             Send-Ctl $s @('session', 'type', "`n", '--target', $id) | Out-Null
             Wait-PaneText $id $marker
@@ -1701,11 +1724,11 @@ try {
         Start-Sleep -Milliseconds 800
         Check "split close --target <session id> closes the session's OWN shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid) "raw: $raw"
         Check 'the promotion: the node keeps the session id, its split block is gone, the pane is at the full width' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and $null -eq (Node $sid) -and [int](Node $aid).cols -eq $c0 -and (NodeCount) -eq $before) "block '$(SplitBlock $aid)' cols $((Node $aid).cols) nodes $(NodeCount)"
-        Check 'the survivor answers session text under the session id AND under its own pane id' (((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $sid) -match 'p4-mk-split-1')) "by session id: $(Get-PaneText $s $aid)"
+        Check 'the survivor answers session text under the session id AND under its own pane id' (((PaneFlat $aid) -match 'p4-mk-split-1') -and ((PaneFlat $sid) -match 'p4-mk-split-1')) "by session id: $(Get-PaneText $s $aid)"
         # The one single node whose pane id is not its `id`: it carries paneIds alone, so the
         # survivor's own agent can find its session (the skill's env-ids recipe; revmux r2).
         Check "the promoted node names its shell: paneIds [the survivor's pane id], and no paneCount" ((@((Node $aid).paneIds) -join ',') -eq $sid -and -not (Node $aid).PSObject.Properties['paneCount']) "node: $((Node $aid) | ConvertTo-Json -Compress)"
-        Check "and the closed shell is gone: its marker is nowhere" (-not ((Get-PaneText $s $aid) -match 'p4-mk-owner-1'))
+        Check "and the closed shell is gone: its marker is nowhere" (-not ((PaneFlat $aid) -match 'p4-mk-owner-1'))
         Check 'a promotion is not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0) "tree $(EvSince $cur 'tree') session $(EvSince $cur 'session')"
         Check 'the node is active, its survivor focused, not marked exited' ([bool](Node $aid).active -and -not [bool](Node $aid).exited)
         Check 'session type by the session id reaches the survivor' ((Mark $aid 'p4-typed-after') -and (Wait-PaneText $sid 'p4-typed-after' 2000))
@@ -1743,7 +1766,7 @@ try {
         $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $sid2)
         Start-Sleep -Milliseconds 800
         Check "split close --target <split shell id> closes that shell and answers the survivor's pane id" ([string](ConvertFrom-Json $raw).result -eq $sid -and (SplitBlock $aid) -eq '' -and [bool](Node $aid)) "raw: $raw, block '$(SplitBlock $aid)'"
-        Check 'the survivor still answers under both ids; tree fired, no session event' (((Get-PaneText $s $sid) -match 'p4-mk-split-1') -and ((Get-PaneText $s $aid) -match 'p4-mk-split-1') -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        Check 'the survivor still answers under both ids; tree fired, no session event' (((PaneFlat $sid) -match 'p4-mk-split-1') -and ((PaneFlat $aid) -match 'p4-mk-split-1') -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
         # A promoted session is the one whose `id` and `paneId` differ, and two pre-P4 sites compared
         # or wrote the session id where the shell's id was meant (revmux r1, both Majors):
         #   - restore capture's stale-entry re-check rejected the promoted pane, so a targeted capture
@@ -1803,7 +1826,7 @@ try {
         $cur = Cursor
         Send-Ctl $s @('session', 'type', 'exit', '--target', $aid) | Out-Null
         Send-Ctl $s @('session', 'type', "`n", '--target', $aid) | Out-Null
-        Check "the session's OWN shell exiting promotes the survivor: the node keeps its id, session text by it reaches the survivor, not exited" ((Wait-Single $aid) -and ((Get-PaneText $s $aid) -match 'p4-mk-split-8') -and -not [bool](Node $aid).exited -and (EvSince $cur 'session') -eq 0) "text: $(Get-PaneText $s $aid)"
+        Check "the session's OWN shell exiting promotes the survivor: the node keeps its id, session text by it reaches the survivor, not exited" ((Wait-Single $aid) -and ((PaneFlat $aid) -match 'p4-mk-split-8') -and -not [bool](Node $aid).exited -and (EvSince $cur 'session') -eq 0) "text: $(Get-PaneText $s $aid)"
         # `session close` on the split shell's id: that shell, an unsplit (its pre-P4 meaning), now with `tree`.
         $sid9 = SplitOn
         $cur = Cursor
@@ -1871,8 +1894,8 @@ try {
         Check 'and the tree agrees: paneIds [split, session], focusedPane 1, axis vertical' ((SplitBlock $aid) -eq "2|$sw,$own|1|vertical") "block '$(SplitBlock $aid)'"
         Check 'the swap emitted a tree event' ((EvSince $cur 'tree') -ge 1)
         Check "the session's own shell kept its grid within a column: the two halves, not a new layout" ([math]::Abs([int](Node $aid).cols - $cOwn) -le 1 -and [int](Node $aid).rows -eq $rOwn) "grid $((Node $aid).cols)x$((Node $aid).rows), was ${cOwn}x${rOwn}"
-        Check 'a swap moves panes, never ids: each marker reads back under the id it was typed under' (((Get-PaneText $s $aid) -match 'p4-mk-owner-s') -and ((Get-PaneText $s $sw) -match 'p4-mk-split-s') -and -not ((Get-PaneText $s $aid) -match 'p4-mk-split-s')) "by session id: $(Get-PaneText $s $aid)`nby split id: $(Get-PaneText $s $sw)"
-        Check 'and session type by each id still reaches the same shell after the swap' ((Mark $aid 'p4-typed-owner-s') -and (Mark $sw 'p4-typed-split-s') -and -not ((Get-PaneText $s $sw) -match 'p4-typed-owner-s')) "by split id: $(Get-PaneText $s $sw)"
+        Check 'a swap moves panes, never ids: each marker reads back under the id it was typed under' (((PaneFlat $aid) -match 'p4-mk-owner-s') -and ((PaneFlat $sw) -match 'p4-mk-split-s') -and -not ((PaneFlat $aid) -match 'p4-mk-split-s')) "by session id: $(Get-PaneText $s $aid)`nby split id: $(Get-PaneText $s $sw)"
+        Check 'and session type by each id still reaches the same shell after the swap' ((Mark $aid 'p4-typed-owner-s') -and (Mark $sw 'p4-typed-split-s') -and -not ((PaneFlat $sw) -match 'p4-typed-owner-s')) "by split id: $(Get-PaneText $s $sw)"
         Check "and the node keeps its name, its row and its id: still active, not exited" ([bool](Node $aid).active -and -not [bool](Node $aid).exited -and (NodeCount) -eq $before)
         # `on` when split answers slot 1's id: after the swap, the session's own pane id.
         $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $aid)
@@ -1897,7 +1920,7 @@ try {
         # `split close` with no target closes the FOCUSED pane: the split shell, in slot 0 now — no promotion.
         $raw = Send-Ctl $s @('session', 'split', 'close')
         Start-Sleep -Milliseconds 800
-        Check "split close with no target on the swapped session closes the focused split shell (slot 0): the session's own shell survives" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq '' -and ((Get-PaneText $s $aid) -match 'p4-mk-owner-s')) "raw: $raw, block '$(SplitBlock $aid)'"
+        Check "split close with no target on the swapped session closes the focused split shell (slot 0): the session's own shell survives" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq '' -and ((PaneFlat $aid) -match 'p4-mk-owner-s')) "raw: $raw, block '$(SplitBlock $aid)'"
         # `split off` after a swap closes SLOT 1: the session's own shell — a promotion; the session keeps its id.
         $sw2 = SplitOn
         Check 'setup: split again, a marker in the split shell' ([bool]$sw2 -and (Mark $sw2 'p4-mk-split-s2'))
@@ -1906,7 +1929,7 @@ try {
         $cur = Cursor
         $raw = Send-Ctl $s @('session', 'split', 'off', '--target', $aid)
         Start-Sleep -Milliseconds 800
-        Check "split off after a swap closes slot 1 — the session's own shell: a promotion, the survivor's pane id answered, the session keeps its id" ([string](ConvertFrom-Json $raw).result -eq $sw2 -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and ((Get-PaneText $s $aid) -match 'p4-mk-split-s2') -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', text: $(Get-PaneText $s $aid)"
+        Check "split off after a swap closes slot 1 — the session's own shell: a promotion, the survivor's pane id answered, the session keeps its id" ([string](ConvertFrom-Json $raw).result -eq $sw2 -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and ((PaneFlat $aid) -match 'p4-mk-split-s2') -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', text: $(Get-PaneText $s $aid)"
         Check 'and it was a promotion, not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
         Check 'the promoted session is single again, so a swap is refused as before' (-not (ConvertFrom-Json (Send-Ctl $s @('session', 'swap', '--target', $aid))).ok -and (SplitBlock $aid) -eq '')
         # A session NOT on screen can be swapped; nothing moves (#230); selecting it shows the swapped pair.
