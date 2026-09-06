@@ -92,7 +92,7 @@ pipe thread is read in the paint without `g_lock`.
 refused wholesale when the `S` count does not add up, the `P` guard's rule; `K` is written after
 `P` by convention — it sits with the `P` lines it describes — not by requirement: the reader
 collects every line type in file order and applies them in its own fixed order, so a `K` above a
-`P` restores identically (the Fails-when list and `docs/state-file.md` say the same). A restore that put the
+`P` restores identically (`docs/state-file.md` and the save comment in `saveSessionState` say the same). A restore that put the
 slot on the wrong pane, or dropped it because the split came back a moment later, would answer a
 `tree` that disagrees with the reply the caller kept. `test/restore-matrix.ps1` pins the cells
 (`context-graceful`, `context-killed`, `capture-graceful`, `capture-killed`, `capture-split`, the

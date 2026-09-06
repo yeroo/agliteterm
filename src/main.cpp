@@ -8243,8 +8243,8 @@ static std::string ctlDispatch(const std::string& line) {
         // their shell pids under g_lock; QUERY the processes with NO lock held (captureForeground:
         // one Toolhelp32 snapshot, milliseconds); WRITE the slots under g_lock re-checking that every
         // session is still in the list, then save and answer from what landed. Every refusal but one
-        // returns before the query, with nothing written for anyone and nothing saved; the one is
-        // the save that did not land, after the write (below).
+        // returns before the WRITE (the query-failed one after the query ran), with nothing written
+        // for anyone and nothing saved; the one is the save that did not land, after the write (below).
         //
         // The reply is agwinterm's RestoreCaptureReply, an object (ctlOk): `captured` = the panes
         // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
@@ -8336,14 +8336,15 @@ static std::string ctlDispatch(const std::string& line) {
         // slots are left as captured — rolling them back would make the tree disagree with a
         // capture that read the processes correctly (revmux r1). The count is what the loop wrote
         // (a pane closed between the snapshot and the write is not in it), and the sentence stops
-        // at "not on disk": the refresh posted below drives a UI-thread save of the same slots with
-        // a higher stamp, which can land moments later — a prediction about the next restart would
-        // be a guess (revmux r2 of #28, lite #29).
+        // at what THIS save did: the refresh posted below drives a UI-thread save of the same slots
+        // with a higher stamp, which can land moments later — even before this reply is sent — so
+        // neither "the checkpoint is not on disk" nor a prediction about the next restart is a
+        // claim the verb can stand behind (revmux r2 of #28, lite #29, and its round 1).
         bool onDisk = saveSessionState();
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         if (!onDisk)
             return ctlErr("restore capture: " + std::to_string(written) + " pane(s) were captured into memory but the state "
-                          "file could not be written (see the log) — the checkpoint is not on disk. "
+                          "file could not be written (see the log) — this save did not put the checkpoint on disk. "
                           "tree --json still shows what was captured.");
         return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":false,\"panes\":[" + panes + "]}");
     }
@@ -9113,9 +9114,10 @@ static ParsedState parseStateFile(const std::wstring& path) {
     // K lines: positional like C and P, so the same guard and the same range check — the SAME
     // comparison as P's, so whenever the P set is refused the K set goes with it in this pass and
     // no pane-1 slot is ever orphaned that way. (The pane-1 slot additionally needs its split:
-    // restoreSessions drops it when the split failed to start, or when a K line names a split the
-    // file has no P line for — a hand-edited or downgrade-written file; the slot is meaningless
-    // without the shell it describes.)
+    // restoreSessions drops it when the split failed to start, when the owner itself failed to
+    // start (no split is attempted for a dead entry), or when a K line names a split the file has
+    // no P line for — a hand-edited or downgrade-written file; the slot is meaningless without the
+    // shell it describes. The K loop's comment there is the full list.)
     if (!ps.captures.empty() && ps.sLines != (int)ps.specs.size()) {
         logWarn("state: %d session line(s) but %zu parsed - refusing %zu capture line(s) rather than "
                 "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.captures.size());
