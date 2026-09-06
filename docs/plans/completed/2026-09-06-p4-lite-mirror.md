@@ -241,8 +241,8 @@ Copied, not re-decided, from the agwinterm plan:
   `session type --target <id>` + `session text --target <id>` proves each id still reaches the
   same shell (a marker typed before the swap is read back after it under the same id); `swap` on a
   single session refused; `split close --target <owner's id>` → the session's node keeps its id,
-  the split block gone and `paneIds` now the survivor's shell alone, the survivor answers `session
-  text` under BOTH the session id and its own pane id, `session closed` NOT in `events`, `tree` is; `split close --target <split's id>` symmetric;
+  `paneCount`, `focusedPane` and `axis` gone, `paneIds` now the survivor's shell alone, the
+  survivor answers `session text` under BOTH the session id and its own pane id, `session closed` NOT in `events`, `tree` is; `split close --target <split's id>` symmetric;
   `split close` on a single session refused naming `session close`; `focus` — each word, the wrong
   pair refused naming the axis, one-pane refused; `session split off` after a swap closes the
   owner's shell and the session keeps its id; the close chord on the focused pane of a split
@@ -506,8 +506,9 @@ could not work for the promoted session it was written for — a promoted sessio
 node carried no `paneIds`, and its `id` is the closed shell's. The r1 fix stated a recipe without
 running it. Fixed at the source, not in the prose: a promoted session's node now carries `paneIds`
 alone (`[<its shell's id>]`, no `paneCount`) — `paneIds` is present exactly when the session's pane
-ids are not simply `[id]`; a lite-only key in a lite-only state, so in every state agwinterm can be
-in the node shape is still agwinterm's. The same shape once more, in `callerWorkspace`
+ids are not simply `[id]`; round 2 believed this a lite-only key in a lite-only state, leaving
+the node shape agwinterm's in every state it can be in — round 3 found that false; its note below
+records the key as a deliberate divergence. The same shape once more, in `callerWorkspace`
 (pre-existing since P2's caller rule): the caller of `session new` is a SHELL's id, and two shells
 hold an id that is no node's `id` — a split shell (hidden; it now answers with its owner's
 workspace) and a promoted survivor (found by the `paneId` arm now) — both used to fall through to
@@ -524,18 +525,18 @@ from the split shell and from the promoted survivor lands in the session's works
 one active.
 
 **What revmux round 3 found** (`03-after-fix2`, the r2 fix commit `5089ae9`): no Major. Eight
-Minors, all prose but one, all fixed. The prose ones were one finding filed from seven angles: the
-r2 fix stated the new `paneIds` rule in the skill, README and the r2 note, and left the plan's own
-design statement (the "single session emits none of them" sentence above), the promotion check's
-description, the `lite-parity.md` draft paragraph, the PR body's "What changed" bullet and
-`qa/panes.md`'s promotion case saying the old rule — five copies of a rule, two updated. The
-lesson for the next batch, in one line: **a rule changed at the source is changed at every copy the
-same commit, and the copies are found by grepping the OLD wording, not by remembering where the
-rule lives.** The round also caught the emitter comment's justification: "lite-only state, lite-only
-key" was false — agwinterm reaches the state (its env vars are per pane; closing the carrier pane
-keeps the session) and emits nothing for it — so the key is a deliberate node-shape divergence and
-is recorded as one (the comment, the design note, the `lite-parity.md` paragraph, the PR's
-divergences list). The code one: `callerWorkspace`'s hidden-to-owner walk was `splitOwnerOf`
+Minors, all prose but one, all fixed. Six of the prose ones were one finding filed from six angles:
+the r2 fix stated the new `paneIds` rule in the skill, README and the r2 note, and left the plan's
+own design statement (the "single session emits none of them" sentence above), the promotion
+check's description, the `lite-parity.md` draft paragraph, the PR body's "What changed" bullet and
+`qa/panes.md`'s promotion case saying the old rule — eight copies of a rule, three updated, five
+stale. The lesson for the next batch, in one line: **a rule changed at the source is changed at
+every copy in the same commit, and the copies are found by grepping the OLD wording, not by
+remembering where the rule lives.** The seventh prose one was the emitter comment's
+justification: "lite-only state, lite-only key" was false — agwinterm reaches the state (its env
+vars are per pane; closing the carrier pane keeps the session) and emits nothing for it — so the
+key is a deliberate node-shape divergence and is recorded as one (the comment, the design note,
+the `lite-parity.md` paragraph, the PR's divergences list). The code one: `callerWorkspace`'s hidden-to-owner walk was `splitOwnerOf`
 written out (a sixth copy of a walk with one owner) — replaced by the call, with the null guard
 the helper's contract requires.
 
