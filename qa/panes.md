@@ -82,7 +82,7 @@ is no close) and relaunched. After the restart the tree's split block says `hori
 session's own shell in slot 1, each captured slot sits on the shell that ran it (`K` is by role,
 field 2 the session's own shell whatever its slot), both shells answer `session text`, and a
 `PrintWindow` capture of the restored window lands in `%TEMP%\agliteterm-layout-restart\restored.png`
-for the PR body. `-Graceful` closes instead of kills. Run alone.
+for the PR body (the 2026-09-06 run is `docs/img/qa-p4-layout-restart.png`). `-Graceful` closes instead of kills. Run alone.
 
 **Fails when:** the `P` line stops being written, or the parser's guard drops it wrongly. That guard
 refuses ALL `P` lines when the number of `S` lines it counted does not match the number that parsed,
