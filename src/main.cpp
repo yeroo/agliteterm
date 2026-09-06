@@ -1019,6 +1019,7 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 #define WM_APP_HOSTACT     (WM_APP + 8)   // reader thread -> UI thread: a drained host action
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
+#define WM_APP_PANEEXIT    (WM_APP + 10)  // reader thread -> UI thread: a shell hit EOF (lParam = Session*); a split side collapses to its survivor (P4)
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
@@ -1716,11 +1717,13 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
         s->cols = cols;
         s->rows = rows;
     }
-    if (!s->id.empty()) {   // a restore placeholder has no host session — only its emulator resizes
+    // The host knows the SHELL, and a shell's host id is its paneId: after a promotion (closeSplitSide)
+    // the session id sits on a shell born under another id, so every host request keys on paneId.
+    if (!s->paneId.empty()) {   // a restore placeholder has no host session — only its emulator resizes
         agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
         req.which_cmd = agwinterm_ptyhost_Request_resize_tag;
-        strcpy_s(req.cmd.resize.id, s->id.c_str());
+        strcpy_s(req.cmd.resize.id, s->paneId.c_str());
         req.cmd.resize.cols = (uint32_t)cols;
         req.cmd.resize.rows = (uint32_t)rows;
         ReqOutcome why;
@@ -1954,6 +1957,9 @@ static DWORD WINAPI readerThread(void* param) {
     s->exited = true;   // EOF: child exited, host shut down, or we were superseded
     InvalidateRect(windowForSession(s), nullptr, FALSE);
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // reflect the exited marker in the tree
+    // A split side that exits collapses to its survivor (P4, OnPaneExit) — judged on the UI thread
+    // against the list, since this shell may be one closeSplitSide is dropping right now.
+    PostMessageW(g_hwnd, WM_APP_PANEEXIT, 0, (LPARAM)s);
     return 0;
 }
 
@@ -2283,11 +2289,11 @@ static void scanHostSessions() {
 
 static void killSession(Session* s) {
     { LockG lk; if (g_sel.sess == s) g_sel.clear(); }   // keyed by session: don't outlive it
-    if (s->id.empty()) return;            // restore placeholder: nothing on the host to kill
+    if (s->paneId.empty()) return;        // restore placeholder: nothing on the host to kill
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_kill_tag;
-    strcpy_s(req.cmd.kill.id, s->id.c_str());
+    strcpy_s(req.cmd.kill.id, s->paneId.c_str());   // the shell's host id (see syncPaneSizes)
     request(req, &rep);
 }
 
@@ -2380,38 +2386,88 @@ static void reopenClosed() {
         selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 }
-static void toggleSplit();   // fwd
+static Session* closeSplitSide(Session* owner, bool closeOwner);   // fwd
+static Session* splitOwnerOf(Session* s);                             // fwd (with the split verbs' refusals)
+// The close chord / menu close: the focused PANE, either side (P4). With the split shell focused
+// this is the unsplit it always was; with the session's own shell focused on a split session it
+// is a PROMOTION (the survivor becomes the session) — before P4 it closed the whole session, the
+// one thing no verb could do to the other side. A one-pane session still closes the session.
 static void closeFocused() {
-    if (g_focus == 1 && g_pane[1] >= 0) { toggleSplit(); return; }   // closing the split pane = unsplit
+    if (g_pane[1] >= 0) {
+        Session* owner = displayedOwner();
+        if (owner) { closeSplitSide(owner, g_focus == 0); return; }
+    }
     closeSessionAt(g_pane[0]);
 }
 
-// Unsplit `owner`: kill and drop its hidden split shell, whether or not the owner is the session
-// on screen (a non-displayed session can be split and unsplit over the pipe, P4). The one
-// structural change that emitted NO `tree` event before P4 — closed here. Task 2 folds this into
-// closeSplitSide(owner, closeOwner), the primitive that closes EITHER side; until then slot 1 is
-// always the split shell (nothing sets `swapped` yet). Returns false when `owner` is not in the
-// list any more (the #21 class: the caller resolved it on another thread).
-static bool unsplitSession(Session* owner) {
-    int oi = indexOfSession(owner);
-    if (oi < 0) return false;
-    int sp = indexOfSessionId(owner->splitId);
-    owner->splitId.clear();
-    owner->swapped = false;
-    bool displayed = g_pane[0] == oi;
-    if (displayed) { g_pane[1] = -1; g_focus = 0; }
-    if (sp >= 0) {   // remove the hidden split shell (no ClosedSpec, no `session closed`: it is no session)
-        killSession(g_sessions[sp]);
-        EnterCriticalSection(&g_lock);
-        g_sessions.erase(g_sessions.begin() + sp);
-        for (int p = 0; p < 2; p++) if (g_pane[p] > sp) g_pane[p]--;   // fix the surviving indices
+// Close ONE side of `owner`'s split — the primitive every unsplit goes through (P4): the menu / key
+// toggle and `session split off` (slot 1), `session split close` (either side), the close chord on
+// a focused pane, `session close` on the split shell's id, and a split side whose shell exits
+// (OnPaneExit). Works whether or not the owner is the session on screen (a non-displayed session
+// can be split and unsplit over the pipe, #230: nothing here moves focus or selection). Returns the
+// SURVIVOR — the Session that is the session afterwards — or nullptr when `owner` is not in the
+// list any more (the #21 class: the caller resolved it on another thread) or has no split.
+//
+// closeOwner == false closes the hidden split shell: the unsplit lite always had, now with a `tree`
+// event (the one structural change that emitted none before P4). closeOwner == true is the
+// PROMOTION — THE SESSION-ID RULE (the plan's vocabulary section; agwinterm ISessionHost.SplitClose):
+// when the session's own shell closes, the surviving shell BECOMES the session. The survivor
+// object takes `id`, `name`, `ws`, `flagged`, `context`, `horizontal` and the owner's place in
+// g_sessions (the two pointers are exchanged, so the sidebar order and g_pane[0] are unchanged);
+// it keeps ITS OWN `paneId` and `capturedCmd` — both are the shell's, which is why `--target` by
+// the session id and by the survivor's pane id reach the same shell afterwards, and why the `K`
+// line's field 2 is the survivor's slot. The owner's object is dropped the way the split shell
+// is: no ClosedSpec (the session did not close — undo would resurrect a session that is still
+// there), no `session closed` event, a `tree` event (the node lost its split block).
+//
+// Everything structural happens under ONE hold of g_lock, BEFORE the victim's shell is killed: a
+// reader that sees the kill's EOF posts WM_APP_PANEEXIT for a pointer that is no longer in the
+// list, and OnPaneExit does nothing with it. The kill and the relayout are host round trips and
+// run outside the lock, the way closeSessionAt orders them.
+static Session* closeSplitSide(Session* owner, bool closeOwner) {
+    Session* victim = nullptr;
+    Session* survivor = nullptr;
+    bool displayed = false;
+    {
+        LockG hold;
+        int oi = indexOfSession(owner);
+        if (oi < 0) return nullptr;
+        int si = indexOfSessionId(owner->splitId);
+        if (si < 0) return nullptr;
+        Session* split = g_sessions[si];
+        displayed = g_pane[0] == oi;
+        if (!closeOwner) {
+            victim = split;
+            survivor = owner;
+        } else {
+            victim = owner;
+            survivor = split;
+            survivor->id = owner->id;                  // the session id moves; paneId stays (the shell's)
+            survivor->name = owner->name;
+            survivor->context = owner->context;
+            survivor->ws = owner->ws;
+            survivor->flagged = owner->flagged;
+            survivor->horizontal = owner->horizontal;  // kept for the next `split on`
+            survivor->hidden = false;
+            std::swap(g_sessions[oi], g_sessions[si]); // the survivor takes the owner's row; the victim sits where the split shell did
+            victim->id = victim->paneId;               // no two entries under one id, even for the instant it is still listed
+            victim->hidden = true;
+            victim->name.clear(); victim->context.clear(); victim->flagged = false;
+        }
+        survivor->splitId.clear();
+        survivor->swapped = false;                     // a fresh split is in the default order
+        victim->splitId.clear();
+        int vi = indexOfSession(victim);
+        g_sessions.erase(g_sessions.begin() + vi);
+        if (displayed) { g_pane[1] = -1; g_focus = 0; }
+        for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
         emitEvent("tree");
-        LeaveCriticalSection(&g_lock);
     }
+    killSession(victim);   // outside g_lock: a host round trip (the object is never freed — its reader may still hold it)
     if (displayed) syncPaneSizes();
-    PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+    PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // rebuilds the tree, and saves (refreshTree)
     InvalidateRect(g_hwnd, nullptr, FALSE);
-    return true;
+    return survivor;
 }
 
 // Toggle the 2-pane split. Splitting spawns an INDEPENDENT new shell for the second pane (separate
@@ -2435,7 +2491,7 @@ static void toggleSplit() {
             emitEvent("tree");
         }
     } else {
-        unsplitSession(prim);                        // closes SLOT 1 (the split shell until Task 2)
+        closeSplitSide(prim, prim->swapped);         // closes SLOT 1: the split shell, or after a swap the owner's own shell
         return;
     }
     syncPaneSizes();
@@ -6067,6 +6123,7 @@ public:
         MESSAGE_HANDLER(WM_APP_FOCUSTERM, OnFocusTerm)
         MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
         MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
+        MESSAGE_HANDLER(WM_APP_PANEEXIT, OnPaneExit)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -6416,6 +6473,26 @@ public:
     }
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
     // icon both belong to this thread, so it does that half of the work.
+    LRESULT OnPaneExit(UINT, WPARAM, LPARAM lp, BOOL&) {   // reader thread -> UI thread: a shell hit EOF (P4)
+        // A split side whose shell exits collapses to the survivor (agwinterm OnPaneProcessExited,
+        // agterm #121): the session's own shell exiting is a promotion, the split shell's an
+        // unsplit — a side that stayed on screen as "(exited)" was a pane nothing could type into
+        // and no verb could close. A one-pane session stays on screen as "(exited)", as it always
+        // has. The pointer is judged under g_lock against the list: a shell closeSplitSide or
+        // closeSessionAt already dropped is not there, and a hidden shell no session names (a
+        // cover) has no split to collapse.
+        Session* s = (Session*)lp;
+        Session* owner = nullptr;
+        bool closeOwner = false;
+        {
+            LockG hold;
+            if (indexOfSession(s) < 0) return 0;
+            if (!s->hidden) { if (indexOfSessionId(s->splitId) >= 0) { owner = s; closeOwner = true; } }
+            else owner = splitOwnerOf(s);
+        }
+        if (owner) closeSplitSide(owner, closeOwner);
+        return 0;
+    }
     LRESULT OnHostAction(UINT, WPARAM wp, LPARAM lp, BOOL&) {
         if (wp == HA_CLIP) {                       // OSC 52: the program wrote the clipboard
             std::string* t = (std::string*)lp;
@@ -6881,6 +6958,18 @@ static std::string splitCoverPane(const std::string& paneId) {
            "`session overlay close` or `quick off` dismiss those. Nothing was split.";
 }
 static const char* const kSplitNotSplit = "session is not split (one pane); nothing to focus";
+// `session split close` (SplitCloseReply.cs): each closes nothing.
+static const char* const kSplitCloseNoActive = "split close: there is no active session to close a pane of. Nothing closed.";
+static std::string splitCloseUnknown(const std::string& target) {
+    return "split close: no pane or session matches '" + target + "'. Nothing closed.";
+}
+static std::string splitCloseSinglePane(const std::string& sessionId) {
+    return "split close: session '" + sessionId + "' has one pane, so there is no split to close; `session close` closes the session. Nothing closed.";
+}
+static std::string splitCloseCover(const std::string& paneId) {
+    return "split close: '" + paneId + "' is a scratch/overlay/quick pane, not a side of a split; `session scratch off`, "
+           "`session overlay close` or `quick off` dismiss those. Nothing closed.";
+}
 // `session focus`'s words (SplitAxes.TryFocusIndex): primary = slot 0 and split = slot 1 on either
 // axis; left/right = slot 0/1 on a VERTICAL split only; top/bottom = slot 0/1 on a HORIZONTAL one
 // only; other = the slot not focused. A direction that does not exist on the axis is refused naming
@@ -7772,16 +7861,27 @@ static std::string ctlDispatch(const std::string& line) {
     if (cmd == "session.close") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         // Close the session that was ASKED for, by index. The old form pointed the focused pane at it
-        // and called closeFocused(), which with the split pane focused reroutes into toggleSplit() —
+        // and called closeFocused(), which with the split pane focused rerouted into the unsplit —
         // so it killed the repointed target through the unsplit path, ORPHANING the hidden split
         // shell (a live process with no pane, no tree entry and no kill until exit) and skipping
         // everything closeSessionAt does: the reopen stack, the deliberate-empty mark, the teardown.
+        // The split shell's id (P4): close THAT shell through the either-side primitive, whether or
+        // not its owner is on screen — the unsplit it always meant (lite's pre-P4 divergence in its
+        // own favour: the id reaches the shell it names, where agwinterm answers "session not
+        // found" for a pane id; recorded in lite-parity.md, not changed here). A session's own id
+        // closes the whole session, split shell and all (closeSessionAt's cascade).
+        Session* owner = nullptr;
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");   // closed since the resolve (#21)
+            if (target->hidden) owner = splitOwnerOf(target);
+        }
+        if (owner) {
+            if (!closeSplitSide(owner, false)) return ctlErr("session not found");
+            return ctlOkStr("closed");
+        }
         for (int i2 = 0; i2 < (int)g_sessions.size(); i2++)
-            if (g_sessions[i2] == target) {
-                if (g_pane[1] == i2) toggleSplit();   // it IS the split pane's shell: closing it unsplits
-                else closeSessionAt(i2);
-                break;
-            }
+            if (g_sessions[i2] == target) { closeSessionAt(i2); break; }
         return ctlOkStr("closed");
     }
     if (cmd == "session.overlay") {   // run a command in an overlay popup over the main window
@@ -8174,20 +8274,63 @@ static std::string ctlDispatch(const std::string& line) {
             if (changed && displayed) { syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
             return ctlOkStr(paneId);
         }
-        if (!want && cur) {   // unsplit inline (Task 2 routes this through closeSplitSide)
-            // No lock across it: it kills the shell and lays the panes out (host round trips), the
-            // way toggleSplit runs from session.close on this thread. The survivor is read back
-            // under a hold of its own, after the #21 re-check.
-            if (!unsplitSession(owner)) return ctlErr("session not found");
+        if (!want && cur) {   // off closes SLOT 1: the split shell, or after a swap the owner's own shell (a promotion)
+            // No lock across the close: it kills a shell and lays the panes out (host round trips),
+            // the way closeSessionAt runs on this thread. The survivor is read back under a hold
+            // of its own, after the #21 re-check — it is the owner object, or after a promotion
+            // the split shell's, so the pointer closeSplitSide hands back is the one to read.
+            bool slot1IsOwner = false;
+            {
+                LockG hold;
+                if (indexOfSession(owner) < 0) return ctlErr("session not found");
+                slot1IsOwner = owner->swapped;
+            }
+            Session* survivor = closeSplitSide(owner, slot1IsOwner);
+            if (!survivor) return ctlErr("session not found");
             LockG hold;
-            if (indexOfSession(owner) < 0) return ctlErr("session not found");
-            return ctlOkStr(owner->paneId);
+            if (indexOfSession(survivor) < 0) return ctlErr("session not found");
+            return ctlOkStr(survivor->paneId);
         }
         // `off` when already single — still hand back an id, so a caller that does not know
         // whether the session was split gets something addressable either way.
         LockG hold;
         if (indexOfSession(owner) < 0) return ctlErr("session not found");
         return ctlOkStr(owner->paneId);
+    }
+    if (cmd == "session.split.close") {   // close ONE pane, EITHER side; reply the survivor's pane id (P4)
+        // agwinterm's session.split.close (SplitCloseReply.cs, its sentences verbatim). `off` keeps
+        // its rule (slot 1 goes); this is the verb that can close EITHER side, which before P4 no
+        // verb and no key could: closeSessionAt killed the split shell with its owner, and the
+        // close chord on the session's own shell closed the whole session. No target / `active` =
+        // the focused pane of the displayed session, what the close chord closes; a session id
+        // (or its name, or the pane id of its own shell) = the session's OWN shell — THE SESSION-ID
+        // RULE, the plan's vocabulary section — and closing that PROMOTES the survivor; the split
+        // shell's id = that shell. Refused, each with nothing closed: an unknown target; a cover,
+        // which is not a side of a split; a ONE-PANE session, naming `session close` — a split
+        // close that quietly closed the session would be the silent-success class one verb over.
+        // The close runs inline on this thread the way the `on` arm creates (nothing to return
+        // from a posted message); the survivor is read back after the #21 re-check.
+        const std::string& t = req.get("target");
+        std::string shown = t.empty() ? "active" : t;
+        if (!target) {
+            if (!targetWhy.empty()) return ctlErr(targetWhy);
+            return ctlErr(t.empty() || t == "active" ? kSplitCloseNoActive : splitCloseUnknown(t));
+        }
+        Session* owner = nullptr;
+        bool closeOwner = false;
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr(splitCloseUnknown(shown));   // closed since the resolve (#21)
+            owner = splitOwnerOf(target);
+            if (!owner) return ctlErr(splitCloseCover(target->id));
+            if (indexOfSessionId(owner->splitId) < 0) return ctlErr(splitCloseSinglePane(owner->id));
+            closeOwner = target == owner;
+        }
+        Session* survivor = closeSplitSide(owner, closeOwner);
+        if (!survivor) return ctlErr(splitCloseUnknown(shown));
+        LockG hold;
+        if (indexOfSession(survivor) < 0) return ctlErr("session not found");
+        return ctlOkStr(survivor->paneId);
     }
     if (cmd == "session.focus") {   // primary|split|left|right|top|bottom|other, the DISPLAYED session (P4)
         // agwinterm's session.focus: the active session only, default `other` (the one word that

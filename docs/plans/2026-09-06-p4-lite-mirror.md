@@ -290,7 +290,7 @@ Copied, not re-decided, from the agwinterm plan:
       (`session swap x` → "Nothing sent") are in; Tasks 2/3/5 extend the block.
 
 ### Task 2: one primitive closes either side
-- [ ] `closeSplitSide(Session* owner, bool closeOwner)` on the UI thread: `closeOwner == false` is
+- [x] `closeSplitSide(Session* owner, bool closeOwner)` on the UI thread: `closeOwner == false` is
       today's unsplit (`toggleSplit`'s second half, moved here, now with a `tree` event);
       `closeOwner == true` is the promotion — the survivor object takes `id`, `name`, `ws`,
       `flagged`, `context`, `horizontal`, the owner's position in `g_sessions` (exchange the two
@@ -299,12 +299,35 @@ Copied, not re-decided, from the agwinterm plan:
       is killed and erased the way the split shell is today (no `ClosedSpec`, no `session closed`);
       `g_pane[1] = -1`, `g_focus = 0`, `syncPaneSizes`, invalidate, `WM_APP_REFRESHTREE`, save,
       `emitEvent("tree")`.
-- [ ] Route through it: `toggleSplit`'s unsplit (closes SLOT 1); `session split off`; `closeFocused`
+- [x] Route through it: `toggleSplit`'s unsplit (closes SLOT 1); `session split off`; `closeFocused`
       (the focused PANE, either side — a one-pane session still closes the session); `session.close`
       on the split shell's id (unchanged meaning: that shell); a split side's process exit (posted
       to the UI thread; `exited` on a one-pane session stays visible as today).
-- [ ] `session split close [--target]`: resolution per the vocabulary section; the three refusals
+- [x] `session split close [--target]`: resolution per the vocabulary section; the three refusals
       with agwinterm's sentences; reply the survivor's `paneId`.
+      ➕ Task 2 notes: the primitive runs INLINE on whichever thread calls it (the control-pipe
+      thread for the verbs, the UI thread for the keys, the menu and a shell's exit), the way
+      `closeSessionAt` and the `on` arm do — "on the UI thread" in the checkbox meant "not
+      post-and-return", and it is not. Everything structural (the field moves, the pointer
+      exchange, the erase, the `g_pane` fix-up, the `tree` event) happens under ONE hold of
+      `g_lock` BEFORE the victim's shell is killed, so the exit its reader then reports finds a
+      pointer that is no longer listed. The save is `refreshTree`'s (posted `WM_APP_REFRESHTREE`),
+      as for every other structural change. Two consequences the plan did not spell out: (1) the
+      pty-host knows a SHELL by its pane id, so the resize and kill requests now key on `paneId`
+      (before this they keyed on `id`, which after a promotion names another shell); (2) a shell's
+      exit is reported to the UI thread by a new `WM_APP_PANEEXIT` (lParam = the `Session*`),
+      judged against the list under `g_lock` — a one-pane session's exit still shows as
+      "(exited)". The honesty block covers every route: the three refusals, the promotion under
+      both ids, `split on` after it (`paneIds` = [survivor, new]), the symmetric close, no-target
+      on either focused slot, the close chord on either side (Key_Close seeded to Ctrl+Shift+W in
+      HKCU before the sandbox launches, restored after), both sides' shells exiting, `session
+      close` on the split shell's id, and a promotion off-screen by name (#230).
+      ➕ Harness: `test/restore-matrix.ps1` now scrubs `AGWINTERM_SESSION_ID` / `AGWINTERM_PANE_ID` /
+      `AGWINTERM_PIPE` at the top the way conformance does — run from inside an agwinterm pane, its
+      untargeted `session split on` calls aimed at the developer's own pane id and the
+      `capture-split` cell failed with "session not found" (the `split-with-session` cell's split
+      silently failed the same way and its assertion never noticed). All twelve suites green under
+      `-Strict` with the P4 dev CLI after the fix.
 
 ### Task 3: `session swap`
 - [ ] `swapped = !swapped` on the owner under the UI-thread pattern; reply

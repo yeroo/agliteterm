@@ -28,6 +28,14 @@ $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
+# agwintermctl defaults its target to $AGWINTERM_SESSION_ID when none is given (conformance.ps1 says
+# why that is a trap): this runner is itself launched from a terminal session, so every untargeted
+# `& $ctl` below — the `session split on` of the split cells first of all — would aim at the
+# DEVELOPER's pane id, which the cell's instance has never heard of ("session not found"). Found
+# by the P4-lite run from inside an agwinterm pane; scrubbed the way the other suites scrub.
+$env:AGWINTERM_SESSION_ID = $null
+$env:AGWINTERM_PANE_ID = $null
+$env:AGWINTERM_PIPE = $null
 $dir = "$env:LOCALAPPDATA\agliteterm"
 $script:failed = @()
 $script:skipped = 0
