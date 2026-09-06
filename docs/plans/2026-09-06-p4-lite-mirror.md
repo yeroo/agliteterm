@@ -375,12 +375,54 @@ Copied, not re-decided, from the agwinterm plan:
       suites green under `-Strict` with the P4 dev CLI.
 
 ### Task 5: docs, trackers, tests
-- [ ] Skill: the splits section rewritten around the four verbs, the vocabulary, the session-id
+- [x] Skill: the splits section rewritten around the four verbs, the vocabulary, the session-id
       rule in full (quoted from this plan), the verb index; `README.md` (verb count, the Scriptable
       bullet, the keys); `qa/panes.md`; agwinterm `docs/lite-parity.md` "Splits as sessions"
       paragraph rewritten (swap implemented; the one sentence lite's session-id rule differs by;
-      `restore`/`active`/promotion notes) — in the agwinterm repo, a docs PR after this merges.
-- [ ] `tools/check-contract.ps1 -Update`; conformance probe; the honesty block; `run-all -Strict`.
+      `restore`/`active`/promotion notes) — in the agwinterm repo, a docs PR after this merges
+      (drafted in the notes below; not committed here — the other repo, after the merge).
+- [x] `tools/check-contract.ps1 -Update`; conformance probe; the honesty block; `run-all -Strict`.
+      ➕ Task 5 notes: the skill's "A second pane" section is now the vocabulary paragraph, the
+      session-id rule quoted in full with lite's one difference, the four verbs with every refusal
+      class, the events rule and the two slot-based keys; `AGWINTERM_PANE_ID` is explained as
+      parting from the session id after a promotion; `restore capture`'s "left/right pane" wording
+      is gone (keyed by `paneIds`); the verb index lists `split [on|off|toggle|close]|swap|focus`.
+      README: 48 verbs (the dispatcher's `cmd ==` set, 45 + `session.focus`, `session.split.close`,
+      `session.swap`), the Terminals bullet names the axes, the keys sentence says the two focus
+      rows are slot 0 / slot 1 for both axes, the Scriptable bullet carries the P4 paragraph, the
+      Tests paragraph names the #238 probe. `qa/panes.md`: the intro carries the words, plus the
+      three cases (a horizontal split stacks and re-orients live; a swap exchanges contents, not
+      geometry, and the ids keep reaching their shells; a promotion keeps the sidebar row and the
+      tree id, with `tree` and no `session closed`). Contract: `-Update` brought the two P4 steps
+      (`split on --axis horizontal --target {beta}` capturing `{pane}`, `split close --target
+      {pane}`), the `off` note and the two refusals; `check-contract` is green. Conformance: the
+      `$cliHasP4` probe (`session swap x` → "Nothing sent") and a `Needs-NewClient` rule that skips
+      `split` with `--axis` or `close`, `swap` and `focus` on a pre-#238 client — that client drops
+      `--axis` on the floor, so the `diagonal` refusal would PASS as a plain split and the
+      horizontal step would split vertical; the `{pane}`-carrying close step skips with them. All
+      P4 steps and refusals pass under `-Strict` with the dev CLI, and SKIP (not fail) with the
+      released 0.17.10 CLI in `bin/`. The honesty block was complete after Tasks 1–3 (every item of
+      the Testing Strategy list has a check); nothing to add. `run-all -Strict` green, twelve suites.
+      ➕ The `lite-parity.md` "Splits as sessions" paragraph, for the agwinterm docs PR:
+      "lite models a split as a hidden session; agwinterm models panes inside a session. Behaviour
+      matches — a split belongs to its session, closes with it, restores with it, axis and order
+      included (an `L` line beside the `P`) — and the internal shape stays different. P4-lite
+      implemented `session swap` after all: the hidden session is drawn in the owner's other slot,
+      so a swap is one flag read where the two panes are laid out and hit-tested; no tree identity
+      moves, no id moves, the `K` line stays by role. `session split close` on the session's own
+      shell promotes the hidden session's object into the session's place (same id, name,
+      workspace, flag, context, sidebar row; its own pane id kept — `Session::paneId`, set once and
+      never written), with a `tree` event and no `session closed` — agwinterm's `[B]` picture. The
+      one sentence the session-id rule differs by: agwinterm's session id names the FOCUSED pane
+      while no pane carries it; lite's always names the session's own shell, and the split's shell
+      is reached only by its own id (no per-session pane resolution). `session close <split
+      shell's id>` is a pre-P4 divergence in lite's favour: it closes that shell (an unsplit) where
+      agwinterm answers `session not found` for a pane id. `tree`: a lite node is `active` when the
+      displayed session is it, whichever pane has focus; the split's shell has no node. Restore:
+      split shells are recreated, never adopted, ids are fresh after a graceful restart, and the
+      `L` line puts the axis and order back onto the recreated pair. A split side whose shell
+      exits collapses to the survivor in both products; a one-pane session's exit stays on screen
+      as `(exited)` in lite."
 
 ### Task 6: [Final] Verify acceptance criteria
 - [ ] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P4 dev CLI; `check-contract` green

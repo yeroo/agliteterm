@@ -7225,7 +7225,7 @@ static std::string lastCommandOutput(Session* s, bool* haveMarks) {
 // one. A skill that overpromises is worse than no skill.
 static const char* kSkillMarkdown = R"SKILL(---
 name: agliteterm
-description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, run commands in named sessions, read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
+description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, split a session into two panes (either axis, close either side, swap, focus), run commands in named sessions, read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
 ---
 
 # agliteterm
@@ -7240,7 +7240,9 @@ You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteter
 - `AGWINTERM_SESSION_ID` - your session id, and the default target when you pass none. Read
   that twice: a command with no `--target` goes to YOUR OWN pane. Pass `--target` whenever you
   mean a different one, or you will type into your own prompt
-- `AGWINTERM_PANE_ID` - same value; use it when you specifically mean the pane
+- `AGWINTERM_PANE_ID` - the same value when the shell is born; use it when you specifically mean
+  the pane. The two part after a promotion (the splits section): the session id moves to the
+  surviving shell, the pane id stays on it, and `--target` accepts either
 - `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
 
 The variables keep the `AGWINTERM_` prefix on purpose: the same hooks and scripts work in both
@@ -7317,22 +7319,90 @@ refused. So `session type --stdin --target <quick session id>` types into it.
 a pane without any program having printed anything — useful for a banner or a marker, and no use at
 all for sending keys.
 
-## A second pane, beside you
+## A second pane, beside you or below you
 
-`session split` opens the CURRENT SESSION's right-hand pane and RETURNS ITS SESSION ID. That id is
-the only handle it has: the split shell is hidden, so it appears in no tree listing and has no name.
+A session has at most TWO panes, and in lite each pane is a shell with its own id. The split shell
+is hidden: it has no node of its own in `tree`, no sidebar row and no name, so its id is the only
+handle on it. A split session's node carries the split block - `paneCount: 2`, `paneIds` (slot
+order), `focusedPane` (a slot) and `axis` - and a single session carries none of the four. The
+split belongs to that session: switch to another session and the second pane shows that one's
+split, or none at all. It closes with its owner and comes back with it after a restart.
 
-The split belongs to that session: switch to another session and the right pane shows that one's
-split, or none at all. It closes with its owner.
+The words (agterm's): **`vertical` = left/right panes** - the default of a session never split -
+and **`horizontal` = top/bottom panes**. The axis names the ARRANGEMENT, never the divider. Case
+matters: `Horizontal` or `h` is refused naming both words. **A slot is a position, an id is a
+shell**: slot 0 is the left/top box, slot 1 the right/bottom box; `primary` / `left` / `top` name
+slot 0, `split` / `right` / `bottom` name slot 1 (left/right exist on a vertical split only,
+top/bottom on a horizontal one). Fresh from `split on`, slot 0 holds the session's own shell and
+slot 1 the split shell; **a swap exchanges the slots and nothing else**.
+
+**THE SESSION-ID RULE, by condition.** A session id names the session's own shell (pane 0 of a
+fresh session; after a swap, whichever slot it sits in) while that shell exists. When that shell is
+closed - by `split close` on it, by the close chord on it while focused, by `split off` after a
+swap (slot 1 is the owner then), or by its process exiting - the surviving shell becomes the
+session: it keeps the session id, name, workspace, flag, context and sidebar row, and it keeps ITS
+OWN pane id. After such a promotion `--target <session id>` and `--target <that shell's pane id>`
+reach the same shell, and the next `split on` mints a fresh pane id for the new hidden shell, so
+`paneIds` reads `[<survivor's id>, <fresh id>]`. Lite's one difference from the full app: a session
+id ALWAYS names the session's own shell - the split's shell is reached only by its own id (the full
+app lets a session id fall through to the focused pane while no pane carries it). Pane ids never
+move: not by a split, a close, a swap or a promotion.
 
 ```
-id=$(agwintermctl session split)
+agwintermctl session split [on|off|toggle] [--axis vertical|horizontal] [--target <id>]
+agwintermctl session split close [--target <id>]
+agwintermctl session swap [--target <id>]
+agwintermctl session focus [primary|split|left|right|top|bottom|other]
+```
+
+`session split` REPLIES WITH A PANE ID, a bare string. `on` = slot 1's pane id - ALSO when the
+session was already split (nothing changes; a caller that does not know whether it split gets
+something addressable either way - after a swap that is the session's own shell). `off` = the
+survivor's pane id, also when already single. `toggle` = whichever it produced; the default op is
+`toggle`. `off` closes SLOT 1 and destroys that shell (the full app hides it): before a swap the
+split shell, after one the session's own shell - a promotion. `--axis` on an already-split session
+re-orients it live; omitted, the current axis stays; a session never split defaults to vertical.
+`--target` takes a session id, EITHER pane's id, a prefix or a name and acts on the session that
+shell belongs to, not the active one; a session not on screen can be split (the shell shows when
+the session is selected; focus and selection do not move). Refused, with nothing split: an unknown
+target; a quick / scratch / overlay cover (not a session; its dismissing verb is named); an axis
+outside the two words; an op outside `on` / `off` / `toggle` - an unknown op is NOT a toggle,
+because a toggle on a split session closes a pane.
+
+`session split close` closes the targeted pane, EITHER side (`off` can only close slot 1); the
+survivor takes the whole width or height and the focus, and the reply is the survivor's pane id.
+No target, or `active`, = the focused pane of the displayed session, what the close chord closes;
+a session id = the session's own shell (the rule above); a pane id = that shell. Refused, with
+nothing closed: an unknown target; a cover; a ONE-PANE session - `session close` is the verb that
+closes a session, and a split close that quietly closed one would be a silent success.
+
+`session swap` exchanges the two slots. What moves: the pane order (left/right or top/bottom), the
+focus (it follows its pane - the shell you were typing into is still the one you are typing into,
+on the other side) and the two shells' contents. What does not: the axis, EVERY id, the name,
+context, flag, and the captured-command slots. Reply `{session, paneIds, focusedPane, axis}` - the
+tree's split block after the swap. Refused, with nothing moved: an unknown target; a cover; a
+one-pane session (`session split on` makes a split). The order survives a restart (an `L` line).
+
+`session focus` moves the focus between the active session's panes; default `other`, the one word
+valid on either axis. Refused: a one-pane session; a word outside the list; the pair that does not
+exist on the session's axis (`top` on a vertical split), naming the axis.
+
+Every structural change - split, unsplit, close of either side, swap, re-orient - emits a `tree`
+event. A promotion is NOT a session close: `tree` fires, `session` / `closed` does not, and undo
+does not resurrect anything. A split side whose shell exits collapses to the survivor on its own;
+a one-pane session's exit stays on screen as "(exited)" as before. The two focus keys, Focus Left /
+Top Pane and Focus Right / Bottom Pane, are slot 0 and slot 1, whichever shell a swap put there.
+
+```
+id=$(agwintermctl session split on --axis horizontal)   # the bottom pane's id
 agwintermctl session type "ralphex docs/plans/my-plan.md\n" --target $id
+agwintermctl session swap                                # the panes change places; $id still reaches the same shell
+agwintermctl session split close --target $id            # closes that pane; the reply is the survivor's id
 ```
 
-Keep the id if you want to read that pane later (`session text --target $id`). Closing the split
-kills the shell. For something durable and visible instead, make a NAMED session - it shows in the
-sidebar and can be addressed by name - it simply will not sit side by side.
+Keep the id if you want to read that pane later (`session text --target $id`). For something durable
+and visible instead, make a NAMED session - it shows in the sidebar and can be addressed by name -
+it simply will not sit beside or below you.
 
 For a session that already exists, type into it (`\n` is sent as Enter):
 
@@ -7409,9 +7479,9 @@ denylist file) - into a durable per-pane slot, saves, and answers
 command line or `null` (the shell had nothing non-denylisted running; null is written too, so a
 fresh capture replaces an older checkpoint, including with nothing); the top-level `captured`
 counts the non-null ones. The slots read back from `tree --json` as `capturedCommands` on the
-owning session node, keyed by pane id - the session id for the left pane, the split's id for the
-right - and persist as a `K` line. `--target` names one session (its own left pane), a split's id
-(that one pane) or `active` (the focused pane). The reply describes a state that is already on
+owning session node, keyed by pane id - the ids `paneIds` lists, which after a promotion (the
+splits section) are not the session id - and persist as a `K` line. `--target` names one session
+(its own shell), either pane's id (that one pane) or `active` (the focused pane). The reply describes a state that is already on
 disk when you read it.
 
 **`replayOnRestore` is always `false` here.** lite restores a session's LAUNCH spec at the next
@@ -7483,7 +7553,8 @@ and still prints the `cli` half when nothing is listening, marking the app `unav
 ## Sessions, workspaces, windows
 
 ```
-agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|split|scratch|overlay|write
+agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|scratch|overlay|write
+agwintermctl session split [on|off|toggle|close]|swap|focus
 agwintermctl session copy|paste|type|text|output|status|context
 agwintermctl surface cursor
 agwintermctl restore capture
