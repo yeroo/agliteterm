@@ -75,6 +75,15 @@ and typing into that id reaches a live shell.
 The shell is fresh, not the old one: only `S` lines carry host ids, so a split is recreated rather
 than adopted. Its scrollback does not come back - the pane does.
 
+**The layout half (P4):** `qa/fixtures/layout-restart.ps1` drives it end to end - split
+`--axis horizontal`, a marker command in each shell, one `restore capture`, a `session swap`, then
+the window killed (the `L` line has to have been checkpointed by the save the swap triggered; there
+is no close) and relaunched. After the restart the tree's split block says `horizontal` with the
+session's own shell in slot 1, each captured slot sits on the shell that ran it (`K` is by role,
+field 2 the session's own shell whatever its slot), both shells answer `session text`, and a
+`PrintWindow` capture of the restored window lands in `%TEMP%\agliteterm-layout-restart\restored.png`
+for the PR body. `-Graceful` closes instead of kills. Run alone.
+
 **Fails when:** the `P` line stops being written, or the parser's guard drops it wrongly. That guard
 refuses ALL `P` lines when the number of `S` lines it counted does not match the number that parsed,
 because a dropped `S` line slides every owner index onto the wrong session.

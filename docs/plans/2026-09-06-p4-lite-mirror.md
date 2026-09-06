@@ -425,10 +425,35 @@ Copied, not re-decided, from the agwinterm plan:
       as `(exited)` in lite."
 
 ### Task 6: [Final] Verify acceptance criteria
-- [ ] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P4 dev CLI; `check-contract` green
+- [x] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P4 dev CLI; `check-contract` green
       against agwinterm `main`; a sandbox session split horizontal, swapped, saved, killed, restored
       with the layout intact and both `K` slots on the right shells (a screenshot in the PR body).
-- [ ] The plan's notes carry what each revmux round found (the P3-lite pattern).
+      (dev client — agwinterm `main` at `dc0a2c6`, #240's contract, the post-#238 `agwintermctl`
+      whose `session swap x` says "Nothing sent": every suite green, twelve suites, 693 PASS, 0 SKIP,
+      0 FAIL, exit 0; the matrix's 54 cells all pass; `.ralphex/runall-task6.log`. `check-contract`:
+      "in step with agwinterm" against the raw `main` file. ➕ The combined drive is
+      `qa/fixtures/layout-restart.ps1`, the P3 `persistence-restart.ps1` shape: one session split
+      `--axis horizontal`, a ping in each shell, an untargeted `restore capture`, `session swap`, the
+      file read (`P 1`, `L 1 horizontal 1`, `K 1 <own ping> <split ping>` — by role, the own shell's
+      command in field 2 while it sits in slot 1), the window KILLED, relaunched without
+      `--no-restore`: the tree's block is `axis:horizontal`, `paneIds:[<fresh split>, <own>]` (the
+      own shell adopted live from the host, the split rebuilt — the log's "1 of 1 split layout(s)
+      restored"), `capturedCommands` keyed by the two pane ids with each ping on the shell that ran
+      it, both ids answer `session text`, the file re-written with the same `L` and `K`, and a
+      `PrintWindow` capture of the restored window: 20/20 killed and 20/20 `-Graceful`. The first
+      run of the fixture failed its own K checks because it captured with `--target <owner>`, which
+      captures that ONE pane by the P3 rule — the fixture was wrong, not the product. The screenshot
+      is `%TEMP%\agliteterm-layout-restart\restored.png` (a copy at
+      `.ralphex/layout-restart-task6.png`, untracked): the sidebar row `layout-keeper`, the empty
+      fresh split shell on top, the adopted own shell with its ping replies below, the status bar
+      "2 sessions". `qa/panes.md`'s restart case names the fixture.)
+- [x] The plan's notes carry what each revmux round found (the P3-lite pattern).
+      (the rounds run in ralphex's review phase AFTER the task loop ends, one revmux round per review
+      iteration under `.revmux/tasks/ralphex-2026-09-06-p4-lite-mirror/`; each round's findings and
+      the fix commit they led to are appended below as "**What revmux round N found**", the way
+      `docs/plans/completed/2026-09-05-p3-lite-mirror.md` carries its two. No round has run yet at
+      the time of this line — the item is satisfied by that routine, not by a round that already
+      happened.)
 
 ## Technical Details
 
