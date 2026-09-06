@@ -1769,6 +1769,104 @@ try {
         Check 'session close on the promoted session closes it (the survivor shell, by its own host id): session closed fired' ($null -eq (Node $o2) -and (EvSince $cur 'session') -ge 1 -and (NodeCount) -eq $before)
         Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
         Start-Sleep -Milliseconds 400
+        # ---- Task 3: `session swap` — the slots exchange, the ids stay, the focus follows ----------
+        # A SWAP MOVES PANES, NEVER IDS (SwapReply.cs): `paneIds` reverses, `focusedPane` follows the
+        # pane, `axis` is kept, and each id reaches the shell it reached before — proved by a marker
+        # typed under an id before the swap and read back under the same id after it. The reply is
+        # the one object among the split verbs: the node's split block after the flip. Every refusal
+        # is agwinterm's sentence and moves nothing. The slot-based verbs follow by construction —
+        # `focus left` is slot 0 whichever shell sits there, `split on` when split answers slot 1's
+        # id, `split off` closes slot 1 — and each is checked here on a swapped session.
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'swap on a one-pane session is refused naming `session split on`' (-not $r.ok -and [string]$r.error -eq "swap: session '$aid' has one pane, so there is nothing to exchange; ``session split on`` makes a split. Nothing moved.") "raw: $raw"
+        Check 'and nothing moved: the session is there, single' ([bool](Node $aid) -and (SplitBlock $aid) -eq '' -and (NodeCount) -eq $before)
+        $raw = Send-Ctl $s @('session', 'swap', '--target', 'no-such-session-9999')
+        Check 'swap on an unknown target is refused naming it' (-not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "swap: no pane or session matches 'no-such-session-9999'. Nothing moved.") "raw: $raw"
+        $cur = Cursor
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"on"}}' | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $created = @((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$cur"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' })
+        $covId = [string]($created | Select-Object -Last 1).session
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $covId)
+        Check 'swap on a scratch cover is refused as no side of a split' ([bool]$covId -and -not (ConvertFrom-Json $raw).ok -and [string](ConvertFrom-Json $raw).error -eq "swap: '$covId' is a scratch/overlay/quick pane, not a side of a split. Nothing moved.") "raw: $raw"
+        Check 'and nothing moved: no session event beyond the created one, no split block anywhere' ((EvSince $cur 'session') -eq 1 -and @(Nodes | Where-Object { $_.PSObject.Properties['paneCount'] }).Count -eq 0)
+        Send-Raw '{"cmd":"session.scratch","target":"","args":{"op":"off"}}' | Out-Null
+        Start-Sleep -Milliseconds 500
+        # The swap itself: a marker in each shell first, then the reply, the tree, the grid and the ids.
+        # The session's OWN pane id is read off the tree: the promotions above moved the session id
+        # onto a shell whose pane id is not the session id (pane ids never move), and `paneIds`
+        # reports panes. `--target $aid` still reaches that shell — the session-id rule.
+        $sw = SplitOn
+        $own = [string]@((Node $aid).paneIds)[0]
+        Check 'setup: split, focus on slot 0, a marker in each shell' ([bool]$sw -and [bool]$own -and $own -ne $sw -and (SplitBlock $aid) -eq "2|$own,$sw|0|vertical" -and (Mark $aid 'p4-mk-owner-s') -and (Mark $sw 'p4-mk-split-s')) "block '$(SplitBlock $aid)'"
+        $nOwn = Node $aid; $cOwn = [int]$nOwn.cols; $rOwn = [int]$nOwn.rows
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $aid)
+        Start-Sleep -Milliseconds 600
+        $r = ConvertFrom-Json $raw
+        Check 'swap answers the split block after the flip: session, paneIds reversed, focusedPane 1 (the focus followed the pane), axis kept' ([bool]$r.ok -and [string]$r.result.session -eq $aid -and (@($r.result.paneIds) -join ',') -eq "$sw,$own" -and [int]$r.result.focusedPane -eq 1 -and [string]$r.result.axis -eq 'vertical') "raw: $raw"
+        Check 'and the tree agrees: paneIds [split, session], focusedPane 1, axis vertical' ((SplitBlock $aid) -eq "2|$sw,$own|1|vertical") "block '$(SplitBlock $aid)'"
+        Check 'the swap emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        Check "the session's own shell kept its grid within a column: the two halves, not a new layout" ([math]::Abs([int](Node $aid).cols - $cOwn) -le 1 -and [int](Node $aid).rows -eq $rOwn) "grid $((Node $aid).cols)x$((Node $aid).rows), was ${cOwn}x${rOwn}"
+        Check 'a swap moves panes, never ids: each marker reads back under the id it was typed under' (((Get-PaneText $s $aid) -match 'p4-mk-owner-s') -and ((Get-PaneText $s $sw) -match 'p4-mk-split-s') -and -not ((Get-PaneText $s $aid) -match 'p4-mk-split-s')) "by session id: $(Get-PaneText $s $aid)`nby split id: $(Get-PaneText $s $sw)"
+        Check 'and session type by each id still reaches the same shell after the swap' ((Mark $aid 'p4-typed-owner-s') -and (Mark $sw 'p4-typed-split-s') -and -not ((Get-PaneText $s $sw) -match 'p4-typed-owner-s')) "by split id: $(Get-PaneText $s $sw)"
+        Check "and the node keeps its name, its row and its id: still active, not exited" ([bool](Node $aid).active -and -not [bool](Node $aid).exited -and (NodeCount) -eq $before)
+        # `on` when split answers slot 1's id: after the swap, the session's own pane id.
+        $raw = Send-Ctl $s @('session', 'split', 'on', '--target', $aid)
+        Check "split on when split, after a swap, answers slot 1's id — the session's own pane — and changes nothing" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq "2|$sw,$own|1|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # The focus words are slots: `left` / `primary` land on slot 0, which is the split shell now.
+        foreach ($pair in @(@('left', 0), @('right', 1), @('primary', 0), @('split', 1), @('other', 0), @('other', 1))) {
+            $raw = Send-Ctl $s @('session', 'focus', $pair[0])
+            Start-Sleep -Milliseconds 200
+            Check "focus $($pair[0]) on the swapped session lands on slot $($pair[1])" ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq "2|$sw,$own|$($pair[1])|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        }
+        # A swap by the split shell's id acts on its session: the order comes back, the focus follows again.
+        $raw = Send-Ctl $s @('session', 'swap', '--target', $sw)
+        Start-Sleep -Milliseconds 600
+        $r = ConvertFrom-Json $raw
+        Check "swap by the split shell's id acts on its session: the order back to [session, split], the focus followed to slot 0" ([bool]$r.ok -and (@($r.result.paneIds) -join ',') -eq "$own,$sw" -and [int]$r.result.focusedPane -eq 0 -and (SplitBlock $aid) -eq "2|$own,$sw|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # No target: the displayed session, through whichever of its panes is focused — the split shell here.
+        Send-Ctl $s @('session', 'focus', 'split') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $raw = Send-Ctl $s @('session', 'swap')
+        Start-Sleep -Milliseconds 600
+        Check 'swap with no target acts on the displayed session with its split shell focused: reversed, the focus followed to slot 0' ([bool](ConvertFrom-Json $raw).ok -and (SplitBlock $aid) -eq "2|$sw,$own|0|vertical") "raw: $raw, block '$(SplitBlock $aid)'"
+        # `split close` with no target closes the FOCUSED pane: the split shell, in slot 0 now — no promotion.
+        $raw = Send-Ctl $s @('session', 'split', 'close')
+        Start-Sleep -Milliseconds 800
+        Check "split close with no target on the swapped session closes the focused split shell (slot 0): the session's own shell survives" ([string](ConvertFrom-Json $raw).result -eq $own -and (SplitBlock $aid) -eq '' -and ((Get-PaneText $s $aid) -match 'p4-mk-owner-s')) "raw: $raw, block '$(SplitBlock $aid)'"
+        # `split off` after a swap closes SLOT 1: the session's own shell — a promotion; the session keeps its id.
+        $sw2 = SplitOn
+        Check 'setup: split again, a marker in the split shell' ([bool]$sw2 -and (Mark $sw2 'p4-mk-split-s2'))
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 500
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'split', 'off', '--target', $aid)
+        Start-Sleep -Milliseconds 800
+        Check "split off after a swap closes slot 1 — the session's own shell: a promotion, the survivor's pane id answered, the session keeps its id" ([string](ConvertFrom-Json $raw).result -eq $sw2 -and (SplitBlock $aid) -eq '' -and [bool](Node $aid) -and ((Get-PaneText $s $aid) -match 'p4-mk-split-s2') -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', text: $(Get-PaneText $s $aid)"
+        Check 'and it was a promotion, not a session close: tree fired, session closed did not' ((EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -eq 0)
+        Check 'the promoted session is single again, so a swap is refused as before' (-not (ConvertFrom-Json (Send-Ctl $s @('session', 'swap', '--target', $aid))).ok -and (SplitBlock $aid) -eq '')
+        # A session NOT on screen can be swapped; nothing moves (#230); selecting it shows the swapped pair.
+        $o3 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'new', '--name', 'p4-offscreen3'))).result
+        Check 'setup: a second session' (Wait-Node $o3)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $os3 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'split', 'on', '--target', $o3))).result
+        Start-Sleep -Milliseconds 500
+        $raw = Send-Ctl $s @('session', 'swap', '--target', 'p4-offscreen3')
+        Start-Sleep -Milliseconds 500
+        $r = ConvertFrom-Json $raw
+        Check 'swap by NAME on a session not on screen reverses its order; focusedPane 1, the slot its own shell now sits in' ([bool]$r.ok -and [string]$r.result.session -eq $o3 -and (@($r.result.paneIds) -join ',') -eq "$os3,$o3" -and [int]$r.result.focusedPane -eq 1 -and (SplitBlock $o3) -eq "2|$os3,$o3|1|vertical") "raw: $raw, block '$(SplitBlock $o3)'"
+        Check 'while the displayed session and the selection did not move (#230)' ([bool](Node $aid).active -and -not [bool](Node $o3).active)
+        Send-Ctl $s @('session', 'select', '--target', $o3) | Out-Null
+        Start-Sleep -Milliseconds 800
+        Check 'selecting it shows the swapped pair, its own shell focused on slot 1, at half the columns' ([bool](Node $o3).active -and (SplitBlock $o3) -eq "2|$os3,$o3|1|vertical" -and (HalfOf ([int](Node $o3).cols) $c0)) "block '$(SplitBlock $o3)' cols $((Node $o3).cols)"
+        Send-Ctl $s @('session', 'close', '--target', $o3) | Out-Null
+        Start-Sleep -Milliseconds 500
+        Check 'setup: the second session is gone' ($null -eq (Node $o3) -and (NodeCount) -eq $before)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
     }
 
     # ---- #23: two persisted values that cannot coexist ------------------------------------------

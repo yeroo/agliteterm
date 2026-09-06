@@ -6970,6 +6970,17 @@ static std::string splitCloseCover(const std::string& paneId) {
     return "split close: '" + paneId + "' is a scratch/overlay/quick pane, not a side of a split; `session scratch off`, "
            "`session overlay close` or `quick off` dismiss those. Nothing closed.";
 }
+// `session swap` (SwapReply.cs): each moves nothing.
+static const char* const kSwapNoActive = "swap: there is no active session to swap the panes of. Nothing moved.";
+static std::string swapUnknown(const std::string& target) {
+    return "swap: no pane or session matches '" + target + "'. Nothing moved.";
+}
+static std::string swapSinglePane(const std::string& sessionId) {
+    return "swap: session '" + sessionId + "' has one pane, so there is nothing to exchange; `session split on` makes a split. Nothing moved.";
+}
+static std::string swapCover(const std::string& paneId) {
+    return "swap: '" + paneId + "' is a scratch/overlay/quick pane, not a side of a split. Nothing moved.";
+}
 // `session focus`'s words (SplitAxes.TryFocusIndex): primary = slot 0 and split = slot 1 on either
 // axis; left/right = slot 0/1 on a VERTICAL split only; top/bottom = slot 0/1 on a HORIZONTAL one
 // only; other = the slot not focused. A direction that does not exist on the axis is refused naming
@@ -7006,6 +7017,19 @@ static Session* splitOwnerOf(Session* s) {
     if (!s->hidden) return s;
     for (Session* o : g_sessions) if (!o->hidden && o->splitId == s->id) return o;
     return nullptr;
+}
+// The split block of a split session (P4), the three fields the tree's node and `session swap`'s
+// reply share — agwinterm's keys and spellings: `paneIds` in SLOT order (slot 0 = left/top, so
+// after a swap the split shell's id comes first), `focusedPane` a slot, `axis` the two words.
+// `ownerIdx` is the owner's index in g_sessions. A session not on screen has no live focus in
+// lite, and selecting it focuses its own shell (selectPrimary), so the slot that shell sits in is
+// the one reported for it. Caller holds g_lock.
+static std::string splitBlockFields(const Session* owner, const Session* split, int ownerIdx) {
+    const Session* slot0 = owner->swapped ? split : owner;
+    const Session* slot1 = owner->swapped ? owner : split;
+    int focusedSlot = g_pane[0] == ownerIdx ? (owner->swapped ? 1 - g_focus : g_focus) : (owner->swapped ? 1 : 0);
+    return "\"paneIds\":[\"" + jsonEscape(slot0->paneId) + "\",\"" + jsonEscape(slot1->paneId) +
+           "\"],\"focusedPane\":" + std::to_string(focusedSlot) + ",\"axis\":\"" + axisWord(owner) + "\"";
 }
 // The process query did not run. Refused rather than reported as "nothing running" everywhere: an
 // empty answer from a dead query would write null into every slot and look exactly like a quiet desk.
@@ -7591,13 +7615,7 @@ static std::string ctlDispatch(const std::string& line) {
                 // (slot 0 = left/top), `focusedPane` a slot; `axis` always while split, like
                 // focusedPane. A session not on screen has no live focus in lite, and selecting it
                 // focuses its own shell (selectPrimary), so that is the slot reported for it.
-                if (sh) {
-                    const Session* slot0 = s->swapped ? sh : s;
-                    const Session* slot1 = s->swapped ? s : sh;
-                    int focusedSlot = g_pane[0] == i2 ? (s->swapped ? 1 - g_focus : g_focus) : (s->swapped ? 1 : 0);
-                    sess += ",\"paneCount\":2,\"paneIds\":[\"" + jsonEscape(slot0->paneId) + "\",\"" + jsonEscape(slot1->paneId) +
-                            "\"],\"focusedPane\":" + std::to_string(focusedSlot) + ",\"axis\":\"" + axisWord(s) + "\"";
-                }
+                if (sh) sess += ",\"paneCount\":2," + splitBlockFields(s, sh, i2);
                 sess += "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +
@@ -8331,6 +8349,49 @@ static std::string ctlDispatch(const std::string& line) {
         LockG hold;
         if (indexOfSession(survivor) < 0) return ctlErr("session not found");
         return ctlOkStr(survivor->paneId);
+    }
+    if (cmd == "session.swap") {   // exchange the two panes of a split session; reply its split block (P4)
+        // agwinterm's session.swap (SwapReply.cs, its sentences verbatim). A swap exchanges the SLOTS
+        // and nothing else: `swapped` flips on the owner, and the two helpers of the slot map
+        // (slotOf / paneOfSlot) turn that into the other rect for each shell — paneRect, the divider,
+        // hitTest, the keybindings and `session focus` all follow. A SWAP MOVES PANES, NEVER IDS: an
+        // agent holding a pane id keeps reaching the same shell, now on the other side. Focus follows
+        // the pane — the shell being typed into is still the one being typed into — and in lite that
+        // is g_focus UNCHANGED, since g_focus indexes owner/split, not slots. Axis kept, name /
+        // context / flag / `K` slots untouched (the `K` line is by role). Resolution is `split
+        // close`'s: no target / `active` = the displayed session (through the focused pane, which
+        // may be its split shell); a session id, either pane's id, a prefix or a name = the session
+        // that shell belongs to — the verb acts on the pair, never on one side. A session not on
+        // screen can be swapped; nothing here moves focus or selection (#230). Refused, each with
+        // nothing moved: an unknown target; a cover; a one-pane session (an ok:true for it would be
+        // the silent-success class). The reply is the ONE object among the split verbs — the node's
+        // split block read back AFTER the flip, under the same hold, so it describes state that
+        // exists. Structural, so `tree` fires; the flip is a field write under g_lock, the relayout
+        // a host round trip outside it, the way closeSplitSide orders them.
+        const std::string& t = req.get("target");
+        std::string shown = t.empty() ? "active" : t;
+        if (!target) {
+            if (!targetWhy.empty()) return ctlErr(targetWhy);
+            return ctlErr(t.empty() || t == "active" ? kSwapNoActive : swapUnknown(t));
+        }
+        std::string reply;
+        bool displayed = false;
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr(swapUnknown(shown));   // closed since the resolve (#21)
+            Session* owner = splitOwnerOf(target);
+            if (!owner) return ctlErr(swapCover(target->id));
+            int oi = indexOfSession(owner), si = indexOfSessionId(owner->splitId);
+            if (si < 0) return ctlErr(swapSinglePane(owner->id));
+            owner->swapped = !owner->swapped;
+            displayed = g_pane[0] == oi;
+            emitEvent("tree");   // paneIds and focusedPane changed
+            reply = "{\"session\":\"" + jsonEscape(owner->id) + "\"," + splitBlockFields(owner, g_sessions[si], oi) + "}";
+        }
+        if (displayed) syncPaneSizes();   // each shell's rect is the other slot's now (a column may differ on an odd width)
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // rebuilds the tree, and saves (refreshTree)
+        return ctlOk(reply);
     }
     if (cmd == "session.focus") {   // primary|split|left|right|top|bottom|other, the DISPLAYED session (P4)
         // agwinterm's session.focus: the active session only, default `other` (the one word that

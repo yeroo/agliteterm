@@ -330,9 +330,23 @@ Copied, not re-decided, from the agwinterm plan:
       `-Strict` with the P4 dev CLI after the fix.
 
 ### Task 3: `session swap`
-- [ ] `swapped = !swapped` on the owner under the UI-thread pattern; reply
+- [x] `swapped = !swapped` on the owner under the UI-thread pattern; reply
       `{"session","paneIds","focusedPane","axis"}` read back after the flip; the refusals.
-- [ ] `focus` words and `on`-when-split follow slots (they do by construction — add the checks).
+- [x] `focus` words and `on`-when-split follow slots (they do by construction — add the checks).
+      ➕ Task 3 notes: the flip is one field write under `g_lock`, with the `tree` event and the reply
+      read back under the same hold (`splitBlockFields`, now shared with the tree's node so the two
+      cannot disagree); the relayout (`syncPaneSizes`, only when displayed) and the invalidate run
+      outside it, `closeSplitSide`'s order. `g_focus` is untouched — it indexes owner/split, so the
+      focus follows the pane with no code. Resolution and the four refusals are `split close`'s shape
+      with `SwapReply.cs`'s sentences. The honesty block proves a swap moves panes, never ids, with
+      markers typed under each id before the swap and read back under the same id after it; every
+      focus word by slot on a swapped session; `split on` when split answering the session's own
+      pane id after a swap; no-target `split close` closing the focused split shell in slot 0; `split
+      off` after a swap promoting; a swap by name off-screen (#230). One thing the checks had to
+      learn: after Task 2's promotions the session id names a shell whose pane id is not the session
+      id, so `paneIds` is compared against the pane id read off the tree, not `$aid` — the rule,
+      demonstrated by the suite's own history. The `L` line (Task 4) is what makes the order survive
+      a restart; until then a swap is in memory and in the tree only.
 
 ### Task 4: the `L` line
 - [ ] Writer: after the `P` lines, before `K`, `L\t<ownerIdx>\t<axis>\t<0|1>` for each split
