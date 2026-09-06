@@ -464,9 +464,10 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       completes. PR #28's body carries the validation above; revmux rounds follow it)
 
 **What revmux round 1 found** (`.revmux/tasks/p3-lite-mirror/01-initial`, full branch at
-`26ae272`): no Major or Critical; nine Minors, six of them fixed in `ca527a6` because four are real
-product gaps and the round rule (two minimum, and a lock change never ships without its own round)
-meant a fix round was due anyway. Round 2 is scoped to that commit.
+`26ae272`): no Major or Critical; nine Minors, all nine fixed in `ca527a6` (the commit message
+says six — it was written before the last three went in) because four are real product gaps and
+the round rule (two minimum, and a lock change never ships without its own round) meant a fix
+round was due anyway. Round 2 is scoped to that commit.
 
 - **A save preempted between releasing `g_lock` and taking `g_saveLock` could publish an OLDER
   snapshot last** — two locks in sequence do not give "the later snapshot wins" on their own.

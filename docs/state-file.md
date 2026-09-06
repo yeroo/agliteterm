@@ -76,7 +76,8 @@ the build before P4 wrote.
   U+0001 at offset 3 …`); the session restores without it and nothing is drawn.
 - **A `K` slot lands on the session the restore creates**: `pane0` on the session, `pane1` on the
   split the matching `P` line rebuilds. When that split did not come back — the split failed to
-  start, or the `K` line names a split the file has no `P` line for (a hand-edited or
+  start, the owner session itself failed to start (a dead entry gets no split, so its `P` line is
+  never attempted), or the `K` line names a split the file has no `P` line for (a hand-edited or
   downgrade-written file) — the `pane1` slot has no pane to belong to and is dropped with a
   `logWarn` naming the session. (A `P` set refused by the count guard takes the `K` set with it —
   the same comparison — so that case never reaches the per-session drop.) A session whose app failed to start keeps its `pane0` slot the way it
