@@ -3042,6 +3042,18 @@ static bool saveSessionState() {
     // the sessions without their slots — and drops them on its next save (the same write-back loss
     // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
     std::string capLines;
+    // "L\t<idx>\t<axis>\t<0|1>" — a split's LAYOUT (P4): the axis word (Session::horizontal's
+    // vocabulary, `vertical` / `horizontal`) and the slot order (0 = the session's own shell sits
+    // in slot 0, 1 = swapped), indexed by S-line position like P. Written ONLY when the layout
+    // differs from the default (horizontal, or swapped, or both), so a vertical unswapped tree
+    // writes the exact bytes 0.17.14 wrote — and only for a session whose split shell exists,
+    // because the layout describes the pair (a lone session keeps `horizontal` in memory for its
+    // next `split on`, but a file has no pair to describe). Written after the P lines it refers
+    // to, before K, by the same convention as K. Additive: an older build ignores L and restores
+    // the split in the default layout — and drops the line on its next save (the write-back
+    // loss C and K have). Not a fifth P field: P's tail is `args...`, and a 0.17.14 reader would
+    // launch the split shell with the axis word as its first argument.
+    std::string layoutLines;
     const std::string tab(1, (char)9);       // the field separator, spelled without an escape
     for (size_t oi = 0; oi < savedOrder.size(); oi++) {
         const Session* owner = savedOrder[oi];
@@ -3055,6 +3067,8 @@ static bool saveSessionState() {
                         + tab + tsvField(scw.empty() ? sh->cwd : scw);
             for (const auto& a : sh->args) splitLines += tab + tsvField(a);
             splitLines += "\n";
+            if (owner->horizontal || owner->swapped)
+                layoutLines += "L" + tab + std::to_string(oi) + tab + axisWord(owner) + tab + (owner->swapped ? "1" : "0") + "\n";
         }
         const std::string& p1 = sh ? sh->capturedCmd : std::string();
         if (!owner->capturedCmd.empty() || !p1.empty())
@@ -3069,7 +3083,8 @@ static bool saveSessionState() {
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
     out += ctxLines;                         // C lines: session contexts, with F and D, before P
-    out += splitLines;                       // P lines: each session's own right-hand shell
+    out += splitLines;                       // P lines: each session's own split shell
+    out += layoutLines;                      // L lines: a split's axis and order, only when not the default
     out += capLines;                         // K lines: the captured-command slots, after the P they name
     out += "A\t" + std::to_string(g_activeWs) + "\n";
 
@@ -8826,11 +8841,17 @@ struct RestoreSpec { int ws; std::string name, app, cwd; std::vector<std::string
 // A split shell, and which S line owns it. It has no name and no workspace of its own - it is one
 // session's right-hand pane, so it is restored only if that session was.
 struct SplitSpec { int owner = -1; RestoreSpec spec; };
+// A split's layout (the L line, P4): which S line owns it, the axis and the slot order. Validated
+// in parseStateFile — the axis is exactly one of the two words (anything else restores vertical),
+// the order exactly `0` / `1` (anything else restores 0) — and applied onto the pair the matching
+// P line rebuilt; an L for an owner with no P line describes no pair and is dropped, named.
+struct LayoutSpec { int owner = -1; bool horizontal = false; bool swapped = false; };
 
 struct ParsedState {
     std::vector<std::wstring> wss;
     std::vector<RestoreSpec> specs;
     std::vector<SplitSpec> splits;       // from P lines; empty for any file written before 0.17.13
+    std::vector<LayoutSpec> layouts;     // from L lines (P4); empty for a default layout, or a file written before it
     // From C lines (P3): (S-line index, raw text) per session that had a context. Raw here — the
     // loader runs each one through contextRefusal, the verb's own rules, before it is set.
     std::vector<std::pair<int, std::string>> contexts;
@@ -8884,6 +8905,24 @@ static ParsedState parseStateFile(const std::wstring& path) {
             SplitSpec sp; sp.owner = atoi(ff[1].c_str()); sp.spec.app = ff[2]; sp.spec.cwd = ff[3];
             for (size_t k = 4; k < ff.size(); k++) sp.spec.args.push_back(ff[k]);
             ps.splits.push_back(sp);
+        } else if (ff[0] == "L" && ff.size() >= 4) {   // a split's layout: owner, axis word, order (P4)
+            // Positional like P, and validated field by field rather than refused as a line: a
+            // hand-edited axis word or order digit loses that one setting, never the split. The
+            // owner index is checked against the P set after the whole file is read (below), the
+            // way K's pane-1 slot needs its split.
+            LayoutSpec ls; ls.owner = atoi(ff[1].c_str());
+            if (!parseAxis(ff[2], &ls.horizontal)) {
+                logWarn("state: layout line for session index %d has axis '%s' (not vertical / horizontal) - restoring vertical",
+                        ls.owner, ff[2].c_str());
+                ls.horizontal = false;
+            }
+            if (ff[3] == "1") ls.swapped = true;
+            else if (ff[3] != "0") {
+                logWarn("state: layout line for session index %d has order '%s' (not 0 / 1) - restoring 0",
+                        ls.owner, ff[3].c_str());
+                ls.swapped = false;
+            }
+            ps.layouts.push_back(ls);
         } else if (ff[0] == "C" && ff.size() >= 3) {   // a session's context: S-line index, text
             // Kept as (index, text) rather than applied here: the index is checked against the
             // spec list only after the whole file is read, under the same count guard as P below.
@@ -8951,6 +8990,29 @@ static ParsedState parseStateFile(const std::wstring& path) {
             logWarn("state: capture line names session index %d but the file has %zu session(s) - dropped",
                     ci, ps.specs.size());
             ps.captures.erase(ps.captures.begin() + k);
+        } else k++;
+    }
+    // L lines (P4): positional like P, so the same wholesale guard (the SAME comparison, so a refused
+    // P set takes its L set with it here). Then each surviving L needs the P line it describes: an
+    // L for an owner without a P line (a hand-edited file, or a P line dropped by an older build's
+    // re-save while the L was kept by hand) names no pair and is dropped, named in the log. The
+    // axis and order words were validated per line above, where they were read.
+    if (!ps.layouts.empty() && ps.sLines != (int)ps.specs.size()) {
+        logWarn("state: %d session line(s) but %zu parsed - refusing %zu layout line(s) rather than "
+                "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.layouts.size());
+        ps.layouts.clear();
+    }
+    for (size_t k = 0; k < ps.layouts.size();) {
+        int li = ps.layouts[k].owner;
+        bool hasSplit = false;
+        for (const auto& sp : ps.splits) if (sp.owner == li) { hasSplit = true; break; }
+        if (li < 0 || li >= (int)ps.specs.size()) {
+            logWarn("state: layout line names session index %d but the file has %zu session(s) - dropped",
+                    li, ps.specs.size());
+            ps.layouts.erase(ps.layouts.begin() + k);
+        } else if (!hasSplit) {
+            logWarn("state: layout line for session index %d has no split (P) line to describe - dropped", li);
+            ps.layouts.erase(ps.layouts.begin() + k);
         } else k++;
     }
     if (!ps.savedIds.empty() && ps.savedIds.size() != ps.specs.size()) {
@@ -9177,6 +9239,26 @@ static bool restoreSessions() {
     }
     if (!ps.splits.empty())
         logInfo("restore: %d of %zu split shell(s) rebuilt", splitsBuilt, ps.splits.size());
+    // The layout (the L lines, P4) goes onto the owner whose split the P line just rebuilt: the axis
+    // and the order describe the PAIR, so with no pair — the split shell failed to start (an L for
+    // an owner with no P line never reaches here; parseStateFile dropped it) — the line is dropped
+    // and named rather than left on a lone session where the next `split on` would silently pick
+    // it up. Set before resolveSplitForPrimary / syncPaneSizes below, which read it through paneRect.
+    int layoutsSet = 0;
+    for (const auto& ls : ps.layouts) {
+        if (ls.owner < 0 || ls.owner >= (int)bySpec.size() || !bySpec[ls.owner]) continue;
+        Session* owner = bySpec[ls.owner];
+        if (splitOf[ls.owner]) {
+            LockG hold;
+            owner->horizontal = ls.horizontal;
+            owner->swapped = ls.swapped;
+            layoutsSet++;
+        } else {
+            logWarn("restore: layout for session '%s' dropped - its split was not restored", specs[ls.owner].name.c_str());
+        }
+    }
+    if (!ps.layouts.empty())
+        logInfo("restore: %d of %zu split layout(s) restored", layoutsSet, ps.layouts.size());
     // Pane 1's slot goes onto the split the P line just rebuilt (a fresh Session, so the value has
     // to be re-attached here). No split — the split failed to start, or a K line describes a split
     // the file has no P line for (a P set refused wholesale takes the K set with it in

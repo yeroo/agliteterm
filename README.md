@@ -157,17 +157,21 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
   reading of "my sessions are gone": right sessions, wrong window.
 - **Format**: tab-separated UTF-8 text, `V1` header, one record per line — `W` workspace, `S` session
   (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `C` a
-  session's context, `P` a session's split shell, `K` a session's captured commands, `A` active
-  workspace; `C`, `P` and `K` name their session by its position among the `S` lines and are refused
-  wholesale when that count does not add up. The format grows by *adding* line types, so a file
-  written by an older build still restores, a line type this build doesn't write is still honoured
-  when it finds one (`O`, focused workspace), and a file from a **newer** build is read for the
-  lines this one knows rather than thrown away. Every line type, field by field, is in
-  [docs/state-file.md](docs/state-file.md).
+  session's context, `P` a session's split shell, `L` a split's layout (its axis and slot order,
+  written only when it is not the default left/right unswapped), `K` a session's captured commands,
+  `A` active workspace; `C`, `P`, `L` and `K` name their session by its position among the `S` lines
+  and are refused wholesale when that count does not add up. The format grows by *adding* line
+  types, so a file written by an older build still restores, a line type this build doesn't write
+  is still honoured when it finds one (`O`, focused workspace), and a file from a **newer** build is
+  read for the lines this one knows rather than thrown away (a build before P4 restores an
+  `L`-carrying split left/right, unswapped — the layout is lost, never the split). Every line type,
+  field by field, is in [docs/state-file.md](docs/state-file.md).
 - **What is saved**: the visible sessions, each with its *live* working directory (read from the
   shell process, so it follows you as you `cd`), its context and its captured command, and each
-  session's split shell (its own app, cwd and slot) so the split comes back with its owner. The
-  quick, scratch and overlay panes are hidden covers and are not persisted.
+  session's split shell (its own app, cwd and slot) with its layout — top/bottom or left/right,
+  and which side the session's own shell sits on after a `session swap` — so the split comes back
+  with its owner the way it was. The quick, scratch and overlay panes are hidden covers and are not
+  persisted.
 - **Writes are atomic, and keep one generation.** The save writes `sessions.tsv.tmp`, rotates the
   current file to **`sessions.tsv.bak`**, then renames the temp over the target — a crash or a full
   disk mid-write can no longer leave a truncated file where a good one was. A zero-session save is

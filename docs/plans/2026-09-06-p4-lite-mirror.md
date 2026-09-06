@@ -349,11 +349,30 @@ Copied, not re-decided, from the agwinterm plan:
       a restart; until then a swap is in memory and in the tree only.
 
 ### Task 4: the `L` line
-- [ ] Writer: after the `P` lines, before `K`, `L\t<ownerIdx>\t<axis>\t<0|1>` for each split
+- [x] Writer: after the `P` lines, before `K`, `L\t<ownerIdx>\t<axis>\t<0|1>` for each split
       owner whose layout is not vertical-unswapped. Parser: `struct LayoutSpec`, the count guard,
       the no-`P` drop, the two validations. Restore: apply after the split loop. `docs/state-file.md`:
       the row, the by-role note on `K`, the downgrade sentence; `README.md` state-file section.
-- [ ] `test/restore-matrix.ps1` cells (Testing Strategy).
+- [x] `test/restore-matrix.ps1` cells (Testing Strategy).
+      ➕ Task 4 notes: the two validations are per FIELD and per line, done where the line is read
+      (a bad axis word restores vertical, a bad order digit restores 0, each named in the log with
+      the offending word) — a bad field loses that field, never the line and never the split. The
+      no-`P` drop is the parser's (it sees the whole P set); the restore side has its own drop for a
+      `P` line whose shell would not start ("restore: layout for session 'x' dropped - its split was
+      not restored"), so a layout never lands on a lone session where the next `split on` would
+      silently pick it up. The wholesale guard is the SAME comparison as P's, so a refused P set
+      takes the L set with it. The `L` is written only when the split shell exists (the layout
+      describes the pair); `horizontal` on a lone session stays in memory for its next `split on`
+      but is not persisted. The matrix's `Signature` now carries the split block as `%axis:order`
+      (order derived from "is paneIds[0] the session's id", because ids are fresh after a graceful
+      restart — the same reason K is compared by value); the pre-existing `capture-split` cell's
+      regex absorbed it unchanged. Nine cells: `axis-graceful`, `axis-killed` (the `L` was
+      checkpointed by the save the split itself triggered), `swap-killed` (order 1 AND the `K`
+      slots by role, `^cmd0;cmd1` unchanged around `%vertical:1`), and seeded `layout-bad-words`,
+      `layout-no-p`, `layout-stray-index`, `layout-count-mismatch`, `layout-split-failed`,
+      `layout-default-no-l` (the second run's file has exactly the P3 line-type shape `V1 W S D P
+      A` — the shape, not the bytes, because the D ids and live cwd differ run to run). All twelve
+      suites green under `-Strict` with the P4 dev CLI.
 
 ### Task 5: docs, trackers, tests
 - [ ] Skill: the splits section rewritten around the four verbs, the vocabulary, the session-id

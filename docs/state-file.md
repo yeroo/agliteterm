@@ -22,12 +22,14 @@ an "empty field" is a real value and an absent line is the only way to say "none
 | `D` | `id`… | The pty-host session id of every `S` line, in order. Lets a relaunch after a kill **adopt** a shell the host still holds instead of starting a new one. Absent in files from before 0.17.x builds that wrote it; the count must equal the `S` count or the whole line is ignored. |
 | `C` | `i` `text` | The **context** of the session at `S` index `i` (parity batch P3, `session context`). One line per session that has one; no line for a session without one, because an empty field could not tell "no context" from a context that is empty. Written after `D`, before `P`. |
 | `P` | `owner` `app` `cwd` `arg`… | The **split shell** of the session at `S` index `owner`: its own launch spec. One line per session that has a split. |
-| `K` | `i` `pane0` `pane1` | The **captured commands** of the session at `S` index `i` (parity batch P3, `restore capture`): `pane0` is the slot of the session's own shell, `pane1` the slot of its split shell (empty when there is no split, or nothing was captured there). An empty field is "none"; a slot is a plain string with no rules of its own, so unlike `C` one line carries both panes. One line per session with at least one slot. Written after the `P` lines by convention — `K` sits with the `P` lines it describes — not by requirement: the reader collects every line type in file order and applies them in its own fixed order, so a `K` above a `P` restores identically. A slot is a checkpoint a caller reads back (`tree --json`, `capturedCommands`); lite never types it into the shell. |
+| `L` | `owner` `axis` `order` | The **layout** of the split of the session at `S` index `owner` (parity batch P4): `axis` is `vertical` (left/right panes) or `horizontal` (top/bottom panes) — the arrangement of the panes, never the divider, case-sensitive; `order` is `0` when the session's own shell sits in slot 0 (left/top) or `1` after a `session swap` put it in slot 1. Written **only when the layout is not the default** (horizontal, or swapped, or both), so a vertical unswapped split writes the exact bytes 0.17.14 wrote, and only for a session whose `P` line exists — the layout describes the pair. Written after the `P` lines, before `K`, by the same convention as `K`. **Downgrade**: an older build ignores `L` (unknown line types are ignored) and restores the split in the default layout — the `P` line is untouched, so a downgrade loses the layout, not the split — and drops the line on its next save. On load each field is validated on its own: an `axis` other than the two words restores `vertical`, an `order` other than `0` / `1` restores `0`, each named in the log; an `L` for an owner with no `P` line is dropped and named. |
+| `K` | `i` `pane0` `pane1` | The **captured commands** of the session at `S` index `i` (parity batch P3, `restore capture`): `pane0` is the slot of the session's own shell, `pane1` the slot of its split shell (empty when there is no split, or nothing was captured there). An empty field is "none"; a slot is a plain string with no rules of its own, so unlike `C` one line carries both panes. One line per session with at least one slot. **The fields are by ROLE, not by position on screen**: `pane0` is always the session's own shell and `pane1` always the split shell, whatever slot each sits in — the `L` line carries the order, `K` does not repeat it. After a promotion (the session's own shell closed, the split shell became the session) the survivor's slot is `pane0`, because it is the session's own shell now. Written after the `P` lines by convention — `K` sits with the `P` lines it describes — not by requirement: the reader collects every line type in file order and applies them in its own fixed order, so a `K` above a `P` restores identically. A slot is a checkpoint a caller reads back (`tree --json`, `capturedCommands`); lite never types it into the shell. |
 | `A` | `ws` | The active workspace. Clamped on load to the workspaces the file has. |
 | `O` | `ws` | The focused workspace. Read when present; this build does not write it. |
 
 A file written by the current build, one workspace, two sessions, the first with a context, a split
-and a captured command in each pane:
+stacked top/bottom and swapped (its own shell in the bottom slot), and a captured command in each
+pane:
 
 ```
 V1
@@ -38,23 +40,34 @@ F	0
 D	a1b2c3d4-…	e5f6a7b8-…
 C	0	reviewing the P3 diff
 P	0	pwsh.exe	C:\src\app\tests
+L	0	horizontal	1
 K	0	npm test	ping -n 3 127.0.0.1
 A	0
 ```
+
+The same file with the split left/right and unswapped has no `L` line at all — byte for byte what
+the build before P4 wrote.
 
 ## The rules the reader applies
 
 - **Unknown line types are ignored**, and the lines it knows are honoured. That is what lets an
   older build read a newer file (it restores the sessions and drops what it cannot carry — and
-  writes the file back without those lines on its next save, so a downgrade loses contexts, splits
-  and slots, not sessions) and a newer build read an older one (a file from before P3 has no `C` or
-  `K` and restores exactly as it did).
-- **A malformed `S` line still counts.** `C`, `P`, `K` and `D` index sessions by *position* among the
-  `S` lines, so a session line the reader could not parse shifts every index after it. Rather than
-  hang a context, a split or a slot on the wrong session, each of those sets is refused **wholesale**
-  when the number of `S` lines differs from the number that parsed, with one `logWarn` naming both
-  counts (`state: 2 session line(s) but 1 parsed - refusing 1 context line(s) rather than attaching
-  them to the wrong sessions`). Every parseable session still restores.
+  writes the file back without those lines on its next save, so a downgrade loses contexts, splits,
+  slots and layouts, not sessions; a build before P4 reads an `L`-carrying file and restores the
+  split left/right, unswapped) and a newer build read an older one (a file from before P3 has no
+  `C` or `K`, one from before P4 no `L`, and each restores exactly as it did). Nothing migrates in
+  either direction.
+- **A malformed `S` line still counts.** `C`, `P`, `L`, `K` and `D` index sessions by *position* among
+  the `S` lines, so a session line the reader could not parse shifts every index after it. Rather
+  than hang a context, a split, a layout or a slot on the wrong session, each of those sets is
+  refused **wholesale** when the number of `S` lines differs from the number that parsed, with one
+  `logWarn` naming both counts (`state: 2 session line(s) but 1 parsed - refusing 1 context line(s)
+  rather than attaching them to the wrong sessions`). Every parseable session still restores.
+- **An `L` line needs its pair.** The layout is applied onto the split the matching `P` line
+  rebuilds; an `L` whose owner has no `P` line (`state: layout line for session index 0 has no split
+  (P) line to describe - dropped`), or whose split failed to start (`restore: layout for session 'x'
+  dropped - its split was not restored`), is dropped and named. A bad `axis` word or `order` digit
+  loses that one field to its default (`vertical` / `0`), named in the log, never the line.
 - **An index past the `S` list** (a hand-shortened file) drops that one line, named in the log; the
   sessions it does not name are untouched.
 - **A loaded context goes through the verb's own rules** — trimmed, not blank, no control character,
@@ -78,6 +91,8 @@ A	0
   sessions, then a fresh window.
 
 `test/restore-matrix.ps1` seeds these files byte for byte and asserts the branches above (a
-control character in a `C` line, a `C`/`P`/`K` count mismatch, a stray index, a pre-P3 file, a
-truncated write, a `.bak` fallback, a future line type); `test/control-honesty.ps1` reads the `C`
-and `K` lines back after each verb.
+control character in a `C` line, a `C`/`P`/`L`/`K` count mismatch, a stray index, a pre-P3 file, an
+`L` with a bad axis word or order, an `L` without its `P`, a default split writing no `L`, a
+truncated write, a `.bak` fallback, a future line type) and restarts a horizontal and a swapped
+split, gracefully and killed; `test/control-honesty.ps1` reads the `C` and `K` lines back after
+each verb.
