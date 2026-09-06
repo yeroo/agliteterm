@@ -33,7 +33,9 @@ rather than pretending.
   `null` is "the shell had no non-denylisted child" and is written too (a fresh capture replaces an
   older checkpoint, including to nothing). Refusals, each with nothing written for anyone: an
   unknown target (the verb's own wording, naming the target); a present-but-empty target; a
-  quick/scratch/overlay cover (never restored, so no slot); a process query that did not run. The
+  quick/scratch/overlay cover (never restored, so no slot); a process query that did not run. A
+  fifth refusal arrived in `ca527a6` and comes AFTER the write: the save did not land — the slots
+  are replaced in memory and the reply says so (revmux round 1 below). The
   slots read back from `tree --json` as `capturedCommands` on the owning session node, keyed by
   pane id (the session id for pane 0, the split's id for pane 1); persisted as a **`K` line**.
   **`replayOnRestore` is always `false`** in lite — see Technical Details.
@@ -307,7 +309,8 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       agwinterm's `UnknownTarget(target)` wording; a hidden session that no visible session's
       `splitId` names (quick/scratch/overlay) → `CoverPane(id)` wording; a present-but-empty target
       (`req.fields.find("target")` found and empty — the CLI refuses it too, so also pin it with a
-      raw JSON line) → `EmptyTarget` wording. Every refusal returns before the query.
+      raw JSON line) → `EmptyTarget` wording. Every refusal in this task returns before the query;
+      the save-failed refusal `ca527a6` added later comes after the write (see round 1).
       A visible session named as the target captures its own shell (pane 0; lite keeps no
       per-session focused pane), `active` is the focused pane (may be the split shell), a split's id
       captures that one pane; an ambiguous name is refused in the verb's words with lite's "names N
@@ -464,9 +467,10 @@ Both replies are objects (`ctlOk(rawJson)`); lite's session verbs answered bare 
       completes. PR #28's body carries the validation above; revmux rounds follow it)
 
 **What revmux round 1 found** (`.revmux/tasks/p3-lite-mirror/01-initial`, full branch at
-`26ae272`): no Major or Critical; nine Minors, six of them fixed in `ca527a6` because four are real
-product gaps and the round rule (two minimum, and a lock change never ships without its own round)
-meant a fix round was due anyway. Round 2 is scoped to that commit.
+`26ae272`): no Major or Critical; nine Minors, all nine fixed in `ca527a6` (the commit message
+says six — it was written before the last three went in) because four are real product gaps and
+the round rule (two minimum, and a lock change never ships without its own round) meant a fix
+round was due anyway. Round 2 is scoped to that commit.
 
 - **A save preempted between releasing `g_lock` and taking `g_saveLock` could publish an OLDER
   snapshot last** — two locks in sequence do not give "the later snapshot wins" on their own.

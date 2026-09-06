@@ -2905,7 +2905,11 @@ static bool captureForeground(const std::vector<DWORD>& shellPids, std::map<DWOR
 }
 
 static std::string sessionLiveCwd(const Session* s) {
-    std::string cw = processCwd(s->childPid);            // the shell's real cwd, straight from its PEB
+    // livePid, not childPid: after the shell exits the pid is stale and Windows recycles it, so a
+    // save could persist SOME OTHER process's cwd as this session's (the same hole restore.capture
+    // closed with livePid). An exited shell falls through to the emulator's last OSC 7, then the
+    // creation directory — what the shell had when it was alive.
+    std::string cw = processCwd(livePid(s));             // the shell's real cwd, straight from its PEB
     if (!cw.empty()) return cw;
     if (!s->emu) return "";
     uint32_t len = 0;                                    // fallback: OSC 7/9;9 seen by the emulator
@@ -3089,6 +3093,10 @@ static bool saveSessionState() {
     // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
     // zero-session refusal and the .bak delete — the two decisions that can cost saved sessions.
     bool userEmptied = g_userEmptied;
+    // The A line's value is sampled here too: workspace.select writes g_activeWs from a pipe thread,
+    // and a read after the release could put an OLDER workspace into a HIGHER-stamped buffer, which
+    // the overtake guard below orders by stamp alone (revmux r2 of #28).
+    int activeWs = g_activeWs;
     unsigned long long stamp = ++g_saveStamp;   // this buffer's place in the order of snapshots
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
@@ -3097,7 +3105,7 @@ static bool saveSessionState() {
     out += splitLines;                       // P lines: each session's own split shell
     out += layoutLines;                      // L lines: a split's axis and order, only when not the default
     out += capLines;                         // K lines: the captured-command slots, after the P they name
-    out += "A\t" + std::to_string(g_activeWs) + "\n";
+    out += "A\t" + std::to_string(activeWs) + "\n";
 
     // From here on the file is touched: the zero-session read below, the .tmp write and the
     // publish. One saver at a time (g_saveLock — see its declaration for the ordering rule: g_lock
@@ -7523,7 +7531,11 @@ toggle the day lite has a replay.
 Refusals, each with nothing written for ANY pane and nothing saved: a `--target` that matches no
 pane or session; a `--target` that is present but empty (omit it to mean every pane); a
 quick, scratch or overlay pane (never restored, so no slot); a process query that did not run
-(refused, never `null` written into every slot).
+(refused, never `null` written into every slot). One refusal comes AFTER the write and says so -
+"captured into memory but the state file could not be written": every slot the reply counts was
+replaced in memory (`tree --json` shows the new values, the earlier checkpoint is gone from the
+slots), only the save did not land; fix the state directory (the log names the cause) and
+capture again, or let the next save carry them.
 
 ## Find out what happened
 
@@ -8230,8 +8242,9 @@ static std::string ctlDispatch(const std::string& line) {
         // Three phases, agwinterm's Program.ControlHost RestoreCapture shape: SNAPSHOT the panes and
         // their shell pids under g_lock; QUERY the processes with NO lock held (captureForeground:
         // one Toolhelp32 snapshot, milliseconds); WRITE the slots under g_lock re-checking that every
-        // session is still in the list, then save and answer from what landed. Every refusal returns
-        // before the query, with nothing written for anyone and nothing saved.
+        // session is still in the list, then save and answer from what landed. Every refusal but one
+        // returns before the WRITE (the query-failed one after the query ran), with nothing written
+        // for anyone and nothing saved; the one is the save that did not land, after the write (below).
         //
         // The reply is agwinterm's RestoreCaptureReply, an object (ctlOk): `captured` = the panes
         // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
@@ -8297,13 +8310,14 @@ static std::string ctlDispatch(const std::string& line) {
         // rewritten, while `id` moves onto a promoted survivor (closeSplitSide) and would reject the
         // very pane this was meant to validate (revmux r1: every promoted session silently dropped).
         std::string panes;
-        int captured = 0;
+        int captured = 0, written = 0;   // written = slots the loop replaced (null included); captured = the non-null ones
         {
             LockG hold;
             for (const auto& p : snap) {
                 if (indexOfSession(p.s) < 0 || p.s->paneId != p.id) continue;
                 auto f = p.pid ? found.find(p.pid) : found.end();
                 p.s->capturedCmd = f != found.end() ? f->second : std::string();
+                written++;
                 if (!panes.empty()) panes += ",";
                 panes += "{\"pane\":\"" + jsonEscape(p.id) + "\",\"session\":\"" + jsonEscape(p.owner) + "\",\"captured\":";
                 if (p.s->capturedCmd.empty()) panes += "null";
@@ -8320,13 +8334,18 @@ static std::string ctlDispatch(const std::string& line) {
         // the log) is a REFUSAL: the slots are in memory and in tree --json, which is what the
         // caller asked for, but the reply's claim is durability and that claim would be false. The
         // slots are left as captured — rolling them back would make the tree disagree with a
-        // capture that read the processes correctly (revmux r1).
+        // capture that read the processes correctly (revmux r1). The count is what the loop wrote
+        // (a pane closed between the snapshot and the write is not in it), and the sentence stops
+        // at what THIS save did: the refresh posted below drives a UI-thread save of the same slots
+        // with a higher stamp, which can land moments later — even before this reply is sent — so
+        // neither "the checkpoint is not on disk" nor a prediction about the next restart is a
+        // claim the verb can stand behind (revmux r2 of #28, lite #29, and its round 1).
         bool onDisk = saveSessionState();
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         if (!onDisk)
-            return ctlErr("restore capture: " + std::to_string(snap.size()) + " pane(s) were captured into memory but the state "
-                          "file could not be written (see the log) — the checkpoint is not on disk and will not survive a "
-                          "restart. tree --json still shows what was captured.");
+            return ctlErr("restore capture: " + std::to_string(written) + " pane(s) were captured into memory but the state "
+                          "file could not be written (see the log) — this save did not put the checkpoint on disk. "
+                          "tree --json still shows what was captured.");
         return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":false,\"panes\":[" + panes + "]}");
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
@@ -9095,9 +9114,10 @@ static ParsedState parseStateFile(const std::wstring& path) {
     // K lines: positional like C and P, so the same guard and the same range check — the SAME
     // comparison as P's, so whenever the P set is refused the K set goes with it in this pass and
     // no pane-1 slot is ever orphaned that way. (The pane-1 slot additionally needs its split:
-    // restoreSessions drops it when the split failed to start, or when a K line names a split the
-    // file has no P line for — a hand-edited or downgrade-written file; the slot is meaningless
-    // without the shell it describes.)
+    // restoreSessions drops it when the split failed to start, when the owner itself failed to
+    // start (no split is attempted for a dead entry), or when a K line names a split the file has
+    // no P line for — a hand-edited or downgrade-written file; the slot is meaningless without the
+    // shell it describes. The K loop's comment there is the full list.)
     if (!ps.captures.empty() && ps.sLines != (int)ps.specs.size()) {
         logWarn("state: %d session line(s) but %zu parsed - refusing %zu capture line(s) rather than "
                 "attaching them to the wrong sessions", ps.sLines, ps.specs.size(), ps.captures.size());
@@ -9379,9 +9399,11 @@ static bool restoreSessions() {
     if (!ps.layouts.empty())
         logInfo("restore: %d of %zu split layout(s) restored", layoutsSet, ps.layouts.size());
     // Pane 1's slot goes onto the split the P line just rebuilt (a fresh Session, so the value has
-    // to be re-attached here). No split — the split failed to start, or a K line describes a split
-    // the file has no P line for (a P set refused wholesale takes the K set with it in
-    // parseStateFile, so that case never reaches here) — and the slot is dropped and named: it
+    // to be re-attached here). No split — the split failed to start, the OWNER failed to start (a
+    // dead entry has no split: the P loop above skips a null bySpec owner, so its shell was never
+    // attempted), or a K line describes a split the file has no P line for (a P set refused
+    // wholesale takes the K set with it in parseStateFile, so that case never reaches here) — and
+    // the slot is dropped and named: it
     // describes a shell that does not exist, and hanging it on the session's own pane would claim a
     // command that pane never ran.
     int capSet = 0, capDropped = 0;

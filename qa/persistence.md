@@ -89,8 +89,10 @@ pipe thread is read in the paint without `g_lock`.
 ## The persisted half: a restart brings the context and the slot back, and the file says so
 
 **Guards:** the `C` and `K` lines are positional (the session's index among the `S` lines) and are
-refused wholesale when the `S` count does not add up, the `P` guard's rule; `K` is written AFTER
-`P` because its second field belongs to the split the `P` line rebuilds. A restore that put the
+refused wholesale when the `S` count does not add up, the `P` guard's rule; `K` is written after
+`P` by convention — it sits with the `P` lines it describes — not by requirement: the reader
+collects every line type in file order and applies them in its own fixed order, so a `K` above a
+`P` restores identically (`docs/state-file.md` and the save comment in `saveSessionState` say the same). A restore that put the
 slot on the wrong pane, or dropped it because the split came back a moment later, would answer a
 `tree` that disagrees with the reply the caller kept. `test/restore-matrix.ps1` pins the cells
 (`context-graceful`, `context-killed`, `capture-graceful`, `capture-killed`, `capture-split`, the

@@ -109,7 +109,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   `K` line. Its `replayOnRestore` is **always `false`** in lite: it restores launch specs and never
   types a slot back (`session restore` is a later batch), so a captured command is a checkpoint to
   read, not a command that will run. An unknown, empty or cover-pane target, or a process query
-  that did not run, is refused with nothing written for anyone. Parity batch P4 gives a split its
+  that did not run, is refused with nothing written for anyone; a save that did not land is
+  refused too, but AFTER the slots were replaced in memory (the reply says so, `tree --json` shows
+  them) — that save did not put the checkpoint on disk; a later one may. Parity batch P4 gives a split its
   full shape, in agterm's words: `vertical` = left/right panes (the default), `horizontal` =
   top/bottom — the axis names the arrangement, never the divider. `session split [on|off|toggle]
   [--axis ..] [--target ID]` **answers a pane id** (a bare string) whichever way it went — `on`
