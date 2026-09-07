@@ -1772,8 +1772,10 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
     // the tree, so the number stayed the grid of the last tree refresh (lite #25). Posted, not
     // called: this runs on pipe threads too (syncPaneSizes from session.select / split), and
     // updateStatus sends to the status bar and takes g_lock — UI thread only, like refreshTree.
-    // One post per grid change that the host accepted; the no-change and refused paths above
-    // never reach here, so a drag that lands on the same grid posts nothing.
+    // One post per emulator resize, which is every path that gets this far: the same-grid early
+    // out and the retry/rollback return before it, so a drag that lands on the same grid posts
+    // nothing; an exited session and a restore placeholder reach here with no host behind them,
+    // which is right - the bar shows the emulator's grid, and that is what changed.
     PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
 

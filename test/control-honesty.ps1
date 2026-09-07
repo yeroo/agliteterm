@@ -115,7 +115,7 @@ public static class LiteHonesty {
         finally { if (attached) AttachThreadInput(me, fgThread, false); }
         return GetForegroundWindow() == h;
     }
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeoutMs, out IntPtr result);
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr addr, UIntPtr size, uint type, uint prot);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool VirtualFreeEx(IntPtr p, IntPtr addr, UIntPtr size, uint type);
@@ -124,19 +124,23 @@ public static class LiteHonesty {
     // The text of one part of a status bar in ANOTHER process. SB_GETTEXTW writes into a buffer
     // the bar's process can address, so one is allocated there for the call and read back; the
     // length comes from SB_GETTEXTLENGTHW (LOWORD), which needs no buffer. Null when the process
-    // could not be opened or the allocation failed - a check reading null fails, it does not pass.
+    // could not be opened, the allocation failed, or the bar's thread did not answer within the
+    // timeout (a cross-process SendMessage has no bound of its own; hostResize's pipe request can
+    // park lite's UI thread) - a check reading null fails, it does not pass, and never stalls.
     public static string StatusPart(IntPtr bar, int part) {
         uint pid = PidOf(bar);
         if (pid == 0) return null;
         IntPtr p = OpenProcess(0x0038 /* VM_OPERATION | VM_READ | VM_WRITE */, false, pid);
         if (p == IntPtr.Zero) return null;
         try {
-            int len = (int)(SendMessageW(bar, 0x040C /* SB_GETTEXTLENGTHW */, (IntPtr)part, IntPtr.Zero).ToInt64() & 0xFFFF);
+            IntPtr r;
+            if (SendMessageTimeoutW(bar, 0x040C /* SB_GETTEXTLENGTHW */, (IntPtr)part, IntPtr.Zero, 0x0002 /* SMTO_ABORTIFHUNG */, 5000, out r) == IntPtr.Zero) return null;
+            int len = (int)(r.ToInt64() & 0xFFFF);
             UIntPtr size = (UIntPtr)(uint)((len + 1) * 2);
             IntPtr mem = VirtualAllocEx(p, IntPtr.Zero, size, 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 0x04 /* PAGE_READWRITE */);
             if (mem == IntPtr.Zero) return null;
             try {
-                SendMessageW(bar, 0x040D /* SB_GETTEXTW */, (IntPtr)part, mem);
+                if (SendMessageTimeoutW(bar, 0x040D /* SB_GETTEXTW */, (IntPtr)part, mem, 0x0002 /* SMTO_ABORTIFHUNG */, 5000, out r) == IntPtr.Zero) return null;
                 byte[] buf = new byte[len * 2]; UIntPtr got;
                 if (len > 0 && !ReadProcessMemory(p, mem, buf, (UIntPtr)(uint)buf.Length, out got)) return null;
                 return System.Text.Encoding.Unicode.GetString(buf);
