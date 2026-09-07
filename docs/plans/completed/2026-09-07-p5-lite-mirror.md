@@ -107,7 +107,11 @@ Copied, not re-decided, from the agwinterm plan:
   that never completed (closed early, or a command line that did not parse) leaves the slot's
   result as it was; (d) the session-wide `open` keeps accepting any target that resolves (P2-lite),
   where agwinterm refuses a pane id of a split without `--pane` (#213); (e) `open --pane` answers
-  an id, the popup a status word (gate 4).
+  an id, the popup a status word (gate 4); (f) an overlay's id on a session verb (`flag`, `seen`,
+  `rename`, `status`, `duplicate`, `move`) is REFUSED as a cover naming the session to use, where
+  agwinterm's `FindSesForTarget` lands a scratch or overlay cover id on the session it covers —
+  lite's `session context` refuses every hidden target already (revmux r1), and one refusal family
+  is what P4-lite's covers speak (revmux r2).
 
 Refusals are agwinterm's sentences **verbatim** (`src/Agwinterm.Pty/OverlayPanes.cs` — agterm's
 phrase as the head, a colon, what our guard saw); grouped in one `// ---- P5: the overlay verbs'
@@ -544,7 +548,12 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   on both products; (e) `open --pane` answers the overlay's id (a lite session id, `<prefix>-<seq>`;
   the program inside holds it) because the slot is created inline the way `session split on` is,
   while the popup keeps its status word (created after the reply is written) — the contract's step
-  notes both spellings. Lite has no `--wait` / `--block` (the overlay stays up until closed, P2-lite)
+  notes both spellings; (f) an overlay's (or any cover's) id on `flag` / `seen` / `rename` /
+  `status` / `duplicate` / `move` is refused naming the session it covers (`session <verb>: '<id>'
+  is a scratch/overlay/quick pane, not a session; … Nothing <done>.`), where agwinterm lands a
+  scratch or overlay cover id on the session it covers (`FindSesForTarget`) — a program inside a
+  lite overlay that wants the pane's session row names that session's id (`tree`'s `paneOverlays`
+  says which); lite's `session context` refuses a cover the same way. Lite has no `--wait` / `--block` (the overlay stays up until closed, P2-lite)
   and no `overlay not realized` / `OverlayIdGoneRefusal` (the emulator is built before `newSession`
   returns; the slot's verbs run inline under one lock — documented, not emitted). Under "What is
   deliberately different" add: **`session text` reads the whole buffer in lite** (screen + scrollback,
