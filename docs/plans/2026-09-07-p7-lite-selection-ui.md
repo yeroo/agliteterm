@@ -528,6 +528,17 @@ say what it was.
   Contract check and all PowerShell parses pass. Confirming review and full-suite gate remain
   pending; Task 8 stays unchecked. PR #47 merged at `2f4adf9` (merge `320a0cf`), the same revision
   with previously reported teardown ownership concerns; that does not authorize unsafe suite runs.
+- Revmux `02-after-fix`, comprehensive, cumulative `af737e7..bcfeabf`: **0 Major/Critical**,
+  4/4 sources reported, no degradation. Codex's first attempt timed out; its automatic retry
+  completed. Final actionable results: one code Minor (wide CJK/emoji continuation cells can
+  produce partial/empty word or mark selections) and three comment Minors (hit-test locking,
+  mouse-report helper contract, and paint's mark-mode cancellation side effect).
+  Five other candidates were classified immaterial; two were pre-existing; no open questions.
+  Counts converge from four executable gating findings in round 1 to zero in round 2.
+  Record: `.revmux/tasks/feat-p7-lite-selection-ui/02-after-fix/report.md`.
+  Minor sweep awaits Boris's choice; no fixes were silently made after the clean review.
+  Implementation hash is `bcfeabf`; this record-only update changes no tested code.
+  Claude received that hash for independent review; no separate peer verdict has arrived.
 
 ## Post-Completion
 
