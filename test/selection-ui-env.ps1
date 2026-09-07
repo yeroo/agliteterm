@@ -1,5 +1,13 @@
 # P7's isolated UI harness. No sweeps by process name, path, command line or PID difference.
 # The caller holds the desktop suite token through Stop-SelectionSandbox and state restoration.
+function Invoke-SelectionCleanup([scriptblock]$ProcessCleanupStep,[scriptblock]$RegistryRestoreStep,[scriptblock]$ClipboardRestoreStep) {
+    $ok=$true
+    foreach($step in @(@{Name='processes';Run=$ProcessCleanupStep},@{Name='registry';Run=$RegistryRestoreStep},@{Name='clipboard';Run=$ClipboardRestoreStep})){
+        try { & $step.Run | Out-Null }
+        catch { $ok=$false;Write-Host "TEARDOWN INCOMPLETE ($($step.Name)): $($_.Exception.Message)" }
+    }
+    return $ok
+}
 . "$PSScriptRoot/ui-lib.ps1"
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 if (-not ('SelectionUi' -as [type])) { Add-Type @'
@@ -10,6 +18,8 @@ public static class SelectionUi {
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  [StructLayout(LayoutKind.Sequential)] public struct RECT {public int Left,Top,Right,Bottom;}
  [StructLayout(LayoutKind.Sequential)] public struct POINT {public int X,Y;}
+ [StructLayout(LayoutKind.Sequential)] struct GUIINFO {public uint Size,Flags;public IntPtr Active,Focus,Capture,MenuOwner,MoveSize,Caret;public RECT CaretRect;}
+ [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread,ref GUIINFO info);
  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc c,IntPtr l);
  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h,EnumProc c,IntPtr l);
  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
@@ -31,6 +41,7 @@ public static class SelectionUi {
  public static IntPtr Window(int pid,string cls){IntPtr result=IntPtr.Zero;EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid && Class(h)==cls && (cls!="AgwintermLitePopup" || IsWindowVisible(h))){result=h;return false;}return true;},IntPtr.Zero);return result;}
  public static IntPtr Child(IntPtr h,string cls){IntPtr result=IntPtr.Zero;EnumChildWindows(h,(c,l)=>{if(Class(c)==cls){result=c;return false;}return true;},IntPtr.Zero);return result;}
  public static RECT Rect(IntPtr h){RECT r;GetClientRect(h,out r);return r;}
+ public static IntPtr Capture(IntPtr h){uint pid;uint thread=GetWindowThreadProcessId(h,out pid);var info=new GUIINFO{Size=(uint)Marshal.SizeOf<GUIINFO>()};if(thread==0 || !GetGUIThreadInfo(thread,ref info))throw new InvalidOperationException("Cannot read owned window capture");return info.Capture;}
  public static RECT ChildRect(IntPtr parent,string cls){var h=Child(parent,cls);RECT r=new RECT();if(h==IntPtr.Zero)return r;GetWindowRect(h,out r);var a=new POINT{X=r.Left,Y=r.Top};var b=new POINT{X=r.Right,Y=r.Bottom};ScreenToClient(parent,ref a);ScreenToClient(parent,ref b);return new RECT{Left=a.X,Top=a.Y,Right=b.X,Bottom=b.Y};}
  public static string Status(IntPtr h,int part){
   var bar=Child(h,"msctls_statusbar32");uint pid;GetWindowThreadProcessId(bar,out pid);if(pid==0)return null;
@@ -117,7 +128,41 @@ function Selection-Capture([IntPtr]$h,[string]$name,[int]$left,[int]$top,[int]$w
 }
 function Selection-PixelDiff($a,$b){$n=0;for($i=0;$i -lt $a.Length;$i++){if($a[$i] -ne $b[$i]){$n++}};return $n}
 
-function Save-SelectionClipboard {
+function Export-SelectionClipboard($snapshot,[string]$path) {
+    # Recovery survives a crashed runner. DPAPI keeps clipboard contents local to this user.
+    $records=@(foreach($format in $snapshot.GetFormats($false)){
+        $data=$snapshot.GetData($format,$false)
+        $kind=if($data -is [Drawing.Bitmap]){'Bitmap'}elseif($data -is [IO.MemoryStream]){'Stream'}elseif($data -is [byte[]]){'Bytes'}elseif($data -is [string[]]){'Strings'}else{'Text'}
+        $value=if($kind-eq 'Bitmap'){
+            $stream=[IO.MemoryStream]::new()
+            try{$data.Save($stream,[Drawing.Imaging.ImageFormat]::Png);[Convert]::ToBase64String($stream.ToArray())}finally{$stream.Dispose()}
+        }else{Clipboard-Fingerprint $data}
+        @{Format=$format;Kind=$kind;Value=$value}
+    })
+    $plain=[Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $records -Depth 5 -Compress))
+    try {
+        $encrypted=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+        [IO.File]::WriteAllBytes($path,$encrypted)
+    } finally {[Array]::Clear($plain,0,$plain.Length)}
+}
+function Import-SelectionClipboard([string]$path) {
+    $plain=[Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($path),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+    try {$records=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString($plain))}finally{[Array]::Clear($plain,0,$plain.Length)}
+    $copy=[Windows.Forms.DataObject]::new()
+    foreach($record in $records){
+        $data=switch($record.Kind){
+            'Bitmap' {$stream=[IO.MemoryStream]::new([Convert]::FromBase64String($record.Value));try{$bitmap=[Drawing.Bitmap]::new($stream);try{[Drawing.Bitmap]::new($bitmap)}finally{$bitmap.Dispose()}}finally{$stream.Dispose()}}
+            'Stream' {[IO.MemoryStream]::new([Convert]::FromBase64String($record.Value))}
+            'Bytes' {,[Convert]::FromBase64String($record.Value)}
+            'Strings' {,[string[]](ConvertFrom-Json -NoEnumerate $record.Value)}
+            'Text' {[string]$record.Value}
+            default {throw 'Invalid encrypted clipboard snapshot kind'}
+        }
+        $copy.SetData($record.Format,$false,$data)
+    }
+    return $copy
+}
+function Save-SelectionClipboard([string]$RecoveryPath) {
     # Eagerly materialize every native/registered format before any selection can replace it.
     # Unknown object types fail closed, while the user's clipboard is still untouched.
     $source=[Windows.Forms.Clipboard]::GetDataObject();$copy=[Windows.Forms.DataObject]::new()
@@ -130,13 +175,31 @@ function Save-SelectionClipboard {
         if($null -eq $data){throw "Clipboard format $format could not be captured; no test mutation performed"}
         $copy.SetData($format,$false,$data)
     }}
+    if(-not $RecoveryPath){throw 'Clipboard recovery path required before test mutations'}
+    Export-SelectionClipboard $copy $RecoveryPath
+    $roundtrip=Import-SelectionClipboard $RecoveryPath
+    if($roundtrip.GetFormats($false).Count -ne $copy.GetFormats($false).Count){throw 'Clipboard recovery snapshot format count mismatch'}
+    foreach($format in $copy.GetFormats($false)){
+        if(-not $roundtrip.GetDataPresent($format,$false) -or (Clipboard-Fingerprint $roundtrip.GetData($format,$false)) -cne (Clipboard-Fingerprint $copy.GetData($format,$false))){throw "Clipboard recovery snapshot failed verification: $format"}
+    }
     return $copy
 }
 
 function Clipboard-Fingerprint($data) {
     if($data -is [Drawing.Bitmap]) {
-        $stream=[IO.MemoryStream]::new()
-        try {$data.Save($stream,[Drawing.Imaging.ImageFormat]::Png);return [Convert]::ToBase64String($stream.ToArray())} finally {$stream.Dispose()}
+        # PNG codec metadata may change on decode. Compare dimensions and exact ARGB pixels.
+        $rect=[Drawing.Rectangle]::new(0,0,$data.Width,$data.Height)
+        $normalized=$data.Clone($rect,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        try {
+            $bits=$normalized.LockBits($rect,[Drawing.Imaging.ImageLockMode]::ReadOnly,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            try {
+                $bytes=[byte[]]::new($data.Width*$data.Height*4)
+                for($row=0;$row-lt $data.Height;$row++){
+                    [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($bits.Scan0,$row*$bits.Stride),$bytes,$row*$data.Width*4,$data.Width*4)
+                }
+                return "$($data.Width)x$($data.Height):$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)))"
+            }finally{$normalized.UnlockBits($bits)}
+        }finally{$normalized.Dispose()}
     }
     if($data -is [IO.MemoryStream]){return [Convert]::ToBase64String($data.ToArray())}
     if($data -is [byte[]]){return [Convert]::ToBase64String($data)}

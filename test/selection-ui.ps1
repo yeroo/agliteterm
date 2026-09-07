@@ -6,6 +6,7 @@ $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux
 New-Item -ItemType Directory $script:selectionArtifact -Force | Out-Null
 Start-Transcript "$script:selectionArtifact/transcript.log" | Out-Null
 $hub='C:/Users/boris/AI/bin/suite-token.py';$lease=$null;$ownLease=$false
+function Skip-Selection([string]$reason){"SKIP selection-ui: $reason";Stop-Transcript|Out-Null;exit $(if($Strict){1}else{0})}
 if(Test-Path $hub){
     if($env:AGLITETERM_TEST_RECEIPT){
         $lease=Get-Content -Raw $env:AGLITETERM_TEST_RECEIPT|ConvertFrom-Json
@@ -15,20 +16,22 @@ if(Test-Path $hub){
         $run=Split-Path $script:selectionArtifact -Leaf
         $raw=& python $hub acquire --owner codex-agwinterm --run $run --worktree (Split-Path $PSScriptRoot -Parent) --holder-pid $PID --purpose 'P7 selection UI verification'
         $lease=$raw|ConvertFrom-Json
-        if($LASTEXITCODE -ne 0 -or -not $lease.ok){$raw;Stop-Transcript;exit 2}
+        if($LASTEXITCODE -ne 0 -or -not $lease.ok){Skip-Selection "suite token unavailable: $raw"}
         $ownLease=$true
     }
-}elseif($env:CI -ne 'true'){throw 'Shared suite-token helper absent: refusing local interactive tests'}
+}elseif($env:CI -ne 'true'){Skip-Selection 'shared suite-token helper absent; no local interactive tests ran'}
 $script:selectionPipe='p7sel'+[guid]::NewGuid().ToString('N').Substring(0,10)
 $script:selectionProc=$null;$script:selectionHosts=@();$script:selectionLaunched=$false;$script:checks=0;$script:failures=0
-$clipboard=$null;$geoSaved=$false;$regBefore=@{};$cleanupOk=$true;$regPath='Software\agliteterm'
+$clipboard=$null;$geoSaved=$false;$regBefore=@{};$cleanupOk=$true;$regPath='Software\agliteterm';$skipReason=$null
 function Check([string]$name,[bool]$ok,[string]$detail=''){$script:checks++;if($ok){"PASS $name"}else{$script:failures++;"FAIL $name : $detail"}}
 try {
     . "$PSScriptRoot/selection-ui-env.ps1"
     if($ownLease){$lease|ConvertTo-Json -Depth 8|Set-Content "$script:selectionArtifact/lease.json"}
+    & "$PSScriptRoot/selection-ui-cleanup.unit.ps1"
+    & "$PSScriptRoot/selection-ui-snapshot.unit.ps1"
     # Token excludes other cooperating suites, not the user's app. Do not adopt/stop a shared host.
-    if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){throw 'Existing lite/host: refusing isolated selection fixture'}
-    $clipboard=Save-SelectionClipboard
+    if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){$skipReason='Existing lite/host: refusing isolated selection fixture';throw $skipReason}
+    $clipboard=Save-SelectionClipboard "$script:selectionArtifact/clipboard-before.dpapi"
     $reg=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regPath)
     $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
     foreach($name in $names){$exists=$reg -and $reg.GetValueNames() -contains $name;$regBefore[$name]=@{Exists=$exists;Value=$(if($exists){$reg.GetValue($name)});Kind=$(if($exists){[int]$reg.GetValueKind($name)})}}
@@ -75,15 +78,42 @@ try {
     # Release semantics: double-click does not copy until the corresponding button-up.
     Main-Screen;Write-Screen ($esc+'[HMARKER-7 word two'+$esc+'[6;3H')
     $x=$g.Left+2*$g.Cw;$y=$g.Top+[int]($g.Ch/2)
-    Set-Marker;[SelectionUi]::Button($h,0x203,$x,$y);Start-Sleep -Milliseconds 200
+    Set-Marker;[SelectionUi]::Button($h,0x203,$x,$y);[SelectionUi]::Button($h,0x200,($x+1),$y);Start-Sleep -Milliseconds 200
     Check 'double-click: word selection uses non-blank cells' ((Selected)-eq 'MARKER-7') (Selected)
     Check 'double-click: clipboard stays unchanged while button is held' ((Clip)-eq 'P7-CLIPBOARD-SENTINEL')
     [SelectionUi]::Button($h,0x202,$x,$y);Start-Sleep -Milliseconds 200
     Check 'release copies: selected word matches clipboard' ((Clip)-eq 'MARKER-7') (Clip)
-    [SelectionUi]::Button($h,0x201,$x,$y);[SelectionUi]::Button($h,0x202,$x,$y);Start-Sleep -Milliseconds 200
+    # A fresh, contiguous click sequence: assertions/pipe/clipboard round trips cannot consume
+    # the system's double-click interval between the second and third press.
+    [SelectionUi]::Button($h,0x203,$x,$y);[SelectionUi]::Button($h,0x202,$x,$y)
+    [SelectionUi]::Button($h,0x201,$x,$y);[SelectionUi]::Button($h,0x200,($x+1),$y);[SelectionUi]::Button($h,0x202,$x,$y);Start-Sleep -Milliseconds 200
     Check 'triple-click: selects and copies the whole visible line' ((Selected)-eq 'MARKER-7 word two' -and (Clip)-eq (Selected)) (Selected)
     Set-Marker;[SelectionUi]::Button($h,0x203,($g.Left+30*$g.Cw),$y);[SelectionUi]::Button($h,0x202,($g.Left+30*$g.Cw),$y);Start-Sleep -Milliseconds 200
     Check 'double-click blank: no selection and clipboard untouched' ((Selected)-eq '' -and (Clip)-eq 'P7-CLIPBOARD-SENTINEL')
+    [SelectionUi]::Button($h,0x203,($g.Left+1),$y);[SelectionUi]::Button($h,0x200,($g.Left+2),$y);[SelectionUi]::Button($h,0x202,($g.Left+2),$y);Start-Sleep -Milliseconds 200
+    Check 'double-click: first-cell jitter preserves the whole word on release' ((Selected)-eq 'MARKER-7' -and (Clip)-eq 'MARKER-7') (Selected)
+
+    # The timer cancellation door: enter alt while holding an out-of-bounds ordinary drag.
+    [SelectionUi]::Button($h,0x201,($g.Left+50),($g.Top+3*$g.Ch));[SelectionUi]::Button($h,0x200,($g.Left+50),($g.Top-20));Start-Sleep -Milliseconds 100
+    Check 'cancel setup: frame drag owns capture' ([SelectionUi]::Capture($h)-eq $h)
+    Write-Screen ($esc+'[?1049h'+$esc+'[2J'+$esc+'[HCANCEL-ALT')
+    Check 'cancel: screen crossing releases frame capture before button-up' ([SelectionUi]::Capture($h)-eq [IntPtr]::Zero)
+    [SelectionUi]::Button($h,0x202,($g.Left+50),($g.Top-20));Start-Sleep -Milliseconds 100
+    Check 'cancel: frame capture remains released after button-up' ([SelectionUi]::Capture($h)-eq [IntPtr]::Zero)
+    Main-Screen;Write-Screen ($esc+'[HEVICT-BEGIN')
+    [SelectionUi]::Button($h,0x201,($g.Left+8),$y);[SelectionUi]::Button($h,0x200,($g.Left+40),($y+$g.Ch));Start-Sleep -Milliseconds 100
+    Check 'cancel setup: eviction fixture owns capture' ([SelectionUi]::Capture($h)-eq $h)
+    # Eviction is accounted by the PTY reader, not display-only session.write injection.
+    # Emit through the fixture shell so this exercises the production bookkeeping path.
+    $null=Selection-Rpc 'session.type' @{text='[Console]::Write(("E"+[char]13+[char]10)*6000)'}
+    [LiteUi]::Key($h,0x0D,1)
+    for($i=0;$i-lt 50;$i++){
+        if([string](Selection-Rpc 'session.text')-notmatch 'EVICT-BEGIN'){break}
+        Start-Sleep -Milliseconds 100
+    }
+    [SelectionUi]::Button($h,0x200,($g.Left+48),($y+$g.Ch));Start-Sleep -Milliseconds 100
+    Check 'cancel: eviction drops selection and releases capture on the next move' ((Selected)-eq '' -and [SelectionUi]::Capture($h)-eq [IntPtr]::Zero)
+    [SelectionUi]::Button($h,0x202,($g.Left+48),($y+$g.Ch))
 
     # Caret is deliberately placed on row 0, col 0: Enter after five Right moves copies ABCDE.
     Main-Screen;Write-Screen ($esc+'[HABCDEFGHIJKLMN'+$esc+'[H')
@@ -180,7 +210,13 @@ try {
     Check 'popup: mark mode extends at its own caret' ((Selected)-eq 'POPUP' -and [SelectionUi]::Status($h,2)-match 'MARK') (Selected)
     [LiteUi]::Chord($ph,[int][char]'C',$false)
     Check 'popup: mark Ctrl+C copies and exits' ((Clip)-eq 'POPUP' -and [SelectionUi]::Status($h,2)-notmatch 'MARK')
+    [SelectionUi]::Button($ph,0x201,8,12);[SelectionUi]::Button($ph,0x200,16,12);Start-Sleep -Milliseconds 100
+    Check 'cancel setup: popup drag owns capture' ([SelectionUi]::Capture($ph)-eq $ph)
     Write-Screen ($esc+'[?1049h'+$esc+'[2J'+$esc+'[HPOPUP-ALT'+$esc+'[?25l')
+    [SelectionUi]::Button($ph,0x200,24,12);Start-Sleep -Milliseconds 100
+    Check 'cancel: screen crossing releases popup capture on the next move' ([SelectionUi]::Capture($ph)-eq [IntPtr]::Zero)
+    [SelectionUi]::Button($ph,0x202,24,12);Start-Sleep -Milliseconds 100
+    Check 'cancel: popup capture remains released after button-up' ([SelectionUi]::Capture($ph)-eq [IntPtr]::Zero)
     $p0=Selection-Capture $ph 'popup-alt-before' 0 0 240 80
     [SelectionUi]::Wheel($ph,80,40,10);$p1=Selection-Capture $ph 'popup-alt-after' 0 0 240 80
     Check 'THE PIN: popup wheel is pinned on its alt screen' ((Selection-PixelDiff $p0 $p1)-eq 0)
@@ -221,19 +257,20 @@ try {
     Check 'bindings: rebound mark chord also toggles it off' ([SelectionUi]::Status($h,2)-notmatch 'MARK')
     Write-Screen ($esc+'[2J'+$esc+'[HSELECT-ALL-REBOUND');Set-Marker;[LiteUi]::Chord($h,[int][char]'L',$true)
     Check 'bindings: rebound Select All highlights without copying' ((Selected)-match 'SELECT-ALL-REBOUND' -and (Clip)-eq 'P7-CLIPBOARD-SENTINEL')
-}catch{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}
+}catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
-    try{
-        Stop-SelectionSandbox
+    $cleanupOk=Invoke-SelectionCleanup { Stop-SelectionSandbox } {
         if($geoSaved){
             $reg=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($regPath)
+            try {
             foreach($name in $regBefore.Keys){$saved=$regBefore[$name];if($saved.Exists){$reg.SetValue($name,$saved.Value,[Microsoft.Win32.RegistryValueKind]$saved.Kind)}else{$reg.DeleteValue($name,$false)}}
             foreach($name in $regBefore.Keys){$saved=$regBefore[$name];if($saved.Exists){if([string]$reg.GetValue($name)-ne [string]$saved.Value){throw "Registry restore failed: $name"}}elseif($reg.GetValueNames()-contains $name){throw "Registry deletion failed: $name"}}
-            $reg.Dispose()
+            } finally {$reg.Dispose()}
         }
+    } {
         if($null -ne $clipboard){Restore-SelectionClipboard $clipboard}
-        'Cleanup verified: owned windows/hosts exited; captured clipboard formats and touched registry values restored; no queued launches.'
-    }catch{$cleanupOk=$false;"TEARDOWN INCOMPLETE: $($_.Exception.Message)"}
+    }
+    if($cleanupOk){'Cleanup verified: owned windows/hosts exited; captured clipboard formats and touched registry values restored; no queued launches.'}
     if($ownLease -and $cleanupOk){
         $raw=& python $hub release --owner $lease.owner --token $lease.token --cleanup-confirmed
         $raw|Set-Content "$script:selectionArtifact/release.json";$raw

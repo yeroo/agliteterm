@@ -487,6 +487,48 @@ say what it was.
   Use `PrintWindow` and selections at known cells for all viewport assertions below/above.
   `surface cursor` returns only a column, not a row; mark-mode fixtures must seed a known caret.
 
+## Review and verification record
+
+- Initial implementation `2fefdcc`: 50 UI checks passed; generation 19 released after cleanup.
+- Revmux `01-initial`, comprehensive: 4/4 sources, no degradation; 4 gating findings
+  (3 production-code Major, 1 test-code Major), 5 Minor, 2 pre-existing Minor.
+  Code mechanisms: canceled frame/popup drag retained capture (`cancelDrag`);
+  word/line spans collapsed on pointer jitter (`extendSelection`); reporting mouse I/O held
+  the emulator lock while awaiting the host (`mouseReportSurface` and callers).
+  Test mechanism: process teardown failure skipped registry/clipboard restoration.
+- Fixes: release capture after clearing drag ownership; retain fixed word/line spans through
+  release; take a short locked reporting snapshot but perform pipe I/O outside the lock;
+  run all cleanup steps independently and release the lease only when all succeed.
+  Sweep covered frame/popup move/down/up/wheel callers, timer cancellation, and mark takeover.
+  Regression cases distinguish frame timer versus popup move cancellation, eviction, word at
+  first/middle cell, line jitter, and all eight cleanup-failure combinations.
+- Minor dispositions: corrected popup renderer and keybinding-dialog documentation; preserved
+  native Alt+Space in mark mode; made non-Strict missing prerequisites skip; made the triple-click
+  test sequence contiguous. Alt+F4/F10 terminal-key routing predates P7, so it is not broadened here.
+  Pre-existing orphan reporting release and stale startup comment remain outside this batch.
+- Generation 22: 57 checks, 2 failures (popup cancellation guard and cleanup). Painting had already
+  cleared `active`, so popup motion must still reconcile a drag owner; its early return was fixed.
+  The new cleanup callback parameter shadowed the caller clipboard snapshot. Renamed parameters,
+  added a caller-capture regression. Token stayed held during recovery; processes and ten registry
+  values independently verified clean. Exact latest pre-run clipboard-history item restored and
+  its text compared in memory; its timestamp matched generation 19 restoration. No content logged.
+  Recovery details: `.revmux/selection-ui-20260907T234218-fc1f4a/recovery.md`.
+- Harness recovery now materializes supported formats, writes a CurrentUser-DPAPI encrypted
+  snapshot, and verifies its round trip BEFORE any test mutation. An exited runner can recover
+  using `Import-SelectionClipboard <artifact>/clipboard-before.dpapi` followed by
+  `Restore-SelectionClipboard`, under the still-held lease. Synthetic tests cover text/empty text,
+  bytes, stream, string arrays (empty/single/multiple), bitmap pixels, and an empty clipboard;
+  no real clipboard is used by these unit tests. All nine snapshot cases and nine cleanup cases pass.
+- Fresh build `p7-build-20260907T235550` passed; generation 23 released. Run
+  `selection-ui-20260907T235623-62faf8`: 59 checks, one fixture failure; generation 24 cleanly released.
+  Eviction must use real shell output: display-only `session.write` bypasses PTY-reader bookkeeping.
+  Corrected run `selection-ui-20260907T235912-4a61ab`: **59 UI checks, 0 failures**, plus nine cleanup
+  and nine encrypted-snapshot unit cases. Generation 25 released after verified restoration of
+  captured clipboard formats and registry values, owned process exit, and no queued launches.
+  Contract check and all PowerShell parses pass. Confirming review and full-suite gate remain
+  pending; Task 8 stays unchecked. PR #47 merged at `2f4adf9` (merge `320a0cf`), the same revision
+  with previously reported teardown ownership concerns; that does not authorize unsafe suite runs.
+
 ## Post-Completion
 
 - agwinterm docs PR: `docs/lite-parity.md`, the batch index P6+P7 shipped, differences (a)–(i).

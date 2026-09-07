@@ -1139,6 +1139,7 @@ struct Sel {
 static Sel g_sel;
 static void syncSelection();   // fwd: the paint path uses it above the definition
 static HWND g_selWindow = nullptr;   // UI-thread drag owner; never inferred from focus
+static bool g_selFixedSpan = false;  // word/line spans wait for release without following pointer jitter
 static int g_selAutoDir = 0, g_selMouseX = 0;
 static DWORD g_lastDoubleClick = 0;
 static Session* g_doubleSession = nullptr;
@@ -3506,8 +3507,8 @@ static HFONT styleFont(uint32_t attrs) {
     return g_fonts[((attrs & kAttrBold) ? 1 : 0) | ((attrs & kAttrItalic) ? 2 : 0)];
 }
 
-// Render one session's viewport into rect pr. `pane` selects the selection-highlight span (-1 = none,
-// e.g. popup windows); `showCursor` draws the cursor (the focused main pane, or a popup terminal).
+// Render one session's viewport into rect pr. Frame slots are 0/1, popups use kPopupPane,
+// and -1 suppresses selection. `showCursor` draws the focused pane or popup caret.
 // ---- AGWin Bitmap (.agbf) — pre-rasterized font packs, no vector fonts at runtime -------------
 // Format v1 (fonts/generate.py): 172-byte header, sorted glyph records, 8-bit alpha atlas.
 // Record flags: 1 = synthesized, 2 = 1-bit glyph (rows bit-packed MSB-first, byte-padded —
@@ -4431,15 +4432,18 @@ static bool altDown() { return (GetKeyState(VK_MENU) & 0x8000) != 0; }
 // swallowed (a reporting pane), so the caller skips selection/paste; false = do the normal UI action.
 // cb: 0 left, 1 middle, 2 right, 64 wheel-up, 65 wheel-down.
 static bool mouseReportSurface(Session* s, RECT pr, int x, int y, int cb, bool press, bool motion) {
-        LockG lk;
-        if (!s || !s->emu) return false;
         FfiEmuInfo info{};
-        EnterCriticalSection(&g_lock);
-        emu_info(s->emu, &info);
-        LeaveCriticalSection(&g_lock);
+        HANDLE data = INVALID_HANDLE_VALUE;
+        {
+        LockG lk;
+        if (!s || indexOfSession(s) < 0 || !s->emu || !emu_info(s->emu, &info)) return false;
         if (!info.mouseClick && !info.mouseDrag && !info.mouseMotion) return false;  // no reporting -> selection path
         if (motion && !info.mouseDrag && !info.mouseMotion) return true;             // click-only app: swallow motion
         if (s->data == INVALID_HANDLE_VALUE) return true;
+        // Unlisting keeps the Session and data handle alive for its reader (unlistOverlayLocked).
+        // Snapshot under the lock, but never hold it over I/O: readers must drain host output.
+        data = s->data;
+        }
         int col = (x - pr.left) / g_cw + 1;
         int row = (y - pr.top) / g_ch + 1;
         int mods = (shiftDown() ? 4 : 0) + (altDown() ? 8 : 0) + (ctrlDown() ? 16 : 0);
@@ -4453,19 +4457,22 @@ static bool mouseReportSurface(Session* s, RECT pr, int x, int y, int cb, bool p
             int cc = col > 223 ? 0 : col, rr = row > 223 ? 0 : row;
             len = wsprintfA(buf, "\x1b[M%c%c%c", 32 + b, 32 + cc, 32 + rr);
         }
-        ovIo(s->data, true, buf, nullptr, (DWORD)len);
+        ovIo(data, true, buf, nullptr, (DWORD)len);
         return true;
 }
 static bool mouseReport(int x, int y, int cb, bool press, bool motion) {
-    LockG lk;
     RECT rc; GetClientRect(g_hwnd, &rc);
+    RECT hit{}; Session* s = nullptr;
+    {
+    LockG lk;
     for (int p = 0; p < 2; p++) {
         if (g_pane[p] < 0) continue;
         RECT pr; paneRect(p, rc, &pr);
         if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
-        return mouseReportSurface(surfaceOf(g_sessions[g_pane[p]]), pr, x, y, cb, press, motion);
+        hit = pr; s = surfaceOf(g_sessions[g_pane[p]]); break;
     }
-    return false;
+    }
+    return mouseReportSurface(s, hit, x, y, cb, press, motion);
 }
 
 static void scrollSurface(Session* s, int deltaRows) {
@@ -4517,7 +4524,11 @@ static void endMarkModeIfMoved() {
 static void cancelDrag(HWND h) {
     LockG lk;
     if (g_selWindow != h) return;
-    stopSelAuto(); g_sel.active = false; g_selWindow = nullptr;
+    stopSelAuto(); g_sel.active = false; g_selWindow = nullptr; g_selFixedSpan = false;
+    // A screen switch/eviction can drop the selection mid-drag. Capture must not survive it,
+    // even though the later button-up no longer finds a live drag owner. Clear ownership first
+    // because ReleaseCapture synchronously calls WM_CAPTURECHANGED back into this handler.
+    if (::GetCapture() == h) ::ReleaseCapture();
 }
 static void beginSelection(HWND h, Session* s, int pane, RECT pr, int x, int y, bool word = false) {
     LockG lk;
@@ -4547,16 +4558,18 @@ static void beginSelection(HWND h, Session* s, int pane, RECT pr, int x, int y, 
     g_doubleSession = word ? s : nullptr;
     if (word) { g_lastDoubleClick = GetTickCount(); g_doublePoint = { x, y }; }
     g_sel = { pane, s, true, row, a, row, b, s->evicted, info.isAltScreen != 0 };
+    g_selFixedSpan = word || line;
     g_selWindow = h; g_selMouseX = x;
     ::SetCapture(h);
     InvalidateRect(h, nullptr, FALSE);
 }
 static void extendSelection(HWND h, int x, int y) {
     LockG lk;
-    if (g_selWindow != h || !g_sel.active) return;
+    if (g_selWindow != h) return;
     syncSelection();
     RECT pr;
     if (!g_sel.active || !selectionRect(&pr)) { cancelDrag(h); return; }
+    if (g_selFixedSpan) return;   // preserve the entire word/line until the actual release
     int row, col;
     if (!cellAt((Session*)g_sel.sess, pr, x, y, &row, &col)) { cancelDrag(h); return; }
     g_sel.bRow = row; g_sel.bCol = col; g_selMouseX = x;
@@ -4587,7 +4600,7 @@ static void finishSelection(HWND h) {
         if (g_selWindow == h) {
             stopSelAuto();
             if (g_sel.active) text = selectionText();
-            g_sel.active = false; g_selWindow = nullptr;
+            g_sel.active = false; g_selWindow = nullptr; g_selFixedSpan = false;
         }
     }
     if (::GetCapture() == h) ::ReleaseCapture();
@@ -4619,6 +4632,7 @@ static bool markModeKey(WPARAM vk) {
     if (!s->emu || !emu_info(s->emu, &info) || !info.rows || !info.cols) { endMarkMode(); return false; }
     BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
     if (vk == VK_ESCAPE || (g_keys[KB_MARK] && g_keys[KB_MARK] == MAKEWORD((BYTE)vk, mods))) { endMarkMode(); return true; }
+    if (vk == VK_SPACE && altDown()) return false;   // preserve the native system menu (unless rebound above)
     if (vk == VK_RETURN || (vk == 'C' && ctrlDown() && !altDown())) { copySelection(); endMarkMode(false); return true; }
     int first = info.isAltScreen ? (int)info.historyCount : 0;
     int last = (int)info.historyCount + (int)info.rows - 1;
@@ -6200,13 +6214,17 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDBLCLK: {
             if (!s || g_palette) return 0;
             RECT rc; GetClientRect(h, &rc);
-            LockG lk; g_focusOverride = s; endMarkModeIfMoved();
-            if (!mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, false))
+            { LockG lk; g_focusOverride = s; endMarkModeIfMoved(); }
+            if (!mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, false)) {
+                LockG lk;
+                if (indexOfSession(s) >= 0)
                 beginSelection(h, s, kPopupPane, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), m == WM_LBUTTONDBLCLK);
+            }
             SetFocus(h); return 0;
         }
         case WM_MOUSEMOVE: {
             RECT rc; GetClientRect(h, &rc);
+            if ((w & MK_LBUTTON) && g_selWindow == h) { extendSelection(h, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0; }
             if ((w & MK_LBUTTON) && !mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, true))
                 extendSelection(h, GET_X_LPARAM(l), GET_Y_LPARAM(l));
             return 0;
@@ -6869,10 +6887,11 @@ public:
         // One hold for the hit-test, the alt-screen flag and the eviction count: absRow is derived
         // from historyCount, and if the reader evicts between reading the row and reading the count
         // the two describe different buffers — permanently, since nothing later can detect it.
+        { LockG lk; if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) g_focus = pane; }
+        if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
         LockG lk;
         if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) {
             g_focus = pane;
-            if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
             int si = g_pane[pane];                              // begin drag-select, bound to THIS session —
             Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? surfaceOf(g_sessions[si]) : nullptr;   // the pane's surface (P5): a drag inside a covered box selects in the overlay
             RECT rc, pr; GetClientRect(&rc); paneRect(pane, rc, &pr);
@@ -6883,11 +6902,14 @@ public:
     }
     void OnLButtonDblClk(UINT, CPoint pt) {
         if (g_palette || inSplitter(pt.x, pt.y)) return;
-        LockG lk;
         int pane, row, col;
+        { LockG lk;
         if (!hitTest(pt.x, pt.y, &pane, &row, &col)) return;
         g_focus = pane; g_focusOverride = nullptr;
+        }
         if (!mouseReport(pt.x, pt.y, 0, true, false)) {
+            LockG lk;
+            if (!hitTest(pt.x, pt.y, &pane, &row, &col)) return;
             RECT rc, pr; GetClientRect(&rc); paneRect(pane, rc, &pr);
             beginSelection(m_hWnd, surfaceOf(g_sessions[g_pane[pane]]), pane, pr, pt.x, pt.y, true);
         }
@@ -8552,7 +8574,7 @@ Every window is its own process with its own pipe, so `--pipe <name>` picks the 
 
 `selection all` selects the whole buffer, or only the app's screen on the alt screen, including
 popup terminals (overlay, quick and scratch). It highlights without copying. Ctrl+Shift+A is its
-seeded chord; Ctrl+Shift+M toggles mark mode at the caret (both rebindable/clearable in Properties).
+seeded chord; Ctrl+Shift+M toggles mark mode at the caret (both rebindable/clearable in File → Keyboard).
 In mark mode arrows and Home/End extend; Enter or Ctrl+C copies, exits and keeps the highlight;
 Esc or the configured mark chord clears and exits. A surface/screen change also ends the mode.
 Double/triple-click selects a word/line and copies on button release; dragging beyond the edge
