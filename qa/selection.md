@@ -33,6 +33,15 @@ copy`, wait 300 ms for the posted clipboard write, and compare `Get-Clipboard -R
 record byte for byte. Expect `copied N chars` (N is its UTF-8 byte count), `session copy` empty,
 and a capture showing no highlight. Restore the saved clipboard in `finally`.
 
+## Blank API Copy clears; blank Finalize keeps the highlight
+
+On the alt screen, select all, then blank the cells with `ESC[2J`. Save the clipboard and set a
+sentinel. `selection copy` must answer `nothing to copy`, leave the sentinel untouched and clear
+the selection: a second Copy answers `no selection`. Select all again and call `selection finalize`:
+it answers `finalized (empty)` with the clipboard unchanged. Write a marker into those cells;
+`session copy` must now include it, proving Finalize kept the selection. Restore the clipboard.
+These cases are automated in `test/control-honesty.ps1`.
+
 ## A selected shell carries its highlight through a swap
 
 Split vertically and write distinct `LEFT-SELECTED` and `RIGHT-UNSELECTED` markers into the two

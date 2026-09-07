@@ -8327,7 +8327,10 @@ Every window is its own process with its own pipe, so `--pipe <name>` picks the 
 terminals (overlay, quick and scratch) refuse it: `the popup paints no selection`. `selection
 copy` posts the selected text to the Windows clipboard and clears the highlight; `copied N chars`
 counts UTF-8 bytes, unlike the full app's UTF-16 count. Allow the next UI message before reading
-the clipboard. `selection clear` leaves a different surface's selection alone.
+the clipboard. Blank Copy answers `nothing to copy` and still clears the highlight without
+changing the clipboard; Finalize alone keeps it. Copy and Finalize refuse a failed UI enqueue:
+`the clipboard write could not be queued; selection unchanged`. `selection clear` leaves a
+different surface's selection alone.
 
 Nothing here takes the foreground from the user: `quick on` and the session-wide `session overlay
 open` raise their popup only when this process already holds the foreground, and flash the taskbar
@@ -9622,8 +9625,10 @@ static std::string ctlDispatch(const std::string& line) {
         bool finalize = cmd == "selection.finalize";
         if (!g_sel.isFor(target)) return ctlOkStr(finalize ? "finalized (empty)" : "no selection");
         std::string text = selectionText();
-        if (text.find_first_not_of("\r\n ") == std::string::npos)
+        if (text.find_first_not_of("\r\n ") == std::string::npos) {
+            if (!finalize) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
             return ctlOkStr(finalize ? "finalized (empty)" : "nothing to copy");
+        }
         if (!postClipboardUtf8(text)) return ctlErr("the clipboard write could not be queued; selection unchanged");
         if (!finalize) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
         return ctlOkStr(finalize ? "finalized (copied)" : "copied " + std::to_string(text.size()) + " chars");

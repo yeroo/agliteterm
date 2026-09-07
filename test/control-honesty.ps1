@@ -2682,11 +2682,11 @@ try {
         Check 'the popup is gone' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
         # ---- the close command with the popup focused closes the POPUP (the P2 rule), the pane overlay stays ----
         $raw = Overlay @('open', 'echo', 'p5-pop-cl;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
-        Check 'setup: a popup over the covered pane, focused' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
+        Check 'setup: a popup over the covered pane' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
         Start-Sleep -Milliseconds 300
         Focus-SandboxPopup (OverlayHwnd)
         [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]2, [IntPtr]::Zero) | Out-Null   # IDM_CLOSE: the close chord's command
-        Check 'IDM_CLOSE with the popup focused closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        Check 'IDM_CLOSE after the popup logical WM_SETFOCUS closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
         Check 'and the pane overlay under it is untouched: still up, still the surface, the block unchanged' ((Resolves $ovt) -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-t4' $true 1000) -and (SplitBlock $aid) -eq $block9 -and (NodeCount) -eq $before) "words '$(Words $aid)' block '$(SplitBlock $aid)' nodes $(NodeCount)"
         Send-Ctl $s @('session', 'focus', 'right') | Out-Null
         Start-Sleep -Milliseconds 300
@@ -2776,7 +2776,7 @@ try {
         Check 'selection setup has a popup and its id' ($hp -ne [IntPtr]::Zero -and [bool]$popupId)
         Focus-SandboxPopup $hp
         $r = Selection 'all'
-        Check 'all on active while the popup is focused refuses without replacing the shell selection' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected)
+        Check 'all on active after popup logical WM_SETFOCUS refuses without replacing the shell selection' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected)
         $r = Selection 'all' $popupId
         $popupCopy = ConvertFrom-Json (Overlay @('copy','--target',$sa))
         Check 'popup all is refused; no invisible selection is installed and shell selection survives' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and -not $popupCopy.ok -and $popupCopy.error -eq 'no selection' -and (Selected $popupId) -eq '' -and (Selected $sa) -eq $selected)
@@ -2823,12 +2823,16 @@ try {
         Write-SelectionScreen $sa ($esc + '[2J')
         Set-Clipboard -Value 'P6-BLANK-SENTINEL'
         $r = Selection 'copy' $sa
-        Check 'copy of live cells blanked by a TUI answers nothing to copy and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Check 'copy of live cells blanked by a TUI answers nothing to copy, clears selection and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL' -and (Selected $sa) -eq '')
+        $r = Selection 'copy' $sa
+        Check 'copy after blank copy answers no selection and keeps the clipboard' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Selection 'all' $sa | Out-Null
         $r = Selection 'finalize' $sa
         Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
         Write-SelectionScreen $sa ($esc + '[HSELECTION-STILL-BOUND')
-        Check 'blank copy and finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
+        Check 'blank finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
         Write-SelectionScreen $sa ($esc + '[2J' + $esc + '[HCaf' + [char]0xE9 + ' ' + [char]0x4E2D)
+        Selection 'all' $sa | Out-Null
         $unicodeText = Selected $sa
         $r = Selection 'copy' $sa
         Start-Sleep -Milliseconds 300

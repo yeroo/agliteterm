@@ -73,6 +73,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   allow its next message before reading it. `selection finalize` is the release-copy testing
   hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Select All
   is refused on popup terminals (overlay, quick and scratch): `the popup paints no selection`.
+  Blank Copy answers `nothing to copy`, clears the highlight, and leaves the clipboard alone;
+  blank Finalize keeps the highlight. Copy and Finalize can refuse a failed UI enqueue with
+  `the clipboard write could not be queued; selection unchanged`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
   52 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three

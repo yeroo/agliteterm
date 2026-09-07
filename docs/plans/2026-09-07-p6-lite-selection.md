@@ -48,9 +48,9 @@ words; an unresolved target is refused the way every lite verb refuses it (`ok:f
   the length of the text put on the clipboard, CRLF-joined, trailing spaces trimmed per line — what
   `session copy` returns); `no selection` when the target has none (the window's selection belongs
   to another surface, or there is none); `nothing to copy` when the selection is live but its cells
-  hold no text — a TUI blanked them — in which case the clipboard is left alone and the highlight
-  stays (`copySelection`'s content test, already there). The clipboard write lands on the UI thread
-  (posted, `HA_CLIP`'s road); the reply counts what was posted — difference (d).
+  hold no text — a TUI blanked them — in which case the clipboard is left alone but the highlight
+  is still cleared (agwinterm's `CopySelection` clears regardless of content). The clipboard write
+  lands on the UI thread (posted, `HA_CLIP`'s road); the reply counts what was posted — difference (d).
 - **`selection clear [--target ID]`** — drop the selection if it is the target's; repaint. Reply
   `cleared` always, with nothing selected there or not (agwinterm: `ClearSel` is unconditional).
   A selection that belongs to a **different** surface is left alone: `clear` on session B does not
@@ -198,7 +198,8 @@ the follow-up parity documentation.
   `MARKER-n` lines, enters the alt screen (`\e[?1049h`) and paints distinct text, then `selection
   all` + `session copy`: non-empty, no `MARKER-`; leave the alt screen → `session copy` is `""`
   (dropped by `syncSelection`); a blanked selection: `all` on a session whose alt screen is
-  cleared (`\e[2J`) → `copy` answers `nothing to copy`, clipboard unchanged, highlight kept.
+  cleared (`\e[2J`) → `copy` answers `nothing to copy`, clipboard unchanged, highlight cleared;
+  a second copy answers `no selection`. Reselect for blank finalize: it alone keeps the highlight.
 - `qa/selection.md` gains the markdown case **Select All on the alt screen takes only the alt
   screen** (agwinterm's wording), and **`selection copy` reads what is highlighted** (a drag, then
   the verb, then `Get-Clipboard` equals the highlighted lines).
@@ -235,10 +236,10 @@ the follow-up parity documentation.
   target->evicted, isAltScreen != 0 }`; `InvalidateRect(g_hwnd, nullptr, FALSE)` (safe from any
   thread); `"selected all"`.
 - `selection.copy`: under the hold `syncSelection()`, `if (!g_sel.isFor(target)) → "no
-  selection"`; `t = selectionText()`; content test → `"nothing to copy"` (nothing changed);
-  else `g_sel.clear()`, invalidate, post `HA_CLIP` with `new std::string(t)`, reply
+  selection"`; `t = selectionText()`; content test → `"nothing to copy"` (clear highlight, leave clipboard);
+  else post `HA_CLIP` with `new std::string(t)`; if accepted, `g_sel.clear()`, invalidate, reply
   `"copied " + t.size() + " chars"`. Factor the post into `postClipboardUtf8(std::string)` and
-  make the reader-thread site :1960 call it.
+  make the reader-thread site :1960 call it. Failed enqueue frees the payload and refuses without clearing.
 - `selection.clear`: under the hold `if (g_sel.isFor(target)) { g_sel.clear(); invalidate }`;
   `"cleared"`.
 - `selection.finalize`: as `copy` without the clear: `"finalized (copied)"` / `"finalized (empty)"`
@@ -321,6 +322,17 @@ sandbox popup before the close command, without taking the real foreground. Addi
 cover quick/scratch refusal by id and active, popup-active refusal, wrong-owner copy/finalize,
 and non-ASCII byte counts. PrintWindow captures confirmed the highlight moves with its shell
 through a swap and disappears after clear; that case is now recorded in `qa/selection.md`.
+
+**What revmux round 2 found** (`.revmux/tasks/p6-lite-selection/02-after-fix`, `8a04c01`,
+final): no findings, both sources reported without degradation. The independent Claude Code
+re-review confirmed the popup and locking fixes but caught a mistake in this plan: agwinterm's
+`CopySelection(clear: true)` clears even a blank selection. Copy now follows that rule;
+Finalize alone retains a blank selection. Tests reselect between those cases and explicitly
+check that a second blank Copy answers `no selection`.
+
+Both Copy and Finalize can return `ok:false` with
+`the clipboard write could not be queued; selection unchanged` if the UI enqueue fails.
+This preserves the selection for retry; queue refusal is source-reviewed, not fault-injected.
 
 ## Technical Details
 
