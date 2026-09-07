@@ -49,7 +49,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   off-screen), workspace focus, sidebar **drag & drop**.
 - **Terminals**: workspaces + sessions with restore, a 2-pane split (left/right or top/bottom,
   either side closable, the two swappable), quick / scratch / overlay
-  popup terminals, font catalog (incl. bundled Cozette, Tamzen, Terminus, Spleen, UNSCII &
+  popup terminals, a **pane overlay** — a command drawn over ONE pane's box, badged `overlay`,
+  while the other pane stays interactive (`session overlay open <cmd> --pane left|right`), font catalog (incl. bundled Cozette, Tamzen, Terminus, Spleen, UNSCII &
   GNU Unifont bitmap fonts) — face and size are chosen once in Properties; there is deliberately
   **no zoom**, because a raster face only exists at the strike sizes its pack ships,
   MS-DOS/EGA palette, cmd.exe-style Properties dialog, fully rebindable keys (all unbound by
@@ -133,7 +134,37 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   whose shell exits collapses to the survivor on its own. After a kill-and-relaunch a promoted
   session is adopted by its shell's id and comes back under it (the file records shells, not
   promotions). The close chord and File ▸ Close Pane / Session close the focused **pane** on a split
-  session; the sidebar row's Close Session closes the whole session.
+  session; the sidebar row's Close Session closes the whole session. Parity batch P5 gives a
+  session three overlay slots: the session-wide one — the popup, unchanged — and one per pane.
+  `session overlay open <cmd> --pane left|right` runs the command in a hidden session drawn in
+  that pane's box instead of its shell (`left` = slot 0, `right` = slot 1, whatever the axis; a
+  one-pane session takes `left`) and **answers the overlay's id**, a session id the program inside
+  holds as its `AGWINTERM_SESSION_ID`; the sibling pane keeps rendering and taking input, and the
+  overlay is the covered pane's **surface** — keys and the mouse reach it, the pane's own id
+  reaches the shell underneath, and on `session overlay` the overlay's id names its slot (the
+  `--target` rule is below). Refused with nothing opened: a word that is not `left` /
+  `right`, `--pane right` on one pane (`pane not visible`), a slot already holding one (`pane
+  overlay already open` — no silent replace), a `--target` naming the other side, and
+  `--size-percent` / `resize` with `--pane` (a pane overlay is always full-box; the CLI refuses
+  first, the server for a raw client). `close --pane X` shows the shell again (`closed`, or `no
+  overlay` when empty); `result --pane X` is that slot's `exit N` — the command's status as
+  PowerShell reports it, carried in an FTCS mark the overlay's own command line emits — refused
+  `overlay still running` while it is up and `no overlay result` before anything completed there;
+  the bare `result` is the window-wide last popup exit. `copy` and `text [--all | --lines N]`
+  answer `{text}` on either slot — the selection made inside the overlay (the clipboard
+  untouched) and its buffer — refused `no overlay` / `no selection`; the popup's `copy` is always
+  `no selection`, said rather than hidden. `session text` gains the same `--lines N` (the last N
+  lines; `0` the screen; a non-number refused instead of dropped) and `--all` (lite's bare form —
+  the full app's bare form is the screen only, a recorded difference); the pair is refused. The
+  tree node carries `paneOverlays` (`["left"]`, `["right"]`, both, in slot order; absent when
+  empty); the slot moves with its pane on a swap and dies with it (`split close`, `split off`,
+  the shell exiting, `session close`); the close chord closes a focused popup first, then the
+  focused pane's overlay; `--target active` on a session verb (`select`, `flag`, `rename`,
+  `duplicate`, …) is the session under the focused pane, on a pane verb (`close`, the split
+  verbs, `restore capture`) the pane's shell, on a surface verb (`type`, `text`, `copy`, …) the
+  overlay; an overlay's id reaches it on the surface verbs only and is refused as a cover by
+  every other verb (`close`, `select`, `flag`, `rename`, `duplicate`, …; `flag clear` alone takes
+  no target and unflags every session); nothing of it is persisted.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's
@@ -197,8 +228,8 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
   shell process, so it follows you as you `cd`), its context and its captured command, and each
   session's split shell (its own app, cwd and slot) with its layout — top/bottom or left/right,
   and which side the session's own shell sits on after a `session swap` — so the split comes back
-  with its owner the way it was. The quick, scratch and overlay panes are hidden covers and are not
-  persisted.
+  with its owner the way it was. The quick, scratch and overlay covers — the three popups and a pane
+  overlay alike — are hidden and are not persisted.
 - **Writes are atomic, and keep one generation.** The save writes `sessions.tsv.tmp`, rotates the
   current file to **`sessions.tsv.bak`**, then renames the temp over the target — a crash or a full
   disk mid-write can no longer leave a truncated file where a good one was. A zero-session save is
@@ -330,9 +361,11 @@ pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. They ski
 when it is absent rather than failing obscurely. A check that needs a client newer than the
 fetched release — `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field, all
 agwinterm #226; `session context` and `restore capture`, agwinterm #233; `session split --axis`,
-`split close`, `swap` and `focus`, agwinterm #238 — probes the client first
+`split close`, `swap` and `focus`, agwinterm #238; `session overlay --pane`, `overlay copy` /
+`text` and `session text --all` / `--lines`, agwinterm #250 — probes the client first
 (`agwintermctl restore` answers a usage line on a post-#233 client; `session swap x` is refused
-with "Nothing sent" by a post-#238 one, before any pipe is opened) and SKIPs on an older one
+with "Nothing sent" by a post-#238 one, and `session overlay resize --pane left` by a post-#250
+one, before any pipe is opened) and SKIPs on an older one
 (`-Strict` turns that into a failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
 dev build: `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
 

@@ -14,6 +14,16 @@ id, name, flag, context, sidebar row) and keeps its own pane id — the rule in 
 exception (a kill-and-relaunch brings a promoted session back under its shell's id), is the
 plan's vocabulary section (`docs/plans/completed/2026-09-06-p4-lite-mirror.md`).
 
+**A covered pane (P5):** a pane may hold a PANE OVERLAY — `session overlay open <cmd> --pane
+left|right` — one more hidden session drawn in that pane's box instead of its shell, badged
+`overlay`, and the pane's SURFACE while it is open (keys, the mouse, and `--target active` on a
+SURFACE verb — `text`, `type`, `copy` — reach it; on a session verb `active` is the session under
+the pane, on a pane verb the pane's shell; the pane's own id reaches the shell underneath). `left`
+is slot 0 and `right` slot 1
+whatever the axis; the slot moves with its shell on a swap and dies with its pane. The rule in
+full is the P5-lite plan's vocabulary section (`docs/plans/completed/2026-09-07-p5-lite-mirror.md`);
+the popup over the whole window is the session-wide slot and is unchanged.
+
 Setup for every case: sandbox instance per `qa/product.md`.
 
 ---
@@ -171,3 +181,52 @@ hold `tree` and NOT `session`/`closed`. `session text --target <session id>` and
 **Fails when:** `closeSplitSide` on the owner goes through `closeSessionAt` (a `ClosedSpec` push and
 a `session closed` event), the field move skips a field, or a site reports the pane through `id`
 where `paneId` was meant.
+
+---
+
+## A pane overlay covers one pane and the other stays interactive
+
+**Guards:** gate 1 of P5-lite: a pane overlay is IN-WINDOW — one more hidden `Session` hung on the
+shell it covers (`Session::overlay`), painted in the pane's box by `paint`'s pane loop asking
+`surfaceOf(shell)` for what to draw there — not a popup sized to the pane rect. A popup is framed,
+floats off the box after a window move, is raised only when the process holds the foreground, and
+its `g_focusOverride` takes EVERY keystroke, so the sibling pane could not stay interactive — the
+rule's one hard property. The automated block (`test/control-honesty.ps1`, `# ---- P5: pane
+overlays ----`) reads every surface through the pipe; this case is the picture: the overlay drawn
+in the RIGHT box and nowhere else, the divider where it was, the LEFT box showing what was typed
+into it while the overlay was up, and the `overlay` badge framed in the right box's top-right
+corner. `qa/fixtures/pane-overlay.ps1` drives it end to end and writes the capture; run alone.
+
+**Setup:** one session named `covered`, `session split on` (vertical), wide enough for both boxes
+to be read.
+
+**Steps:**
+1. `session overlay open "echo P5-OVERLAY-MARKER; Start-Sleep 300" --pane right --target <session
+   id>`; keep the reply (the overlay's id).
+2. `session type "echo P5-LEFT-MARKER`r" --target <session id>` — the left pane's shell, typed into
+   while the right pane is covered.
+3. `tree --json`; `session text --target <overlay id>`; `session text --target <split shell's id>`;
+   `session overlay text --pane right --target <session id>`.
+4. Capture the main window with `PrintWindow`.
+5. `session overlay close --pane right --target <session id>`; `tree --json`; `session focus right`
+   then `session text`.
+
+**Expect:** step 1 answers a session id of this instance (`<pipe>-<seq>`) that is none of the three
+ids already known — an id, not the popup's status word. Step 3: `paneOverlays` is `["right"]` on the
+node and the split block (`paneCount`, `paneIds`, `axis`) is unchanged; the overlay's id reads
+`P5-OVERLAY-MARKER`; the split shell's id reads its own prompt and NOT the marker — the shell is
+still there underneath; `overlay text --pane right` is byte for byte the overlay id's text. The left
+pane read by the session id holds `P5-LEFT-MARKER`. The capture: the LEFT box shows the typed marker
+at its prompt with the caret after it, the RIGHT box shows
+`P5-OVERLAY-MARKER` with no prompt after it (the command is sleeping), the divider sits between them
+at the same x as before the open, the word `overlay` is framed in the right box's top-right corner,
+and there is NO framed popup over the window. Step 5: `closed`; `paneOverlays` is absent from the
+node; the right box shows the split shell again (`session text` with slot 1 focused is the shell's
+prompt, the overlay's marker gone) and the overlay's id resolves nowhere. The 2026-09-07 run of the
+fixture is `docs/img/qa-p5-pane-overlay.png`.
+
+**Fails when:** `paint`'s loop stops asking `surfaceOf` (the shell paints under the overlay's
+session); `openPaneOverlay` reaches `openOverlay` (a framed popup appears, the left pane stops
+taking keys — the marker never lands); `syncPaneSizes` / `paneGridSize` size the overlay to the
+window instead of the box (the overlay's lines wrap at the wrong width, or overrun the divider);
+or the badge is drawn from the popup's title path (no `overlay` word in the box).

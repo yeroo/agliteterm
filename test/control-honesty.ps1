@@ -65,6 +65,14 @@ $cliHasP3 = $probe -match 'usage: agwintermctl restore'
 # unknown command client-side, so the whole P4 block SKIPs on it rather than fail on the client.
 $probe = (& $ctl session swap x --pipe 'honesty-probe' --json 2>&1) -join ''
 $cliHasP4 = $probe -match 'Nothing sent'
+# And for P5 (`session overlay --pane`, `overlay copy` / `text`, `session text --all` / `--lines`;
+# agwinterm #250, contract #252): a post-#250 client refuses `session overlay resize --pane left` on
+# its own side ("Nothing sent") before any pipe is opened — a pane overlay is always full-pane; an
+# older client drops `--pane` and sends a bare resize to a pipe that is not there. A pre-P5 client
+# would drop `--pane` from every open too, and the popup would open where a pane overlay was asked
+# for, so the whole P5 block SKIPs on it rather than fail on the client.
+$probe = (& $ctl session overlay resize --pane left --pipe 'honesty-probe' --json 2>&1) -join ''
+$cliHasP5 = $probe -match 'Nothing sent'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -536,6 +544,104 @@ try {
     Check 'and nothing reopened' ((OverlayHwnd) -eq [IntPtr]::Zero)
     $raw = Overlay @('close')
     Check 'and close after the hand-close answers "no overlay", not "closed"' ([string](ConvertFrom-Json $raw).result -eq 'no overlay') "raw: $raw"
+
+    # ---- P5 (task 1): the popup's `result`, and `session close` on a cover --------------------------
+    # `session overlay result` (bare) is the window-wide exit of the LAST popup's command
+    # (agwinterm's _lastOverlayExit): `no overlay` at start and reset by every open, `exit N` once
+    # the popup closed after its command completed. The exit rides an FTCS mark the overlay's own
+    # command line emits around the command (OSC 133;A / C before, D;<code> after), read off the
+    # popup's session in its WM_DESTROY — so the checks read the world twice: the mark's arrival
+    # through `session output` (which answers the command's output only once a D mark closed it),
+    # then `result` before and after the close. Every popup this block ran before now was `cmd /k`
+    # (never completes), so the value is still the starting one. Any client sends the action word
+    # through, so this needs no client probe.
+    "-- P5: the popup's result, session close on a cover --"
+    $raw = Overlay @('result')
+    $r = ConvertFrom-Json $raw
+    Check 'result with no popup ever completed answers ok "no overlay"' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    function Wait-OverlayCompleted([string]$id, [int]$ms = 8000) {   # the D mark closed the wrapper's command
+        for ($i = 0; $i -lt ($ms / 200); $i++) {
+            $o = [string](Get-CtlResult $s @('session', 'output', '--target', $id))
+            if (-not $o.StartsWith('no completed command marks')) { return $true }
+            Start-Sleep -Milliseconds 200
+        }
+        return $false
+    }
+    function OverlayIdSince([long]$since) {   # the popup's session id, from the session/created event after $since
+        $id = ''
+        for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+            $id = [string](@((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$since"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' }) | Select-Object -Last 1).session
+            if (-not $id) { Start-Sleep -Milliseconds 200 }
+        }
+        return $id
+    }
+    # The three exits of the rule: $LASTEXITCODE for a native program, else 0 when $? is true and 1
+    # when it is false. Each open resets the value; each close after completion writes it.
+    foreach ($case in @(@('cmd /c exit 3', 'exit 3', 'a native program'), @("'ok'", 'exit 0', 'an expression that succeeds'), @('Get-Item C:\no-such', 'exit 1', 'a cmdlet that fails'))) {
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        $raw = Overlay (@('open') + ($case[0] -split ' '))
+        $r = ConvertFrom-Json $raw
+        Check "open `"$($case[0])`" ($($case[2])) answers ok" ([bool]$r.ok) "raw: $raw"
+        $hp = Wait-Overlay $true
+        Check 'and the popup is up' ($hp -ne [IntPtr]::Zero)
+        $pid_ = OverlayIdSince $cursor
+        Check 'and its session id arrived as a session/created event' ([bool]$pid_)
+        $raw = Overlay @('result')
+        $r = ConvertFrom-Json $raw
+        Check 'result while the popup is up is "no overlay" (the open reset it; the shell stays up after the command)' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+        Check 'the command completed (a D mark closed it, seen through `session output`)' (Wait-OverlayCompleted $pid_) "output: $(Send-Ctl $s @('session', 'output', '--target', $pid_))"
+        Overlay @('close') | Out-Null
+        $gone = Wait-Overlay $false
+        Check 'the popup closed' ($gone -eq [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 300
+        $raw = Overlay @('result')
+        $r = ConvertFrom-Json $raw
+        Check "and result after the close is `"$($case[1])`"" ([bool]$r.ok -and [string]$r.result -eq $case[1]) "raw: $raw"
+    }
+    # A command that never completes leaves the value as it was: `cmd /k` emits no D mark, so the
+    # open's reset ("no overlay") is what survives its close — not a made-up exit.
+    $raw = Overlay @('open', 'cmd', '/k')
+    Check 'open "cmd /k" (never completes) answers ok' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    Wait-Overlay $true | Out-Null
+    Start-Sleep -Milliseconds 1500
+    Overlay @('close') | Out-Null
+    Wait-Overlay $false | Out-Null
+    Start-Sleep -Milliseconds 300
+    $raw = Overlay @('result')
+    $r = ConvertFrom-Json $raw
+    Check 'result after a popup whose command never completed is the open''s reset, "no overlay", not an invented exit' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    # `result` skips the target check (agwinterm's order): the window-wide value is not about any
+    # session, and the shared "nothing opened, resized or closed" would describe nothing.
+    $raw = Overlay @('result', '--target', 'no-such-session')
+    $r = ConvertFrom-Json $raw
+    Check 'result --target no-such-session still answers the window-wide value (not the target refusal)' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    # The action list grew: an unknown action names `result` too.
+    $raw = Overlay @('sideways')
+    Check 'an unknown action names result among the actions' ([string](ConvertFrom-Json $raw).error -match 'result') "raw: $raw"
+
+    # `session close --target <the popup's id>`: a cover, refused with the P4 cover sentence, and
+    # the popup — window and session — is still there afterwards. Before this, the close fell
+    # through to closeSessionAt and destroyed the session under the popup (a dangling pointer).
+    $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+    $cvMarker = 'cover-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $raw = Overlay @('open', 'cmd', '/k', "echo $cvMarker")
+    Check 'setup: a popup opens' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    $hc = Wait-Overlay $true
+    $pid_ = OverlayIdSince $cursor
+    Check 'setup: its session id is known' ([bool]$pid_)
+    Start-Sleep -Milliseconds 800
+    $raw = Send-Ctl $s @('session', 'close', '--target', $pid_)
+    $r = ConvertFrom-Json $raw
+    Check 'session close --target <the popup''s id> is refused with the cover sentence' (-not $r.ok -and [string]$r.error -eq "session close: '$pid_' is a scratch/overlay/quick pane, not a session; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing closed.") "raw: $raw"
+    Start-Sleep -Milliseconds 500
+    Check 'and the popup is still up, the same window' ((OverlayHwnd) -eq $hc -and [LiteHonesty]::IsWindow($hc))
+    # Waited for, not read once: `cmd /k` under clink takes over a second to print on a loaded machine.
+    $t = ''; $deadline = [DateTime]::Now.AddSeconds(8)
+    do { $t = [string](Get-PaneText $s $pid_); if ($t.Contains($cvMarker)) { break }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
+    Check 'and its session still answers `session text` (the marker the command printed is there)' ($t.Contains($cvMarker)) "text: $t"
+    Overlay @('close') | Out-Null
+    Wait-Overlay $false | Out-Null
+    Check 'setup: the popup closed' ((OverlayHwnd) -eq [IntPtr]::Zero)
 
     # ---- sidebar ---------------------------------------------------------------------------------
     # The world here is the native SysTreeView32 child (the sidebar) — its window rect IS the
@@ -1996,6 +2102,593 @@ try {
         Check 'setup: the second session is gone' ($null -eq (Node $o3) -and (NodeCount) -eq $before)
         Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
         Start-Sleep -Milliseconds 400
+    }
+
+    # ---- P5: pane overlays — the slot on the shell, the surface seam, the lifecycle (task 2) -------
+    # A pane overlay is one more hidden Session hung on the shell it covers, drawn in that pane's box
+    # and the pane's SURFACE while it is open: `--target active` on the focused pane reads it, the
+    # pane's own id reads the shell underneath, and the sibling pane stays interactive. The slot
+    # moves with its shell (a swap, a promotion) and dies with its pane (`split close`, the shell
+    # exiting, `session close`). Every opener here is `echo <marker>; Start-Sleep 300`: the marker
+    # proves WHICH surface a read reached, and the overlay's shell (found by that marker on its
+    # command line) is the process behind the slot — there while the slot is open, gone once it
+    # closed, so an orphan would show. The task-3 run below adds the rest of the verb family and `paneOverlays`.
+    "-- P5: pane overlays --"
+    if (-not ($cliHasP4 -and $cliHasP5)) {
+        Skip 'P5 pane overlays (the whole block)' "the client at $ctl predates P5 (no `session overlay --pane`)"
+    } else {
+        function OverlayP([string[]]$rest) { Send-Ctl $s (@('session', 'overlay') + $rest) }
+        # The process behind a slot is the overlay's OWN shell — powershell.exe running the FTCS-wrapped
+        # command line, found by the marker in that line (never by name alone). The command is a
+        # PowerShell-native sleep, not a child program: the pty-host's kill terminates the shell and
+        # leaves a grandchild (a ping) running, for every shell kill in lite (the P3 block's Stop-Ping
+        # is that), so a grandchild could not tell an orphaned slot from the host's own behaviour.
+        function Shell5([string]$marker) { @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape("echo $marker;") }) }
+        function Wait-Shell5([string]$marker, [bool]$present, [int]$ms = 10000) {
+            for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Shell5 $marker).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
+            return $false
+        }
+        function Resolves([string]$id) { try { [bool](ConvertFrom-Json (Send-Ctl $s @('session', 'text', '--target', $id))).ok } catch { $false } }
+        function Wait-Gone([string]$id, [int]$ms = 6000) {
+            for ($i = 0; $i -lt ($ms / 200); $i++) { if (-not (Resolves $id)) { return $true }; Start-Sleep -Milliseconds 200 }
+            return $false
+        }
+        function OpenP([string]$marker, [string]$pane, [string]$tgt) {   # open an overlay; its id, or '' with the raw reply in $script:lastOpen
+            $script:lastOpen = OverlayP @('open', "echo $marker;", 'Start-Sleep', '300', '--pane', $pane, '--target', $tgt)
+            $r = try { ConvertFrom-Json $script:lastOpen } catch { $null }
+            if ($r -and $r.ok) { [string]$r.result } else { '' }
+        }
+        function Active { PaneFlat '' }   # `session text` with no target: the FOCUSED pane's surface
+        # Setup: the active session, split vertical, a marker in each shell. The session's own pane id
+        # is read off `paneIds` (the P4 promotions moved the session id onto a shell whose pane id it is not).
+        $sp = SplitOn
+        $own = [string]@((Node $aid).paneIds)[0]
+        Check 'setup: a vertical split, focus on slot 0, both shells marked' ([bool]$sp -and [bool]$own -and (SplitBlock $aid) -eq "2|$own,$sp|0|vertical" -and (Mark $own 'p5-mk-left-0') -and (Mark $sp 'p5-mk-right-0')) "block '$(SplitBlock $aid)'"
+        # ---- open --pane right: the id, the surface, the sibling, the shell underneath ----
+        $cur = Cursor
+        $ov = OpenP 'p5-ov-right' 'right' $aid
+        Check 'open --pane right answers ok with the overlay id: a bare session id of this instance, none of the three known' ([bool]$ov -and $ov -like "$($s.Pipe)-*" -and $ov -ne $aid -and $ov -ne $own -and $ov -ne $sp) "raw: $($script:lastOpen)"
+        Check 'the open emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        Check 'session text --target <overlay id> reads the overlay: the marker its command printed' (Wait-PaneText $ov 'p5-ov-right') "text: $(Get-PaneText $s $ov)"
+        Check 'and the command is running behind it: its shell process exists, the wrapped command line on it' (Wait-Shell5 'p5-ov-right' $true)
+        Check "the overlay has no tree node of its own, and the session's split block is unchanged" ($null -eq (Node $ov) -and (SplitBlock $aid) -eq "2|$own,$sp|0|vertical") "block '$(SplitBlock $aid)'"
+        Check "the right pane's shell is still there UNDERNEATH: session text --target <right pane id> is the shell (its marker), not the overlay" (((PaneFlat $sp) -match 'p5-mk-right-0') -and -not ((PaneFlat $sp) -match 'p5-ov-right')) "text: $(Get-PaneText $s $sp)"
+        Check 'the left pane is interactive: a marker typed into it by its id reads back there' (Mark $own 'p5-mk-left-1') "text: $(Get-PaneText $s $own)"
+        Check 'and neither the overlay nor the covered shell got it' (-not ((PaneFlat $ov) -match 'p5-mk-left-1') -and -not ((PaneFlat $sp) -match 'p5-mk-left-1'))
+        # `--target active` is the FOCUSED pane's surface: the left shell, then the overlay.
+        Send-Ctl $s @('session', 'focus', 'left') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'with slot 0 focused, --target active is the left shell' ((Active) -match 'p5-mk-left-1' -and -not ((Active) -match 'p5-ov-right')) "active: $(Get-PaneText $s '')"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'with the covered slot focused, --target active is the OVERLAY: the surface, not the shell under it' ((Active) -match 'p5-ov-right' -and -not ((Active) -match 'p5-mk-right-0')) "active: $(Get-PaneText $s '')"
+        Check "and the tree's focusedPane followed: slot 1" ((SplitBlock $aid) -eq "2|$own,$sp|1|vertical")
+        # No silent replace: the slot refuses while it holds one.
+        $raw = OverlayP @('open', 'echo', 'p5-ov-again', '--pane', 'right', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'open --pane right while the slot holds one is refused: pane overlay already open, naming the close and the reads' (-not $r.ok -and [string]$r.error -eq 'pane overlay already open: close it first (session overlay close --pane right), or read it (result / copy / text)') "raw: $raw"
+        Check 'and nothing was replaced: the same overlay, its shell still running' (((PaneFlat $ov) -match 'p5-ov-right') -and (Wait-Shell5 'p5-ov-right' $true 1000) -and -not ((Active) -match 'p5-ov-again'))
+        # The word: neither pane.
+        $raw = OverlayP @('open', 'echo', 'x', '--pane', 'top', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'open --pane top is refused naming both words and the absent form' (-not $r.ok -and [string]$r.error -eq "--pane 'top' is not one of left (pane 0) or right (pane 1); omit --pane for the session-wide overlay. Nothing opened, closed or read.") "raw: $raw"
+        Check 'the resolve did not happen first: the same refusal on an unknown target' ([string](ConvertFrom-Json (OverlayP @('open', 'echo', 'x', '--pane', 'top', '--target', 'no-such-session-9999'))).error -match "^--pane 'top' is not one of")
+        # ---- a swap moves the slot with its shell ----
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 600
+        Check 'setup: swapped — the covered shell sits in slot 0 now, still focused' ((SplitBlock $aid) -eq "2|$sp,$own|0|vertical") "block '$(SplitBlock $aid)'"
+        Send-Ctl $s @('session', 'focus', 'left') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'after the swap, focus left (slot 0) is the overlay: the slot moved with its shell' ((Active) -match 'p5-ov-right') "active: $(Get-PaneText $s '')"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check "and focus right (slot 1) is the session's own shell, uncovered" ((Active) -match 'p5-mk-left-1' -and -not ((Active) -match 'p5-ov-right')) "active: $(Get-PaneText $s '')"
+        Check 'the ids did not move: the overlay id still reads the overlay, the covered pane id its shell' (((PaneFlat $ov) -match 'p5-ov-right') -and ((PaneFlat $sp) -match 'p5-mk-right-0'))
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 600
+        Check 'setup: swapped back' ((SplitBlock $aid) -eq "2|$own,$sp|0|vertical") "block '$(SplitBlock $aid)'"
+        # ---- close --pane right: the shell shows again, the id is gone, the process is gone ----
+        $cur = Cursor
+        $raw = OverlayP @('close', '--pane', 'right', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'close --pane right answers closed' ([bool]$r.ok -and [string]$r.result -eq 'closed') "raw: $raw"
+        Check 'the overlay id resolves nowhere afterwards' (Wait-Gone $ov)
+        Check 'the process behind it is gone: no orphan (its shell ended with the slot)' (Wait-Shell5 'p5-ov-right' $false)
+        Check 'the close emitted a tree event' ((EvSince $cur 'tree') -ge 1)
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'the pane shows its shell again: --target active on slot 1 is the shell it was before' ((Active) -match 'p5-mk-right-0' -and -not ((Active) -match 'p5-ov-right')) "active: $(Get-PaneText $s '')"
+        Check 'and the split is intact' ((SplitBlock $aid) -eq "2|$own,$sp|1|vertical") "block '$(SplitBlock $aid)'"
+        $raw = OverlayP @('close', '--pane', 'right', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'close --pane right when the slot is empty answers ok "no overlay" (the popup''s shape)' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+        Check 'the covered shell was interactive all along: a marker typed into it after the close reads back' (Mark $sp 'p5-mk-right-1')
+        # ---- lifecycle (a): `split close` on the covered pane takes its overlay ----
+        $ov2 = OpenP 'p5-ov-a' 'right' $aid
+        Check 'setup: an overlay on the right again, its shell up' ([bool]$ov2 -and (Wait-PaneText $ov2 'p5-ov-a') -and (Wait-Shell5 'p5-ov-a' $true)) "raw: $($script:lastOpen)"
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $sp)
+        Check "split close on the covered pane: the session single, the survivor the session's own shell" ([string](ConvertFrom-Json $raw).result -eq $own -and (Wait-Single $aid) -and ((PaneFlat $aid) -match 'p5-mk-left-1')) "raw: $raw, block '$(SplitBlock $aid)'"
+        Check 'and the overlay went with its pane: the id resolves nowhere, its shell is gone' ((Wait-Gone $ov2) -and (Wait-Shell5 'p5-ov-a' $false))
+        # ---- lifecycle (a'): a promotion KEEPS the survivor's own overlay ----
+        $sp2 = SplitOn
+        Check 'setup: split again, the split shell marked' ([bool]$sp2 -and (Mark $sp2 'p5-mk-right-2'))
+        $ov3 = OpenP 'p5-ov-b' 'right' $aid
+        Check 'setup: an overlay on the split shell (slot 1)' ([bool]$ov3 -and (Wait-PaneText $ov3 'p5-ov-b') -and (Wait-Shell5 'p5-ov-b' $true)) "raw: $($script:lastOpen)"
+        $raw = Send-Ctl $s @('session', 'split', 'close', '--target', $aid)
+        Check "split close on the session's OWN shell promotes the survivor — and the survivor keeps its overlay: the id still resolves, its shell still runs" ([string](ConvertFrom-Json $raw).result -eq $sp2 -and (Wait-Single $aid) -and (Resolves $ov3) -and (Wait-Shell5 'p5-ov-b' $true 1000)) "raw: $raw"
+        Check 'the slot came to slot 0 with its shell: --target active is the overlay' ((Active) -match 'p5-ov-b') "active: $(Get-PaneText $s '')"
+        Check "and the session id reaches the shell underneath (the promoted survivor's marker)" (((PaneFlat $aid) -match 'p5-mk-right-2') -and -not ((PaneFlat $aid) -match 'p5-ov-b')) "text: $(Get-PaneText $s $aid)"
+        Check 'a single-pane session accepts --pane left: close --pane left closes it, the shell shows again' ([string](ConvertFrom-Json (OverlayP @('close', '--pane', 'left', '--target', $aid))).result -eq 'closed' -and (Wait-Gone $ov3) -and (Wait-Shell5 'p5-ov-b' $false) -and ((Active) -match 'p5-mk-right-2')) "active: $(Get-PaneText $s '')"
+        $raw = OverlayP @('open', 'echo', 'x', '--pane', 'right', '--target', $aid)
+        $r = ConvertFrom-Json $raw
+        Check 'open --pane right on a single-pane session is refused: pane not visible, naming --pane left and the omission' (-not $r.ok -and [string]$r.error -eq "pane not visible: session $aid has one pane; pass --pane left or omit --pane") "raw: $raw"
+        # ---- lifecycle (b): the shell UNDER an overlay exiting collapses the split and takes the overlay ----
+        $sp3 = SplitOn
+        Check 'setup: split, the split shell up' ([bool]$sp3 -and (Mark $sp3 'p5-mk-right-3'))
+        $ov4 = OpenP 'p5-ov-c' 'right' $aid
+        Check 'setup: an overlay over it' ([bool]$ov4 -and (Wait-PaneText $ov4 'p5-ov-c') -and (Wait-Shell5 'p5-ov-c' $true)) "raw: $($script:lastOpen)"
+        Send-Ctl $s @('session', 'type', 'exit', '--target', $sp3) | Out-Null    # by the PANE id: the shell underneath, not the overlay
+        Send-Ctl $s @('session', 'type', "`n", '--target', $sp3) | Out-Null
+        Check 'the shell under the overlay exiting collapses the split, and the collapse takes the overlay: single, the id gone, the shell gone' ((Wait-Single $aid) -and (Wait-Gone $ov4) -and (Wait-Shell5 'p5-ov-c' $false)) "block '$(SplitBlock $aid)'"
+        Check 'the overlay itself did not get the exit: its command ran to the collapse (the survivor is the session, uncovered)' (((PaneFlat $aid) -match 'p5-mk-right-2') -and -not ((Active) -match 'p5-ov-c'))
+        # ---- a NON-displayed session: both slots covered, nothing on screen moves (#230); `session close` kills both ----
+        $o5 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'new', '--name', 'p5-offscreen'))).result
+        Check 'setup: a second session' (Wait-Node $o5)
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
+        $os5 = [string](ConvertFrom-Json (Send-Ctl $s @('session', 'split', 'on', '--target', $o5))).result
+        Start-Sleep -Milliseconds 500
+        $ov5 = OpenP 'p5-ov-d' 'left' 'p5-offscreen'
+        $ov6 = OpenP 'p5-ov-e' 'right' $os5
+        Check 'open --pane left by NAME and --pane right by the split pane id on a session not on screen both answer ids' ([bool]$ov5 -and [bool]$ov6 -and $ov5 -ne $ov6) "raw: $($script:lastOpen)"
+        Check 'both overlays run: each id reads its own marker' ((Wait-PaneText $ov5 'p5-ov-d') -and (Wait-PaneText $ov6 'p5-ov-e') -and (Wait-Shell5 'p5-ov-d' $true) -and (Wait-Shell5 'p5-ov-e' $true))
+        Check 'while the displayed session and its focus did not move (#230)' ([bool](Node $aid).active -and -not [bool](Node $o5).active -and (Active) -match 'p5-mk-right-2') "active: $(Get-PaneText $s '')"
+        $raw = OverlayP @('open', 'echo', 'x', '--pane', 'left', '--target', $os5)
+        $r = ConvertFrom-Json $raw
+        Check "open --pane left --target <the RIGHT pane's id> is refused: the agreement check, nothing opened" (-not $r.ok -and [string]$r.error -eq "'$os5' is the right pane; --pane left names the other one. Nothing opened.") "raw: $raw"
+        Check 'and both slots hold what they held' (((PaneFlat $ov5) -match 'p5-ov-d') -and ((PaneFlat $ov6) -match 'p5-ov-e'))
+        Send-Ctl $s @('session', 'select', '--target', $o5) | Out-Null
+        Start-Sleep -Milliseconds 800
+        Check 'selecting it shows both overlays: --target active (slot 0, its own shell) is the left overlay' ([bool](Node $o5).active -and (Active) -match 'p5-ov-d') "active: $(Get-PaneText $s '')"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'and slot 1 the right overlay' ((Active) -match 'p5-ov-e') "active: $(Get-PaneText $s '')"
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'close', '--target', $o5)
+        Start-Sleep -Milliseconds 800
+        Check 'session close on a session with two pane overlays closes it: the node gone, session closed fired' ([bool](ConvertFrom-Json $raw).ok -and $null -eq (Node $o5) -and (EvSince $cur 'session') -ge 1) "raw: $raw"
+        Check 'and both overlays died with it: the ids resolve nowhere, both shells gone, no orphan' ((Wait-Gone $ov5) -and (Wait-Gone $ov6) -and (Wait-Shell5 'p5-ov-d' $false) -and (Wait-Shell5 'p5-ov-e' $false))
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 400
+        Check 'setup: back on the first session, the node count as before' ([bool](Node $aid).active -and (NodeCount) -eq $before) "nodes $(NodeCount) vs $before"
+        # ---- the close chord: the focused pane's overlay first, the pane itself second ----
+        $sp7 = SplitOn
+        Check 'setup: split, the split shell marked' ([bool]$sp7 -and (Mark $sp7 'p5-mk-right-7'))
+        $ov7 = OpenP 'p5-ov-f' 'right' $aid
+        Check 'setup: an overlay on the right' ([bool]$ov7 -and (Wait-PaneText $ov7 'p5-ov-f') -and (Wait-Shell5 'p5-ov-f' $true)) "raw: $($script:lastOpen)"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $before7 = SplitBlock $aid
+        $cur = Cursor
+        [LiteUi]::Chord($s.Hwnd, 0x57, $true)
+        Check "the close chord with the focused pane's overlay up closes the OVERLAY first: the id gone, its shell gone, the pane still there" ((Wait-Gone $ov7) -and (Wait-Shell5 'p5-ov-f' $false) -and (SplitBlock $aid) -eq $before7) "block '$(SplitBlock $aid)' was '$before7'"
+        Check 'and the pane shows its shell again, tree fired, no session event' ((Active) -match 'p5-mk-right-7' -and (EvSince $cur 'tree') -ge 1 -and (EvSince $cur 'session') -le 1) "active: $(Get-PaneText $s '')"
+        [LiteUi]::Chord($s.Hwnd, 0x57, $true)
+        Check 'the chord again closes the pane itself, as before' ((Wait-Single $aid) -and (NodeCount) -eq $before) "block '$(SplitBlock $aid)'"
+        # ---- task 3: the rest of the family — copy / text, the overlay id as the slot, result per slot, paneOverlays ----
+        # `copy` and `text` answer {"text": ...} (agterm's shape, the contract's `fields: [text]`); an
+        # empty slot refuses them naming the slot; `result --pane X` is REFUSED while the slot runs
+        # (`overlay still running`) and while nothing completed there (`no overlay result`), ok
+        # `exit N` otherwise — per slot, the other slot's value untouched. A pane overlay's own id on
+        # --target with --pane omitted names its slot on every action; with the other word it is
+        # refused (the overlay flavour of the agreement check). `tree` carries `paneOverlays` as an
+        # array of words in SLOT order, omitted when empty, following a swap with the shells.
+        function Words([string]$id) { $n = Node $id; if ($n -and $n.PSObject.Properties['paneOverlays']) { @($n.paneOverlays) -join ',' } else { '' } }
+        function OvRead([string[]]$rest) { $script:lastRead = OverlayP $rest; try { ConvertFrom-Json $script:lastRead } catch { $null } }   # copy / text: {text} under result
+        function OvTextFlat([string[]]$rest) { $r = OvRead $rest; if ($r -and $r.ok) { ([string]$r.result.text) -replace "`n", '' } else { '' } }
+        function Wait-OvText([string[]]$rest, [string]$needle, [int]$ms = 12000) {
+            $deadline = [DateTime]::Now.AddMilliseconds($ms)
+            do { if ((OvTextFlat $rest) -match [regex]::Escape($needle)) { return $true }; Start-Sleep -Milliseconds 250 } while ([DateTime]::Now -lt $deadline)
+            $false
+        }
+        Check 'a single session with no overlay has no paneOverlays key at all' ((Words $aid) -eq '' -and -not (Node $aid).PSObject.Properties['paneOverlays'])
+        $sp9 = SplitOn
+        Check 'setup: split, the split shell marked, still no paneOverlays' ([bool]$sp9 -and (Mark $sp9 'p5-mk-right-9') -and (Words $aid) -eq '') "words '$(Words $aid)'"
+        # The empty slot: result / copy / text are refusals naming the state; close is ok (checked above).
+        $raw = OverlayP @('result', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'result --pane right with nothing ever run in the slot is REFUSED: no overlay result' (-not $r.ok -and [string]$r.error -eq 'no overlay result') "raw: $raw"
+        $raw = OverlayP @('copy', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'copy --pane right on an empty slot is refused: no overlay, naming the slot' (-not $r.ok -and [string]$r.error -eq 'no overlay: --pane right names which slot, and nothing is open in it') "raw: $raw"
+        $raw = OverlayP @('text', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'text --pane right on an empty slot is refused the same way' (-not $r.ok -and [string]$r.error -eq 'no overlay: --pane right names which slot, and nothing is open in it') "raw: $raw"
+        # One overlay on the right: the words, the reads, the id as the slot.
+        $ovg = OpenP 'p5-ov-g' 'right' $aid
+        Check 'setup: an overlay on the right, its marker up' ([bool]$ovg -and (Wait-PaneText $ovg 'p5-ov-g') -and (Wait-Shell5 'p5-ov-g' $true)) "raw: $($script:lastOpen)"
+        Check 'tree: paneOverlays is ["right"], an array, beside the split block' ((Words $aid) -eq 'right' -and (Node $aid).paneOverlays -is [Array] -and (SplitBlock $aid) -ne '') "words '$(Words $aid)'"
+        $r = OvRead @('text', '--pane', 'right', '--target', $aid)
+        Check "overlay text --pane right answers {text}: the overlay's buffer, the marker in it" ([bool]$r.ok -and $r.result.PSObject.Properties['text'] -and ([string]$r.result.text) -match 'p5-ov-g') "raw: $($script:lastRead)"
+        Check 'and it is the same buffer session text --target <overlay id> reads' ((OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -eq (PaneFlat $ovg)) "overlay text: $(OvTextFlat @('text', '--pane', 'right', '--target', $aid))`nsession text: $(PaneFlat $ovg)"
+        Check 'text --target <overlay id> with --pane omitted names its slot: the same text' ((OvTextFlat @('text', '--target', $ovg)) -eq (PaneFlat $ovg))
+        Check "and the shell under it is not what it reads: the covered pane's marker is absent" (-not ((OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -match 'p5-mk-right-9'))
+        $raw = OverlayP @('result', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'result --pane right while it runs is REFUSED: overlay still running' (-not $r.ok -and [string]$r.error -eq 'overlay still running') "raw: $raw"
+        $raw = OverlayP @('result', '--target', $ovg); $r = ConvertFrom-Json $raw
+        Check "result --target <overlay id> is the slot's, not the window-wide popup value: overlay still running" (-not $r.ok -and [string]$r.error -eq 'overlay still running') "raw: $raw"
+        $raw = OverlayP @('copy', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'copy --pane right with nothing selected inside the overlay is refused: no selection' (-not $r.ok -and [string]$r.error -eq 'no selection') "raw: $raw"
+        # The id with the OTHER word: the overlay flavour of the agreement refusal, on a read and on a close; nothing done.
+        $raw = OverlayP @('text', '--target', $ovg, '--pane', 'left'); $r = ConvertFrom-Json $raw
+        Check "text --target <overlay id> --pane left is refused: the id is the right pane's overlay" (-not $r.ok -and [string]$r.error -eq "'$ovg' is the right pane's overlay; --pane left names the other one. Nothing opened.") "raw: $raw"
+        $raw = OverlayP @('close', '--target', $ovg, '--pane', 'left'); $r = ConvertFrom-Json $raw
+        Check 'close --target <overlay id> --pane left is refused the same way, and the overlay is still up' (-not $r.ok -and [string]$r.error -match "^'$ovg' is the right pane's overlay;" -and (Resolves $ovg) -and (Words $aid) -eq 'right') "raw: $raw"
+        $raw = OverlayP @('open', 'echo', 'x', '--target', $ovg); $r = ConvertFrom-Json $raw
+        Check "open --target <overlay id> with --pane omitted is that slot's open: pane overlay already open" (-not $r.ok -and [string]$r.error -match '^pane overlay already open: close it first \(session overlay close --pane right\)') "raw: $raw"
+        # The usage refusals server-side, through a raw request (the CLI refuses them first): nothing opened, resized or read.
+        foreach ($case in @(
+            @('--pane + size-percent', ('{"cmd":"session.overlay","target":"' + $aid + '","args":{"action":"open","command":"echo p5-ov-raw","pane":"left","size-percent":40}}'), '--pane and --size-percent cannot be combined: a pane overlay is always full-pane. Nothing opened.'),
+            @('resize --pane', ('{"cmd":"session.overlay","target":"' + $aid + '","args":{"action":"resize","pane":"right","size-percent":50}}'), 'resize --pane: a pane overlay is always full-pane and cannot be resized; omit --pane to resize the session-wide overlay. Nothing resized.'),
+            @('resize --target <overlay id>', ('{"cmd":"session.overlay","target":"' + $ovg + '","args":{"action":"resize","size-percent":50}}'), "'$ovg' is the right pane's overlay, which is always full-pane and cannot be resized; pass the session id to resize the session-wide overlay. Nothing resized."),
+            @('open --target <overlay id> --size-percent', ('{"cmd":"session.overlay","target":"' + $ovg + '","args":{"action":"open","command":"echo p5-ov-raw","size-percent":40}}'), "'$ovg' is the right pane's overlay, and a pane overlay is always full-pane: --size-percent does not apply. Nothing opened."),
+            @('open --target <overlay id> --size-percent 150 (the range is checked first)', ('{"cmd":"session.overlay","target":"' + $ovg + '","args":{"action":"open","command":"echo p5-ov-raw","size-percent":150}}'), 'size-percent 150 is not a whole number in 1..100; omit --size-percent to use the default popup size'))) {
+            $raw = Send-Raw $case[1]; $r = ConvertFrom-Json $raw
+            Check "raw $($case[0]) is refused server-side with agwinterm's sentence" (-not $r.ok -and [string]$r.error -eq $case[2]) "raw: $raw"
+        }
+        Start-Sleep -Milliseconds 500
+        Check 'and none of them opened anything: no popup, the words unchanged, no p5-ov-raw shell' ((OverlayHwnd) -eq [IntPtr]::Zero -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-raw' $false 500))
+        $raw = Send-Ctl $s @('session', 'close', '--target', $ovg); $r = ConvertFrom-Json $raw
+        Check 'session close --target <pane overlay id> is refused with the cover sentence, the overlay still up' (-not $r.ok -and [string]$r.error -eq "session close: '$ovg' is a scratch/overlay/quick pane, not a session; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing closed." -and (Resolves $ovg) -and (Wait-Shell5 'p5-ov-g' $true 1000)) "raw: $raw"
+        # A selection inside the overlay: a drag posted into the right box (clipboard.ps1's recipe, no
+        # input injected). The release auto-copies in lite (a convention of the window, not of the
+        # verb), so the clipboard is saved first, set to a sentinel right before the verb, and put back.
+        $savedClip = try { Get-Clipboard -Raw } catch { '' }
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $client = ClientSize $s.Hwnd
+        $tb = [LiteHonesty]::FindWindowExW($s.Hwnd, [IntPtr]::Zero, 'ToolbarWindow32', $null)
+        $tbH = 0
+        if ($tb -ne [IntPtr]::Zero) { $tr = New-Object LiteHonesty+RECT; [void][LiteHonesty]::GetWindowRect($tb, [ref]$tr); $tbH = $tr.Bottom - $tr.Top }
+        $contentX = if (StateVisible) { (TreeWidth) + 6 } else { 0 }
+        $rightX = $contentX + [int](($client[0] - $contentX) / 2) + 4
+        [LiteUi]::Drag($s.Hwnd, $rightX, $tbH + 4, $rightX + 200, $tbH + 90)
+        Start-Sleep -Milliseconds 600
+        $sentinel = "p5-clip-$(Get-Random)"
+        Set-Clipboard -Value $sentinel; Start-Sleep -Milliseconds 250
+        $r = OvRead @('copy', '--pane', 'right', '--target', $aid)
+        Check "after a drag inside the right box, overlay copy --pane right answers {text} with the selection: the overlay's marker" ([bool]$r.ok -and ([string]$r.result.text) -match 'p5-ov-g') "raw: $($script:lastRead)"
+        Check "and session copy --target <overlay id> is the same selection (g_sel is the overlay's)" (([string](Get-CtlResult $s @('session', 'copy', '--target', $ovg))) -match 'p5-ov-g')
+        $clipNow = try { Get-Clipboard -Raw } catch { '' }
+        Check 'and the copy verb did not touch the clipboard' ($clipNow -eq $sentinel)
+        Check "the selection is not the covered shell's: session copy --target <right pane id> is empty" (([string](Get-CtlResult $s @('session', 'copy', '--target', $sp9))) -eq '')
+        if ($savedClip) { Set-Clipboard -Value $savedClip } else { Set-Clipboard -Value ' ' }
+        # Both slots: the words in slot order; a swap keeps the words and moves the text with the shells.
+        $ovh = OpenP 'p5-ov-h' 'left' $aid
+        Check 'setup: an overlay on the left too' ([bool]$ovh -and (Wait-PaneText $ovh 'p5-ov-h')) "raw: $($script:lastOpen)"
+        Check 'tree: paneOverlays is ["left","right"], slot order' ((Words $aid) -eq 'left,right') "words '$(Words $aid)'"
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 600
+        Check 'after a swap the words stay ["left","right"] (both slots hold one)' ((Words $aid) -eq 'left,right') "words '$(Words $aid)'"
+        Check 'and overlay text --pane left is now the overlay that was on the right: the slot moved with its shell' ((OvTextFlat @('text', '--pane', 'left', '--target', $aid)) -match 'p5-ov-g' -and (OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -match 'p5-ov-h')
+        $raw = OverlayP @('close', '--target', $ovh); $r = ConvertFrom-Json $raw
+        Check 'close --target <overlay id> (no --pane) closes that slot: closed, the id gone, its shell gone' ([bool]$r.ok -and [string]$r.result -eq 'closed' -and (Wait-Gone $ovh) -and (Wait-Shell5 'p5-ov-h' $false)) "raw: $raw"
+        Check 'one overlay left, in slot 0 after the swap: ["left"]' ((Words $aid) -eq 'left') "words '$(Words $aid)'"
+        Send-Ctl $s @('session', 'swap', '--target', $aid) | Out-Null
+        Start-Sleep -Milliseconds 600
+        Check 'swapped back: ["right"]' ((Words $aid) -eq 'right') "words '$(Words $aid)'"
+        # The popup over a covered session: the two slots read independently; the popup's close leaves
+        # the pane slot. The focused pane is the COVERED one here (the drag above), so a bare verb
+        # (no target) resolves through the overlay's surface — and must still mean the popup: the
+        # first run of this block closed the pane overlay where it asked the popup to close.
+        $raw = Overlay @('open', 'echo', 'p5-pop-2;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
+        Check 'the popup opens over a session with a pane overlay' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero) "raw: $raw"
+        Check 'overlay text (no --pane) reads the POPUP: {text} with its marker' (Wait-OvText @('text') 'p5-pop-2') "raw: $($script:lastRead)"
+        $raw = OverlayP @('copy'); $r = ConvertFrom-Json $raw
+        Check 'overlay copy on the popup is refused: no selection (the popup takes no drag; said in the skill)' (-not $r.ok -and [string]$r.error -eq 'no selection') "raw: $raw"
+        Check 'and the pane slot is untouched by the popup: paneOverlays still ["right"], text --pane right still the pane overlay' ((Words $aid) -eq 'right' -and (OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -match 'p5-ov-g')
+        Overlay @('close') | Out-Null
+        Check 'the popup closed' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 300
+        $raw = OverlayP @('text'); $r = ConvertFrom-Json $raw
+        Check 'overlay text with no popup is refused: no overlay (the bare phrase)' (-not $r.ok -and [string]$r.error -eq 'no overlay') "raw: $raw"
+        $raw = OverlayP @('copy'); $r = ConvertFrom-Json $raw
+        Check 'and overlay copy the same' (-not $r.ok -and [string]$r.error -eq 'no overlay') "raw: $raw"
+        Check 'the pane overlay outlived the popup: still running, still read' ((Resolves $ovg) -and (Wait-Shell5 'p5-ov-g' $true 1000) -and (Words $aid) -eq 'right')
+        # result per slot: the three exits of the rule, the slot's own value, the other slot untouched; a
+        # command that never completed leaves the value as it was.
+        foreach ($case in @(@('cmd /c exit 3', 'exit 3', 'a native program'), @('Get-Item C:\no-such', 'exit 1', 'a cmdlet that fails'), @("'ok'", 'exit 0', 'an expression that succeeds'))) {
+            $raw = OverlayP (@('open') + ($case[0] -split ' ') + @('--pane', 'left', '--target', $aid)); $r = ConvertFrom-Json $raw
+            $oid = [string]$r.result
+            Check "open `"$($case[0])`" --pane left ($($case[2])) answers the overlay id" ([bool]$r.ok -and $oid -like "$($s.Pipe)-*") "raw: $raw"
+            Check 'the command completed (its D mark, through session output on the overlay id)' (Wait-OverlayCompleted $oid) "output: $(Send-Ctl $s @('session', 'output', '--target', $oid))"
+            $raw = OverlayP @('result', '--pane', 'left', '--target', $aid); $r = ConvertFrom-Json $raw
+            Check 'result --pane left while the slot is open is still refused: overlay still running (the shell stays up after the command)' (-not $r.ok -and [string]$r.error -eq 'overlay still running') "raw: $raw"
+            $raw = OverlayP @('close', '--pane', 'left', '--target', $aid)
+            Check 'close --pane left: closed, the id gone' ([string](ConvertFrom-Json $raw).result -eq 'closed' -and (Wait-Gone $oid)) "raw: $raw"
+            $raw = OverlayP @('result', '--pane', 'left', '--target', $aid); $r = ConvertFrom-Json $raw
+            Check "and result --pane left after the close is ok `"$($case[1])`"" ([bool]$r.ok -and [string]$r.result -eq $case[1]) "raw: $raw"
+            $raw = OverlayP @('result', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+            Check "while result --pane right is still the right slot's own: overlay still running" (-not $r.ok -and [string]$r.error -eq 'overlay still running') "raw: $raw"
+        }
+        $ovi = OpenP 'p5-ov-i' 'left' $aid
+        Check 'setup: a command that never completes, on the left' ([bool]$ovi -and (Wait-PaneText $ovi 'p5-ov-i')) "raw: $($script:lastOpen)"
+        OverlayP @('close', '--pane', 'left', '--target', $aid) | Out-Null
+        [void](Wait-Gone $ovi)
+        $raw = OverlayP @('result', '--pane', 'left', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check "a command that never completed leaves the slot's result as it was: exit 0" ([bool]$r.ok -and [string]$r.result -eq 'exit 0') "raw: $raw"
+        $cur = Cursor
+        $raw = OverlayP @('close', '--target', $ovg)
+        Check 'close --target <overlay id> on the right: closed, the words gone, tree fired' ([string](ConvertFrom-Json $raw).result -eq 'closed' -and (Wait-Gone $ovg) -and (Wait-Shell5 'p5-ov-g' $false) -and (Words $aid) -eq '' -and (EvSince $cur 'tree') -ge 1) "raw: $raw, words '$(Words $aid)'"
+        $raw = OverlayP @('result', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'and result --pane right after a close with nothing completed there is still refused: no overlay result' (-not $r.ok -and [string]$r.error -eq 'no overlay result') "raw: $raw"
+        # ---- task 4: `text` with --lines N and --all, on both verbs (gate 2) ------------------------
+        # One reader, two verbs: the bare form and `--all` are the WHOLE buffer (lite's default, a
+        # recorded divergence from agwinterm's screen), `--lines N` the last N lines of that same text
+        # (the trailing blank rows under the prompt squashed first, so N lines come back, not blanks),
+        # `--lines 0` the visible screen (the sentence's promise). `--all` with `--lines` is refused
+        # naming both — by the CLI before anything is sent, and by the server for a raw client with
+        # the same words; a `--lines` that is not a whole number is refused, not dropped (it used to
+        # read the buffer and report success). Both usage refusals come BEFORE the target is resolved.
+        $allWithLines = '--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.'
+        function LinesRefusal([string]$raw) { "--lines needs a whole number of lines (0 = the visible screen), not '$raw'. Nothing read." }
+        function LinesOf([string]$text) {   # the lines of a read: newline-separated, the empty piece after the final newline dropped
+            $a = @(($text -replace "`r", '') -split "`n")
+            if ($a.Count -gt 0 -and $a[-1] -eq '') { $a = @($a | Select-Object -SkipLast 1) }
+            $a   # emitted element by element: every caller wraps the call in @()
+        }
+        function TailOf([string]$text, [int]$n) { ((@(LinesOf $text) | Select-Object -Last $n) -join "`n") + "`n" }
+        function TextArgs([string[]]$rest) { Get-CtlResult $s (@('session', 'text') + $rest) }
+        function RawText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.text","target":"' + $tgt + '","args":{' + $argsJson + '}}') }
+        function RawOvText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.overlay","target":"' + $tgt + '","args":{"action":"text",' + $argsJson + '}}') }
+        # The split shell has its banner, two markers and their prompts: more than three lines, some of
+        # them on the screen with blank rows under the prompt.
+        Check 'setup: two more markers in the split shell, so the buffer has a known tail' ((Mark $sp9 'p5-t4-a') -and (Mark $sp9 'p5-t4-b')) "text: $(Get-PaneText $s $sp9)"
+        Start-Sleep -Milliseconds 400
+        $full = Get-PaneText $s $sp9
+        $fullLines = @(LinesOf $full)
+        Check 'the bare session text has at least four lines to cut a tail from' ($fullLines.Count -ge 4) "lines: $($fullLines.Count)`n$full"
+        Check 'session text --all is the bare form, byte for byte (the whole buffer, gate 2)' ((TextArgs @('--all', '--target', $sp9)) -eq $full) "all:`n$(TextArgs @('--all', '--target', $sp9))`nbare:`n$full"
+        $l3 = TextArgs @('--lines', '3', '--target', $sp9)
+        Check 'session text --lines 3 is exactly three lines' (@(LinesOf $l3).Count -eq 3) "got $(@(LinesOf $l3).Count):`n$l3"
+        Check 'and they are the LAST three of the bare form' ($l3 -eq (TailOf $full 3)) "lines 3:`n$l3`ntail:`n$(TailOf $full 3)"
+        # The count is from the END: the last marker sits some lines above the bottom (the prompt's
+        # lines below it — one, or three on a multi-line prompt), and --lines reaches it at exactly
+        # that depth, one line short of it not.
+        $depth = 0
+        for ($k = $fullLines.Count - 1; $k -ge 0; $k--) { if ($fullLines[$k] -match 'p5-t4-b') { $depth = $fullLines.Count - $k; break } }
+        Check "the last marker is $depth lines from the bottom, and --lines $depth reaches it while --lines $($depth - 1) does not" ($depth -ge 2 -and (TextArgs @('--lines', "$depth", '--target', $sp9)) -match 'p5-t4-b' -and -not ((TextArgs @('--lines', "$($depth - 1)", '--target', $sp9)) -match 'p5-t4-b')) "depth $depth`n$full"
+        $l1 = TextArgs @('--lines', '1', '--target', $sp9)
+        Check '--lines 1 is the last line alone: the prompt, no marker' (@(LinesOf $l1).Count -eq 1 -and $l1 -eq (TailOf $full 1) -and -not ($l1 -match 'p5-t4')) "lines 1: $l1"
+        $l0 = TextArgs @('--lines', '0', '--target', $sp9)
+        $rows = [int](Node $aid).rows
+        Check '--lines 0 is the visible screen: a tail of the bare form, no longer than the grid is tall, the last marker on it' ($l0.Length -gt 0 -and $full.EndsWith($l0) -and @(LinesOf $l0).Count -le $rows -and $l0 -match 'p5-t4-b') "rows $rows, lines $(@(LinesOf $l0).Count):`n$l0"
+        Check '--lines 9999 (more than there are) is the whole buffer, unchanged' ((TextArgs @('--lines', '9999', '--target', $sp9)) -eq $full)
+        # The pair and the bad count: the CLI refuses first (its stderr, nothing sent), the server the same words.
+        $raw = Send-Ctl $s @('session', 'text', '--all', '--lines', '3', '--target', $sp9)
+        Check 'session text --all --lines 3 is refused by the CLI in the server''s words, nothing sent' ($raw -match [regex]::Escape($allWithLines) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = Send-Ctl $s @('session', 'text', '--lines', '5O', '--target', $sp9)
+        Check 'session text --lines 5O (a letter O) is refused by the CLI naming the value, not dropped' ($raw -match [regex]::Escape((LinesRefusal '5O')) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = RawText $sp9 '"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'a raw session.text with all and lines is refused by the server with the same sentence' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawText $sp9 '"all":true,"lines":0'; $r = ConvertFrom-Json $raw
+        Check 'and with lines 0 beside all too: lines PRESENT is what is refused, whatever its value' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawText 'no-such-session-9999' '"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'the usage refusal comes before the resolve: the same sentence on an unknown target' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        foreach ($bad in @(@('"5O"', '5O'), @('-1', '-1'), @('2.5', '2.5'), @('true', 'true'), @('""', ''))) {
+            $raw = RawText $sp9 ('"lines":' + $bad[0]); $r = ConvertFrom-Json $raw
+            Check "a raw lines of $($bad[0]) is refused naming it: --lines needs a whole number" (-not $r.ok -and [string]$r.error -eq (LinesRefusal $bad[1])) "raw: $raw"
+        }
+        $raw = RawText $sp9 '"all":true'; $r = ConvertFrom-Json $raw
+        Check 'a raw all:true alone is the whole buffer, ok' ([bool]$r.ok -and [string]$r.result -eq $full) "raw: $raw"
+        $raw = RawText $sp9 '"all":false,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a raw all:false beside lines is the flag NOT asked for: the tail, ok' ([bool]$r.ok -and [string]$r.result -eq (TailOf $full 2)) "raw: $raw"
+        # The same three on `overlay text`, on a pane slot and on the popup — the same reader.
+        # Three echo lines, so the overlay's buffer has a tail to cut (its command sleeps, so no prompt
+        # follows them); Wait-Shell5 finds the shell by the first `echo <marker>;` on its command line.
+        $ovt = OpenP 'p5-ov-t4; echo p5-ov-t4-b; echo p5-ov-t4-c' 'right' $aid
+        Check 'setup: an overlay on the right for the text flags, its three lines up' ([bool]$ovt -and (Wait-PaneText $ovt 'p5-ov-t4-c') -and (Wait-Shell5 'p5-ov-t4' $true)) "raw: $($script:lastOpen)"
+        Start-Sleep -Milliseconds 600
+        $ovFull = Get-PaneText $s $ovt
+        $ovBare = OvRead @('text', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --pane right (bare) is the overlay''s whole buffer: what session text --target <overlay id> reads' ($ovBare -and $ovBare.ok -and ([string]$ovBare.result.text) -eq $ovFull) "overlay text: $($script:lastRead)`nsession text:`n$ovFull"
+        $ovAll = OvRead @('text', '--all', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --all --pane right equals the bare form' ($ovAll -and $ovAll.ok -and ([string]$ovAll.result.text) -eq $ovFull) "raw: $($script:lastRead)"
+        Check 'the overlay''s buffer is the three echo lines' (@(LinesOf $ovFull).Count -eq 3) "lines: $(@(LinesOf $ovFull).Count)`n$ovFull"
+        $ov2 = OvRead @('text', '--lines', '2', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --lines 2 --pane right is its last two lines: the second and third echo, not the first' ($ov2 -and $ov2.ok -and @(LinesOf ([string]$ov2.result.text)).Count -eq 2 -and ([string]$ov2.result.text) -eq (TailOf $ovFull 2) -and ([string]$ov2.result.text) -eq "p5-ov-t4-b`np5-ov-t4-c`n") "raw: $($script:lastRead)`ntail:`n$(TailOf $ovFull 2)"
+        $ov1 = OvRead @('text', '--lines', '1', '--target', $ovt)
+        Check 'and --lines 1 through the overlay id with --pane omitted (the id names its slot): the last line' ($ov1 -and $ov1.ok -and ([string]$ov1.result.text) -eq (TailOf $ovFull 1)) "raw: $($script:lastRead)"
+        $ov0 = OvRead @('text', '--lines', '0', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --lines 0 is the overlay''s screen: a tail of its buffer, the marker on it' ($ov0 -and $ov0.ok -and $ovFull.EndsWith([string]$ov0.result.text) -and ([string]$ov0.result.text) -match 'p5-ov-t4') "raw: $($script:lastRead)"
+        Check 'the shell UNDER the overlay keeps its own tail: session text --lines 2 --target <right pane id> is that shell''s last two lines, not the overlay''s' ((TextArgs @('--lines', '2', '--target', $sp9)) -eq (TailOf (Get-PaneText $s $sp9) 2))
+        $raw = Send-Ctl $s @('session', 'overlay', 'text', '--all', '--lines', '2', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --all --lines 2 is refused by the CLI, nothing sent' ($raw -match [regex]::Escape($allWithLines) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"right","all":true,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a raw overlay text with all and lines is refused by the server with the same sentence' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"right","lines":"x"'; $r = ConvertFrom-Json $raw
+        Check 'a raw overlay text with lines "x" is refused naming it' (-not $r.ok -and [string]$r.error -eq (LinesRefusal 'x')) "raw: $raw"
+        $raw = RawOvText 'no-such-session-9999' '"pane":"right","all":true,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'the overlay''s usage refusal comes before the resolve too' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"left","lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a good --lines on an EMPTY slot is still the slot''s refusal: no overlay, naming the slot' (-not $r.ok -and [string]$r.error -eq 'no overlay: --pane left names which slot, and nothing is open in it') "raw: $raw"
+        $raw = OverlayP @('text', '--lines', '2', '--pane', 'top', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'and a bad --pane word is refused before the text flags are read' (-not $r.ok -and [string]$r.error -match "^--pane 'top' is not one of") "raw: $raw"
+        # The popup: the same reader on the session-wide slot.
+        $raw = Overlay @('open', 'echo', 'p5-pop-t4;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
+        Check 'setup: the popup opens for the text flags' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-t4')) "raw: $raw"
+        Start-Sleep -Milliseconds 400
+        $popBare = OvRead @('text'); $popText = if ($popBare -and $popBare.ok) { [string]$popBare.result.text } else { '' }
+        $popAll = OvRead @('text', '--all')
+        Check 'overlay text --all on the popup equals the bare form' ($popText.Length -gt 0 -and $popAll -and $popAll.ok -and ([string]$popAll.result.text) -eq $popText) "raw: $($script:lastRead)"
+        $pop1 = OvRead @('text', '--lines', '1')
+        Check 'overlay text --lines 1 on the popup is its last line' ($pop1 -and $pop1.ok -and ([string]$pop1.result.text) -eq (TailOf $popText 1)) "raw: $($script:lastRead)`ntail: $(TailOf $popText 1)"
+        $raw = RawOvText '' '"all":true,"lines":1'; $r = ConvertFrom-Json $raw
+        Check 'a raw popup text with all and lines is refused the same way' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        Overlay @('close') | Out-Null
+        Check 'the popup closed' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        # ---- `active` by verb kind (revmux r1 of P5-lite): the SURFACE verbs (type, write, output, text,
+        # cursor, copy, paste, overlay) reach the focused pane's overlay; every OTHER verb — identity
+        # (select, flag, rename, context, duplicate, seen, status, move, close) and the state's
+        # activeSession — reaches the SHELL under it, then its owner. The overlay has no node, so an
+        # identity verb that landed on it changed a session nobody can see (r1: `session select
+        # --target active` installed the hidden overlay in the primary slot; `duplicate` cloned the
+        # wrapper). The covered pane (slot 1, $ovt) is focused for all of these.
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        $block9 = SplitBlock $aid
+        $own9 = [string]@((Node $aid).paneIds)[0]
+        $name0 = [string](Node $aid).name
+        Check 'setup: the covered pane focused — active reads the overlay, the block names slot 1, the node has a name, the left shell marked' ((Active) -match 'p5-ov-t4' -and $block9 -eq "2|$own9,$sp9|1|vertical" -and [bool]$name0 -and (Mark $own9 'p5-mk-left-9')) "active: $(Get-PaneText $s '')`nblock '$block9' name '$name0'"
+        $nc9 = NodeCount
+        $raw = Send-Ctl $s @('session', 'select', '--target', 'active'); $r = ConvertFrom-Json $raw
+        # What an explicit `select --target <the session id>` does (P4: a select lands on slot 0), and
+        # nothing else: the session stays, its split intact, the overlay up in its slot.
+        $block0 = "2|$own9,$sp9|0|vertical"
+        Check 'session select --target active selects the SESSION under the overlay: ok, the split intact with the focus on slot 0 (select''s rule), the overlay still up in its slot' ([bool]$r.ok -and [bool](Node $aid).active -and (SplitBlock $aid) -eq $block0 -and (Words $aid) -eq 'right' -and (Resolves $ovt) -and (Wait-Shell5 'p5-ov-t4' $true 1000)) "raw: $raw, block '$(SplitBlock $aid)' words '$(Words $aid)'"
+        Check 'and the overlay is not in the primary slot: --target active on slot 0 is the session''s own shell, not the overlay' ((Active) -match 'p5-mk-left-9' -and -not ((Active) -match 'p5-ov-t4')) "active: $(Get-PaneText $s '')"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'setup: focus back on the covered pane' ((SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4') "block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'select', '--target', $ovt); $r = ConvertFrom-Json $raw
+        Check 'session select --target <overlay id> is refused as a cover, naming the id and the three dismissals' (-not $r.ok -and [string]$r.error -eq "session select: '$ovt' is a scratch/overlay/quick pane, not a session; select the session it covers (its own id), or dismiss it with ``session scratch off``, ``session overlay close`` or ``quick off``. Nothing selected.") "raw: $raw"
+        Check 'and nothing changed: the same block, the overlay still the surface' ((SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4' -and (NodeCount) -eq $nc9) "block '$(SplitBlock $aid)' nodes $(NodeCount)"
+        $raw = Send-Ctl $s @('session', 'select', '--target', $sp9); $r = ConvertFrom-Json $raw
+        Check 'session select --target <split shell id> lands on its owner: ok, the session selected, its split intact (focus on slot 0, select''s rule), no node added' ([bool]$r.ok -and (SplitBlock $aid) -eq $block0 -and [bool](Node $aid).active -and (NodeCount) -eq $nc9) "raw: $raw, block '$(SplitBlock $aid)'"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'setup: focus back on the covered pane' ((SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4') "block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'flag', 'on', '--target', 'active'); $r = ConvertFrom-Json $raw
+        Check 'session flag on --target active flags the SESSION (the node), not the overlay' ([bool]$r.ok -and [string]$r.result -eq 'flagged' -and [bool](Node $aid).flagged) "raw: $raw, node flagged $((Node $aid).flagged)"
+        $raw = Send-Ctl $s @('session', 'flag', 'off', '--target', 'active')
+        Check 'and flag off --target active unflags it' ([string](ConvertFrom-Json $raw).result -eq 'unflagged' -and -not [bool](Node $aid).flagged) "raw: $raw"
+        # The chord's command (IDM_FLAG, what Ctrl+Shift+F posts) while the covered SPLIT pane is
+        # focused: the session, through its owner — it used to be a no-op on any split pane.
+        [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]126, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 400
+        Check 'IDM_FLAG with the covered split pane focused flags the session' ([bool](Node $aid).flagged) "node flagged $((Node $aid).flagged)"
+        [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]126, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 400
+        Check 'and again unflags it' (-not [bool](Node $aid).flagged)
+        $raw = Send-Ctl $s @('session', 'rename', 'p5-renamed-active', '--target', 'active'); $r = ConvertFrom-Json $raw
+        Check 'session rename --target active renames the session: the node carries the new name' ([bool]$r.ok -and [string](Node $aid).name -eq 'p5-renamed-active') "raw: $raw, node name '$((Node $aid).name)'"
+        $raw = Send-Ctl $s @('window', 'state'); $r = ConvertFrom-Json $raw
+        Check 'window state names it as activeSession: the session under the overlay, not the overlay (which has no name)' ([bool]$r.ok -and [string]$r.result.activeSession -eq 'p5-renamed-active') "raw: $raw"
+        Send-Ctl $s @('session', 'rename', $name0, '--target', 'active') | Out-Null
+        Check 'renamed back' ([string](Node $aid).name -eq $name0) "node name '$((Node $aid).name)'"
+        $raw = Send-Ctl $s @('session', 'context', 'p5-ctx-active', '--target', 'active'); $r = ConvertFrom-Json $raw
+        Check 'session context --target active sets the SESSION''s context' ([bool]$r.ok -and [string](Node $aid).context -eq 'p5-ctx-active') "raw: $raw, node: $((Node $aid) | ConvertTo-Json -Compress)"
+        Send-Ctl $s @('session', 'context', '--clear', '--target', 'active') | Out-Null
+        $cur = Cursor
+        $raw = Send-Ctl $s @('session', 'duplicate', '--target', 'active'); $r = ConvertFrom-Json $raw
+        $dup = if ($r -and $r.ok) { [string]$r.result } else { '' }
+        Start-Sleep -Milliseconds 800
+        Check 'session duplicate --target active clones the SESSION: a new node, one more' ([bool]$dup -and $dup -ne $aid -and [bool](Node $dup) -and (NodeCount) -eq $before + 1) "raw: $raw, nodes $(NodeCount) vs $before"
+        Check 'and not the overlay''s wrapper: exactly one shell still carries the p5-ov-t4 command line' (@(Shell5 'p5-ov-t4').Count -eq 1) "shells: $(@(Shell5 'p5-ov-t4').Count)"
+        if ($dup) { Send-Ctl $s @('session', 'close', '--target', $dup) | Out-Null; Start-Sleep -Milliseconds 600 }
+        Send-Ctl $s @('session', 'select', '--target', $aid) | Out-Null
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 400
+        Check 'the duplicate closed, the split session back on screen with its covered pane focused, the overlay still up' ((NodeCount) -eq $before -and [bool](Node $aid).active -and (SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4' -and (Wait-Shell5 'p5-ov-t4' $true 1000)) "nodes $(NodeCount), block '$(SplitBlock $aid)'"
+        # ---- an EXPLICIT overlay id on the session verbs (revmux r2): refused as a cover ----
+        # `active` is remapped; the overlay's own id is not — and the program inside sends it as
+        # its default target. Before this, `duplicate --target <overlay id>` cloned the FTCS
+        # wrapper's command line into a visible session and the other five answered ok for a write
+        # on an object with no node (r1 listed them; the fix covered `active` only).
+        function IdCover([string]$verb, [string]$id, [string]$nothing) {
+            "session ${verb}: '$id' is a scratch/overlay/quick pane, not a session; it has no sidebar row and no session line in the state file, so there is nothing of it to act on. Name the session it covers (its own id), or dismiss it with ``session scratch off``, ``session overlay close`` or ``quick off``. Nothing $nothing."
+        }
+        $flag0 = [bool](Node $aid).flagged
+        foreach ($case in @(
+            @('duplicate', @('session', 'duplicate', '--target', $ovt), 'created'),
+            @('flag', @('session', 'flag', 'on', '--target', $ovt), 'changed'),
+            @('seen', @('session', 'seen', '--target', $ovt), 'marked'),
+            @('rename', @('session', 'rename', 'p5-cover-renamed', '--target', $ovt), 'renamed'),
+            @('status', @('session', 'status', 'blocked', '--target', $ovt), 'set'),
+            @('move', @('session', 'move', 'up', '--target', $ovt), 'moved'))) {
+            $raw = Send-Ctl $s $case[1]; $r = ConvertFrom-Json $raw
+            Check "session $($case[0]) --target <overlay id> is refused as a cover, naming the verb, the id and the three dismissals" (-not $r.ok -and [string]$r.error -eq (IdCover $case[0] $ovt $case[2])) "raw: $raw"
+        }
+        Start-Sleep -Milliseconds 500
+        Check 'and nothing changed: no node added, one wrapper shell, the name, the flag, the block and the surface as they were' ((NodeCount) -eq $before -and @(Shell5 'p5-ov-t4').Count -eq 1 -and [string](Node $aid).name -eq $name0 -and [bool](Node $aid).flagged -eq $flag0 -and (SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4' -and (Resolves $ovt)) "nodes $(NodeCount), shells $(@(Shell5 'p5-ov-t4').Count), name '$((Node $aid).name)', block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'flag', 'on', '--target', $sp9); $r = ConvertFrom-Json $raw
+        Check 'while an explicit SPLIT shell id is no cover: flag on --target <split shell id> answers flagged (P4''s meaning, on a shell nobody sees)' ([bool]$r.ok -and [string]$r.result -eq 'flagged') "raw: $raw"
+        Send-Ctl $s @('session', 'flag', 'off', '--target', $sp9) | Out-Null
+        # `flag clear` is the one op that takes no target (agwinterm: "clear always succeeds"):
+        # an overlay id beside it is ignored, not refused — THE RULE carves it out (revmux r3).
+        Send-Ctl $s @('session', 'flag', 'on', '--target', $aid) | Out-Null
+        $raw = Send-Ctl $s @('session', 'flag', 'clear', '--target', $ovt); $r = ConvertFrom-Json $raw
+        Start-Sleep -Milliseconds 300
+        Check 'flag clear --target <overlay id> is not refused: it takes no target and unflags every session' ([bool]$r.ok -and [string]$r.result -eq 'cleared' -and -not [bool](Node $aid).flagged) "raw: $raw, flagged $((Node $aid).flagged)"
+        if ($flag0) { Send-Ctl $s @('session', 'flag', 'on', '--target', $aid) | Out-Null }
+        # `lines` past int range: the CLI refuses it as not a whole number (its own int32 parse —
+        # the sentence is the CLI's and is wrong about a valid whole number: agwinterm #254, lite
+        # #42; this pins what the CLI does today, not that it is right); a raw client's number
+        # saturates to "everything" on the server — neither wraps to a small N.
+        $raw = Send-Ctl $s @('session', 'text', '--lines', '99999999999', '--target', $sp9)
+        Check '--lines 99999999999 is refused by the CLI, nothing sent' ($raw -match [regex]::Escape((LinesRefusal '99999999999')) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = RawText $sp9 '"lines":99999999999'; $r = ConvertFrom-Json $raw
+        Check 'a raw lines 99999999999 (past int range) is the whole buffer, not a wrapped small count' ([bool]$r.ok -and [string]$r.result -eq (Get-PaneText $s $sp9)) "raw: $raw"
+        # ---- a layout change regrids the overlay (r1: the sizing line was untested) ----
+        # The left slot gets an overlay whose one output line is narrower than its box; the sidebar
+        # then widens (the panes narrow) and the overlay's text must wrap — the emulator behind the
+        # overlay was resized with the box. Read off the emulator through the overlay's id.
+        $sbw0 = [int](ConvertFrom-Json (Send-Ctl $s @('sidebar', 'width'))).result.width
+        $cL = [int](Node $aid).cols   # slot 0's grid: the box the left overlay covers
+        $rgm = 'p5-rg-' + ('x' * ($cL - 12))
+        $rg = OpenP $rgm 'left' $aid
+        Check "setup: an overlay on the left whose echo line is $($cL - 6) cells in a $cL-wide box: one row" ([bool]$rg -and (Wait-PaneText $rg 'p5-rg-x') -and @(LinesOf (Get-PaneText $s $rg)).Count -eq 1) "raw: $($script:lastOpen)`ntext: $(Get-PaneText $s $rg)"
+        $raw = SidebarWidthSet "$($sbw0 + 200)"; $r = ConvertFrom-Json $raw
+        Start-Sleep -Milliseconds 900
+        $cL2 = [int](Node $aid).cols
+        Check 'setup: the sidebar 200 px wider, applied; slot 0 lost at least 12 columns' ([bool]$r.ok -and $r.result.applied -eq $true -and $cL2 -le $cL - 12) "raw: $raw, cols $cL -> $cL2"
+        $wrapped = $false
+        for ($i = 0; $i -lt 20 -and -not $wrapped; $i++) { $wrapped = @(LinesOf (Get-PaneText $s $rg)).Count -ge 2; if (-not $wrapped) { Start-Sleep -Milliseconds 250 } }
+        Check 'the overlay regridded with its box: its one line now wraps onto a second row' $wrapped "text:`n$(Get-PaneText $s $rg)"
+        Check 'and the marker still reads back whole' ((PaneFlat $rg) -match $rgm)
+        SidebarWidthSet "$sbw0" | Out-Null
+        Start-Sleep -Milliseconds 900
+        Check 'the sidebar restored: slot 0 back at its width' ([int](Node $aid).cols -eq $cL) "cols $((Node $aid).cols) vs $cL"
+        $raw = OverlayP @('close', '--pane', 'left', '--target', $aid)
+        Check 'the regrid overlay closed' ([string](ConvertFrom-Json $raw).result -eq 'closed' -and (Wait-Gone $rg) -and (Wait-Shell5 $rgm $false)) "raw: $raw"
+        # ---- the popup's exit, read at the close it is asked for (r1: the ack race) ----
+        # `close` returns after the popup's exit is on record: `result` right behind it is the value.
+        # Before, WM_DESTROY wrote it and a `result` sent right after `close` could read the old one.
+        $cur = Cursor
+        $raw = Overlay @('open', 'cmd', '/c', 'exit', '4'); $r = ConvertFrom-Json $raw
+        $pid4 = OverlayIdSince $cur
+        Check 'setup: a popup running `cmd /c exit 4`; its id off the created event' ([bool]$r.ok -and [bool]$pid4 -and (Wait-Overlay $true) -ne [IntPtr]::Zero) "raw: $raw, id '$pid4'"
+        Check 'the bare result right after the open is the reset value: no overlay' ([string](Get-CtlResult $s @('session', 'overlay', 'result')) -eq 'no overlay')
+        Check 'setup: the command completed (its D mark landed)' (Wait-OverlayCompleted $pid4)
+        $raw = Overlay @('close')
+        $rr = [string](Get-CtlResult $s @('session', 'overlay', 'result'))
+        Check 'close, then result with no wait at all: exit 4 — the exit is on record before close answers' ([bool](ConvertFrom-Json $raw).ok -and $rr -eq 'exit 4') "close: $raw, result '$rr'"
+        Check 'the popup is gone' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        # A command ending in a `#` comment: the wrapper's D mark is on its own line, so the comment
+        # cannot eat it (r1) — the result is exit 0, not the previous value.
+        $cur = Cursor
+        $raw = Overlay @('open', 'echo', 'p5-cm-1', '#', 'a', 'comment'); $r = ConvertFrom-Json $raw
+        $pidc = OverlayIdSince $cur
+        Check 'setup: a popup whose command ends in a # comment; its id' ([bool]$r.ok -and [bool]$pidc -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-cm-1')) "raw: $raw"
+        Check 'its D mark still lands: the command completes' (Wait-OverlayCompleted $pidc)
+        Overlay @('close') | Out-Null
+        $rr = [string](Get-CtlResult $s @('session', 'overlay', 'result'))
+        Check 'and the result is exit 0 (the comment did not swallow the mark)' ($rr -eq 'exit 0') "result '$rr'"
+        Check 'the popup is gone' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        # ---- the close command with the popup focused closes the POPUP (the P2 rule), the pane overlay stays ----
+        $raw = Overlay @('open', 'echo', 'p5-pop-cl;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
+        Check 'setup: a popup over the covered pane, focused' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
+        Start-Sleep -Milliseconds 300
+        [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]2, [IntPtr]::Zero) | Out-Null   # IDM_CLOSE: the close chord's command
+        Check 'IDM_CLOSE with the popup focused closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        Check 'and the pane overlay under it is untouched: still up, still the surface, the block unchanged' ((Resolves $ovt) -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-t4' $true 1000) -and (SplitBlock $aid) -eq $block9 -and (NodeCount) -eq $before) "words '$(Words $aid)' block '$(SplitBlock $aid)' nodes $(NodeCount)"
+        Send-Ctl $s @('session', 'focus', 'right') | Out-Null
+        Start-Sleep -Milliseconds 300
+        Check 'with the popup gone, active is the pane overlay again' ((Active) -match 'p5-ov-t4') "active: $(Get-PaneText $s '')"
+        # The PANE-class verbs: `active` is the focused pane's shell, as P4 says — `session close`
+        # with the covered split pane focused is the unsplit the chord does, the overlay dies with
+        # its pane, the session survives with its own shell. (The teardown of this section.)
+        $raw = Send-Ctl $s @('session', 'close', '--target', 'active'); $r = ConvertFrom-Json $raw
+        Check 'session close --target active with the covered split pane focused closes that PANE: closed, the session single with its own shell, the overlay and its shell gone with the pane' ([bool]$r.ok -and [string]$r.result -eq 'closed' -and (Wait-Single $aid) -and (Wait-Gone $ovt) -and (Wait-Shell5 'p5-ov-t4' $false) -and [bool](Node $aid).active -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', nodes $(NodeCount) vs $before"
+        Check 'and the survivor is the session''s own shell, uncovered: active reads its marker' ((Active) -match 'p5-mk-left-9' -and (Words $aid) -eq '') "active: $(Get-PaneText $s '')"
+        Check 'nothing of the block is left running: no shell with a p5-ov marker on its command line anywhere' (@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'echo p5-ov-' }).Count -eq 0)
     }
 
     # ---- #23: two persisted values that cannot coexist ------------------------------------------

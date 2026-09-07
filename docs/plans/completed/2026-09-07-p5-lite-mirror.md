@@ -1,0 +1,813 @@
+# P5-lite — a pane gets its own overlay, the agliteterm half
+
+The agliteterm half of batch **P5** of the parity programme (agwinterm
+`docs/plans/2026-09-03-parity-batches.md`). agwinterm shipped its half as PR #250 on 2026-09-07
+(plan: agwinterm `docs/plans/completed/2026-09-07-p5-pane-overlays.md`, three revmux rounds —
+read it first, the rule and the refusal table above all; every rule below was made there and lite
+copies it, it does not re-decide it), followed by the contract PR #252 (four steps, three refusals)
+and the release PR #253 (0.17.14). `tools/check-contract.ps1` goes red on `main` the moment #252
+merges, for exactly those steps and refusals; that is the gate, and it goes green when this merges
+and agwinterm 0.17.14 is tagged.
+
+**Gates, decided before ralphex runs — all five as recommended, Boris, 2026-09-07 ("Ok
+continue" to the five questions as listed below); the plan as written is the decision:**
+
+1. **A pane overlay is IN-WINDOW, the pane's surface** — one more hidden `Session`, drawn in the
+   pane's box instead of the shell while it is open. Not a popup sized to the pane rect (a popup
+   is a framed top-level window that does not follow the main window, is raised only when the
+   process holds the foreground, and `g_focusOverride` sends EVERY keystroke to it — the sibling
+   pane could not stay interactive, which is the rule's one hard property), and not a recorded
+   divergence (the contract runs the same steps on both products). The session-wide overlay stays
+   the popup it is, byte for byte.
+2. **`session text` keeps lite's default (the whole buffer) and gains `--lines N` and `--all`.**
+   `--all` is the explicit spelling of what the bare form already does here; `--lines N` (silently
+   dropped today) is the last N lines; the two together are refused. `overlay text` is the same
+   reader with the same defaults. A recorded divergence: agwinterm's and agterm's bare `session
+   text` is the screen only. The alternative — switch the default to the screen — changes a shipped
+   verb the skill documents as "the whole buffer" under every caller's feet.
+3. **`overlay result` reports the command's exit status through an FTCS mark** the overlay's own
+   command line emits around the command (`OSC 133;A` / `C` before it, `D;<code>` after it; the
+   core already parses these — `lastCommandOutput` reads them). The shell stays up (`-NoExit`, the
+   P2-lite shape; lite has no `--wait`), so `result` says `overlay still running` while the slot is
+   open and `exit N` after it closed, `no overlay result` when nothing completed there. One command
+   line for the popup and the pane slot, so the bare `result` (window-wide, agwinterm's recorded
+   divergence from agterm) works too. The alternative — no exit code, `result` limited to
+   running / never ran — makes the verb answer nothing a caller wants it for.
+4. **`open --pane` answers the overlay's id** (a lite session id, `<prefix>-<seq>`), because the
+   pane slot is created inline the way `session split on` is; the popup keeps its status word (it is
+   created after the reply is written). The contract note in #252 that says "lite: its status word"
+   is corrected there before it merges.
+5. Release after this: lite **0.17.16** (Boris calls the number).
+
+One verb family and one rule, on one subsystem — a session's two panes and the popups over the
+window. In lite a pane IS a `Session` (P4: the owner's shell or the split's hidden shell), so a pane
+overlay is one more hidden `Session` hung on the shell it covers (`Session::overlay`), sized to the
+shell's grid, painted in its box, and reached by `focusedSession()` / `hitTest` when that pane is
+the one under the keys or the pointer. Nothing in the popup machinery changes; the popup is the
+session-wide slot.
+
+## The vocabulary, fixed before anything is written
+
+Copied, not re-decided, from the agwinterm plan:
+
+- **THE RULE, stated once in lite's terms** (agwinterm `ISessionHost.SessionOverlay`'s sentence;
+  quoted here in full and nowhere else in full — the skill, the README and the code comment point
+  here): a session has three overlay slots: **one session-wide** (lite's popup over the window,
+  as today — it covers every pane and any pane overlay under it, and holds input through
+  `g_focusOverride` while focused) and **one per pane**. A pane overlay covers **exactly one
+  pane's box** — always the full box, never floating — and the sibling pane stays visible and
+  interactive. `--pane left|right` names the slot: `left` is **slot 0** (the left / top box) and
+  `right` is **slot 1** (the right / bottom box) **whatever the axis** — the same slots `session
+  focus left|right` names, whichever shell a swap put there; a non-split session accepts `--pane
+  left`; the flag omitted means the session-wide slot — today's behaviour, byte for byte. A pane
+  overlay is that pane's **surface** while it is open: keys typed into the focused pane, the mouse
+  inside the pane's box and `--target active` (or no target) **on a surface verb** — `session
+  type` / `write` / `output` / `text` / `copy` / `paste`, `surface cursor`, `session overlay` —
+  reach the overlay; on every other verb `active` is what lies UNDER the focused pane: on a
+  session verb (`select`, `flag`, `seen`, `rename`, `status`, `context`, `duplicate`, `move`, and
+  `window state`'s `activeSession`) the **session** the pane belongs to (a split pane's owner — a
+  flag or a name on its hidden shell is one nobody can see), on a pane verb (`session close`, the
+  split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a focused
+  split pane is the unsplit the chord does) — because the overlay has no identity of its own (no
+  node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
+  shell's id keeps P4's meaning on every verb but two: `session select` shows the session the
+  pane belongs to (the focus on slot 0) and `session context` refuses every hidden id (a split
+  shell has no row and no session line to keep a context in); `--target <pane id>` reaches the
+  shell **underneath** (`session text` reads the surface underneath); `--target <overlay id>`
+  reaches the overlay from anywhere on the surface verbs (lite resolves hidden sessions by id
+  already) and is refused as a cover by EVERY other verb — the structural ones (`session close`,
+  `select`, `context`, `split`, `split close`, `swap`, `restore capture`) and the session ones
+  (`flag on`/`off`/`toggle`, `seen`, `rename`, `status`, `duplicate`, `move`), each naming the
+  verb that dismisses it (`flag clear` is the one op that takes no target: it unflags every
+  session, whoever sends it — agwinterm's `SessionFlag` says "clear always succeeds") — and on
+  `session overlay` itself names that
+  overlay's slot — the same as passing its `--pane` word — for as long as the id resolves (an
+  overlay that closed is reached by `--pane` only); with `--pane` naming the other side it is
+  refused. The slot moves with its pane (a swap,
+  a `split close` of the other pane — in lite by construction: the slot hangs on the shell) and
+  dies with it (`split close`, `split off`, the shell exiting when that removes the pane — a
+  single-pane session keeps an exited shell on screen, and its overlay with it — `session close`,
+  the window closing).
+- **A slot is a position, a shell is a `Session`** (P4). The pane overlay of slot X lives on
+  `g_sessions[g_pane[paneOfSlot(X)]]->overlay` for the displayed session; on a non-displayed
+  session `paneOfSlot` is computed from the owner's `swapped` the way `splitBlockFields` does.
+- **An overlay id is a session id.** The pane overlay's `Session` is minted by `newSession` and
+  attached hidden, named `overlay`, never in `g_pane`, never a tree node, never in the state file,
+  never adoptable (`restore capture` already refuses covers). Its id is the `open` reply and the
+  `AGWINTERM_SESSION_ID` / `AGWINTERM_PANE_ID` of the program inside it — so a bare `session
+  overlay close` typed inside a pane overlay closes that overlay (the CLI sends the env id as the
+  target), and a bare `session text` inside it reads it.
+- **`--wait` / `--block` stay out** (not in the contract; lite's overlay stays up until closed,
+  which is `--wait` without a banner — recorded in P2-lite). **`--size-percent` / `resize` with
+  `--pane` are refused** at both ends (the CLI, exit 2 "Nothing sent"; the server for a raw client)
+  with agwinterm's sentences — a pane overlay is always full-box.
+- **Lite's differences from agwinterm's sentence, each recorded in `lite-parity.md`, not
+  silently**: (a) the session-wide slot is a popup, not a cover inside the content region (P2-lite,
+  unchanged); (b) `session text` / `overlay text` default to the whole buffer (gate 2); (c) `exit N`
+  is the exit status of the command `open` ran, as PowerShell reports it — `$LASTEXITCODE` for a
+  native program, else 0 when `$?` is true and 1 when it is false — read off the FIRST mark with an
+  exit in that overlay (the wrapper's; a user's own shell integration prompts come later); a command
+  that never completed (closed early, or a command line that did not parse) leaves the slot's
+  result as it was; (d) the session-wide `open` keeps accepting any target that resolves (P2-lite),
+  where agwinterm refuses a pane id of a split without `--pane` (#213); (e) `open --pane` answers
+  an id, the popup a status word (gate 4); (f) an overlay's id on a session verb (`flag on`/`off`/
+  `toggle`, `seen`, `rename`, `status`, `duplicate`, `move` — `flag clear` takes no target and
+  unflags every session, in both products) is REFUSED as a cover naming the session to use, where
+  agwinterm's `FindSesForTarget` lands a scratch or overlay cover id on the session it covers —
+  lite's `session context` refuses every hidden target already (revmux r1), and one refusal family
+  is what P4-lite's covers speak (revmux r2).
+
+Refusals are agwinterm's sentences **verbatim** (`src/Agwinterm.Pty/OverlayPanes.cs` — agterm's
+phrase as the head, a colon, what our guard saw); grouped in one `// ---- P5: the overlay verbs'
+refusals ----` block beside P4's (`src/main.cpp:7012-7053`), the overlay's five inline literals
+(`:8093`, `:8110-8111`, `:8123`, `:8132`, `:8143`) promoted into it unchanged:
+
+| agterm phrase | when | ours, after the colon |
+| --- | --- | --- |
+| (parse) | `--pane` is not exactly `left` / `right` | `OverlayPanes.Refusal`: both words named, the absent form named; nothing opened |
+| `pane not visible` | `--pane right` on a single-pane session | `session <id> has one pane; pass --pane left or omit --pane` |
+| `pane overlay already open` | `open --pane X` while X holds one — **no silent replace** (the popup replaces, as today) | `close it first (session overlay close --pane X), or read it (result / copy / text)` |
+| `no overlay` | `copy` / `text` / `result`? no — `copy` / `text` / `close --pane` with nothing in the slot (`close` answers it `ok`, the popup's shape) | `--pane X` names which slot |
+| `no selection` | `copy` with nothing selected inside the overlay | — |
+| `failed to read surface buffer` | `text` when the emulator read fails | the reason |
+| `overlay still running` | `result --pane X` (or `--target <X's overlay id>`) while X's overlay is up | — |
+| `no overlay result` | `result --pane X` when nothing completed in X since the window opened | — |
+| (agreement) | `--target <pane id>` naming the OTHER side than `--pane` | `OverlayPanes.Disagree`: `'<id>' is the right pane; --pane left names the other one. Nothing opened.` (overlay flavour for an overlay id) |
+| (in flight) | an overlay id that resolved on the pipe thread and is gone in the UI hop | `OverlayIdGoneRefusal` — lite runs the slot's verbs inline under `g_lock`, so this is documented as agwinterm's, not emitted, unless a path produces it |
+| (usage) | `--pane` + `--size-percent`; `resize --pane`; `--all` + `--lines` | `SizeWithPane`, `ResizeWithPane`, `AllWithLines` — the CLI refuses first; the server repeats the sentence for a raw client |
+| (cover) | `session close --target <any overlay's id>` | the P4 cover family: `session close: '<id>' is a scratch/overlay/quick pane, not a session; \`session scratch off\`, \`session overlay close\` or \`quick off\` dismiss those. Nothing closed.` — closes a latent hole: today `:8079-8080` destroys the popup's `Session` under `g_overlaySession` |
+
+`overlay not realized` is agterm's phrase for a slot whose terminal is not up yet; `newSession`
+builds the emulator before it returns, so it is documented, not emitted (agwinterm's decision).
+
+## Overview
+
+- **`session overlay open <cmd> --pane left|right [--target <id>]`** — the command runs in a hidden
+  `Session` sized to that pane's grid, drawn in that pane's box instead of its shell; the other
+  pane keeps rendering and taking input. Created inline on the pipe thread the way `session split
+  on` creates the split shell (`:8398-8506`), so the reply is the overlay's id. Refused, nothing
+  opened: a bad word; `pane not visible`; `pane overlay already open`; the agreement check; a
+  target that resolves to nothing (`:8130-8132`'s sentence); a cover as the target without `--pane`
+  stays the popup's arm. Without `--pane`: unchanged — the popup (`openOverlay:5899`), `WM_APP_OVERLAY`,
+  the status word, the 70 % default, the floor and its wording.
+- **`session overlay close --pane left|right`** — kills that slot's session (the way
+  `closeSplitSide` kills a shell: listed out under `g_lock` first, then the host kill) and the pane
+  shows its shell again; `ok "no overlay"` when empty. **`session overlay result [--pane
+  left|right]`** — new action: with a pane, that slot's `overlay still running` / `exit N` / `no
+  overlay result`; bare, the window-wide last popup exit (`exit N`, or `ok "no overlay"` when none;
+  reset to `no overlay` by any popup open — agwinterm's `_lastOverlayExit`).
+- **`session overlay copy [--pane left|right]`** — `{"text": <the selection inside the overlay>}`
+  (`g_sel.isFor(overlay)` → `selectionText()`; the clipboard is not touched); `no overlay` / `no
+  selection`. Without `--pane` on the popup: the popup paints no selection and `hitTest` never
+  enters it, so `no selection` is what a caller gets — said in the skill, not hidden. **`session
+  overlay text [--all] [--lines N] [--pane left|right]`** — `{"text": …}` through
+  `dumpBufferRange` on the overlay's session; `--lines N` = the last N lines of the buffer; `--all`
+  and the bare form the whole buffer (gate 2). **`session text` gains `--lines N` and `--all`** —
+  the same reader, the same words, `--all` + `--lines` refused.
+- **`tree --json`**: `"paneOverlays":["left"]` / `["right"]` / `["left","right"]` inside the
+  session node in slot order, **omitted when empty**, beside the split block — agwinterm's key, an
+  ARRAY of words (not an object keyed by pane id; `capturedCommands` is the object).
+- **The surface seam**: `focusedSession()` (`:1624`), `paint`'s pane loop (`:3920-3930`),
+  `hitTest` (`:4028`), `paneGridSize` / `syncPaneSizes` (`:1558`, `:1790`), `InvalidateCaret`
+  (`:6405`), the wheel (`:6277`) — each asks `surfaceOf(shell)` (= `shell->overlay ? overlay :
+  shell`) where it used the shell. Selection works inside a pane overlay by construction (`g_sel`
+  is keyed by `Session*`). A badge `overlay` in the box's top-right corner tells a human the box is
+  covered (the popup's title word).
+- **Keys**: the Close Pane / Session action (`IDM_CLOSE` → `closeFocused:2414`, the unbound
+  `Key_Close`, the palette row, the File menu) closes a focused POPUP first (the session-wide slot,
+  a scratch or a quick pane — whatever holds `g_focusOverride`; revmux r1), then the focused
+  pane's overlay when one is open (agwinterm's ⌘W rule), else what it closes today. Lite's Esc is the palette (`:4606`) — no
+  `close_cover` chord exists here; nothing added.
+- **Lifecycle**: `closeSessionAt` (a session close kills both panes' overlays), `closeSplitSide`
+  (the victim's overlay dies, the survivor keeps its own — the pointer exchange moves the whole
+  object, so a promotion keeps the survivor's slot), the `WM_APP_PANEEXIT` collapse (the same
+  primitive), `OnDestroy` (everything in `g_sessions`, already). A swap moves nothing (the slot is
+  on the shell). `selectPrimary` needs nothing (a non-displayed session's pane overlay is simply
+  not painted). Restore: never persisted (`hidden` is skipped by the writer).
+
+## Context (from discovery)
+
+- Overlay state `src/main.cpp:481-485` (`g_overlayHwnd` / `g_overlaySession` / `g_focusOverride`,
+  one popup per process); `openOverlay` `:5897-5915` (`DestroyWindow` the old one at `:5900`,
+  `powershell.exe -NoExit -Command <cmd>` at `:5905`, `hidden` + name `overlay` `:5912`,
+  `showPopupRaised` → `g_focusOverride` `:5913`); `resizeOverlay` `:5920-5936`; the popup class
+  `:5725-5764` (one class for quick / scratch / overlay, told apart by HWND); `popupProc`
+  `:5656-5724` (`WM_SETFOCUS` / `WM_KILLFOCUS` set / clear the override `:5666-5667`, `WM_CLOSE`
+  destroys overlay and scratch `:5699-5708`, `WM_DESTROY` kills the session and nulls both globals
+  `:5709-5721`); `paintPopup` `:5643-5655` (pane `-1`: no selection drawn); `windowForSession`
+  `:1630-1635`; `refitPopupSessions` `:1817-1828`; `applyTheme` `:907`.
+- The verb `session.overlay` `:8083-8164`: action `open|close|resize` `:8090-8093`;
+  `size-percent` by presence `:8102-8113`; the command before the target `:8121-8123`; the target
+  `:8130-8132`; dispatch `:8136-8163` (`close` with none → `ctlOkStr("no overlay")` `:8138`;
+  `OverlayReq` posted as `WM_APP_OVERLAY` `:1021`, handler `:6527-6532`). No `wait` / `block` /
+  `pane` / `all` / `lines` anywhere (`grep 'args\.'`).
+- Splits (P4): `struct Session` `:355-429` (`splitId` `:361`, `paneId` `:368`, `horizontal`
+  `:375`, `swapped` `:381`, `hidden` `:385`); the slot map `:1519-1550` (`slotOf`, `paneOfSlot`,
+  `slotRect`, `paneRect` — the one geometry choke point); `displayedLayout` `:1513`;
+  `splitOwnerOf` `:7086-7090` (a cover answers `nullptr`); `splitBlockFields` `:7097-7103`;
+  `closeSplitSide` `:2446-2500` (the pointer exchange, `g_sel.pane` reset `:2485`);
+  `closeSessionAt` `:2325-2375`; `closeFocused` `:2414-2418`; `unsplit` `:2518`;
+  `OnPaneExit` `:6551-6563`; `session.split` `:8398`, `.split.close` `:8507`, `.swap` `:8542`,
+  `.focus` `:8585`, `focusSlotFor` `:7059`.
+- Surfaces: `focusedSession` `:1624-1628`; `paint` `:3915-3936` (`paintPane(mem, pr, session, p,
+  p == g_focus)`); `paintPane` `:3728` (the selection test `:3839` is `g_sel.isFor(s) && g_sel.pane
+  == pane`); `hitTest` `:4028-4049`; `struct Sel` `:1087-1110` (keyed by `Session*`, `isFor`
+  `:1105`); `selectionText` `:4078-4124`; `syncSelection` `:4058`; `paneGridSize` `:1558`;
+  `syncPaneSizes` `:1790-1811` (`hostResize` per pane); `InvalidateCaret` `:6405`; `OnMouseWheel`
+  `:6277`; `handleKeyDown` `:4595` (Esc = palette `:4606`); the exit path `:1976-1981`
+  (`exited = true`, `WM_APP_PANEEXIT`).
+- Reads: `dumpBufferRange` `:7213-7249` (history + screen as one absolute sequence, `-1,-1` =
+  everything), `dumpBufferText` `:7250`; `session.text` `:8011-8014` (ignores `lines`);
+  `session.output` `:8004` / `lastCommandOutput` `:7258-7279` (FTCS marks, `FfiMark` `:88-92`:
+  `hasExit`, `exitCode`); `session.copy` `:8634-8638` (`ctlOkStr("")` when the selection is not
+  the target's — pre-existing, untouched). The core's `ftcs_dispatch` (agwinterm
+  `native/agwinterm-core/src/emulator.rs:873-922`): `A` opens a mark, `D;<n>` closes it with
+  `exit_code` — the wrapper emits `A`, `C`, the command, `D;<code>`.
+- Resolution: `resolveTarget` `:7147-7173` (empty / `active` → `focusedSession()`; exact `id`;
+  exact `paneId`; ≥4-char prefix of either — hidden sessions included; names among visible only
+  `:7165`); `callerWorkspace` (P4 r2: a hidden caller walks to its owner — a pane overlay's caller
+  needs the same walk to the shell that holds it, then that shell's owner).
+- Refusal blocks: P3 `:6980-7010`, P4 `:7012-7053` — the overlay's are inline literals today.
+- Tree `:7715-7805`: hidden skipped `:7727`; `capturedCommands` `:7765-7775`; the split block
+  `:7783` / `paneIds`-alone `:7796`; `active` `:7739`. `window.state` `:8965` has
+  `quickTerminalVisible`, no `overlayVisible` (unchanged).
+- `session.close` `:8057-8082`: a hidden target that is no split shell falls to `closeSessionAt`
+  `:8079-8080` — the dangling `g_overlaySession` (pre-existing; fixed here because a pane overlay
+  is one more cover it could reach). `session.context` `:8265` and `restore.capture` `:7008` refuse
+  covers already.
+- Skill `kSkillMarkdown` `:7289-7690`: the overlay section `:7485-7513` ("A command in a popup
+  over the window"), `session text` = "the whole buffer" `:7583`, the verb index `:7636`;
+  `README.md:51`, `:69` (48 verbs), `:86` (the P2 overlay paragraph), `:102`, `:200`;
+  `qa/panes.md`, `qa/control-honesty.md`, `qa/selection.md`, `qa/product.md` (sandbox rules).
+- Tests: `test/control-api.json` (mirrored, refreshed ONLY by `tools/check-contract.ps1 -Update
+  [-Url <raw url>]` — the `-Url` arm takes #252's branch file until #252 is on `main`, then `main`
+  again); `test/conformance.ps1` (probes `:55-104`: `$cliHasP4` = `session swap x` → "Nothing sent"
+  `:79`; `Needs-NewClient` `:90-103`; the `checked + skipped == steps` guard); `test/control-honesty.ps1`
+  (probes `:38-67`; the overlay block `:235-470` finds the popup by title `agliteterm — overlay`
+  `:157` and its session id through `events` `:259`; `# ---- P4: splits ----` `:1547`, its
+  `$cliHasP4` gate `:1557`); `test/clipboard.ps1:65-68` (a mouse drag by `PostMessage`
+  `WM_LBUTTONDOWN` / `WM_MOUSEMOVE` / `WM_LBUTTONUP` into the app's own window — the selection
+  recipe to reuse inside a pane overlay); `test/ui-lib.ps1` (`Start-Sandbox` / `Send-Ctl` /
+  `Get-PaneText`; the HKCU rule `:1-16`); `test/run-all.ps1` (twelve suites, `-Strict` through).
+- Versions: `installer/agliteterm.iss:6` `AppVersion "0.17.15"` is the single source; `ping`
+  answers it. CI: `check-contract` between build and suites; the suites run `-Strict` with
+  `AGWINTERMCTL=<workspace>\bin\agwintermctl.exe` — the RELEASED CLI, so every P5 check SKIPs (=
+  fails under `-Strict`) until agwinterm tags 0.17.14 (#253 merged, then the tag — Boris). Red by
+  design until then, as P4-lite before 0.17.13.
+
+## Constraints
+
+- **Do not hand-edit `test/control-api.json`.** `tools/check-contract.ps1 -Update` (with `-Url`
+  pointing at #252's branch while it is unmerged) once; re-run from `main` after #252 merges — the
+  parsed content is the same.
+- **The popup is unchanged in every observable way**: the same replies (`overlay opened at N%`,
+  `resized N%`, the floor wording, `closed`, `no overlay`), the same `WM_APP_OVERLAY` hop, the same
+  70 % default, the same accept-any-resolving-target rule, the same title. The honesty suite's
+  overlay block (`:235-470`) passes unchanged. The one addition it takes is the wrapped command
+  line (gate 3), which changes nothing the block reads.
+- **A pane overlay is always full-box.** `--pane` + `--size-percent`, `resize --pane`: refused at
+  the CLI (already, #250) AND the server (a raw client), agwinterm's sentences.
+- **`left` = slot 0, `right` = slot 1, whatever the axis** — the rule's sentence, once.
+- **Refusals leave the world untouched**; a target is resolved once, and every write re-checks
+  `indexOfSession` under `g_lock` (#21). A verb on a non-displayed session must not move focus or
+  selection (#230). The slot's verbs run INLINE on the pipe thread the way `session split on` and
+  `closeSplitSide` do — everything structural under one hold of `g_lock`, the host round trip
+  outside it — never post-and-return (the reply is read off state that exists).
+- **Every path that finds, sizes, paints, kills or counts a shell handles its overlay**: the
+  Context list is the checklist (`closeSessionAt`, `closeSplitSide`, `OnPaneExit`, `syncPaneSizes`,
+  `paint`, `hitTest`, `focusedSession`, `InvalidateCaret`, the wheel, `callerWorkspace`, the
+  tree, the state writer's `hidden` skip, `restore.capture`'s cover refusal, `session.close`'s new
+  one). A missed one is a leak, a dangling pointer or a crash, not a Minor.
+- **Refusal sentences are agwinterm's, verbatim** (`OverlayPanes.cs`) — one spelling, one block.
+- **No ABI change, no pty-host protocol change** (`tools/check-abi.ps1`); the exit code travels
+  inside the terminal stream as an FTCS mark, which the core already parses.
+- **HKCU\Software\agliteterm is shared with the user's real app** — any test that writes it
+  (`Key_Close` for the chord check) restores it. Sandbox rules of `qa/product.md` in full:
+  `--pipe`, throwaway profile, `--no-restore` never against real data, `PrintWindow` never
+  `CopyFromScreen`, never `keybd_event` / `SendInput` — `PostMessage` to the app's own handles.
+- **The rule is quoted, not paraphrased**: the vocabulary section above is the one full copy; the
+  skill's overlay section quotes it; the code comment beside `Session::overlay` points at the plan
+  path. A sweep for the OLD wording ("one popup per window", "a popup over the window", "whichever
+  session it names", "the whole buffer") across `src/`, `README.md`, `qa/`, `docs/` is part of the
+  docs task (P4 r3's lesson).
+
+## Testing Strategy
+
+- **Conformance** — `check-contract -Update -Url <#252's raw file>`, then `test/conformance.ps1
+  -Strict` passes every step and refusal against a P5 `agwintermctl` (the dev build at agwinterm
+  `src/Agwinterm.Ctl/bin/Release/net10.0-windows/agwintermctl.exe`, `AGWINTERMCTL`). A fourth
+  client probe `$cliHasP5` (`session overlay resize --pane left --pipe conform-probe` → a post-#250
+  client refuses with "Nothing sent" before any pipe; an older client drops `--pane` and fails to
+  connect) and a fourth `Needs-NewClient` rule: `session overlay` with `--pane`, `overlay copy` /
+  `overlay text`, `session text --all` / `--lines` → `this agwintermctl predates agwinterm #250 and
+  drops --pane / --all and refuses overlay copy / text on its own side - set AGWINTERMCTL to a newer
+  build`. The `checked + skipped == steps` guard still holds.
+- **Honesty** — a `# ---- P5: pane overlays ----` block in `test/control-honesty.ps1`, guarded by
+  `$cliHasP5`, in a sandbox split vertical: `open "cmd /c ping -n 60 127.0.0.1" --pane right` → an
+  id that `session text --target <id>` reads (the ping output) and `tree` shows as `paneOverlays ==
+  ["right"]`; the left pane is interactive (`session type --target <left pane id>` lands a marker
+  `session text --target <left pane id>` reads back) and the RIGHT pane's shell is still there
+  underneath (`session text --target <right pane id>` is the shell, not the ping); `overlay text
+  --pane right` = the same buffer as `session text --target <id>`, `--lines 2` its last two lines,
+  `--all` the same as bare; `--target active` after `session focus right` reads the overlay;
+  `overlay copy --pane right` → `no selection`, then a `PostMessage` drag inside the right box
+  (`clipboard.ps1`'s recipe) → `copy` returns text and the clipboard is unchanged; `open --pane
+  right` again → `pane overlay already open`, the tree unchanged; `open --pane left` →
+  `["left","right"]`; `swap` → the words stay `["left","right"]` and `overlay text --pane left` is
+  now the ping (the slot moved with its shell); with one overlay: `["right"]` → swap → `["left"]`;
+  `result --pane left` → `overlay still running`; `close --pane left` → `closed`, the tree entry
+  gone, the pane's shell drawn again (`session text --target active` is the shell), the overlay's
+  id resolves nowhere, no orphaned host process; `result` after a quick command: `open "cmd /c exit
+  3" --pane left`, settle, `result --pane left` → `overlay still running`, `close`, `result` →
+  `exit 3`; `Get-Item C:\no-such` → `exit 1`; `'ok'` → `exit 0`; `result --pane right` (never ran)
+  → `no overlay result`; `--target <overlay id>` on `result` / `text` / `close` names the slot, and
+  with `--pane <other side>` is refused with nothing done; `open --pane left --target <right pane
+  id>` → the agreement refusal, nothing opened; `open --pane right` on a single-pane session → `pane
+  not visible`; `open --pane top` → both words named; `close --pane right` when empty → `ok "no
+  overlay"`; `--size-percent` beside `--pane` and `resize --pane` refused server-side through a raw
+  request (`Send-Ctl`); `split close --target <the pane with the overlay>` → `paneOverlays` gone, the
+  id resolves nowhere, the host process count unchanged; `split off` with the split shell holding
+  one; the shell UNDER an overlay exiting (`session type "exit\n" --target <pane id>`) → the collapse
+  takes the overlay; `session close --target <overlay id>` refused with the cover sentence and the
+  overlay still there; the popup opened over two pane overlays → `overlay` and `paneOverlays` both in
+  the node, the popup closed → both still running; the bare `result` → `exit N` of the last popup's
+  command after its close, `no overlay` (ok) before any; the Close Pane / Session chord (`Key_Close`
+  seeded to Ctrl+Shift+W in HKCU before the sandbox launches, restored after) with the focused
+  pane's overlay up closes the overlay and keeps the pane; a pane overlay on a NON-displayed session
+  by name (#230: focus and selection unchanged, `paneOverlays` on its node); `session text --all` =
+  `session text`, `--lines 3` = 3 lines; every open / close emits `tree`.
+- **Restore matrix** — nothing new to persist; one `Cell`: a session with a pane overlay saved,
+  killed and relaunched comes back WITHOUT it (`paneOverlays` absent, the file unchanged in shape).
+- **QA** — `qa/panes.md` gains a case: a pane overlay in the right pane with the left pane typed
+  into (`PrintWindow` capture: the left box shows the typed text, the right box the program, the
+  divider intact, the badge at the right box's top-right); the `.png` beside the plan as P4 did.
+- Each task's checks pass before the next task starts; `test/run-all.ps1 -Strict` green with the
+  dev CLI before the PR.
+
+## Progress Tracking
+
+- Mark completed items with `[x]` immediately when done
+- Add newly discovered tasks with ➕ prefix
+- Document issues/blockers with ⚠️ prefix
+- Update plan if implementation deviates from original scope
+
+## Implementation Steps
+
+### Task 1: the vocabulary, the refusal block, the command line, `result` and the cover refusal
+- [x] `// ---- P5: the overlay verbs' refusals ----` beside P4's: the two words, `parsePaneWord`
+      (absent → -1 = session-wide; anything else refused naming both words and the absent form),
+      every sentence of the table as a `static const char* const` / builder, the popup's five inline
+      literals moved in unchanged. A comment beside `Session::overlay` (Task 2) points at this
+      plan's vocabulary section for the rule; nothing paraphrases it.
+- [x] `overlayCommandLine(cmd)`: the one command line both slots run — `powershell.exe -NoExit
+      -Command "<A and C marks>; <cmd>; <capture $? then $LASTEXITCODE>; <D;<code> mark>"`, escapes
+      as `[char]27` / `[char]7` so PS 5.1 and 7 both emit them; `openOverlay` uses it. The exit
+      status rule of vocabulary bullet (c), in a comment.
+- [x] `overlayExitOf(Session*)`: under `g_lock`, the FIRST `FfiMark` with `hasExit` → `exit N`,
+      else empty. `g_lastOverlayExit` (string, `no overlay` at start and on every popup open) written
+      from the popup's `WM_DESTROY` before its session is killed; `session overlay result` (bare) →
+      `ctlOkStr(g_lastOverlayExit)`. Action `result` joins `open|close|resize` in the refusal.
+- [x] `session.close` on a cover (a hidden target `splitOwnerOf` answers `nullptr` for): the cover
+      sentence, nothing closed (the honesty check: the popup is still up, `g_overlaySession` still
+      valid — `session text --target <its id>` still answers).
+- [x] Honesty: the popup's `result` (`exit 3`, `exit 0`, `no overlay`, the reset on open),
+      `session close --target <popup id>` refused; the existing overlay block still green.
+
+### Task 2: the slot on the shell, its lifecycle, the surface seam
+- [x] `Session::overlay` (`Session*`, null when none), `Session::overlayResult` (`std::string`,
+      empty = `no overlay result`). `surfaceOf(Session* shell)`. `openPaneOverlay(shell, cmd)`:
+      `newSession(cols, rows of the shell's grid, "powershell.exe", overlayCommandLine)`, `hidden`,
+      name `overlay`, hung on `shell->overlay` under `g_lock`, then `syncPaneSizes` + invalidate
+      when displayed; `closePaneOverlay(shell)`: read `overlayExitOf` into `overlayResult` and unhook
+      under `g_lock`, kill the session outside it (the `closeSplitSide` order), `g_sel` cleared if it
+      was the overlay's, invalidate, `emitEvent("tree")`.
+- [x] The seam: `focusedSession()` returns `surfaceOf(g_sessions[g_pane[g_focus]])` (the popup
+      override first, as today); `paint`'s loop paints `surfaceOf(...)` with the same pane index and
+      draws the badge; `hitTest` reports the surface; `paneGridSize` / `syncPaneSizes` size the
+      overlay to the same grid; `InvalidateCaret` and the wheel use the surface; `windowForSession`
+      needs nothing (`g_hwnd`).
+- [x] Lifecycle: `closeSessionAt` kills both panes' overlays first; `closeSplitSide` kills the
+      victim's before the victim (the survivor keeps its own by the pointer exchange — a check);
+      `OnPaneExit` reaches the same primitive; `closeFocused` closes the focused pane's overlay
+      first; `callerWorkspace` walks overlay → shell → owner.
+- [x] Honesty: the interactive-sibling checks, the surface reads (`active`, pane id, overlay id),
+      swap, the three lifecycle paths, the chord, no orphaned host process.
+- ➕ The verb's `--pane` arm for `open` / `close` / `result` landed here (the word read first, the
+  two usage refusals, `pane not visible`, `pane overlay already open`, the agreement check in both
+  flavours, `active` = the displayed session — not `focusedSession()`, which is the overlay when
+  the focused pane is covered), so the honesty block had an opener. Task 3 adds `copy` / `text`,
+  the overlay-id-without-`--pane` usage refusals, `paneOverlays`, the conformance probe.
+- ➕ `dumpBufferRange` and `selectionText` read the live screen from the emulator
+  (`emu_copy_grid`), not paintPane's snapshot (`s->grid`). The snapshot is refreshed only when
+  THAT session is painted, so a shell under a pane overlay answered `session text --target <pane
+  id>` with its last painted screen (stale after the promotion relaid it out) and an overlay on a
+  session not on screen answered empty — both as ok. Pre-existing for never-shown split shells;
+  found by the honesty block's first run (three FAILs), fixed at the reader.
+- ⚠️ The pty-host's kill is `TerminateProcess` on the shell: a grandchild keeps running (a `ping`
+  started from the overlay's PowerShell survived the slot's close by more than 10 s) — agwinterm's
+  host, the same for every shell kill in lite (P3's `Stop-Ping` exists for it), no protocol change
+  here. The honesty block's opener is therefore `echo <marker>; Start-Sleep 300` and its orphan
+  oracle the overlay's own `powershell.exe`, found by the wrapped command line on it. Task 6's "no
+  orphaned host process (`Get-Process`)" must count shells, not their children.
+
+### Task 3: the verbs
+- [x] `session.overlay` reads `pane` first (a bad word refused before any resolve); with a pane: the
+      target may be the session id, either pane's id (the agreement check), either pane's overlay id
+      (the overlay flavour), a name, `active`; `pane not visible` past the pane count; `open` /
+      `close` / `result` / `copy` / `text` on the slot, each refusal from the block; `size-percent`
+      present or `resize` with a pane refused before anything; without a pane: the popup arm as
+      today plus `result` / `copy` / `text` on the popup (`copy` → `no selection` always, said in the
+      skill). `--target <overlay id>` with `--pane` omitted names its slot (the rule).
+- [x] `tree`: `paneOverlays` in slot order, present iff non-empty, beside the split block.
+- [x] Conformance: `-Update -Url <#252 raw>`; the `$cliHasP5` probe and the `Needs-NewClient`
+      rule; `-Strict` green with the dev CLI, SKIPs with the released one.
+- [x] Honesty: every refusal of the table, `result` in its three states per slot, `tree` words,
+      the raw-request refusals for `size-percent` / `resize` with a pane.
+- ➕ `result --pane X` answers `overlay still running` and `no overlay result` as REFUSALS (agwinterm's
+  PaneOverlayAction and #252's errors list both pin them so; task 2 had them as ok), and `exit N` as
+  ok; the bare `result` stays ok in every state (agwinterm's `_lastOverlayExit`). `copy` / `text`
+  answer `{"text": …}` on both slots already (the contract's `fields: [text]` step is in task 3's
+  gate), so task 4 has only `--lines` / `--all` left.
+- ➕ The overlay-id-names-its-slot rule applies to an EXPLICIT `--target <id>` only. An empty target
+  and `active` resolve through `focusedSession()`, which is the overlay itself while the focused pane
+  is covered — the first honesty run had a bare `session overlay close` (no target, the covered pane
+  focused) close the pane overlay where the popup was meant, and `overlay text` read the pane
+  overlay as the popup. The flag omitted means the session-wide slot, byte for byte; a program inside
+  a pane overlay still reaches its own slot because the CLI sends the env id explicitly.
+- ➕ `bingwintermctl.exe` (the released client fetched beside the exe) predates #226, so the
+  conformance run without `AGWINTERMCTL` skips 20 steps and refusals, the four P5 ones among them,
+  each naming the client's shortfall; `-Strict` with the dev CLI passes all 56 steps and every
+  refusal. `check-contract` against `main` reports DRIFT until #252 merges (red by design).
+- ➕ The drag inside a pane overlay auto-copies on release (lite's window convention, not the verb's):
+  the honesty check saves the clipboard, sets a sentinel right before `overlay copy`, and pins that
+  the VERB left it alone.
+
+### Task 4: `text` with `--lines` and `--all`, on both verbs
+- [x] `dumpBufferTail(s, n)`: the last N lines of what `dumpBufferText` returns (one walk; no
+      second copy of the row logic). `session.text`: `lines` (a whole number ≥ 1, else refused with
+      agwinterm's `LinesRefusal` sentence) and `all` (bool); both present → `AllWithLines`.
+      `session.overlay text` the same three through the same reader. `copy` → `{"text": …}`.
+- [x] Honesty: `session text --lines 3` is three lines, `--all` equals the bare form, the
+      combination refused through a raw request; the same on `overlay text`.
+- ➕ `--lines 0` is ACCEPTED as the visible screen, not refused: agwinterm's `LinesRefusal` sentence
+  (verbatim here) promises "0 = the visible screen", and a refusal of 0 that names 0 as valid would
+  be a lie; agwinterm's `SurfaceText.Dump` reads 0 as the screen too. So `lines` is a whole number
+  ≥ 0: 0 the screen rows (the range fixed under the same hold as the count), N ≥ 1 the last N lines
+  of the TRIMMED whole-buffer text (the blank rows under the prompt squashed first — agwinterm
+  counts screen rows from the bottom, so its `--lines 3` on a prompt at row 3 of 30 is blanks; lite's
+  is the prompt and what is above it, the tail of gate 2's default). One reader, `dumpBufferLines`,
+  with a `tail` argument; `dumpBufferRange` / `dumpBufferText` / `dumpBufferTail` are its three
+  spellings, `readSurfaceText` the verb-facing one. `all` beside a PRESENT `lines` (any value,
+  `0` too) is `AllWithLines`; `all:false` beside `lines` is the flag not asked for. Both usage
+  refusals come before the target is resolved (an unknown target hears the usage sentence).
+- ➕ The sandbox shell's prompt is three lines (starship: the user / path line wrapped, then `#`), so
+  "the last three lines" of a pane is the prompt with no marker on it; the honesty check finds the
+  marker's depth from the bottom and pins that `--lines <depth>` reaches it while `--lines <depth-1>`
+  does not — prompt-agnostic. An overlay whose command sleeps has NO prompt after its output, so
+  the text-flags overlay echoes three lines to have a tail to cut.
+
+### Task 5: docs, trackers, tests
+- [x] Skill: the overlay section rewritten around the two slots — the rule quoted from this plan,
+      `--pane` on `open` / `close` / `result`, `copy` and `text` with their errors, the exit-status
+      rule, the popup's `copy` answer, `session text --lines / --all`; the verb index; the env-ids
+      bullet (a program inside a pane overlay holds the overlay's id); the old wording swept.
+      `README.md` (verb count unchanged — no new `cmd ==` arm; the Scriptable bullet, the P2
+      overlay paragraph, the Terminals bullet); `qa/panes.md` (the case + capture),
+      `qa/control-honesty.md` (`overlay text` reads the overlay, `session text --target <pane>` the
+      shell under it), `qa/selection.md` (a selection inside a pane overlay). agwinterm
+      `docs/lite-parity.md`: the P5 entry → "Mirrored", the five differences of vocabulary bullet
+      (a)–(e), the `session text` default under "What is deliberately different" — drafted in the
+      notes below for the docs PR in the other repo after this merges.
+- [x] `check-contract` re-run against `main` once #252 is there; `run-all -Strict` green.
+      (#252 and #253 are both still OPEN on 2026-09-07 at the time of this task, so the `main` run
+      reports DRIFT — "same verbs, different expectations", red by design, exactly the P5 steps —
+      and the run against #252's branch file
+      (`https://raw.githubusercontent.com/yeroo/agwinterm/contract/p5-pane-overlays/tests/conformance/control-api.json`)
+      says "in step with agwinterm"; `test/control-api.json` is unchanged since task 3. The `main`
+      re-run is the CI step and turns green when #252 merges; nothing here to redo for it.
+      `run-all -Strict` with the dev CLI after the docs change and a fresh build: twelve suites, all
+      passed, no SKIP, no FAIL — `.ralphex/p5-t5-runall.log`.)
+- ➕ Task 5 notes. The skill's section is now "A command over the window, or over ONE pane": the
+  rule quoted from the vocabulary section (pointing at this plan as the one full copy), the pane
+  arm (`open` answers the id; every refusal of the table as a bullet with agwinterm's sentence;
+  `close` / `result` / `copy` / `text` with their three states), the exit-status rule of vocabulary
+  bullet (c), `tree`'s `paneOverlays`, the chord and the cover refusal, then the session-wide slot's
+  paragraph unchanged in substance plus the bare `result` / `text` / `copy` (the popup's `copy` =
+  `no selection`, said), then `text`'s two flags on both verbs; the frontmatter description, the
+  Detect section (a program inside a pane overlay holds the overlay's id, so a bare `session overlay
+  close` inside one closes it), the "Find out what happened" `session text` lines and the
+  foreground sentence (a pane overlay is in-window and raises nothing) follow. The old wording
+  ("a popup over the window", "one popup per window ... whichever session it names") survives only
+  as the session-wide slot's own sentence, labelled as such; the sweep of `src/`, `README.md`,
+  `qa/`, `docs/` finds "the whole buffer" only where gate 2 means it. README: the Terminals bullet
+  names the pane overlay and its badge, the Scriptable bullet carries the P5 paragraph after P4's,
+  the "What is saved" sentence covers the pane overlay, the Tests paragraph names the #250 probe;
+  48 verbs stays (no new `cmd ==` arm). `qa/panes.md` gains the intro's "A covered pane" paragraph
+  and the case, driven end to end by `qa/fixtures/pane-overlay.ps1` (the P4 fixture's shape: probe
+  the client, sandbox, `covered` split vertical, the overlay opened on the right with `echo
+  P5-OVERLAY-MARKER; Start-Sleep 300`, the left pane typed into by the session id, the four reads,
+  `PrintWindow` to `%TEMP%\agliteterm-pane-overlay\covered.png`, the close, the no-orphan check
+  on the overlay's own `powershell.exe`): 20/20 on the first run; the capture is
+  `docs/img/qa-p5-pane-overlay.png` — the left box with `echo P5-LEFT-MARKER` and its echo at the
+  prompt, the caret after it, the right box with `P5-OVERLAY-MARKER` on its first row and no prompt
+  (the command sleeps), the divider where it was, the `overlay` badge framed top-right, no framed
+  popup. `qa/control-honesty.md` gains the surface-reads case (its "Last run" is that fixture run);
+  `qa/selection.md` the drag-inside-an-overlay case (not run here — it needs the `PostMessage` drag
+  and eyes on the highlight; the automated half is the honesty block's `overlay copy` checks).
+- ➕ The `lite-parity.md` P5 entry, for the agwinterm docs PR after this merges (replacing "To be
+  mirrored: what P5 ... owes lite — P5-lite pending"):
+  "### Mirrored: what P5 (agwinterm #250) owed lite — P5-lite shipped. lite has pane overlays: a
+  pane overlay is IN-WINDOW, one more hidden `Session` hung on the shell it covers
+  (`Session::overlay`), sized to the shell's grid, painted in the pane's box instead of the shell
+  and reached by `focusedSession()` / `hitTest` as that pane's surface while it is open — not a
+  popup sized to the pane rect (a popup's `g_focusOverride` takes every key, so the sibling pane
+  could not stay interactive, the rule's one hard property), and not a recorded divergence: the
+  contract's four P5 steps and three refusals run the same on both products. `--pane left|right`
+  (`left` = slot 0, `right` = slot 1 whatever the axis, the slots `session focus` names), `open` /
+  `close` / `result` / `copy` / `text` on the slot with agwinterm's sentences verbatim
+  (`OverlayPanes.cs`), `paneOverlays` in `tree` as the same array of words, `session text --all` /
+  `--lines N`, the overlay id as `AGWINTERM_SESSION_ID` of the program inside, the chord closing the
+  focused pane's overlay first, the slot moving with its shell on a swap and dying with its pane —
+  all mirrored. What differs, each recorded in the P5-lite plan
+  (`docs/plans/completed/2026-09-07-p5-lite-mirror.md` there): (a) the session-wide slot is a
+  popup over the window, not a cover inside the content region (P2-lite, unchanged; `copy` on it
+  is always `no selection` — the popup paints no selection and takes no drag, lite's selection gap);
+  (b) `session text` and `overlay text` default to the WHOLE buffer (scrollback + screen) — `--all`
+  is the explicit spelling of lite's bare form, `--lines N` the last N lines of that text and
+  `--lines 0` the screen — where agwinterm's and agterm's bare `session text` is the screen only:
+  lite's skill promised "the whole buffer" and its suites read markers from history through it, so
+  the default stays and the flags give a caller the screen when it wants one; (c) `exit N` is the
+  exit status of the command `open` ran as PowerShell reports it (`$LASTEXITCODE` for a native
+  program, else 0 / 1 from `$?`), carried in an FTCS `OSC 133;D;<code>` mark the overlay's own
+  command line emits — read off the FIRST mark with an exit in that overlay; the pty-host protocol
+  carries no exit code and is frozen; a command that never completed leaves the slot's result as it
+  was, and `overlay still running` / `no overlay result` are refusals as in agwinterm — and the
+  mark is the terminal's shared FTCS state, so a command that emits `OSC 133;D` (or a full A–D
+  cycle) of its own sets the exit `result` reports: the status is the command's own claim, not a
+  host-side record, and a caller that needs one it cannot forge should read `session output` or
+  the program's own artefact (revmux r1 of P5-lite; a host-side record is a pty-host protocol
+  change, out of this batch); (d) the
+  session-wide `open` keeps accepting any target that resolves (P2-lite) where agwinterm refuses a
+  pane id of a split without `--pane` (#213) — except a pane overlay's own id, which names its slot
+  on both products; (e) `open --pane` answers the overlay's id (a lite session id, `<prefix>-<seq>`;
+  the program inside holds it) because the slot is created inline the way `session split on` is,
+  while the popup keeps its status word (created after the reply is written) — the contract's step
+  notes both spellings; (f) an overlay's (or any cover's) id on `flag on`/`off`/`toggle` / `seen` /
+  `rename` / `status` / `duplicate` / `move` (`flag clear` takes no target and unflags every session,
+  in both products) is refused naming the session it covers (`session <verb>: '<id>'
+  is a scratch/overlay/quick pane, not a session; … Nothing <done>.`), where agwinterm lands a
+  scratch or overlay cover id on the session it covers (`FindSesForTarget`) — a program inside a
+  lite overlay that wants the pane's session row names that session's id (`tree`'s `paneOverlays`
+  says which); lite's `session context` refuses a cover the same way. Lite has no `--wait` / `--block` (the overlay stays up until closed, P2-lite)
+  and no `overlay not realized` / `OverlayIdGoneRefusal` (the emulator is built before `newSession`
+  returns; the slot's verbs run inline under one lock — documented, not emitted). Under "What is
+  deliberately different" add: **`session text` reads the whole buffer in lite** (screen + scrollback,
+  `--all` its explicit spelling) and the screen only in agwinterm and agterm; `--lines N` is the same
+  reader on both, and a script wanting the screen passes `--lines 0` / reads `--lines N` on either."
+
+### Task 6: [Final] Verify acceptance criteria
+- [x] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P5 dev CLI; `check-contract`
+      green against #252's file; a sandbox split, a pane overlay on the right, a marker typed into
+      the left, `PrintWindow` (the screenshot in the PR body); edge cases probed live (an untracked
+      `.ralphex/p5-lite-edge-cases.ps1`, P4's shape): both panes covered then `swap`; the popup over
+      two pane overlays; `split off` with the split shell covered; the shell under an overlay
+      exiting; the chord; `--pane left` on a single pane then `split on` (the overlay stays on slot
+      0, its grid follows); a horizontal split with `--pane left` (the TOP box); a window resize
+      with a pane overlay up (its grid follows — `tree` cols/rows of the shell equal the overlay's
+      `session text` width); a pane overlay on a non-displayed session then selecting it (drawn,
+      focus where it was); `session text --all` on a pane with history; no orphaned host process
+      after all of it (`Get-Process`).
+      (dev client — agwinterm's `Agwinterm.Ctl` Release build of 2026-09-07 08:00, the post-#250
+      `agwintermctl` whose `session overlay resize --pane left` says "Nothing sent"; the bundled
+      `bin\agwintermctl.exe` of 2026-09-03 predates P5 and fails to connect on the probe, so every
+      run here sets `AGWINTERMCTL`. `check-contract`: "in step with agwinterm" against #252's branch
+      file; DRIFT against `main` (same verbs, different expectations) while #252 is open — the CI
+      step that turns green when it merges, as task 5 recorded. `qa/fixtures/pane-overlay.ps1`
+      re-run with the dev client: 19/19, `.ralphex/p5-t6-fixture.log`; the PR-body screenshot stays
+      `docs/img/qa-p5-pane-overlay.png` from task 5. `run-all -Strict` with the dev client: twelve
+      suites, 925 PASS, 0 SKIP, 0 FAIL, exit 0 — `.ralphex/p5-t6-runall.log`; conformance and
+      control-honesty ran every P5 step and refusal (no SKIP under `-Strict`), no sandbox instance
+      left behind.
+      ➕ The edge probe is `.ralphex/p5-lite-edge-cases.ps1` (untracked, P4's shape: one sandbox on
+      pipe `p5edge`, `Check` lines, the overlay shells found by a `P5-EDGE` marker in their command
+      line), 78/78 on its clean run, `.ralphex/p5-t6-edge.log`, three captures beside it
+      (`p5-edge-*.png`). What it found, case by case: (1) both panes covered then `swap` —
+      `paneOverlays` stays `["left","right"]`, `text --pane left` reads what the RIGHT slot read
+      before (the slot moved with its shell), `--target <ovL id>` still names ovL's slot (`result`:
+      `overlay still running`) and with `--pane left` naming the other side is refused; the pane ids
+      still read the shells under. (2) the popup over two pane overlays — the bare `text` reads the
+      popup, the two slots keep reading through `--pane`, `paneOverlays` unchanged, `close` leaves
+      both slots up and exactly two overlay shells; the bare `result` is `ok "no overlay"` while a
+      popup is up and after one closed EARLY (its command never completed: vocabulary (c)), and
+      `exit 7` after a popup whose `cmd /c exit 7` completed — read at the popup's `WM_DESTROY`, so
+      "no overlay" until the close. My probe's first two spellings of that expectation were wrong,
+      not the product; the third is what the plan says. (3) `split off` with the split shell
+      covered — one pane, `paneOverlays ["left"]`, the right overlay's id gone, `result --pane
+      right` = `pane not visible`, its `powershell.exe` gone within the wait. (4) the shell under an
+      overlay exiting — `exit` typed by the split shell's id (the shell UNDER the cover) collapses
+      the pane and its overlay dies with it (id and process gone); on a one-pane session `solo` the
+      exited shell stays (`exited:true`), `paneOverlays ["left"]` stays, `overlay text` still reads
+      it, `close --pane left` then `session close` clean it. (5) the Close Pane action — `Key_Close`
+      is UNBOUND by default and the bindings live in `HKCU\Software\agliteterm`, the user's real
+      settings, so the probe posts `WM_COMMAND IDM_CLOSE`, which is `runKbAction(KB_CLOSE)` →
+      `closeFocused()`, the same function the chord's keydown match (`:4720`) runs: the overlay
+      closes FIRST, the session stays, the shell under it reads its prompt. (6) `--pane left` on a
+      single pane then `split on` — the overlay stays on slot 0, the shell's cols shrink, and the
+      overlay's grid follows: a probe command inside it (`$Host.UI.RawUI.WindowSize` printed once a
+      second) reports exactly the shell's `cols x rows` from `tree` before and after. (7) a
+      horizontal split with `--pane left` — the TOP box (capture `p5-edge-horizontal-top-covered.png`:
+      the probe's lines and the `overlay` badge in the top box, the prompt in the bottom); a posted
+      click in the top box makes `--target active` read the overlay, one in the bottom box the split
+      shell, `focusedPane` 1. (8) a window resize with it up (1100x700 → 860x560 → back) — the
+      shell's grid changes and the overlay's probe reports the new `cols x rows` each time. (9) a
+      pane overlay on a non-displayed session `bg` — `open` answers an id, `bg`'s node carries
+      `paneOverlays ["left"]`, `--target active` is still the displayed shell's text (focus where it
+      was); `session select bg` and `active` reads the overlay, drawn with its badge
+      (`p5-edge-bg-selected.png`). (10) `session text` on a pane with 80 lines of history — `--all`
+      holds HIST-1 and HIST-80, the bare form equals `--all` byte for byte, `--lines 5` is five
+      lines with HIST-80 and no HIST-1, `--lines 0` the screen, `--all --lines` refused. (11) no
+      `paneOverlays` anywhere at the end, no overlay shell while the window is up, none after it
+      closed, the sandbox instance gone. No product defect found; the one probe defect was mine.)
+- [x] The plan's notes carry what each revmux round found (the P4-lite pattern).
+      (the rounds run in ralphex's review phase AFTER the task loop ends, one revmux round per review
+      iteration under `.revmux/tasks/ralphex-2026-09-07-p5-lite-mirror/`; each round's findings and
+      the fix commit they led to are appended below as "**What revmux round N found**", the way
+      `docs/plans/completed/2026-09-06-p4-lite-mirror.md` carries its three. No round has run yet at
+      the time of this line — the item is satisfied by that routine, not by a round that already
+      happened.)
+
+**What revmux round 1 found** (`.revmux/tasks/p5-lite-mirror/01-initial`, full branch at
+`1ba058d`; the Codex reviewer `codex-agwinterm` was mailed the same scope with the live-probe half
+of the attack list and each fix commit's hash — its findings, when they arrive, are folded into
+the next fix and credited here; none had arrived by the end of round 3): **two Majors**, one shape — `active` resolved through `focusedSession()` for EVERY verb, and
+`focusedSession()` is the SURFACE, so an identity verb on `--target active` (or no target) with
+the focused pane covered acted on the hidden overlay: (1) `session select --target active`
+installed the overlay's index in `g_pane[0]` (a hidden session in the primary slot — the box
+painted its shell's box, the sidebar row vanished); `rename` / `flag` / `seen` / `status` / `move`
+/ `context` changed a session no node shows; (2) `session duplicate --target active` cloned the
+overlay's launch spec — a visible session running the FTCS wrapper. The task-2 ➕ note had already
+narrowed `active` to "the DISPLAYED session" for the `--pane` arm and the rule's sentence said
+"`--target active` reach the overlay" for everything: the class of the agwinterm rounds again —
+THE RULE narrower than the code, and the code wider than the rule. Fixed at the source: THE RULE
+(the vocabulary above, quoted in the skill) now says `active` BY VERB KIND — the surface verbs
+(`type`, `write`, `output`, `text`, `copy`, `paste`, `surface cursor`, `session overlay`) reach the
+overlay, every other verb reaches the focused pane's shell (`focusedShell()`, then — on the session verbs, not on `close` / the split verbs / `restore
+capture`, whose `active` is the pane as P4 says — its owner: the first cut of the fix stopped at
+the shell, and with slot 1 focused `flag` / `rename --target active` wrote a flag and a name on
+the hidden split shell, `context` refused it as a split pane — the honesty block's second run);
+`ctlDispatch` remaps once, after the shared resolve; `selectPrimary` refuses a hidden index;
+`session select` on a cover id is refused (`sessionSelectCover`, the P3 sentence's shape) and on a
+split shell's id lands on its owner. Twelve Minors: (a) a command that emits its own `OSC 133;D`
+sets the exit `result` reports (the emulator keeps the FIRST D per mark) — recorded in the
+`lite-parity.md` draft as part of (c), not fixed (a host-side record is a protocol change); (b) the
+wrapper's `D` trailer sat on the command's line, so a trailing `#` comment ate it — the trailer is
+on its own line now; (c) the skill's "every `session` verb" for an overlay id (five verbs refuse
+it) and "has no name" (it is named `overlay`) — reworded with the rule; (d)
+`overlayReadFailedRefusal` was dead and an `emu_copy_grid` failure answered `""` as ok —
+`dumpBufferLines` reports it and `readSurfaceText` refuses with it; (e) five stale plan paths
+(`docs/plans/…` → `docs/plans/completed/…`); (f) `window state`'s `activeSession` said `overlay` —
+the shell's session, through its owner; (g) `closeSplitSide` re-implemented `closePaneOverlay`'s
+unlist — one `unlistOverlayLocked`, used by both; (h) the skill claimed a bad `--target` is refused
+on the session-wide slot for all six actions — the bare `result` is window-wide, the exception is
+stated; (i) `open` / `close` acknowledged before the popup's exit was on record (`WM_DESTROY`
+wrote it after the reply; a replacing `open` destroyed the previous popup and wrote ITS exit over
+the fresh `no overlay`) — `close` reads the exit before it posts `WM_CLOSE`, `open` resets after
+the post and `g_overlayReplacing` gates the `WM_DESTROY` write; (j) the flag chord no-op'd while a
+pane overlay covered the focused pane (`toggleFlag(focusedSession())` on a hidden session) — and,
+pre-existing, on any split pane: `toggleFlag(focusedShell())` through the owner; (k) `--lines
+9999999999` refused as "not a whole number" — digits of any length, saturating; (l) the seam's
+comment listed `syncPaneSizes` as a `surfaceOf` caller (it sizes both off `overlay` directly);
+(m) nothing failed if the overlay stopped being re-gridded with its box — a sidebar-width change
+with an overlay up now must wrap its line. Pre-existing, fixed here because the fix is the same
+seam: the close chord / `IDM_CLOSE` closed the focused pane's overlay UNDER an active popup —
+`closeFocused` closes what holds `g_focusOverride` first (the popup, a scratch or a quick pane),
+then the pane's overlay, then the pane. Immaterial, left: pane-id prefixes after a promotion; the
+swapped-slot map open-coded in three places. Behaviour that changed, beyond the Majors: the flag
+chord flags the session when its split pane is focused (a no-op before); `session close --target
+active` with the popup focused closes the focused PANE — the session when its own shell is
+focused, the unsplit when the split shell is (a cover refusal before); `flag` / `seen` / `rename`
+/ `status` / `duplicate` / `move --target active` with a split pane focused act on the SESSION
+(the hidden split shell's record before — pre-existing since P4-lite, the same class as the Majors:
+a write nobody can see; an explicit split shell id still reaches the shell, P4's rule);
+`IDM_CLOSE` with a popup focused closes the popup. New honesty checks (the P5 block, after the
+popup text section): `select --target active` selects the SESSION under the overlay — the split
+intact, the overlay up in its slot, and the focus on slot 0, which is what an explicit `select
+--target <the session's own id>` does too (`selectPrimary` sets `g_focus = 0` on every select:
+P4-lite's rule, pre-existing, the first cut of the check wrongly called it a no-op); `--target
+<overlay id>` the cover refusal, `--target <split shell id>` the owner; `flag` / `rename` / `context` / `duplicate --target active`
+on the session (the wrapper not cloned: one overlay shell); `IDM_FLAG` on the covered split pane;
+`window state`'s `activeSession` the session's name; `--lines 99999999999` refused by the CLI
+(its own whole-number parse) and, sent raw, the whole buffer; the
+sidebar widened → the overlay's line wraps; `close` then an immediate `result` = `exit 4`; a `#`
+comment command → `exit 0`; `IDM_CLOSE` with the popup focused closes the popup and leaves the
+pane overlay; `session close --target active` with the covered split pane focused closes that
+pane, the overlay with it, the session survives (the section's teardown).
+
+**What revmux round 2 found** (`.revmux/tasks/p5-lite-mirror/02-after-fix`, narrowed to the fix
+commit `337612d`): **two Majors**, both the fix's own blind spots. (1) The `active` remap closes
+round 1's Major 2 for the WORD only — an EXPLICIT overlay id on the six session verbs still reached
+the hidden object: `session duplicate --target <overlay id>` cloned the FTCS wrapper's command line
+into a visible session (and a program inside the overlay sends that id as its default target, so a
+bare `session duplicate` typed in it did the same), and `flag` / `seen` / `rename` / `status` /
+`move` answered ok for a write nobody can see; the structural verbs already refused a cover by
+name. Fixed with the family's refusal on all six (`sessionIdentityCover`, `isCoverLocked`, under
+`g_lock`), a split shell's id still passing (P4's meaning); THE RULE now states the partition
+whole — an overlay id reaches the overlay on the surface verbs and is refused by EVERY other verb.
+(2) The two `splitOwnerOf` call sites the fix added — `toggleFlag` and `window state` — walked
+`g_sessions` without the hold the helper documents ("Caller holds g_lock"), racing a control
+thread's `session new` push_back (a reallocation frees the buffer a range-for is walking; the
+`syncPaneSizes` comment records the same hazard from an earlier round); both now walk under the
+hold, `window state` copying the name out before it builds the reply. Five Minors, all fixed in
+the same commit: the `Session::overlay` field comment still named `closePaneOverlay` as "the one
+primitive" after the refactor moved the unlisting to `unlistOverlayLocked` (now names both
+callers); "an EXPLICIT id keeps its meaning on every verb" was contradicted eighteen lines below
+by `session select`'s split-shell → owner redirect (the three copies — remap comment, skill, this
+plan — now carry the exception); `shellHolding` had one caller while the overlay arm kept two
+open-coded copies of the walk (both converted; the inference site's two `break`s became one
+nested guard); the README's P5 bullet stated the pre-fix `--target active` / "from anywhere" rule
+at its head and the corrected one twenty lines down (the head now states only what keys and the
+mouse reach, the `--target` rule lives once, below); `qa/panes.md` still stated the pre-fix rule
+(qualified like `qa/control-honesty.md`). Two pre-existing, each a follow-up: the wrapper's `D`
+trailer shares the caller's PowerShell scope, so a command that assigns `$e` / `$b` prints text
+where the mark should be (#41); the honesty check pinning the CLI's "not a whole number" refusal
+of `99999999999` pins a wrong sentence — the CLI's int32 parse, agwinterm #254 / lite #42; the
+check now says so in its comment. Checks added: the six session verbs on `--target <overlay id>`
+each refused naming the verb, the id and the three dismissals; nothing changed after all six (no
+node, one wrapper shell, the name, the flag, the block, the surface); `flag on --target <split
+shell id>` still answers `flagged`.
+
+**What revmux round 3 found** (`.revmux/tasks/p5-lite-mirror/03-after-fix-2`, narrowed to the
+second fix `7d4b85c` and the docs commit `7b85d4f`): **no Major, no Critical** — four Minors and
+five pre-existing, all fixed in one commit rather than carried, because every one sits in the seam
+this batch wrote. The Minors: (1) THE RULE's "refused by EVERY other verb" had one hole — `session
+flag clear` returns before the target refusals and unflags every session for any caller, overlay id
+or not; that is right (agwinterm's `SessionFlag`: "clear always succeeds", the op takes no target),
+so the rule carves it out in all four copies (skill, remap comment, README, this plan) and the arm's
+comment says which; a check pins `flag clear --target <overlay id>` answering `cleared`. (2) The
+rewritten "every verb but `session select`" sentence missed the second exception: `session context`
+refuses every hidden id, a split shell's included (pre-existing, pinned since P3-lite) — the three
+copies now name both. (3) The six new cover guards skipped the "closed since the resolve" re-check
+every neighbouring cover guard opens with (`indexOfSession(target) < 0` → `session not found`): a
+`split close` promotion between the resolve and the hold erases the object and renames it to its
+pane id, so the refusal named an id the caller never passed — the exact defect the remap comment
+says P5 exists to remove; all six re-check first. (4) `qa/control-honesty.md`'s guards paragraph
+still said an overlay's own id reaches the overlay, unqualified. The pre-existing: `window state`
+bound a `const std::wstring&` into `g_workspaces` outside the hold and read it after — the hold the
+round-2 fix added made that window unbounded (a `workspace new` push_back frees the array); the
+name is now copied under the same hold. `session flag clear`'s walk of `g_sessions` was unheld six
+lines above the guard round 2 added (now held). `toggleFlag(focusedShell())` resolved the shell
+before the hold (from `337612d`): `toggleFocusedFlag` resolves it under the hold that flips the
+flag; the sidebar menu's `g_sessions[si]` keeps its neighbours' shape (`closeSessionAt(si)`, the
+UI thread's own indexing — out of this batch, lite #43). The `Session::overlay` field comment said
+`active` on an identity verb is "this shell" — right for a pane verb, wrong for a session verb (now
+both halves). `restore capture` open-coded `splitOwnerOf`'s walk (now the helper). Codex was
+mailed each fix commit's hash as it landed; no findings arrived by hub mail during the three rounds.
+
+**What revmux round 4 found** (`.revmux/tasks/p5-lite-mirror/04-after-fix-3`, narrowed to the third
+fix `c2fa22c`): **no Major, no Critical** — two prose Minors and three pre-existing, the round that
+closes the review. The Minors: difference (f)'s two copies in this plan and the `qa/control-honesty.md`
+clause written in `c2fa22c` still said "every other verb" without the `flag clear` carve-out the same
+commit put in the four copies of THE RULE — the sixth and seventh copies now carry it (grep OLD
+wording in every copy, including the ones a fix writes). The pre-existing, one class: the re-check's
+hold released before the write in `flag` and `seen` (a promotion between the two still landed the
+flag on the erased object and answered ok) — both writes moved into the hold that holds the re-check,
+rename's shape, plain-field writes with no call inside; `status` (`setStatus` under `g_statusLock`),
+`duplicate` (`newSession` outside any hold) and `move` (`idxOf` and the reorder walk unheld, then
+`moveSessionTo`'s own hold) cannot move under `g_lock` without restructuring — that is #21's
+dispatcher-wide lock (home: P9-lite), and the round-4 sites are recorded there. No fifth round: the
+code change is two writes moved inside an existing hold, the shape the round endorsed.
+
+## Technical Details
+
+- **Why the slot hangs on the shell.** A pane is a `Session` in lite; the obligation the P4-lite
+  plan recorded ("P5 must consult the slot map when it anchors an overlay to a pane") is met at ONE
+  place — `paint` / `hitTest` ask `paneRect` for the box and `surfaceOf` for what to draw in it. A
+  swap moves the shell's box and the overlay with it; a promotion exchanges whole objects. No map,
+  no second source of truth.
+- **Why in-window and not a second popup.** Gate 1: the rule's hard property is the sibling pane
+  staying interactive, and a popup's `g_focusOverride` is a single global that takes every key.
+  A popup is also framed, floats over the wrong place after a window move, and is raised only when
+  the process holds the foreground — three ways to be "not the pane's box".
+- **Why the popup stays a popup.** It is shipped, tested and recorded (P2-lite); a cover inside
+  the content region would be a renderer rewrite for a slot the batch does not touch.
+- **Why the exit code rides an FTCS mark.** The pty-host protocol carries no exit code (EOF is the
+  only signal, `:1976`), the protocol is frozen for this batch, and the core already turns `OSC
+  133;D;<n>` into `FfiMark::exitCode`. The wrapper is the same command line the popup used plus two
+  writes; `session output` on an overlay works as a side effect.
+- **Why `session text` keeps the whole buffer.** Gate 2; the skill promised it, the suites read
+  markers from history through it, and `--lines N` gives a caller the screen when it wants one.
+- **`copy` on the popup answers `no selection`.** The popup paints no selection and takes no drag
+  (`paintPane(..., -1, ...)`, `hitTest` loops `g_pane` only) — the other half of the "selection"
+  gap in `lite-parity.md`; a fix there is its own item, not this batch's.
+- **No pane-overlay resize, no floating pane overlay** — agterm has neither; the box is the pane's.
+
+## Post-Completion
+
+- Sibling PRs: agwinterm `docs/lite-parity.md` (the P5 entry → Mirrored, the differences), the
+  batch index's P5 line (mirror shipped).
+- Release: lite's installer to **0.17.16** when Boris calls it; agwinterm 0.17.14 is what turns
+  this PR's CI green.
+- Review: revmux, two rounds minimum, a narrow round per fix commit.
+- P6 onwards: the `capturedCommands` / `paneOverlays` pair is the node's per-pane shape; whatever
+  the next batch adds per pane goes beside them, an array of words or an object keyed by pane id,
+  as agwinterm emits it.
