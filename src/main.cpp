@@ -2593,10 +2593,10 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         victimOverlay = unlistOverlayLocked(victim);
         int vi = indexOfSession(victim);
         g_sessions.erase(g_sessions.begin() + vi);
-        // A promoted survivor's selection was in pane 1, which is gone: it comes back at pane 0 or it
-        // never shows again (killSession clears the victim's). Keyed on the pointer, NOT on `displayed`:
-        // g_sel is per-session and survives a switch, so an off-screen promotion over the pipe has the
-        // same stale slot to fix (revmux r2). The survivor's overlay is its surface: the same fix.
+        // A promotion moves the drag's boundary to slot 0. Paint follows surface identity, but
+        // OnMouseMove still uses pane to reject a drag crossing into a different pane. Keyed on
+        // the pointer, NOT on `displayed`: a selection survives a session switch, and an off-screen
+        // promotion has the same slot to fix. The survivor's overlay is its surface: the same fix.
         if (g_sel.sess == survivor || (survivor->overlay && g_sel.sess == survivor->overlay)) g_sel.pane = 0;
         if (displayed) { g_pane[1] = -1; g_focus = 0; }
         for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
@@ -3865,6 +3865,10 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
                 memcpy(&view[r * info.cols], &s->grid[live * info.cols], info.cols * sizeof(FfiCell));
         }
     }
+    // Snapshot selection in the same hold as the viewport: pipe verbs can replace it while GDI
+    // draws. Geometry, owner, highlight and cursor must all describe this frame's buffer.
+    syncSelection();
+    Sel selection = g_sel;
     LeaveCriticalSection(&g_lock);
 
     std::vector<wchar_t> text;
@@ -3951,10 +3955,10 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
 afterGridPaint:;
 
     // Selection highlight (invert the selected span, buffer-absolute rows mapped into the view).
-    syncSelection();   // the rows may have been renumbered by eviction since the last paint
-    if (g_sel.isFor(s)) {   // follow the surface through a swap or a later display in another slot
+    const bool selected = pane >= 0 && selection.isFor(s);   // -1 is the popup's no-selection sentinel
+    if (selected) {   // follow the surface through a swap or a later display in another slot
         int r0, c0, r1, c1;
-        g_sel.norm(r0, c0, r1, c1);
+        selection.norm(r0, c0, r1, c1);
         int base = (int)info.historyCount - off;   // buffer-absolute row of the top visible line
         for (uint32_t r = 0; r < info.rows; r++) {
             int abs = base + (int)r;
@@ -3974,7 +3978,7 @@ afterGridPaint:;
     // while the window has focus, a hollow outline when it doesn't — the standard terminal cue for
     // "typing lands here", and the thing lite was missing: a static block that never blinks and
     // looks identical focused or not reads as though input focus went somewhere else.
-    if (off == 0 && info.cursorVisible && showCursor && info.cursorCol < info.cols && !g_sel.isFor(s)) {
+    if (off == 0 && info.cursorVisible && showCursor && info.cursorCol < info.cols && !selected) {
         RECT cur{ pr.left + (LONG)info.cursorCol * g_cw, pr.top + (LONG)info.cursorRow * g_ch,
                   pr.left + (LONG)(info.cursorCol + 1) * g_cw, pr.top + (LONG)(info.cursorRow + 1) * g_ch };
         if (cur.right <= pr.right) {
@@ -6678,16 +6682,17 @@ public:
             // ReleaseCapture unconditionally: syncSelection can DROP the selection mid-drag (its
             // rows evicted, or the app switched to the alt screen), which clears `active` — and the
             // mouse then stayed captured with no drag in progress.
-            bool wasDragging;
+            std::string releasedText;
             {
                 LockG lk;
-                wasDragging = g_sel.active;
+                // Capture this drag before releasing the hold: selection.all on another surface
+                // must not make an unrelated mouse-up copy that surface's new whole buffer.
+                if (g_sel.active) releasedText = selectionText();
                 g_sel.active = false;
             }
             if (GetCapture() == m_hWnd) ReleaseCapture();
-            // copySelection reconciles and tests content under the lock; the pipe may clear or
-            // replace g_sel after the mouse-up, so never inspect has() unheld here.
-            if (wasDragging) copySelection();   // auto-copy on release (convention)
+            if (releasedText.find_first_not_of("\r\n ") != std::string::npos)
+                setClipboardUtf8(releasedText);   // auto-copy on release (convention)
         }
     }
     void OnRButtonDown(UINT, CPoint pt) {
@@ -8318,6 +8323,12 @@ agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
 `window list` enumerates them.
 
+`selection all` selects the whole buffer, or only the app's screen on the alt screen. Popup
+terminals (overlay, quick and scratch) refuse it: `the popup paints no selection`. `selection
+copy` posts the selected text to the Windows clipboard and clears the highlight; `copied N chars`
+counts UTF-8 bytes, unlike the full app's UTF-16 count. Allow the next UI message before reading
+the clipboard. `selection clear` leaves a different surface's selection alone.
+
 Nothing here takes the foreground from the user: `quick on` and the session-wide `session overlay
 open` raise their popup only when this process already holds the foreground, and flash the taskbar
 button otherwise (a pane overlay is drawn inside the window and raises nothing). `window select <name>` is the one verb whose purpose IS the raise, so it is attempted -
@@ -9599,7 +9610,8 @@ static std::string ctlDispatch(const std::string& line) {
         LockG hold;   // target liveness, reconciliation, extraction and mutation are one operation
         if (indexOfSession(target) < 0) return ctlErr("session not found");
         if (cmd == "selection.all") {
-            if (target == g_overlaySession) return ctlErr("the popup paints no selection");
+            if (target == g_overlaySession || target == g_quickSession || target == g_scratchSession)
+                return ctlErr("the popup paints no selection");
             return ctlOkStr(selectAllOf(target));
         }
         if (cmd == "selection.clear") {

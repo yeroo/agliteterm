@@ -71,7 +71,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   clears it. `copied N chars` counts UTF-8 bytes of the text `session copy` returns, with CRLF
   between rows and trailing spaces trimmed. The clipboard write is posted to the UI thread;
   allow its next message before reading it. `selection finalize` is the release-copy testing
-  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite.
+  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Select All
+  is refused on popup terminals (overlay, quick and scratch): `the popup paints no selection`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
   52 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three

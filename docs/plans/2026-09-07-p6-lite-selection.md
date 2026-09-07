@@ -66,8 +66,9 @@ words; an unresolved target is refused the way every lite verb refuses it (`ok:f
 Nothing here is persisted, nothing emits an event (agwinterm emits none for selections either);
 the only side-effects are the repaint and, for `copy` / `finalize`, the clipboard.
 
-**The popup.** `paintPopup` draws no selection and `hitTest` never enters the popup, so the
-popup's `copy` is "always `no selection`" (skill, README). A verb that could plant an invisible
+**The popup family (overlay, quick and scratch).** `paintPopup` draws no selection and `hitTest`
+never enters these popups; the overlay popup's `copy` is "always `no selection`" (skill, README).
+A verb that could plant an invisible
 selection there breaks the rule this batch inherits from agwinterm's `ClampSel` — *the highlight
 and the clipboard read the same cells*. So `selection all` on the popup (by its id or as `active`
 while it is focused) is **refused**: `the popup paints no selection` — one sentence, `ok:false`;
@@ -153,13 +154,17 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
   agwinterm defect to fix there (follow-up issue; the contract steps then pin `ok:false`).
 - **(b)** `selection finalize` never answers `finalized (copy-on-select off)`: lite's
   release-copies rule has no off switch (a `CopyOnSelect` knob is P10's, the configuration surface).
-- **(c)** `selection all` on the popup is refused `the popup paints no selection`; agwinterm's
+- **(c)** `selection all` on any popup (overlay, quick or scratch) is refused `the popup paints no selection`; agwinterm's
   covers take a selection. P7-lite paints one and lifts this.
 - **(d)** `selection copy`'s clipboard write is posted to the UI thread; the reply counts the text
   posted. A caller reading the clipboard right after waits for the window's next message (the
   suites' 300 ms).
 - **(e)** the alt-screen pin covers the VERB here; the wheel and the drag still reach main-screen
   history until P7-lite (qa/product.md's last bullet stands until then, narrowed).
+
+The reply's N also differs on non-ASCII text: lite counts UTF-8 bytes, agwinterm UTF-16 code
+units. This counting convention is detailed below and must accompany the five differences in
+the follow-up parity documentation.
 
 ## Constraints
 
@@ -224,7 +229,7 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
   the hold too (:9550 is the one unlocked touch of `g_sel` in the file; `selectionText()` takes
   the recursive lock again, which is fine).
 - `selection.all`: `selectAllOf(Session* target)` (a static beside `copySelection`): under the
-  hold, `if (target == g_overlaySession) return refused`; `emu_info`; `total = historyCount +
+  hold, refuse `g_overlaySession`, `g_quickSession` and `g_scratchSession`; `emu_info`; `total = historyCount +
   rows`; `if (!target->emu || total == 0 || cols == 0) → "empty"`; `first = isAltScreen ?
   historyCount : 0`; `g_sel = { paneOf(target), target, false, first, 0, total - 1, cols,
   target->evicted, isAltScreen != 0 }`; `InvalidateRect(g_hwnd, nullptr, FALSE)` (safe from any
@@ -250,10 +255,11 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
 - **The `pane` field.** Paint tests `g_sel.pane == pane` besides `isFor(s)`; a session is shown in
   at most one slot, so `isFor(s)` alone identifies the pane and `pane` is a fix-up burden
   (`closeSplitSide` :2593 resets it on a promotion; a swap leaves it stale). Drop the `pane == pane`
-  test from paint (:3948) so a selection made by the verb on a session that later lands in slot 1
+  equality test from paint (:3948), while retaining `pane >= 0` to exclude popup paint calls,
+  so a selection made by the verb on a session that later lands in slot 1
   is painted where the session is — otherwise it would be copyable and invisible, the invariant
   this batch imports. Keep `pane` for the drag's cross-pane rejection (:6628) and `has()`. Record
-  the change in Technical Details; the P4 promotion fix-up stays (harmless).
+  the change in Technical Details; the P4 promotion fix-up stays to move an active drag's boundary.
 - `hitTest` / `scrollOff` on the alt screen are NOT touched (P7-lite). Say so in the comment.
 
 ### Task 3: tests
@@ -297,6 +303,25 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
 - PR body: what each verb answers, the five differences, the honesty count, the alt-screen check
   named, screenshots optional (the highlight after `selection all` in a split, one pane).
 
+**What revmux round 1 found** (`.revmux/tasks/p6-lite-selection/01-initial`, `dbad2b4`,
+comprehensive, all four sources reported): **two code Majors**, one mechanism: the popup guard
+only named the overlay while quick and scratch share `paintPopup`, and removing the pane equality
+also removed the popup's `-1` sentinel. A live probe confirmed both other popup kinds answered
+`selected all`. All three now refuse; main-pane paint still follows the surface through a swap,
+while the negative sentinel suppresses popup highlights and selection-based cursor suppression.
+Three Minors: the promotion comment now explains the still-live drag boundary, the popup comment
+has its sentinel back, and mouse-up snapshots the dragged text under the same lock that ends the
+drag, so a concurrent `selection all` on B cannot make A's release copy B. One pre-existing finding
+was fixed in the same seam: paint now snapshots selection together with its viewport under the
+emulator lock, and uses that snapshot for highlight and cursor.
+
+The first strict honesty run passed all 27 new P6 checks but failed three existing P5 checks
+after assuming a background popup had focus. The setup now posts `WM_SETFOCUS` to a PID-checked
+sandbox popup before the close command, without taking the real foreground. Additional checks
+cover quick/scratch refusal by id and active, popup-active refusal, wrong-owner copy/finalize,
+and non-ASCII byte counts. PrintWindow captures confirmed the highlight moves with its shell
+through a swap and disappears after clear; that case is now recorded in `qa/selection.md`.
+
 ## Technical Details
 
 - `Sel` gains nothing; `selection all` fills it the way `OnLButtonDown` :6599-6604 does (one
@@ -304,7 +329,9 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
 - The reply counts `t.size()` (bytes of UTF-8 after CRLF join and trimming); agwinterm counts
   UTF-16 code units of the same text. A difference only on non-ASCII text — say so in the
   README's sentence (`copied N chars` = the text `session copy` returns, N its length).
-- Paint keys on `isFor(s)` alone after Task 2; `g_sel.pane` remains the drag's field.
+- Main-pane paint keys on `isFor(s)` after Task 2; `pane >= 0` preserves the popup sentinel.
+  `g_sel.pane` remains the drag's field. Paint snapshots selection with the viewport under the
+  same lock, and mouse-up snapshots the released text before another surface can replace it.
 - `postClipboardUtf8` is the one cross-thread road to the clipboard (OSC 52 and `selection
   copy` / `finalize`); `setClipboardUtf8` stays UI-thread-only and says so.
 - No event, no persistence, no `tree` field.

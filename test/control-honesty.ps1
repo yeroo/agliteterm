@@ -164,6 +164,14 @@ public static class LiteHonesty {
 # from its code point so the check does not depend on how this file was decoded.
 $overlayTitle = 'agliteterm ' + [char]0x2014 + ' overlay'
 function OverlayHwnd { [LiteHonesty]::FindWindowW('AgwintermLitePopup', $overlayTitle) }
+function Focus-SandboxPopup([IntPtr]$h) {
+    if ($h -eq [IntPtr]::Zero -or [LiteHonesty]::PidOf($h) -ne $s.Proc.Id) {
+        throw 'refusing to post focus to a window outside this sandbox'
+    }
+    # Opening a background popup intentionally does not focus it. Set up the logical focus
+    # event this scenario requires, on this process only, without taking the real foreground.
+    [void][LiteHonesty]::PostMessageW($h, 0x0007, [IntPtr]::Zero, [IntPtr]::Zero)
+}
 function Wait-Overlay([bool]$present, [int]$ms = 4000) {
     for ($i = 0; $i -lt ($ms / 100); $i++) {
         $h = OverlayHwnd
@@ -2676,6 +2684,7 @@ try {
         $raw = Overlay @('open', 'echo', 'p5-pop-cl;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
         Check 'setup: a popup over the covered pane, focused' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
         Start-Sleep -Milliseconds 300
+        Focus-SandboxPopup (OverlayHwnd)
         [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]2, [IntPtr]::Zero) | Out-Null   # IDM_CLOSE: the close chord's command
         Check 'IDM_CLOSE with the popup focused closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
         Check 'and the pane overlay under it is untouched: still up, still the surface, the block unchanged' ((Resolves $ovt) -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-t4' $true 1000) -and (SplitBlock $aid) -eq $block9 -and (NodeCount) -eq $before) "words '$(Words $aid)' block '$(SplitBlock $aid)' nodes $(NodeCount)"
@@ -2722,6 +2731,10 @@ try {
         $r = Selection 'clear' $sb
         Check 'clear on B returns cleared and preserves A selection' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq $selected -and (Selected $sb) -eq '')
         Set-Clipboard -Value 'P6-CLIPBOARD-SENTINEL'
+        foreach ($case in @(@('copy','no selection'), @('finalize','finalized (empty)'))) {
+            $r = Selection $case[0] $sb
+            Check "selection $($case[0]) on B leaves A selection and clipboard untouched" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+        }
         foreach ($op in 'all', 'copy', 'clear', 'finalize') {
             $r = Selection $op 'p6-no-such-session'
             Check "selection $op refuses a missing target without changing selection or clipboard" (-not $r.ok -and $r.error -eq 'session not found' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
@@ -2761,6 +2774,9 @@ try {
         $hp = Wait-Overlay $true
         $popupId = OverlayIdSince $cursor
         Check 'selection setup has a popup and its id' ($hp -ne [IntPtr]::Zero -and [bool]$popupId)
+        Focus-SandboxPopup $hp
+        $r = Selection 'all'
+        Check 'all on active while the popup is focused refuses without replacing the shell selection' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected)
         $r = Selection 'all' $popupId
         $popupCopy = ConvertFrom-Json (Overlay @('copy','--target',$sa))
         Check 'popup all is refused; no invisible selection is installed and shell selection survives' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and -not $popupCopy.ok -and $popupCopy.error -eq 'no selection' -and (Selected $popupId) -eq '' -and (Selected $sa) -eq $selected)
@@ -2770,6 +2786,29 @@ try {
         }
         Overlay @('close','--target',$sa) | Out-Null
         [void](Wait-Overlay $false)
+
+        # Quick and scratch share paintPopup's -1 sentinel with the overlay popup. The quick
+        # session is the one the earlier quick checks created (off hides it without unlisting).
+        foreach ($kind in 'quick','scratch') {
+            $cursor = [long](Get-CtlResult $s @('events')).cursor
+            if ($kind -eq 'quick') { Send-Ctl $s @('quick','on') | Out-Null; $coverId = $quickSid }
+            else {
+                Send-Ctl $s @('session','scratch','on','--target',$sa) | Out-Null
+                $coverId = OverlayIdSince $cursor
+            }
+            $coverHwnd = [IntPtr]::Zero
+            for ($i = 0; $i -lt 40 -and $coverHwnd -eq [IntPtr]::Zero; $i++) {
+                $coverHwnd = [LiteHonesty]::FindWindowW('AgwintermLitePopup', ('agliteterm ' + [char]0x2014 + ' ' + $kind))
+                if ($coverHwnd -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 100 }
+            }
+            Focus-SandboxPopup $coverHwnd
+            foreach ($target6 in @('active', $coverId)) {
+                $r = Selection 'all' $target6
+                Check "$kind popup all ($target6) refuses and leaves the shell selection intact" (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected -and (Selected $coverId) -eq '')
+            }
+            if ($kind -eq 'quick') { Send-Ctl $s @('quick','off') | Out-Null }
+            else { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }
+        }
 
         # Inject exact VT through session.write: no shell prompt races the screen switch/blanking.
         # The history above remains real output from the fixture's process.
@@ -2789,9 +2828,16 @@ try {
         Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
         Write-SelectionScreen $sa ($esc + '[HSELECTION-STILL-BOUND')
         Check 'blank copy and finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
+        Write-SelectionScreen $sa ($esc + '[2J' + $esc + '[HCaf' + [char]0xE9 + ' ' + [char]0x4E2D)
+        $unicodeText = Selected $sa
+        $r = Selection 'copy' $sa
+        Start-Sleep -Milliseconds 300
+        Check 'copied N chars counts UTF-8 bytes on non-ASCII text while clipboard preserves that text' ($r.ok -and $r.result -eq "copied $([Text.Encoding]::UTF8.GetByteCount($unicodeText)) chars" -and [Text.Encoding]::UTF8.GetByteCount($unicodeText) -gt $unicodeText.Length -and (Get-Clipboard -Raw) -eq $unicodeText -and (Selected $sa) -eq '')
         Write-SelectionScreen $sa ($esc + '[?1049l')
     } finally {
         Overlay @('close') | Out-Null
+        Send-Ctl $s @('quick','off') | Out-Null
+        if ($sa) { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }
         foreach ($id in $selectionIds) { Send-Ctl $s @('session','close','--target',$id) | Out-Null }
         Set-Clipboard -Value $(if ($null -eq $selectionClipboard) { '' } else { $selectionClipboard })
     }

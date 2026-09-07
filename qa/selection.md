@@ -33,6 +33,17 @@ copy`, wait 300 ms for the posted clipboard write, and compare `Get-Clipboard -R
 record byte for byte. Expect `copied N chars` (N is its UTF-8 byte count), `session copy` empty,
 and a capture showing no highlight. Restore the saved clipboard in `finally`.
 
+## A selected shell carries its highlight through a swap
+
+Split vertically and write distinct `LEFT-SELECTED` and `RIGHT-UNSELECTED` markers into the two
+shells. Run `selection all` on the left shell by id; capture with PrintWindow. Run `session swap`
+and capture again: the right box now shows `LEFT-SELECTED` highlighted, the left box shows
+`RIGHT-UNSELECTED` without a highlight. `session copy` on the original id must still return only
+its own marker. Run `selection clear` on that id and capture: neither box is highlighted.
+This distinguishes surface identity from the stale `g_sel.pane` slot used by a drag.
+
+**Last run:** 2026-09-07, P6 worktree: all three captures and the owner text check passed.
+
 ## A drag makes a selection, and it follows its text when output scrolls
 
 **Guards:** output used to wipe the selection, which made Ctrl+C-copies useless next to a running
