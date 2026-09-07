@@ -2439,8 +2439,20 @@ try {
         function RawText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.text","target":"' + $tgt + '","args":{' + $argsJson + '}}') }
         function RawOvText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.overlay","target":"' + $tgt + '","args":{"action":"text",' + $argsJson + '}}') }
         # The split shell has its banner, two markers and their prompts: more than three lines, some of
-        # them on the screen with blank rows under the prompt.
-        Check 'setup: two more markers in the split shell, so the buffer has a known tail' ((Mark $sp9 'p5-t4-a') -and (Mark $sp9 'p5-t4-b')) "text: $(Get-PaneText $s $sp9)"
+        # them on the screen with blank rows under the prompt. The markers are PRINTED, not typed as a
+        # comment: a typed `# p5-t4-b` sits after the prompt, and on a narrow grid (CI's split pane is
+        # 36 columns behind a 31-column prompt) the prompt's line wraps and cuts the marker in two —
+        # no LINE holds it, so the depth scan below found nothing and `--lines 0` never matched.
+        # `echo` puts the marker at column 0 of its own row, unwrapped on any grid.
+        function MarkOut([string]$id, [string]$marker) {
+            Wait-Shell $id | Out-Null
+            Send-Ctl $s @('session', 'type', "echo $marker", '--target', $id) | Out-Null
+            Send-Ctl $s @('session', 'type', "`n", '--target', $id) | Out-Null
+            # Wait for the OUTPUT row (the marker at column 0), not the typed command's echo of it.
+            for ($i = 0; $i -lt 40; $i++) { if ((Get-PaneText $s $id) -match "(?m)^$marker") { return $true }; Start-Sleep -Milliseconds 100 }
+            $false
+        }
+        Check 'setup: two more markers in the split shell, so the buffer has a known tail' ((MarkOut $sp9 'p5-t4-a') -and (MarkOut $sp9 'p5-t4-b')) "text: $(Get-PaneText $s $sp9)"
         Start-Sleep -Milliseconds 400
         $full = Get-PaneText $s $sp9
         $fullLines = @(LinesOf $full)
@@ -2451,7 +2463,8 @@ try {
         Check 'and they are the LAST three of the bare form' ($l3 -eq (TailOf $full 3)) "lines 3:`n$l3`ntail:`n$(TailOf $full 3)"
         # The count is from the END: the last marker sits some lines above the bottom (the prompt's
         # lines below it — one, or three on a multi-line prompt), and --lines reaches it at exactly
-        # that depth, one line short of it not.
+        # that depth, one line short of it not. The scan from the end meets the echoed OUTPUT row
+        # first (the typed command's row, marker and all, lies above it).
         $depth = 0
         for ($k = $fullLines.Count - 1; $k -ge 0; $k--) { if ($fullLines[$k] -match 'p5-t4-b') { $depth = $fullLines.Count - $k; break } }
         Check "the last marker is $depth lines from the bottom, and --lines $depth reaches it while --lines $($depth - 1) does not" ($depth -ge 2 -and (TextArgs @('--lines', "$depth", '--target', $sp9)) -match 'p5-t4-b' -and -not ((TextArgs @('--lines', "$($depth - 1)", '--target', $sp9)) -match 'p5-t4-b')) "depth $depth`n$full"
@@ -2638,7 +2651,9 @@ try {
         $raw = SidebarWidthSet "$($sbw0 + 200)"; $r = ConvertFrom-Json $raw
         Start-Sleep -Milliseconds 900
         $cL2 = [int](Node $aid).cols
-        Check 'setup: the sidebar 200 px wider, applied; slot 0 lost at least 12 columns' ([bool]$r.ok -and $r.result.applied -eq $true -and $cL2 -le $cL - 12) "raw: $raw, cols $cL -> $cL2"
+        # The line is $cL - 6 cells: the box must end up narrower than THAT for it to wrap. How many
+        # columns 200 px buys depends on the cell width (and the split halves it): 12 here, 10 on CI.
+        Check "setup: the sidebar 200 px wider, applied; slot 0 narrower than the $($cL - 6)-cell line" ([bool]$r.ok -and $r.result.applied -eq $true -and $cL2 -lt $cL - 6) "raw: $raw, cols $cL -> $cL2"
         $wrapped = $false
         for ($i = 0; $i -lt 20 -and -not $wrapped; $i++) { $wrapped = @(LinesOf (Get-PaneText $s $rg)).Count -ge 2; if (-not $wrapped) { Start-Sleep -Milliseconds 250 } }
         Check 'the overlay regridded with its box: its one line now wraps onto a second row' $wrapped "text:`n$(Get-PaneText $s $rg)"
