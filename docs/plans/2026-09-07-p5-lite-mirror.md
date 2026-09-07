@@ -351,24 +351,41 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
       `session close --target <popup id>` refused; the existing overlay block still green.
 
 ### Task 2: the slot on the shell, its lifecycle, the surface seam
-- [ ] `Session::overlay` (`Session*`, null when none), `Session::overlayResult` (`std::string`,
+- [x] `Session::overlay` (`Session*`, null when none), `Session::overlayResult` (`std::string`,
       empty = `no overlay result`). `surfaceOf(Session* shell)`. `openPaneOverlay(shell, cmd)`:
       `newSession(cols, rows of the shell's grid, "powershell.exe", overlayCommandLine)`, `hidden`,
       name `overlay`, hung on `shell->overlay` under `g_lock`, then `syncPaneSizes` + invalidate
       when displayed; `closePaneOverlay(shell)`: read `overlayExitOf` into `overlayResult` and unhook
       under `g_lock`, kill the session outside it (the `closeSplitSide` order), `g_sel` cleared if it
       was the overlay's, invalidate, `emitEvent("tree")`.
-- [ ] The seam: `focusedSession()` returns `surfaceOf(g_sessions[g_pane[g_focus]])` (the popup
+- [x] The seam: `focusedSession()` returns `surfaceOf(g_sessions[g_pane[g_focus]])` (the popup
       override first, as today); `paint`'s loop paints `surfaceOf(...)` with the same pane index and
       draws the badge; `hitTest` reports the surface; `paneGridSize` / `syncPaneSizes` size the
       overlay to the same grid; `InvalidateCaret` and the wheel use the surface; `windowForSession`
       needs nothing (`g_hwnd`).
-- [ ] Lifecycle: `closeSessionAt` kills both panes' overlays first; `closeSplitSide` kills the
+- [x] Lifecycle: `closeSessionAt` kills both panes' overlays first; `closeSplitSide` kills the
       victim's before the victim (the survivor keeps its own by the pointer exchange — a check);
       `OnPaneExit` reaches the same primitive; `closeFocused` closes the focused pane's overlay
       first; `callerWorkspace` walks overlay → shell → owner.
-- [ ] Honesty: the interactive-sibling checks, the surface reads (`active`, pane id, overlay id),
+- [x] Honesty: the interactive-sibling checks, the surface reads (`active`, pane id, overlay id),
       swap, the three lifecycle paths, the chord, no orphaned host process.
+- ➕ The verb's `--pane` arm for `open` / `close` / `result` landed here (the word read first, the
+  two usage refusals, `pane not visible`, `pane overlay already open`, the agreement check in both
+  flavours, `active` = the displayed session — not `focusedSession()`, which is the overlay when
+  the focused pane is covered), so the honesty block had an opener. Task 3 adds `copy` / `text`,
+  the overlay-id-without-`--pane` usage refusals, `paneOverlays`, the conformance probe.
+- ➕ `dumpBufferRange` and `selectionText` read the live screen from the emulator
+  (`emu_copy_grid`), not paintPane's snapshot (`s->grid`). The snapshot is refreshed only when
+  THAT session is painted, so a shell under a pane overlay answered `session text --target <pane
+  id>` with its last painted screen (stale after the promotion relaid it out) and an overlay on a
+  session not on screen answered empty — both as ok. Pre-existing for never-shown split shells;
+  found by the honesty block's first run (three FAILs), fixed at the reader.
+- ⚠️ The pty-host's kill is `TerminateProcess` on the shell: a grandchild keeps running (a `ping`
+  started from the overlay's PowerShell survived the slot's close by more than 10 s) — agwinterm's
+  host, the same for every shell kill in lite (P3's `Stop-Ping` exists for it), no protocol change
+  here. The honesty block's opener is therefore `echo <marker>; Start-Sleep 300` and its orphan
+  oracle the overlay's own `powershell.exe`, found by the wrapped command line on it. Task 6's "no
+  orphaned host process (`Get-Process`)" must count shells, not their children.
 
 ### Task 3: the verbs
 - [ ] `session.overlay` reads `pane` first (a bad word refused before any resolve); with a pane: the

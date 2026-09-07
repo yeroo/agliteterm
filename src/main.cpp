@@ -383,6 +383,22 @@ struct Session {
     int seenDone = 0;              // completed-command (FTCS) count when the session was last visible
     int unread = 0;                // commands finished while NOT visible — red count pill in the tree
     bool hidden = false;          // split-pane shell: a real shell, but NOT a sidebar/tree session
+    // P5: THIS SHELL's pane overlay — one more hidden Session (minted by newSession, name `overlay`,
+    // never in g_pane, never a tree node, never persisted), drawn in this shell's box instead of the
+    // shell while it is open, and the shell's SURFACE meanwhile (surfaceOf: the focused pane's
+    // keys, the mouse in the box and `--target active` reach it; `--target <this shell's id>` reaches
+    // the shell underneath). The slot hangs on the shell, so a swap or a promotion moves it with the
+    // shell by construction and `split close` / `session close` / the shell exiting take it along
+    // (closePaneOverlay is the one primitive). The rule — three slots, `left` = slot 0 and `right`
+    // = slot 1 whatever the axis, the sibling pane interactive throughout — is stated ONCE, in
+    // docs/plans/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is written");
+    // nothing here paraphrases it. nullptr = the slot is empty. Written under g_lock.
+    Session* overlay = nullptr;
+    // P5: the exit of the LAST overlay that closed in this slot (`exit N`, overlayExitOf's word),
+    // what `session overlay result --pane X` answers once the slot is empty again; "" = nothing has
+    // completed in this slot since the window opened (`no overlay result`). Left alone by an overlay
+    // whose command never completed. Never persisted.
+    std::string overlayResult;
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
@@ -1621,10 +1637,19 @@ static bool fitSidebarToClient(int clientW) {
     return true;
 }
 
+// THE SURFACE SEAM (P5). What a pane SHOWS and what its keys, mouse and `--target active` reach:
+// the shell's pane overlay while one is open, else the shell. Every path that draws, hits, sizes or
+// types into a pane by its g_pane index asks this (paint, hitTest, mouseReport, the selection
+// anchor, InvalidateCaret, syncPaneSizes, focusedSession — and through it sendBytes, scrollFocused,
+// resolveTarget's `active`); a path that reaches a shell by ID (resolveTarget's id arms) does not —
+// that is what makes `--target <pane id>` the shell underneath. Reads a pointer written under
+// g_lock; the object is never freed, so a stale read draws the old surface once, as g_sessions'
+// own reads always could.
+static Session* surfaceOf(Session* shell) { return shell && shell->overlay ? shell->overlay : shell; }
 static Session* focusedSession() {
     if (g_focusOverride) return g_focusOverride;   // a popup terminal owns input while it's focused
     int idx = g_pane[g_focus];
-    return (idx >= 0 && idx < (int)g_sessions.size()) ? g_sessions[idx] : nullptr;
+    return (idx >= 0 && idx < (int)g_sessions.size()) ? surfaceOf(g_sessions[idx]) : nullptr;
 }
 // The window that displays a session (a popup terminal, else the main window) — repaint target.
 static HWND windowForSession(Session* s) {
@@ -1794,6 +1819,7 @@ static void syncPaneSizes(bool fromRetry = false) {
     // thread's attachSession push_back reallocates g_sessions and frees the buffer this loop was
     // indexing (revmux r2: the sibling of the walk r1 locked). No lock spans hostResize.
     Session* want[2] = { nullptr, nullptr };
+    Session* cover[2] = { nullptr, nullptr };   // P5: the pane's overlay, sized to the same grid as its shell
     int grid[2][2]{};
     {
         LockG hold;
@@ -1801,12 +1827,16 @@ static void syncPaneSizes(bool fromRetry = false) {
             int idx = g_pane[p];
             if (idx < 0 || idx >= (int)g_sessions.size()) continue;
             want[p] = g_sessions[idx];
+            cover[p] = want[p]->overlay;
         }
     }
     for (int p = 0; p < 2; p++) {
         if (!want[p]) continue;
         if (!paneGridSize(p, &grid[p][0], &grid[p][1])) continue;
         hostResize(want[p], grid[p][0], grid[p][1], fromRetry);
+        // The overlay is always full-box: the shell's grid is its grid, whatever moved the box (a
+        // window resize, a swap, a promotion, the sidebar). Its own hostResize latch skips a no-op.
+        if (cover[p]) hostResize(cover[p], grid[p][0], grid[p][1], fromRetry);
     }
 }
 
@@ -2322,6 +2352,7 @@ static void killSession(Session* s) {
 struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
+static bool closePaneOverlay(Session* shell);   // fwd (P5, defined with the overlay verbs' helpers)
 static void closeSessionAt(int idx) {
     if (idx < 0 || idx >= (int)g_sessions.size()) return;
     Session* cs = g_sessions[idx];
@@ -2332,10 +2363,17 @@ static void closeSessionAt(int idx) {
         int ci = indexOfSessionId(cs->splitId);
         cs->splitId.clear();
         if (ci >= 0 && ci != idx) {
-            closeSessionAt(ci);
+            closeSessionAt(ci);                // ...and that shell's pane overlay with it (the recursion's own guard below)
             idx = indexOfSession(cs);          // the erase above may have shifted us
             if (idx < 0) return;
         }
+    }
+    // This shell's pane overlay dies with it (P5): a slot hangs on its shell. Before the kill, so a
+    // reader's EOF for the overlay finds it already unlisted, the way closeSplitSide orders things.
+    if (cs->overlay) {
+        closePaneOverlay(cs);                  // erases the overlay's entry: re-find our own index
+        idx = indexOfSession(cs);
+        if (idx < 0) return;
     }
     // ...and the other direction: a split shell that dies on its own (the user typed exit in it)
     // must not leave its owner pointing at nothing.
@@ -2412,6 +2450,17 @@ static Session* splitOwnerOf(Session* s);                             // fwd (wi
 // is a PROMOTION (the survivor becomes the session) — before P4 it closed the whole session, the
 // one thing no verb could do to the other side. A one-pane session still closes the session.
 static void closeFocused() {
+    // The focused pane's overlay FIRST when one is open (P5, agwinterm's Close Pane rule): the
+    // chord dismisses the cover and the pane stays; pressed again, it closes what it always did.
+    {
+        Session* shell = nullptr;
+        {
+            LockG hold;
+            int idx = g_pane[g_focus];
+            if (idx >= 0 && idx < (int)g_sessions.size() && g_sessions[idx]->overlay) shell = g_sessions[idx];
+        }
+        if (shell) { closePaneOverlay(shell); return; }
+    }
     if (g_pane[1] >= 0) {
         Session* owner = displayedOwner();
         if (owner) { closeSplitSide(owner, g_focus == 0); return; }
@@ -2446,6 +2495,7 @@ static void closeFocused() {
 static Session* closeSplitSide(Session* owner, bool closeOwner) {
     Session* victim = nullptr;
     Session* survivor = nullptr;
+    Session* victimOverlay = nullptr;   // P5: the victim pane's overlay, if any
     bool displayed = false;
     {
         LockG hold;
@@ -2476,17 +2526,34 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         survivor->splitId.clear();
         survivor->swapped = false;                     // a fresh split is in the default order
         victim->splitId.clear();
+        // The victim's pane overlay dies with its pane (P5); the SURVIVOR KEEPS ITS OWN — the
+        // pointer exchange above moved the whole object, `overlay` field included, so a promotion
+        // carries the surviving shell's slot to slot 0 and syncPaneSizes below re-grids it. Unlisted
+        // here, under the same hold and before its shell; killed outside the lock with it.
+        victimOverlay = victim->overlay;
+        victim->overlay = nullptr;
+        if (victimOverlay) {
+            if (g_sel.sess == victimOverlay) g_sel.clear();
+            if (g_focusOverride == victimOverlay) g_focusOverride = nullptr;
+            int ovi = indexOfSession(victimOverlay);
+            if (ovi >= 0) {
+                emitEvent("session", victimOverlay->id, "closed");
+                g_sessions.erase(g_sessions.begin() + ovi);
+                for (int p = 0; p < 2; p++) if (g_pane[p] > ovi) g_pane[p]--;
+            }
+        }
         int vi = indexOfSession(victim);
         g_sessions.erase(g_sessions.begin() + vi);
         // A promoted survivor's selection was in pane 1, which is gone: it comes back at pane 0 or it
         // never shows again (killSession clears the victim's). Keyed on the pointer, NOT on `displayed`:
         // g_sel is per-session and survives a switch, so an off-screen promotion over the pipe has the
-        // same stale slot to fix (revmux r2).
-        if (g_sel.sess == survivor) g_sel.pane = 0;
+        // same stale slot to fix (revmux r2). The survivor's overlay is its surface: the same fix.
+        if (g_sel.sess == survivor || (survivor->overlay && g_sel.sess == survivor->overlay)) g_sel.pane = 0;
         if (displayed) { g_pane[1] = -1; g_focus = 0; }
         for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
         emitEvent("tree");
     }
+    if (victimOverlay) killSession(victimOverlay);   // outside g_lock, like the shell under it
     killSession(victim);   // outside g_lock: a host round trip (the object is never freed — its reader may still hold it)
     if (displayed) syncPaneSizes();
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // rebuilds the tree, and saves (refreshTree)
@@ -3922,7 +3989,27 @@ static void paint(HDC dc, RECT rc) {
         if (g_pane[p] < 0 || g_pane[p] >= (int)g_sessions.size()) continue;
         RECT pr;
         paneRect(p, rc, &pr);
-        paintPane(mem, pr, g_sessions[g_pane[p]], p, p == g_focus);
+        // The pane's SURFACE (P5): its overlay while one is open, else its shell — with the same
+        // pane index, so a selection made inside the overlay (g_sel is keyed by Session*) paints.
+        Session* shell = g_sessions[g_pane[p]];
+        paintPane(mem, pr, surfaceOf(shell), p, p == g_focus);
+        if (shell->overlay) {   // the badge: a human is told the box is covered (the popup's title word)
+            HFONT bf = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HGDIOBJ of = SelectObject(mem, bf);
+            SIZE sz{};
+            GetTextExtentPoint32W(mem, L"overlay", 7, &sz);
+            RECT badge{ pr.right - sz.cx - 14, pr.top + 2, pr.right - 4, pr.top + sz.cy + 6 };
+            if (badge.left > pr.left && badge.bottom < pr.bottom) {
+                HBRUSH bb = CreateSolidBrush(g_th.classic ? RGB(60, 62, 70) : g_th.bar);
+                FillRect(mem, &badge, bb); DeleteObject(bb);
+                HBRUSH fb = CreateSolidBrush(g_th.classic ? RGB(120, 122, 130) : g_th.border);
+                FrameRect(mem, &badge, fb); DeleteObject(fb);
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, g_th.classic ? RGB(225, 225, 225) : g_th.text);
+                DrawTextW(mem, L"overlay", -1, &badge, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+            SelectObject(mem, of);
+        }
     }
     if (g_pane[1] >= 0) {   // split divider: after SLOT 0, on the axis (a vertical hairline between
         RECT pr0;           // left/right panes, a horizontal one between top/bottom panes)
@@ -4033,7 +4120,7 @@ static bool hitTest(int x, int y, int* pane, int* absRow, int* col) {
         RECT pr;
         paneRect(p, rc, &pr);
         if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
-        Session* s = g_sessions[g_pane[p]];
+        Session* s = surfaceOf(g_sessions[g_pane[p]]);   // the pane's surface: its overlay while one is open (P5)
         FfiEmuInfo info{};
         EnterCriticalSection(&g_lock);
         emu_info(s->emu, &info);
@@ -4089,13 +4176,18 @@ static std::string selectionText() {
     EnterCriticalSection(&g_lock);
     emu_info(s->emu, &info);
     std::vector<FfiCell> row(info.cols);
+    // The live screen from the emulator, not paintPane's snapshot in `s->grid` (see dumpBufferRange):
+    // a selection is made in a painted surface, but `session copy --target <shell id>` can ask for
+    // it after that shell went under a pane overlay and stopped being painted (P5).
+    std::vector<FfiCell> screen((size_t)info.cols * info.rows);
+    bool haveScreen = !screen.empty() && emu_copy_grid(s->emu, screen.data(), (uint32_t)screen.size());
     for (int abs = r0; abs <= r1; abs++) {
         bool got = false;
         if (abs < (int)info.historyCount) got = emu_copy_history_row(s->emu, (uint32_t)abs, row.data(), info.cols);
         else {
             int live = abs - (int)info.historyCount;
-            if (live < (int)info.rows && s->grid.size() >= (size_t)info.cols * info.rows) {
-                memcpy(row.data(), &s->grid[live * info.cols], info.cols * sizeof(FfiCell));
+            if (haveScreen && live < (int)info.rows) {
+                memcpy(row.data(), &screen[live * info.cols], info.cols * sizeof(FfiCell));
                 got = true;
             }
         }
@@ -4234,7 +4326,7 @@ static bool mouseReport(int x, int y, int cb, bool press, bool motion) {
         if (g_pane[p] < 0) continue;
         RECT pr; paneRect(p, rc, &pr);
         if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
-        Session* s = g_sessions[g_pane[p]];
+        Session* s = surfaceOf(g_sessions[g_pane[p]]);   // the mouse in the box reaches the overlay (P5)
         FfiEmuInfo info{};
         EnterCriticalSection(&g_lock);
         emu_info(s->emu, &info);
@@ -5686,6 +5778,84 @@ static std::string g_lastOverlayExit = "no overlay";
 static void setLastOverlayExit(const std::string& v) { LockG hold; g_lastOverlayExit = v; }
 static std::string lastOverlayExit() { LockG hold; return g_lastOverlayExit; }
 
+// ---- P5: the pane slot — one hidden Session hung on the shell it covers (Session::overlay) ----
+// Is `shell` on screen right now (either pane of the displayed session)? Caller holds g_lock.
+static bool shellDisplayed(const Session* shell) {
+    for (int p = 0; p < 2; p++)
+        if (g_pane[p] >= 0 && g_pane[p] < (int)g_sessions.size() && g_sessions[g_pane[p]] == shell) return true;
+    return false;
+}
+// Open a pane overlay on `shell`: the command runs, FTCS-wrapped (overlayCommandLine — one command
+// line for the popup and the pane slot), in a fresh hidden Session sized to the shell's grid, and
+// the shell's box shows it from the next paint (surfaceOf). Created INLINE on the caller's thread
+// the way `session split on` creates the split shell — the host round trip outside g_lock, the
+// hook-up under one hold — so the reply is the overlay's id, read off state that exists. Refuses
+// (nullptr, *why set, nothing left behind) when the shell closed during the create or another
+// caller filled the slot meanwhile (#21's class: the slot was checked on another hold), or when
+// the host could not create the session. Never moves focus or selection (#230); a shell not on
+// screen gets its overlay too, simply not painted until its session is selected.
+static Session* openPaneOverlay(Session* shell, const std::string& cmd, std::string* why) {
+    int cols = 80, rows = 24;
+    {
+        LockG hold;
+        if (indexOfSession(shell) < 0) { *why = "session not found"; return nullptr; }
+        if (shell->cols >= 1 && shell->rows >= 1) { cols = shell->cols; rows = shell->rows; }
+    }
+    std::vector<std::string> cargs{ "-NoExit", "-Command", overlayCommandLine(cmd) };
+    Session* ov = newSession(cols, rows, "powershell.exe", &cargs);   // outside g_lock: a host round trip
+    if (!ov) { *why = "overlay open: the session for the command could not be created; nothing opened"; return nullptr; }
+    bool displayed = false, hooked = false;
+    {
+        LockG hold;
+        ov->hidden = true;
+        ov->name = L"overlay";
+        if (indexOfSession(shell) >= 0 && !shell->overlay) {
+            shell->overlay = ov;
+            displayed = shellDisplayed(shell);
+            hooked = true;
+            emitEvent("tree");   // newSession's own fired before the slot was filled
+        }
+    }
+    if (!hooked) {   // the shell closed, or the slot filled, during the create: take the session back
+        closeSessionAt(indexOfSession(ov));   // hidden: no ClosedSpec; outside g_lock (a host round trip)
+        *why = "session not found";
+        return nullptr;
+    }
+    if (displayed) { syncPaneSizes(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    return ov;
+}
+// Close `shell`'s pane overlay, if it has one: the slot's last result is read off the overlay's
+// marks (overlayExitOf) and kept on the shell, the overlay is unhooked and unlisted under ONE hold
+// of g_lock — with the selection and the focus override it may hold cleared — and killed outside
+// it, the closeSplitSide order (a reader's EOF then finds nothing to collapse). The shell shows
+// again from the next paint. false = there was none (the caller answers `no overlay`). The one
+// primitive every path that ends a slot goes through: the verb, the close chord, closeSessionAt.
+static bool closePaneOverlay(Session* shell) {
+    Session* ov = nullptr;
+    bool displayed = false;
+    {
+        LockG hold;
+        if (indexOfSession(shell) < 0 || !shell->overlay) return false;
+        ov = shell->overlay;
+        std::string e = overlayExitOf(ov);   // re-entrant: the emulator is read under g_lock
+        if (!e.empty()) shell->overlayResult = e;
+        shell->overlay = nullptr;
+        if (g_sel.sess == ov) g_sel.clear();
+        if (g_focusOverride == ov) g_focusOverride = nullptr;
+        int oi = indexOfSession(ov);
+        if (oi >= 0) {
+            emitEvent("session", ov->id, "closed");
+            g_sessions.erase(g_sessions.begin() + oi);
+            for (int p = 0; p < 2; p++) if (g_pane[p] > oi) g_pane[p]--;
+        }
+        displayed = shellDisplayed(shell);
+        emitEvent("tree");
+    }
+    killSession(ov);   // outside g_lock: a host round trip (the object is never freed — its reader may still hold it)
+    if (displayed) InvalidateRect(g_hwnd, nullptr, FALSE);
+    return true;
+}
+
 // ---- Quick / Scratch popup terminals ----
 static void paintPopup(HWND h, Session* s) {
     PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -6365,8 +6535,8 @@ public:
         if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) {
             g_focus = pane;
             if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
-            int si = g_pane[pane];                              // begin drag-select, bound to THIS session
-            Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? g_sessions[si] : nullptr;
+            int si = g_pane[pane];                              // begin drag-select, bound to THIS session —
+            Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? surfaceOf(g_sessions[si]) : nullptr;   // the pane's surface (P5): a drag inside a covered box selects in the overlay
             FfiEmuInfo ai{};
             bool alt = false;
             if (ss && ss->emu && emu_info(ss->emu, &ai)) alt = ai.isAltScreen != 0;
@@ -6466,7 +6636,7 @@ public:
             RECT pr; paneRect(p, rc, &pr);
             FfiEmuInfo info{};
             EnterCriticalSection(&g_lock);
-            emu_info(g_sessions[g_pane[p]]->emu, &info);
+            emu_info(surfaceOf(g_sessions[g_pane[p]])->emu, &info);   // the caret drawn is the surface's (P5)
             LeaveCriticalSection(&g_lock);
             RECT cur{ pr.left + (LONG)info.cursorCol * g_cw, pr.top + (LONG)info.cursorRow * g_ch,
                       pr.left + (LONG)(info.cursorCol + 1) * g_cw, pr.top + (LONG)(info.cursorRow + 1) * g_ch };
@@ -7372,6 +7542,10 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
         for (Session* s : g_sessions)
             if (s->id.compare(0, caller.size(), caller) == 0 ||
                 s->paneId.compare(0, caller.size(), caller) == 0) { hit = s; break; }
+    // A pane overlay's program holds the overlay's id (P5): walk to the shell that holds the
+    // overlay first, then as any shell — a split shell's owner, or the session itself. A pane
+    // overlay is the one hidden session with a workspace a caller CAN see: its shell's.
+    if (hit) for (Session* s : g_sessions) if (s->overlay == hit) { hit = s; break; }
     if (hit) hit = splitOwnerOf(hit);   // a split shell answers with its owner; a cover has no owner: nullptr
     if (!hit || hit->hidden) return -1;
     if (hit->ws < 0 || hit->ws >= (int)g_workspaces.size()) return -1;
@@ -7412,9 +7586,16 @@ static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) {
     auto wanted = [&](int64_t line) { return from < 0 || (line >= from && line <= to); };
     for (uint32_t h = 0; h < info.historyCount; h++, abs++)
         if (wanted(abs) && emu_copy_history_row(s->emu, h, row.data(), info.cols)) appendRow(row.data());
-    if (s->grid.size() >= (size_t)info.cols * info.rows)
+    // The live screen straight from the emulator, never from `s->grid` — that is paintPane's
+    // snapshot, refreshed only when THIS session is painted, and a session that is not painted has
+    // a stale or empty one: a shell under a pane overlay (its box paints the overlay — P5's rule is
+    // that its id reads the shell UNDERNEATH), a pane overlay on a session not on screen, a hidden
+    // split shell never shown. Before P5 those read as their last painted screen, or as history
+    // alone, and reported success (found by the P5 honesty block).
+    std::vector<FfiCell> live((size_t)info.cols * info.rows);
+    if (!live.empty() && emu_copy_grid(s->emu, live.data(), (uint32_t)live.size()))
         for (uint32_t r = 0; r < info.rows; r++, abs++)
-            if (wanted(abs)) appendRow(&s->grid[r * info.cols]);
+            if (wanted(abs)) appendRow(&live[r * info.cols]);
     LeaveCriticalSection(&g_lock);
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
     return out;
@@ -8273,6 +8454,83 @@ static std::string ctlDispatch(const std::string& line) {
         if (action.empty()) action = "open";
         if (action != "open" && action != "close" && action != "resize" && action != "result")
             return ctlErr(overlayActionRefusal(action));
+        // --pane (P5): read FIRST — a bad word is refused before any resolve, and `left` / `right`
+        // routes to the pane slot (task 2: open / close / result; task 3 completes the family and
+        // the tree). Absent = the session-wide slot, the popup arm below, byte for byte as before.
+        int paneIdx;
+        std::string paneWhy;
+        if (!parsePaneWord(req, &paneIdx, &paneWhy)) return ctlErr(paneWhy);
+        if (paneIdx != kPaneSessionWide) {
+            // A pane overlay is always full-box: the two usage refusals before anything (the CLI
+            // refused first; a raw client hears the same sentence).
+            if (action == "resize") return ctlErr(kOverlayResizeWithPane);
+            if (req.fields.count("args.size-percent")) return ctlErr(kOverlaySizeWithPane);
+            std::string command = req.get("args.command");
+            if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
+            // The target names the SESSION whose slot is meant: empty / `active` = the displayed
+            // session (not focusedSession(): with the focused pane covered that is the overlay, and
+            // the caller means the session's other slot as much as this one); a session id or name;
+            // either pane's id — refused when it names the OTHER side than --pane (the caller named
+            // two panes: overlayDisagree); a pane overlay's own id — its slot, the same check in the
+            // overlay flavour. Everything below one hold of g_lock: the shell pointers are read off
+            // the list that exists, and the host round trips (open / close) run outside it.
+            const std::string& t = req.get("target");
+            Session* shell = nullptr;    // the shell whose slot --pane names
+            std::string reply;           // a refusal decided under the hold, or a `result` answer
+            bool refused = false;
+            {
+                LockG hold;
+                Session* owner = nullptr;
+                Session* hit = target;
+                if (t.empty() || t == "active") { owner = displayedOwner(); hit = owner; }
+                if (!hit) { refused = true; reply = targetWhy.empty() ? kOverlayNoSuchTarget : targetWhy; }
+                else if (indexOfSession(hit) < 0) { refused = true; reply = kOverlayNoSuchTarget; }   // closed since the resolve (#21)
+                else {
+                    // An overlay id: the shell that holds it, remembered for the agreement check.
+                    Session* viaOverlay = nullptr;
+                    if (hit->hidden) for (Session* sh : g_sessions) if (sh->overlay == hit) { viaOverlay = sh; break; }
+                    Session* shellHit = viaOverlay ? viaOverlay : hit;
+                    if (!owner) owner = splitOwnerOf(shellHit);
+                    if (!owner) { refused = true; reply = kOverlayNoSuchTarget; }   // a quick / scratch / popup cover is no session
+                    else {
+                        int si = indexOfSessionId(owner->splitId);
+                        Session* split = si >= 0 ? g_sessions[si] : nullptr;
+                        // slot -> shell: the owner's shell is pane 0 and the split shell pane 1;
+                        // `swapped` exchanges the slots (the slot map's rule, off the owner's flag
+                        // so a session not on screen answers the same).
+                        auto shellOfSlot = [&](int slot) -> Session* { int pane = owner->swapped ? 1 - slot : slot; return pane == 0 ? owner : split; };
+                        auto slotOfShell = [&](const Session* sh) -> int { int pane = sh == owner ? 0 : 1; return owner->swapped ? 1 - pane : pane; };
+                        // The agreement check: a target that named a PANE (the split shell's id, a
+                        // pane overlay's id, or the owner's pane id where that differs from the
+                        // session id — a promoted session) must name the side --pane names. The
+                        // session id, a name and `active` name the session, no side.
+                        bool namesPane = viaOverlay || (shellHit != owner) ||
+                                         (owner->paneId != owner->id && t == owner->paneId);
+                        if (namesPane && slotOfShell(shellHit) != paneIdx) {
+                            refused = true;
+                            reply = overlayDisagree(t, slotOfShell(shellHit), paneIdx, viaOverlay != nullptr);
+                        } else if (paneIdx == 1 && !split) {
+                            refused = true;
+                            reply = overlayNotVisibleRefusal(owner->id);
+                        } else {
+                            shell = shellOfSlot(paneIdx);
+                            if (action == "open" && shell->overlay) { refused = true; reply = overlayAlreadyOpenRefusal(paneIdx); }
+                            else if (action == "result")
+                                reply = shell->overlay ? kOverlayStillRunning
+                                      : shell->overlayResult.empty() ? kOverlayNoResult : shell->overlayResult;
+                        }
+                    }
+                }
+            }
+            if (refused) return ctlErr(reply);
+            if (action == "result") return ctlOkStr(reply);
+            if (action == "close") return ctlOkStr(closePaneOverlay(shell) ? "closed" : kOverlayNone);
+            std::string why;
+            Session* ov = openPaneOverlay(shell, command, &why);   // outside g_lock; re-checks the slot under its own hold
+            if (!ov) return ctlErr(why);
+            LockG hold;
+            return ctlOkStr(ov->id);   // the overlay's id (gate 4): the program inside holds it as AGWINTERM_SESSION_ID
+        }
         // --size-percent: validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
         // client area; openOverlay says why that differs from agwinterm's full region). Present ->
         // all digits in 1..100, else refused naming the value, the range and the way to get the
