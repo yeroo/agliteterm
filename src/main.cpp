@@ -1936,6 +1936,13 @@ static bool haStr(const uint8_t* p, uint32_t len, uint32_t& off, std::string& ou
     off += n;
     return true;
 }
+// Transfer ownership only if the UI accepted the clipboard message.
+static bool postClipboardUtf8(const std::string& text) {
+    auto* posted = new std::string(text);
+    if (PostMessageW(g_hwnd, WM_APP_HOSTACT, HA_CLIP, (LPARAM)posted)) return true;
+    delete posted;
+    return false;
+}
 // Call with g_lock RELEASED: a reply goes straight back down the pty, and everything else is
 // posted to the UI thread, which owns the clipboard and the tray icon.
 static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
@@ -1957,7 +1964,7 @@ static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
                 break;
             case 3:   // Clipboard(text): an OSC 52 write, already base64-decoded by the core
                 if (!haStr(buf, len, off, a)) return;
-                PostMessageW(g_hwnd, WM_APP_HOSTACT, HA_CLIP, (LPARAM)new std::string(a));
+                postClipboardUtf8(a);
                 break;
             case 4:   // Respond(reply): the answer to a query - back down the pty, from this thread
                 if (!haStr(buf, len, off, a)) return;
@@ -3945,7 +3952,7 @@ afterGridPaint:;
 
     // Selection highlight (invert the selected span, buffer-absolute rows mapped into the view).
     syncSelection();   // the rows may have been renumbered by eviction since the last paint
-    if (g_sel.isFor(s) && g_sel.pane == pane) {
+    if (g_sel.isFor(s)) {   // follow the surface through a swap or a later display in another slot
         int r0, c0, r1, c1;
         g_sel.norm(r0, c0, r1, c1);
         int base = (int)info.historyCount - off;   // buffer-absolute row of the top visible line
@@ -4288,6 +4295,33 @@ static bool copySelection() {
     if (t.find_first_not_of("\r\n ") == std::string::npos) return false;
     setClipboardUtf8(t);
     return true;
+}
+
+// Caller holds g_lock. pane remains a drag boundary; paint keys only on the surface identity.
+static int paneOf(Session* target) {
+    for (int p = 0; p < 2; ++p) {
+        int i = g_pane[p];
+        if (i >= 0 && i < (int)g_sessions.size()) {
+            Session* shell = g_sessions[i];
+            if (shell == target || surfaceOf(shell) == target) return p;
+        }
+    }
+    return 0;   // not displayed yet; isFor prevents painting over a different surface
+}
+
+// Caller holds g_lock and has rejected the popup. As agwinterm's ClampSel: main starts at 0,
+// alt starts at historyCount, because the history belongs to the other screen. The clipboard
+// must read the same cells as the highlight. Wheel/drag hitTest and scrollOff are P7's work.
+static const char* selectAllOf(Session* target) {
+    FfiEmuInfo info{};
+    if (!target->emu || !emu_info(target->emu, &info)) return "empty";
+    int total = (int)info.historyCount + (int)info.rows;
+    int first = info.isAltScreen ? (int)info.historyCount : 0;
+    if (total <= first || info.cols == 0) return "empty";
+    g_sel = { paneOf(target), target, false, first, 0, total - 1, (int)info.cols,
+              target->evicted, info.isAltScreen != 0 };
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    return "selected all";
 }
 
 // ---- input ----
@@ -6620,11 +6654,12 @@ public:
             int held = (nFlags & MK_LBUTTON) ? 0 : (nFlags & MK_RBUTTON) ? 2 : 1;
             if (mouseReport(pt.x, pt.y, held, true, true)) return;
         }
-        if (g_sel.active && (nFlags & MK_LBUTTON)) {
+        if (nFlags & MK_LBUTTON) {
             int pane, absRow, col;
             // Held across hit-test, reconcile and store, for the same reason as mouse-down: an
             // eviction landing between any two of them puts the ends in different numberings.
             LockG lk;
+            if (!g_sel.active) return;
             if (hitTest(pt.x, pt.y, &pane, &absRow, &col) && pane == g_sel.pane) {
                 // Reconcile BEFORE writing: absRow is in today's numbering while the anchor may
                 // still be in the numbering from when the drag started, and storing the two
@@ -6650,7 +6685,9 @@ public:
                 g_sel.active = false;
             }
             if (GetCapture() == m_hWnd) ReleaseCapture();
-            if (wasDragging && g_sel.has()) copySelection();   // auto-copy on release (convention)
+            // copySelection reconciles and tests content under the lock; the pipe may clear or
+            // replace g_sel after the mouse-up, so never inspect has() unheld here.
+            if (wasDragging) copySelection();   // auto-copy on release (convention)
         }
     }
     void OnRButtonDown(UINT, CPoint pt) {
@@ -8029,7 +8066,7 @@ non-split session accepts `--pane left`; the flag omitted means the session-wide
 byte for byte as before. A pane overlay is that pane's **surface** while it is open: keys typed into
 the focused pane, the mouse inside the pane's box and `--target active` (or no target) **on a
 surface verb** - `session type` / `write` / `output` / `text` / `copy` / `paste`, `surface cursor`,
-`session overlay` - reach the overlay; on every other verb `active` is what lies UNDER the focused
+`session overlay`, `selection all` / `copy` / `clear` / `finalize` - reach the overlay; on every other verb `active` is what lies UNDER the focused
 pane: on a session verb (`select`, `flag`, `seen`, `rename`, `status`, `context`, `duplicate`,
 `move`, and `window state`'s `activeSession`) the **session** the pane belongs to (a split pane's
 owner - a flag or a name on its hidden shell is one nobody can see), on a pane verb (`session
@@ -8080,7 +8117,8 @@ one is up in it and `no overlay result` while nothing has completed there since 
 `{"text": <the selection inside the overlay>}` - a mouse drag in the covered box selects in the
 overlay, the selection being keyed by the surface; the verb does not touch the clipboard (the
 drag's release does, lite's window rule) - and is refused `no selection` when nothing is selected
-there. `text --pane X` answers `{"text": <the overlay's buffer>}`. Both reads are refused `no
+there. `selection all --target <overlay id>` also makes that selection; `selection copy` writes
+the clipboard and clears its highlight. `text --pane X` answers `{"text": <the overlay's buffer>}`. Both reads are refused `no
 overlay: --pane X names which slot, and nothing is open in it` on an empty slot.
 
 **The exit status.** `exit N` is the status of the command `open` ran, as PowerShell reports it:
@@ -8124,7 +8162,8 @@ own id, which names ITS slot (the rule). Bare `result` is the WINDOW-WIDE last p
 N` once the last popup's command completed and the popup closed, `no overlay` (ok) before any and
 again after every popup `open`. Bare `text` reads the popup's buffer, `no overlay` when none. Bare
 `copy` ALWAYS answers `no selection`: the popup paints no selection and takes no drag - a recorded
-gap of lite's, not something this verb hides.
+gap of lite's, not something this verb hides. `selection all` on it is refused:
+`the popup paints no selection`.
 
 **`text` on either slot and `session text` on any pane take the same two flags.** The bare form
 and `--all` read the whole buffer, scrollback plus screen - `--all` is the explicit spelling of
@@ -8269,6 +8308,7 @@ agwintermctl session new|select|close|rename|duplicate|move|go|flag|seen|scratch
 agwintermctl session split [on|off|toggle|close]|swap|focus
 agwintermctl session copy|paste|type|text|output|status|context
 agwintermctl surface cursor
+agwintermctl selection all|copy|clear [--target <id>]
 agwintermctl restore capture
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
@@ -8295,7 +8335,7 @@ Do not reach for these - they exist in the full agwinterm and will be refused he
 `session search`, `session readonly`, `session bind`, `session restore`, `session background`,
 `command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
 `config get|set|list`, `profiles list|reload`, `theme list|set`, `omp list|set`, `image show|sixel`,
-`font`, `keymap reload`, `selection *`, `restore clear`, `install hooks|shell|cli`, `claude *`.
+`font`, `keymap reload`, `restore clear`, `install hooks|shell|cli`, `claude *`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
 result with `session output` or `session text`.
@@ -8580,7 +8620,8 @@ static std::string ctlDispatch(const std::string& line) {
     // THE `active` RULE, by verb kind (P5; revmux r1 of P5-lite). An empty target / `active` resolves
     // through focusedSession(): the focused pane's SURFACE — its pane overlay while one covers it,
     // the popup while that is focused. That is right for the verbs that read or write a surface
-    // (type, write, output, text, cursor, copy, paste, and `session overlay`, which reads the word
+    // (session type/write/output/text/copy/paste, surface cursor, selection all/copy/clear/finalize,
+    // and `session overlay`, which reads the word
     // itself) and wrong for every other verb, which reaches a SESSION by identity: before this,
     // `session select --target active` installed the hidden overlay in g_pane[0], `duplicate` cloned
     // the wrapper's command line into a visible session, and the cover-guarded verbs (close, context,
@@ -8601,7 +8642,8 @@ static std::string ctlDispatch(const std::string& line) {
     // to its pane id (closeSplitSide), and a refusal must not name an id the caller never passed.
     if (target && (targetWord.empty() || targetWord == "active") &&
         cmd != "session.type" && cmd != "session.write" && cmd != "session.output" && cmd != "session.text" &&
-        cmd != "surface.cursor" && cmd != "session.copy" && cmd != "session.paste" && cmd != "session.overlay") {
+        cmd != "surface.cursor" && cmd != "session.copy" && cmd != "session.paste" && cmd != "session.overlay" &&
+        cmd != "selection.all" && cmd != "selection.copy" && cmd != "selection.clear" && cmd != "selection.finalize") {
         LockG hold;
         if (Session* shell = focusedShell()) {
             target = shell;
@@ -9547,8 +9589,32 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "session.copy") {   // the selection's text (the selection belongs to one session)
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        LockG hold;
+        if (indexOfSession(target) < 0) return ctlErr("session not found");
         if (!g_sel.isFor(target)) return ctlOkStr("");
         return ctlOkStr(selectionText());
+    }
+    if (cmd == "selection.all" || cmd == "selection.copy" || cmd == "selection.clear" || cmd == "selection.finalize") {
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        LockG hold;   // target liveness, reconciliation, extraction and mutation are one operation
+        if (indexOfSession(target) < 0) return ctlErr("session not found");
+        if (cmd == "selection.all") {
+            if (target == g_overlaySession) return ctlErr("the popup paints no selection");
+            return ctlOkStr(selectAllOf(target));
+        }
+        if (cmd == "selection.clear") {
+            if (g_sel.isFor(target)) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+            return ctlOkStr("cleared");
+        }
+        syncSelection();
+        bool finalize = cmd == "selection.finalize";
+        if (!g_sel.isFor(target)) return ctlOkStr(finalize ? "finalized (empty)" : "no selection");
+        std::string text = selectionText();
+        if (text.find_first_not_of("\r\n ") == std::string::npos)
+            return ctlOkStr(finalize ? "finalized (empty)" : "nothing to copy");
+        if (!postClipboardUtf8(text)) return ctlErr("the clipboard write could not be queued; selection unchanged");
+        if (!finalize) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+        return ctlOkStr(finalize ? "finalized (copied)" : "copied " + std::to_string(text.size()) + " chars");
     }
     if (cmd == "session.paste") {   // paste text (or the clipboard) into the target
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);

@@ -16,10 +16,10 @@ only — never the main-screen history that lite still composes above it. The se
 wheel and the drag stop scrolling into main-screen history while the alt screen is up, drag
 autoscroll, the popup painting a selection) is **P7-lite**, not this batch.
 
-This batch builds on **P5-lite** (PR #40, `feat/p5-lite-mirror`): THE RULE for `--target active`,
+This batch builds on **P5-lite** (PR #40, merged as `d03695a`): THE RULE for `--target active`,
 the remap's surface-verb exclusion list, `surfaceOf`, `focusedShell`, `splitOwnerOf`, the pane
-overlays a selection can live in. Branch from that branch's tip and rebase onto `main` once #40
-is squash-merged (`git rebase --onto origin/main feat/p5-lite-mirror feat/p6-lite-selection`).
+overlays a selection can live in. Execution uses `feat/p6-lite-selection` in
+`C:\Users\boris\source\agliteterm-p6`, branched directly from merged `main` at `d03695a`.
 
 ## Overview
 
@@ -205,10 +205,10 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
 
 ## Progress Tracking
 
-- [ ] Task 1: the arms, the remap list, `session.copy`'s locked read
-- [ ] Task 2: the alt-screen range and the `pane` field
-- [ ] Task 3: honesty checks + qa cases
-- [ ] Task 4: docs — skill, README, qa/product.md, qa/selection.md
+- [x] Task 1: the arms, the remap list, `session.copy`'s locked read
+- [x] Task 2: the alt-screen range and the `pane` field
+- [x] Task 3: honesty checks + qa cases
+- [x] Task 4: docs — skill, README, qa/product.md, qa/selection.md
 - [ ] Task 5: [Final] verify acceptance criteria
 
 ## Implementation Steps
@@ -308,6 +308,12 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
 - `postClipboardUtf8` is the one cross-thread road to the clipboard (OSC 52 and `selection
   copy` / `finalize`); `setClipboardUtf8` stays UI-thread-only and says so.
 - No event, no persistence, no `tree` field.
+
+Execution notes: the clipboard helper frees its payload if `PostMessageW` refuses it; the verb
+then refuses without clearing the selection. The mouse-move `active` test now shares its hold
+with the update, and mouse-up relies on the locked extraction's content test instead of reading
+`g_sel.has()` unlocked. The alt-screen test injects exact VT with `session.write` after real
+fixture output establishes history, so no shell prompt races a screen switch or blanking.
 
 ## Post-Completion
 

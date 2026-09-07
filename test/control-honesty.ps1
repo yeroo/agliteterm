@@ -2691,6 +2691,111 @@ try {
         Check 'nothing of the block is left running: no shell with a p5-ov marker on its command line anywhere' (@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'echo p5-ov-' }).Count -eq 0)
     }
 
+    # ---- P6: selection verbs own one surface, including history and the alt-screen boundary -----
+    '-- selection.* --'
+    $selectionClipboard = Get-Clipboard -Raw
+    $selectionIds = @()
+    try {
+        function Selection([string]$op, [string]$id = 'active') {
+            ConvertFrom-Json (Send-Ctl $s @('selection', $op, '--target', $id))
+        }
+        function Selected([string]$id) { [string](Get-CtlResult $s @('session', 'copy', '--target', $id)) }
+        function Write-SelectionScreen([string]$id, [string]$text) {
+            $r = ConvertFrom-Json (Send-Raw (@{cmd='session.write'; target=$id; args=@{text=$text}} | ConvertTo-Json -Compress))
+            if (-not $r.ok) { throw "selection fixture write: $($r.error)" }
+        }
+        $sa = [string](Get-CtlResult $s @('session', 'new', '--name', 'p6-selection-a'))
+        $selectionIds += $sa
+        $sb = [string](Get-CtlResult $s @('session', 'new', '--name', 'p6-selection-b'))
+        $selectionIds += $sb
+        Start-Sleep -Seconds 2
+        Send-Ctl $s @('session', 'select', '--target', $sa) | Out-Null
+        $fixture = New-ScriptFile -Dir $s.AppDir -Name 'p6-selection.ps1' -Lines @(
+            '1..60 | ForEach-Object { [Console]::WriteLine("MARKER-$_") }',
+            '[Console]::WriteLine("SELECT-ME")'
+        )
+        Send-Ctl $s @('session', 'type', "& '$fixture'`r", '--target', $sa) | Out-Null
+        Check 'selection fixture has finished printing distinct history rows' (Wait-PaneText $sa 'SELECT-ME')
+        Start-Sleep -Milliseconds 500
+        $r = Selection 'all' $sa; $selected = Selected $sa
+        Check 'selection all returns selected all and includes history plus the live grid' ($r.ok -and $r.result -eq 'selected all' -and $selected -match 'MARKER-1\r?\n' -and $selected -match 'MARKER-60' -and $selected -match 'SELECT-ME') "reply $($r | ConvertTo-Json -Compress)"
+        $r = Selection 'clear' $sb
+        Check 'clear on B returns cleared and preserves A selection' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq $selected -and (Selected $sb) -eq '')
+        Set-Clipboard -Value 'P6-CLIPBOARD-SENTINEL'
+        foreach ($op in 'all', 'copy', 'clear', 'finalize') {
+            $r = Selection $op 'p6-no-such-session'
+            Check "selection $op refuses a missing target without changing selection or clipboard" (-not $r.ok -and $r.error -eq 'session not found' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+        }
+        $r = Selection 'copy' $sa
+        Start-Sleep -Milliseconds 300
+        $n = [Text.Encoding]::UTF8.GetByteCount($selected)
+        Check 'selection copy reports UTF-8 length, writes precisely session copy text, and clears highlight' ($r.ok -and $r.result -eq "copied $n chars" -and (Get-Clipboard -Raw) -eq $selected -and (Selected $sa) -eq '')
+        $r = Selection 'copy' $sa
+        Check 'selection copy without a selection leaves the clipboard unchanged' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq $selected)
+        $r = Selection 'clear' $sa
+        Check 'selection clear with nothing selected still answers cleared' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq '')
+        $r = ConvertFrom-Json (Send-Raw (@{cmd='selection.all'; target=$sa} | ConvertTo-Json -Compress))
+        Check 'raw JSON selection.all reaches the same handler without the client' ($r.ok -and $r.result -eq 'selected all' -and (Selected $sa) -eq $selected)
+        $r = Selection 'finalize' $sa
+        Start-Sleep -Milliseconds 300
+        Check 'finalize copies and keeps the highlight' ($r.ok -and $r.result -eq 'finalized (copied)' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq $selected)
+        Selection 'clear' $sa | Out-Null
+        $r = Selection 'finalize' $sa
+        Check 'finalize without a selection is empty and leaves clipboard unchanged' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq $selected)
+
+        $ov = [string](Get-CtlResult $s @('session','overlay','open','echo P6-OVERLAY; Start-Sleep 300','--pane','left','--target',$sa))
+        Check 'selection setup has an overlay with its own distinct output' ($ov -and (Wait-PaneText $ov 'P6-OVERLAY'))
+        $r = Selection 'all' $ov
+        $ovText = [string](ConvertFrom-Json (Overlay @('copy','--pane','left','--target',$sa))).result.text
+        Check 'all on overlay id selects the overlay and leaves the shell unselected' ($r.ok -and $r.result -eq 'selected all' -and $ovText -match 'P6-OVERLAY' -and (Selected $sa) -eq '')
+        Selection 'clear' $ov | Out-Null
+        $r = Selection 'all'
+        Check 'all on active with a covered focused pane selects its surface' ($r.ok -and (Selected $ov) -match 'P6-OVERLAY' -and (Selected $sa) -eq '')
+        Overlay @('close','--pane','left','--target',$sa) | Out-Null
+        $r = Selection 'all'
+        Check 'after overlay close, active selects the shell again' ($r.ok -and (Selected $sa) -match 'SELECT-ME')
+        $selected = Selected $sa
+
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        Overlay @('open','echo P6-POPUP; Start-Sleep 300','--target',$sa) | Out-Null
+        $hp = Wait-Overlay $true
+        $popupId = OverlayIdSince $cursor
+        Check 'selection setup has a popup and its id' ($hp -ne [IntPtr]::Zero -and [bool]$popupId)
+        $r = Selection 'all' $popupId
+        $popupCopy = ConvertFrom-Json (Overlay @('copy','--target',$sa))
+        Check 'popup all is refused; no invisible selection is installed and shell selection survives' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and -not $popupCopy.ok -and $popupCopy.error -eq 'no selection' -and (Selected $popupId) -eq '' -and (Selected $sa) -eq $selected)
+        foreach ($case in @(@('copy','no selection'), @('clear','cleared'), @('finalize','finalized (empty)'))) {
+            $r = Selection $case[0] $popupId
+            Check "popup selection $($case[0]) answers $($case[1]) without changing the shell selection" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected)
+        }
+        Overlay @('close','--target',$sa) | Out-Null
+        [void](Wait-Overlay $false)
+
+        # Inject exact VT through session.write: no shell prompt races the screen switch/blanking.
+        # The history above remains real output from the fixture's process.
+        $esc = [string][char]27
+        Write-SelectionScreen $sa ($esc + '[?1049h' + $esc + '[2J' + $esc + '[HSELECT-ALT')
+        $r = Selection 'all' $sa; $altText = Selected $sa
+        Check "selection all on the alt screen takes the app's screen only (minRow = historyCount; revert it and MARKER- lines appear)" ($r.ok -and $r.result -eq 'selected all' -and $altText -match 'SELECT-ALT' -and $altText -notmatch 'MARKER-')
+        Write-SelectionScreen $sa ($esc + '[?1049l')
+        Check 'returning to the main screen drops an alt-screen selection' ((Selected $sa) -eq '')
+        Write-SelectionScreen $sa ($esc + '[?1049h' + $esc + '[2J' + $esc + '[HSELECT-BLANK-ME')
+        Selection 'all' $sa | Out-Null
+        Write-SelectionScreen $sa ($esc + '[2J')
+        Set-Clipboard -Value 'P6-BLANK-SENTINEL'
+        $r = Selection 'copy' $sa
+        Check 'copy of live cells blanked by a TUI answers nothing to copy and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        $r = Selection 'finalize' $sa
+        Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Write-SelectionScreen $sa ($esc + '[HSELECTION-STILL-BOUND')
+        Check 'blank copy and finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
+        Write-SelectionScreen $sa ($esc + '[?1049l')
+    } finally {
+        Overlay @('close') | Out-Null
+        foreach ($id in $selectionIds) { Send-Ctl $s @('session','close','--target',$id) | Out-Null }
+        Set-Clipboard -Value $(if ($null -eq $selectionClipboard) { '' } else { $selectionClipboard })
+    }
+
     # ---- #23: two persisted values that cannot coexist ------------------------------------------
     # SidebarW (one value for every instance) and WinW-<instance> are each valid on their own; a
     # sidebar saved at 900 from a wide monitor and a window rect saved at 700 on the laptop meet at

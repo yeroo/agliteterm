@@ -7,8 +7,8 @@ always what is visibly highlighted. A selection follows its text through scrollb
 dies with its own lines; it never survives a change of screen, because the alt screen is a different
 buffer and an index into one names unrelated text in the other.
 
-The agwinterm sibling of this file carries more cases — mark mode, Select All, drag-autoscroll, a
-`scrollback-lines = 0` case — because lite has none of those features. See `qa/product.md` for the
+Lite has Select All through `selection all` (no chord). The agwinterm sibling carries more cases —
+mark mode, drag-autoscroll, a `scrollback-lines = 0` case — because lite has none of those features. See `qa/product.md` for the
 differences that are deliberate.
 
 Setup for every case: sandbox instance per `qa/product.md`. Fixtures print **distinct** text per
@@ -16,6 +16,22 @@ line — with identical lines a selection that slid onto other rows compares equ
 passes, which is the exact defect being tested for.
 
 ---
+
+## Select All on the alt screen takes only the alt screen
+
+Print distinct `MARKER-n` lines into history, then enter the alt screen (`ESC[?1049h`) and print
+`SELECT-ALT`. Call `selection all`, then `session copy` on that surface. Expect `selected all`,
+non-empty text containing `SELECT-ALT`, and no `MARKER-` lines. Leave the alt screen; `session
+copy` must be empty because the selection cannot survive a screen switch. This is automated in
+`test/control-honesty.ps1`; changing the range start from `historyCount` to 0 fails it.
+
+## `selection copy` reads what is highlighted
+
+Save the clipboard, then run the marker fixture and drag across several distinct lines. Record
+the non-empty `session copy` text and capture the highlight with PrintWindow. Call `selection
+copy`, wait 300 ms for the posted clipboard write, and compare `Get-Clipboard -Raw` with that
+record byte for byte. Expect `copied N chars` (N is its UTF-8 byte count), `session copy` empty,
+and a capture showing no highlight. Restore the saved clipboard in `finally`.
 
 ## A drag makes a selection, and it follows its text when output scrolls
 

@@ -57,6 +57,10 @@ The same `agwintermctl` the full app uses, resolved by `test/ctl-path.ps1` — t
 | --- | --- |
 | `Get-PaneText $s` | `session text` |
 | `Get-PaneSelection $s` | `session copy` |
+| `Send-Ctl $s @('selection','all')` | `selection all` |
+| `Send-Ctl $s @('selection','copy')` | `selection copy` (clipboard write, clears highlight) |
+| `Send-Ctl $s @('selection','clear')` | `selection clear` |
+| `Send-Ctl $s @('selection','finalize')` | `selection finalize` (release copy, keeps highlight) |
 | `Send-Ctl $s @('session','type', "text`r")` | `session type` |
 
 **Clear `AGWINTERM_SESSION_ID` / `AGWINTERM_PANE_ID` / `AGWINTERM_PIPE` before every ctl call.**
@@ -72,18 +76,16 @@ Cases must not assume the main app's behaviour. As of 0.17.11:
 - **A split is a hidden session, not a pane object.** It has no tree row and no name; `session split`
   hands back its id, which is the only handle on it. The full app models panes inside a session
   instead. Behaviour matches: the split belongs to its session either way.
-- **No mark mode, no Select All, no drag-autoscroll.** Those cases exist only in agwinterm's `qa/`.
-- **No `selection.*` control verbs.** agwinterm has `selection.all/clear/copy/finalize`; lite
-  implements none of them. `session.copy` (the selection's text) is there and is what these cases
-  read. A step that calls `selection clear` here does nothing and reports an error nobody reads — do
-  not reach for it; clear a selection with a single click instead.
-- **No `selection.*` control verbs.** agwinterm has `selection.all/clear/copy/finalize`; lite
-  implements none of them. `session.copy` (the selection's text) is there and is what these cases
-  read. A step that calls `selection clear` here does nothing and reports an error nobody reads — do
-  not reach for it; clear a selection with a single click instead.
+- **No mark mode, no drag-autoscroll.** Select All exists only as the `selection all` verb (no chord).
+- **Selection API differences:** (a) unresolved targets are `ok:false`, with lite's usual missing
+  or ambiguous-target sentence (agwinterm currently answers `ok:true` / `no session`);
+  (b) finalize always uses release-copy, with no off mode; (c) `selection all` on the popup is
+  refused `the popup paints no selection`, because it paints no highlight; (d) clipboard writes
+  are posted, so wait for the UI message (the suites use 300 ms); (e) Select All pins to the app's
+  screen on the alt screen, but the wheel and drag still reach main-screen history until P7.
 - **Scrollback is not configurable** — lite does not call `agwcore_emu_set_scrollback` yet, so there
   is no `scrollback-lines = 0` case here.
-- **The alt screen scrolls back into main-screen history.** `paintPane` composes the history tail
+- **The wheel and drag on the alt screen still reach main-screen history.** `paintPane` composes the history tail
   above the live grid using `scrollOff` on *either* screen, and `hitTest` maps clicks through the
   same offset. So wheeling up inside a full-screen app shows real scrollback, and a selection there
   copies what is displayed. agwinterm pins the offset to 0 on the alt screen instead, and had a bug
