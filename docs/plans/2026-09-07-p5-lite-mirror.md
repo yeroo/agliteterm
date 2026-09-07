@@ -532,7 +532,7 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   reader on both, and a script wanting the screen passes `--lines 0` / reads `--lines N` on either."
 
 ### Task 6: [Final] Verify acceptance criteria
-- [ ] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P5 dev CLI; `check-contract`
+- [x] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P5 dev CLI; `check-contract`
       green against #252's file; a sandbox split, a pane overlay on the right, a marker typed into
       the left, `PrintWindow` (the screenshot in the PR body); edge cases probed live (an untracked
       `.ralphex/p5-lite-edge-cases.ps1`, P4's shape): both panes covered then `swap`; the popup over
@@ -543,7 +543,64 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
       `session text` width); a pane overlay on a non-displayed session then selecting it (drawn,
       focus where it was); `session text --all` on a pane with history; no orphaned host process
       after all of it (`Get-Process`).
-- [ ] The plan's notes carry what each revmux round found (the P4-lite pattern).
+      (dev client — agwinterm's `Agwinterm.Ctl` Release build of 2026-09-07 08:00, the post-#250
+      `agwintermctl` whose `session overlay resize --pane left` says "Nothing sent"; the bundled
+      `bin\agwintermctl.exe` of 2026-09-03 predates P5 and fails to connect on the probe, so every
+      run here sets `AGWINTERMCTL`. `check-contract`: "in step with agwinterm" against #252's branch
+      file; DRIFT against `main` (same verbs, different expectations) while #252 is open — the CI
+      step that turns green when it merges, as task 5 recorded. `qa/fixtures/pane-overlay.ps1`
+      re-run with the dev client: 19/19, `.ralphex/p5-t6-fixture.log`; the PR-body screenshot stays
+      `docs/img/qa-p5-pane-overlay.png` from task 5. `run-all -Strict` with the dev client: twelve
+      suites, 925 PASS, 0 SKIP, 0 FAIL, exit 0 — `.ralphex/p5-t6-runall.log`; conformance and
+      control-honesty ran every P5 step and refusal (no SKIP under `-Strict`), no sandbox instance
+      left behind.
+      ➕ The edge probe is `.ralphex/p5-lite-edge-cases.ps1` (untracked, P4's shape: one sandbox on
+      pipe `p5edge`, `Check` lines, the overlay shells found by a `P5-EDGE` marker in their command
+      line), 78/78 on its clean run, `.ralphex/p5-t6-edge.log`, three captures beside it
+      (`p5-edge-*.png`). What it found, case by case: (1) both panes covered then `swap` —
+      `paneOverlays` stays `["left","right"]`, `text --pane left` reads what the RIGHT slot read
+      before (the slot moved with its shell), `--target <ovL id>` still names ovL's slot (`result`:
+      `overlay still running`) and with `--pane left` naming the other side is refused; the pane ids
+      still read the shells under. (2) the popup over two pane overlays — the bare `text` reads the
+      popup, the two slots keep reading through `--pane`, `paneOverlays` unchanged, `close` leaves
+      both slots up and exactly two overlay shells; the bare `result` is `ok "no overlay"` while a
+      popup is up and after one closed EARLY (its command never completed: vocabulary (c)), and
+      `exit 7` after a popup whose `cmd /c exit 7` completed — read at the popup's `WM_DESTROY`, so
+      "no overlay" until the close. My probe's first two spellings of that expectation were wrong,
+      not the product; the third is what the plan says. (3) `split off` with the split shell
+      covered — one pane, `paneOverlays ["left"]`, the right overlay's id gone, `result --pane
+      right` = `pane not visible`, its `powershell.exe` gone within the wait. (4) the shell under an
+      overlay exiting — `exit` typed by the split shell's id (the shell UNDER the cover) collapses
+      the pane and its overlay dies with it (id and process gone); on a one-pane session `solo` the
+      exited shell stays (`exited:true`), `paneOverlays ["left"]` stays, `overlay text` still reads
+      it, `close --pane left` then `session close` clean it. (5) the Close Pane action — `Key_Close`
+      is UNBOUND by default and the bindings live in `HKCU\Software\agliteterm`, the user's real
+      settings, so the probe posts `WM_COMMAND IDM_CLOSE`, which is `runKbAction(KB_CLOSE)` →
+      `closeFocused()`, the same function the chord's keydown match (`:4720`) runs: the overlay
+      closes FIRST, the session stays, the shell under it reads its prompt. (6) `--pane left` on a
+      single pane then `split on` — the overlay stays on slot 0, the shell's cols shrink, and the
+      overlay's grid follows: a probe command inside it (`$Host.UI.RawUI.WindowSize` printed once a
+      second) reports exactly the shell's `cols x rows` from `tree` before and after. (7) a
+      horizontal split with `--pane left` — the TOP box (capture `p5-edge-horizontal-top-covered.png`:
+      the probe's lines and the `overlay` badge in the top box, the prompt in the bottom); a posted
+      click in the top box makes `--target active` read the overlay, one in the bottom box the split
+      shell, `focusedPane` 1. (8) a window resize with it up (1100x700 → 860x560 → back) — the
+      shell's grid changes and the overlay's probe reports the new `cols x rows` each time. (9) a
+      pane overlay on a non-displayed session `bg` — `open` answers an id, `bg`'s node carries
+      `paneOverlays ["left"]`, `--target active` is still the displayed shell's text (focus where it
+      was); `session select bg` and `active` reads the overlay, drawn with its badge
+      (`p5-edge-bg-selected.png`). (10) `session text` on a pane with 80 lines of history — `--all`
+      holds HIST-1 and HIST-80, the bare form equals `--all` byte for byte, `--lines 5` is five
+      lines with HIST-80 and no HIST-1, `--lines 0` the screen, `--all --lines` refused. (11) no
+      `paneOverlays` anywhere at the end, no overlay shell while the window is up, none after it
+      closed, the sandbox instance gone. No product defect found; the one probe defect was mine.)
+- [x] The plan's notes carry what each revmux round found (the P4-lite pattern).
+      (the rounds run in ralphex's review phase AFTER the task loop ends, one revmux round per review
+      iteration under `.revmux/tasks/ralphex-2026-09-07-p5-lite-mirror/`; each round's findings and
+      the fix commit they led to are appended below as "**What revmux round N found**", the way
+      `docs/plans/completed/2026-09-06-p4-lite-mirror.md` carries its three. No round has run yet at
+      the time of this line — the item is satisfied by that routine, not by a round that already
+      happened.)
 
 ## Technical Details
 
