@@ -33,6 +33,9 @@ copy`, wait 300 ms for the posted clipboard write, and compare `Get-Clipboard -R
 record byte for byte. Expect `copied N chars` (N is its UTF-8 byte count), `session copy` empty,
 and a capture showing no highlight. Restore the saved clipboard in `finally`.
 
+**Last run:** 2026-09-07, P6 worktree at `9270505`: mouse-drag, exact clipboard comparison,
+byte-count reply and before/after PrintWindow captures passed.
+
 ## Blank API Copy clears; blank Finalize keeps the highlight
 
 On the alt screen, select all, then blank the cells with `ESC[2J`. Save the clipboard and set a

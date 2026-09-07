@@ -215,7 +215,7 @@ the follow-up parity documentation.
 - [x] Task 2: the alt-screen range and the `pane` field
 - [x] Task 3: honesty checks + qa cases
 - [x] Task 4: docs — skill, README, qa/product.md, qa/selection.md
-- [ ] Task 5: [Final] verify acceptance criteria
+- [x] Task 5: [Final] verify acceptance criteria (test-isolation caveats recorded below)
 
 ## Implementation Steps
 
@@ -333,6 +333,40 @@ check that a second blank Copy answers `no selection`.
 Both Copy and Finalize can return `ok:false` with
 `the clipboard write could not be queued; selection unchanged` if the UI enqueue fails.
 This preserves the selection for retry; queue refusal is source-reviewed, not fault-injected.
+
+**What revmux round 3 found** (`.revmux/tasks/p6-lite-selection/03-final`, `9270505`,
+final): no findings, both Claude Code (`bugs+impl`) and Codex (`adversarial`) reported without
+degradation. This confirms the blank-Copy fix and its distinguishing tests. The API Copy
+mouse-drag case also passed: the clipboard exactly matched `session copy`, its reply counted
+those UTF-8 bytes, and PrintWindow showed the highlight disappear after Copy.
+
+**Test-isolation caveats discovered during verification:** the existing
+`test/restore-matrix.ps1` `Stop-Stray-Lite` cleanup treats every machine-wide new lite PID as
+its own. During the final rerun it stopped PID 35008, a `ctlhonesty` sandbox from the other
+checkout, not this worktree. Claude was alerted; no real/default instance was observed affected.
+That cleanup runs only in `restart-named`, which had finished when the log exposed it; it was
+not rerun. This pre-existing test-infrastructure defect needs a separate ownership-scoped fix;
+do not overlap lite suites across checkouts.
+
+The first full-run registry comparison reported only `WinMax-conf-win` changed. Its original
+snapshot was accidentally overwritten when the final rerun began, so the earlier value could
+not be restored safely and was left alone. This is conformance's named test-window maximization
+flag, not the default window's geometry. Clipboard text was restored after the run. The final
+rerun has its own before/after registry snapshots; neither snapshot proves restoration of the
+lost earlier value.
+
+**Final verification** (`9270505`, 2026-09-07): MSVC build, contract check, PowerShell syntax
+check, and `test/run-all.ps1 -Strict` passed. Its `control-honesty.ps1 -Strict` run passed
+720 checks, including all 36 P6 checks, with zero failures or skips. The alt-screen range,
+blank-Copy clearing, blank-Finalize retention, and non-ASCII byte counts all passed. The final
+run again toggled `WinMax-conf-win`; after its process exited, that exact value was restored
+to the recorded final-run baseline (1), and the complete registry comparison then had no
+differences. This does not recover the lost first-run baseline described above. Ten geometry
+values belonging only to this task's `p6visual` / `p6popup` probes were subsequently removed,
+with a local JSON backup retained. Clipboard text was restored.
+
+Draft PR: https://github.com/yeroo/agliteterm/pull/45. No merge or release was performed.
+The shared-contract additions and agwinterm parity documentation below remain post-merge work.
 
 ## Technical Details
 
