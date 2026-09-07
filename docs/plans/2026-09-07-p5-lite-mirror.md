@@ -9,8 +9,8 @@ and the release PR #253 (0.17.14). `tools/check-contract.ps1` goes red on `main`
 merges, for exactly those steps and refusals; that is the gate, and it goes green when this merges
 and agwinterm 0.17.14 is tagged.
 
-**Gates, decided before ralphex runs** (recorded here with their attribution once Boris answers;
-the recommendation of each is the plan as written):
+**Gates, decided before ralphex runs — all five as recommended, Boris, 2026-09-07 ("Ok
+continue" to the five questions as listed below); the plan as written is the decision:**
 
 1. **A pane overlay is IN-WINDOW, the pane's surface** — one more hidden `Session`, drawn in the
    pane's box instead of the shell while it is open. Not a popup sized to the pane rect (a popup
