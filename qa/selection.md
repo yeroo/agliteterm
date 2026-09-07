@@ -161,3 +161,47 @@ either direction.
 **Automated part:** with the view NOT scrolled, the agreement invariant still holds and is covered by
 the TUI case above. If you cannot scroll, report this case SKIP — never PASS on the un-scrolled path,
 which checks nothing this case is about.
+
+---
+
+## A drag inside a pane overlay selects the overlay's text
+
+**Guards:** `g_sel` is keyed by `Session*` and `hitTest` reports the SURFACE of the box under the
+pointer (P5: `surfaceOf(shell)`, the overlay while one is open), so a drag in a covered box selects
+in the overlay and `paintPane` for that box — the overlay, the same pane index — draws the
+highlight. `session overlay copy --pane X` answers exactly that selection as `{"text": …}` and does
+not touch the clipboard; the drag's RELEASE copies, lite's window rule, unchanged. The failures this
+discriminates: a selection anchored to the shell underneath (the highlight invisible, `copy`
+answering the shell's cells), a `copy` verb that writes the clipboard, and a selection that
+outlives the overlay it was made in.
+
+**Setup:** sandbox, one session, `session split on`; `session overlay open "1..40 | % { \"OV-$_-\" +
+('x' * 16) }; Start-Sleep 300" --pane right --target <session id>` — forty distinct rows in the
+overlay, no prompt after them (the command sleeps). Keep the reply `$ov` and the split shell's id
+`$sp`. Put `SENTINEL` on the clipboard.
+
+**Steps:**
+1. `session overlay copy --pane right`.
+2. Drag inside the RIGHT box — `test/clipboard.ps1`'s recipe, `PostMessage` `WM_LBUTTONDOWN` /
+   `WM_MOUSEMOVE` / `WM_LBUTTONUP` into the sandbox's own window at points inside the right pane's
+   rect (x past the divider). Wait ~300 ms. Put `SENTINEL` on the clipboard AGAIN (the release
+   copied; the case is about the verb).
+3. `session overlay copy --pane right`; `session copy --target $ov`; `session copy --target $sp`;
+   read the clipboard.
+4. Capture with `PrintWindow`.
+5. `session overlay close --pane right`. Capture again; `session copy --target $sp`.
+
+**Expect:**
+- step 1: refused `no selection` (`ok:false`) — not an empty `text`;
+- step 3: `overlay copy` is `ok` with a non-empty `text` of `OV-<n>-` rows in order; `session copy
+  --target $ov` is the same string; `session copy --target $sp` is EMPTY (the selection is the
+  overlay's, not the shell's under it); the clipboard still holds `SENTINEL`;
+- step 4: the highlight sits in the right box over the `OV-` rows the copy returned, nothing
+  highlighted in the left box;
+- step 5: `closed`; the second capture has NO highlight anywhere (the selection died with its
+  surface — `closePaneOverlay` clears it), and `session copy --target $sp` is still empty.
+
+**Fails when:** `hitTest` reports the shell for a covered box; `paintPane` tests the selection
+against the shell instead of the surface it is drawing; the pane arm's `copy` calls
+`copySelection` (the clipboard changes); or `closePaneOverlay` stops clearing `g_sel` when it was
+the overlay's (a dangling selection on a freed session).

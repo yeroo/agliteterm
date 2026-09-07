@@ -7703,7 +7703,7 @@ static std::string lastCommandOutput(Session* s, bool* haveMarks) {
 // one. A skill that overpromises is worse than no skill.
 static const char* kSkillMarkdown = R"SKILL(---
 name: agliteterm
-description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, split a session into two panes (either axis, close either side, swap, focus), run commands in named sessions, read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
+description: Use when running inside the agliteterm terminal (env AGWINTERM_ENABLED=1, TERM_PROGRAM=agliteterm) to control it - report agent status, create/switch/close sessions, split a session into two panes (either axis, close either side, swap, focus), run commands in named sessions, run a command over the window or over ONE pane and read it back (session overlay --pane), read a command's output, check a pane's caret column before typing into it, and poll for events - via the agwintermctl CLI or its control pipe.
 ---
 
 # agliteterm
@@ -7726,6 +7726,10 @@ You are inside agliteterm when `AGWINTERM_ENABLED=1` and `TERM_PROGRAM=agliteter
   either way (a pane id reaches its session). An agent that needs its own session id reads the
   `tree` node whose `id` equals `$AGWINTERM_PANE_ID` or whose `paneIds` contains it - a promoted
   session's node carries `paneIds` (`[<its shell's id>]`) for exactly this lookup
+- A program inside a PANE OVERLAY (the overlay section) holds the OVERLAY's id in both variables -
+  the id `session overlay open --pane` answered - not the id of the pane it covers. So inside one a
+  bare `session overlay close` closes that overlay (the CLI sends the env id as the target, and an
+  overlay's id names its own slot), and a bare `session text` reads it
 - `AGWINTERM_PIPE` - the control pipe name (full path `\.\pipe\<name>`)
 
 The variables keep the `AGWINTERM_` prefix on purpose: the same hooks and scripts work in both
@@ -7899,30 +7903,123 @@ For a session that already exists, type into it (`\n` is sent as Enter):
 agwintermctl session type "npm test`n" --target build
 ```
 
-## A command in a popup over the window
+## A command over the window, or over ONE pane
 
 ```
-agwintermctl session overlay open "git log --oneline" [--size-percent N]
+agwintermctl session overlay open "npm test" --pane left|right [--target <id>]     # a PANE overlay: answers its id
+agwintermctl session overlay close|result|copy|text --pane left|right [--target <id>]
+agwintermctl session overlay text --pane right [--all | --lines N]
+agwintermctl session overlay open "git log --oneline" [--size-percent N] [--target <id>]   # the popup: a status word
 agwintermctl session overlay resize --size-percent N
-agwintermctl session overlay close
+agwintermctl session overlay close|result|copy|text
 ```
 
-`open` runs the command in a popup terminal over the main window and answers a status word, not
-a session id (the popup is created after the reply is written). The popup is `--size-percent` of
-the window's client area on each side, **a whole number in 1..100** (anything else refused). A popup
-cannot be smaller than 30x8 cells, so on a small window a low percentage comes back RAISED to what
-fits and the reply says the percentage IN EFFECT (`overlay opened at N%`, `resized N%`) - compare it
-with what you asked for, as `sidebar width` already makes you. When the window cannot be measured at
-all - it is minimised, or its client is under 30x8 cells - there is no percentage to name and the
-reply says so instead (`overlay opened at the smallest size this window can show (...)`, `resized to
-the smallest size ...`), so a caller matching `at (\d+)%` must handle the miss:
-`0`, `150`, `-5` and `sixty` are refused naming the value and the range, and NO popup opens or
-moves. Omit the flag for lite's default popup (70 %; the full app's default is the whole region -
-the contract pins the reply and the refusal, not the geometry). `open` with no command is refused;
-so is an action other than `open`, `close`, `resize`; so is a `--target` that names no session
+**THE RULE**, quoted from the one full copy (the P5-lite plan's vocabulary section,
+`docs/plans/2026-09-07-p5-lite-mirror.md`; every sentence below is decided there, not here): a
+session has three overlay slots: **one session-wide** (lite's popup over the window, as before - it
+covers every pane and any pane overlay under it, and holds input while focused) and **one per
+pane**. A pane overlay covers **exactly one pane's box** - always the full box, never floating - and
+the sibling pane stays visible and interactive. `--pane left|right` names the slot: `left` is
+**slot 0** (the left / top box) and `right` is **slot 1** (the right / bottom box) **whatever the
+axis** - the same slots `session focus left|right` names, whichever shell a swap put there; a
+non-split session accepts `--pane left`; the flag omitted means the session-wide slot - the popup,
+byte for byte as before. A pane overlay is that pane's **surface** while it is open: keys typed into
+the focused pane, the mouse inside the pane's box and `--target active` reach the overlay; `--target
+<pane id>` reaches the shell **underneath** (`session text` reads the surface underneath);
+`--target <overlay id>` reaches the overlay from anywhere (every `session` verb), and on `session
+overlay` itself names that overlay's slot - the same as passing its `--pane` word - for as long as
+the id resolves (an overlay that closed is reached by `--pane` only); with `--pane` naming the
+other side it is refused. The slot moves with its pane (a swap, a `split close` of the other pane)
+and dies with it (`split close`, `split off`, the shell exiting when that removes the pane - a
+one-pane session keeps an exited shell on screen, and its overlay with it - `session close`, the
+window closing).
+
+**A pane overlay** (`--pane left|right`). `open` runs the command in a hidden session sized to that
+pane's grid, drawn in the pane's box instead of its shell - a badge `overlay` in the box's top-right
+corner tells a human the box is covered - and **answers the overlay's id**, a session id
+(`<prefix>-<seq>`), because the slot is created inline and the id exists when the reply is written.
+The program inside holds that id as `AGWINTERM_SESSION_ID` / `AGWINTERM_PANE_ID` (Detect, above).
+`--target` names the SESSION whose slot is meant: omitted or `active` = the displayed session; a
+session id or a name; either pane's id; a pane overlay's own id. Refused, nothing opened:
+
+- a `--pane` word that is not exactly `left` or `right` (case matters) - refused naming both words
+  and the absent form, BEFORE any target is resolved;
+- `--pane right` on a one-pane session: `pane not visible: session <id> has one pane; pass --pane
+  left or omit --pane`;
+- the slot already holding one: `pane overlay already open: close it first (session overlay close
+  --pane X), or read it (result / copy / text)` - **no silent replace** (the popup replaces; the
+  pane slot refuses);
+- a `--target` pane id or overlay id on the OTHER side than `--pane`: `'<id>' is the right pane;
+  --pane left names the other one. Nothing opened.` (`the right pane's overlay` for an overlay id);
+- `--size-percent` beside `--pane`, and `resize --pane`: a pane overlay is always full-box. The CLI
+  refuses first (exit 2, "Nothing sent"); the server repeats the sentence for a raw client;
+- a target that resolves to nothing, or a quick / scratch / popup cover.
+
+`close --pane X` ends that slot's program and the pane shows its shell again: `closed`, or `ok
+"no overlay"` when the slot was empty (the popup's shape). `result --pane X` is that slot's last
+exit status: `exit N` (ok) once a command completed there; REFUSED `overlay still running` while
+one is up in it and `no overlay result` while nothing has completed there since the window opened
+- so a caller branching on `ok` gets a status only when there is one. `copy --pane X` answers
+`{"text": <the selection inside the overlay>}` - a mouse drag in the covered box selects in the
+overlay, the selection being keyed by the surface; the verb does not touch the clipboard (the
+drag's release does, lite's window rule) - and is refused `no selection` when nothing is selected
+there. `text --pane X` answers `{"text": <the overlay's buffer>}`. Both reads are refused `no
+overlay: --pane X names which slot, and nothing is open in it` on an empty slot.
+
+**The exit status.** `exit N` is the status of the command `open` ran, as PowerShell reports it:
+`$LASTEXITCODE` for a native program, else 0 when `$?` is true and 1 when it is false - carried in
+an FTCS mark the overlay's own command line emits around the command (so `session output` on an
+overlay works too). The overlay's shell stays up after the command (`-NoExit`, no `--wait` here),
+so `result` says `overlay still running` until you `close`; a command that never completed (closed
+early, or a command line that did not parse) leaves the slot's result as it was.
+
+`tree --json`: `paneOverlays` on the session node - `["left"]`, `["right"]` or `["left","right"]`,
+in slot order, ABSENT when empty; the overlay itself has no node, no sidebar row, no name, and is
+never restored. Every open and close emits `tree`. The Close Pane / Session action (the unbound
+`Key_Close` chord, the palette row, File > Close Pane / Session) closes the focused pane's overlay
+FIRST when one is open, then what it closes today. A verb on a session not on screen does the same
+work and moves neither focus nor selection. `session close --target <any overlay's id>` is refused
+as a cover (`session overlay close` dismisses it), the overlay untouched.
+
+**The session-wide slot** (no `--pane`): the popup, unchanged. `open` runs the command in a popup
+terminal over the main window and answers a status word, not a session id (the popup is created
+after the reply is written). The popup is `--size-percent` of the window's client area on each
+side, **a whole number in 1..100** (anything else refused). A popup cannot be smaller than 30x8
+cells, so on a small window a low percentage comes back RAISED to what fits and the reply says the
+percentage IN EFFECT (`overlay opened at N%`, `resized N%`) - compare it with what you asked for,
+as `sidebar width` already makes you. When the window cannot be measured at all - it is minimised,
+or its client is under 30x8 cells - there is no percentage to name and the reply says so instead
+(`overlay opened at the smallest size this window can show (...)`, `resized to the smallest size
+...`), so a caller matching `at (\d+)%` must handle the miss: `0`, `150`, `-5` and `sixty` are
+refused naming the value and the range, and NO popup opens or moves. Omit the flag for lite's
+default popup (70 %; the full app's default is the whole region - the contract pins the reply and
+the refusal, not the geometry). `open` with no command is refused; so is an action other than
+`open`, `close`, `resize`, `result`, `copy`, `text`; so is a `--target` that names no session
 (nothing opened, resized or closed). `resize` with no overlay open is refused - open one first;
-`close` with none open answers `no overlay`, which is true afterwards. lite's overlay is one popup
-per window, so a target that does resolve is accepted whichever session it names.
+`close` with none open answers `no overlay`, which is true afterwards. The session-wide slot is one
+popup per window, so a target that does resolve is accepted whichever session it names (a recorded
+difference: the full app refuses a pane id of a split without `--pane`) - except a pane overlay's
+own id, which names ITS slot (the rule). Bare `result` is the WINDOW-WIDE last popup exit: `exit
+N` once the last popup's command completed and the popup closed, `no overlay` (ok) before any and
+again after every popup `open`. Bare `text` reads the popup's buffer, `no overlay` when none. Bare
+`copy` ALWAYS answers `no selection`: the popup paints no selection and takes no drag - a recorded
+gap of lite's, not something this verb hides.
+
+**`text` on either slot and `session text` on any pane take the same two flags.** The bare form
+and `--all` read the whole buffer, scrollback plus screen - `--all` is the explicit spelling of
+lite's default (the full app's bare `session text` is the screen only; a recorded difference);
+`--lines N` is the last N lines of that text, `--lines 0` the visible screen; a `--lines` that is
+not a whole number is refused naming it (it used to be dropped, and `--lines 5O` read everything
+and said ok); `--all` beside `--lines` is refused naming both. Both refusals come before the
+target is resolved. `session text --target <pane id>` under an overlay reads the SHELL; `--target
+<overlay id>` or `overlay text --pane X` the overlay.
+
+```
+ov=$(agwintermctl session overlay open "npm test" --pane right)   # the overlay's id
+agwintermctl session type "git status`n" --target $AGWINTERM_PANE_ID    # your own pane keeps working
+agwintermctl session overlay text --pane right --lines 20               # the overlay's last 20 lines
+agwintermctl session overlay close --pane right; agwintermctl session overlay result --pane right   # exit N
+```
 
 ## The sidebar
 
@@ -7995,7 +8092,8 @@ Two ways, and prefer the first:
 ```
 agwintermctl events --since <cursor>            # what changed; the reply carries the new cursor
 agwintermctl session output --target build      # the last COMPLETED command's output
-agwintermctl session text --target build        # the whole buffer, when you need context
+agwintermctl session text --target build        # the whole buffer (scrollback + screen), when you need context
+agwintermctl session text --lines 30 --target build   # its last 30 lines; --lines 0 = the screen; --all = the bare form
 ```
 
 `events` is cursor-polled: start with `agwintermctl events` to get a cursor, then pass it as
@@ -8059,9 +8157,9 @@ agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
 `window list` enumerates them.
 
-Nothing here takes the foreground from the user: `quick on` and `session overlay open` raise
-their popup only when this process already holds the foreground, and flash the taskbar button
-otherwise. `window select <name>` is the one verb whose purpose IS the raise, so it is attempted -
+Nothing here takes the foreground from the user: `quick on` and the session-wide `session overlay
+open` raise their popup only when this process already holds the foreground, and flash the taskbar
+button otherwise (a pane overlay is drawn inside the window and raises nothing). `window select <name>` is the one verb whose purpose IS the raise, so it is attempted -
 and the reply says what happened: `selected` only when the window is in front afterwards, and a
 string starting `not raised:` (Windows kept the foreground with the app the user is working in;
 the button flashes) when it is not. Both are `ok` - the window exists and the request was made,
@@ -8713,9 +8811,9 @@ static std::string ctlDispatch(const std::string& line) {
         if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
         // A NAMED target (not empty, not `active`) that resolves to no session is refused for
         // open, close, resize, copy and text with one wording: the overlay the caller meant may still be up,
-        // and ok would say it is gone. lite's overlay is a window-level popup, not per-session, so
-        // a target that DOES resolve is accepted whichever session it names — the popup covers the
-        // main window either way. Empty / `active` stays accepted even with no active session, so
+        // and ok would say it is gone. The session-wide slot is a window-level popup, not per-session,
+        // so a target that DOES resolve is accepted whichever session it names — the popup covers the
+        // main window either way (vocabulary bullet (d) of the P5-lite plan; the pane slot is the arm above). Empty / `active` stays accepted even with no active session, so
         // a bare close in an empty window is not contract-dependent on a session existing. The
         // bare `result` skips the target check (agwinterm's order: the window-wide value is not
         // about any session, and "nothing opened, resized or closed" would describe nothing).

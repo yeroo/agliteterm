@@ -444,7 +444,7 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   the text-flags overlay echoes three lines to have a tail to cut.
 
 ### Task 5: docs, trackers, tests
-- [ ] Skill: the overlay section rewritten around the two slots — the rule quoted from this plan,
+- [x] Skill: the overlay section rewritten around the two slots — the rule quoted from this plan,
       `--pane` on `open` / `close` / `result`, `copy` and `text` with their errors, the exit-status
       rule, the popup's `copy` answer, `session text --lines / --all`; the verb index; the env-ids
       bullet (a program inside a pane overlay holds the overlay's id); the old wording swept.
@@ -455,7 +455,81 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
       `docs/lite-parity.md`: the P5 entry → "Mirrored", the five differences of vocabulary bullet
       (a)–(e), the `session text` default under "What is deliberately different" — drafted in the
       notes below for the docs PR in the other repo after this merges.
-- [ ] `check-contract` re-run against `main` once #252 is there; `run-all -Strict` green.
+- [x] `check-contract` re-run against `main` once #252 is there; `run-all -Strict` green.
+      (#252 and #253 are both still OPEN on 2026-09-07 at the time of this task, so the `main` run
+      reports DRIFT — "same verbs, different expectations", red by design, exactly the P5 steps —
+      and the run against #252's branch file
+      (`https://raw.githubusercontent.com/yeroo/agwinterm/contract/p5-pane-overlays/tests/conformance/control-api.json`)
+      says "in step with agwinterm"; `test/control-api.json` is unchanged since task 3. The `main`
+      re-run is the CI step and turns green when #252 merges; nothing here to redo for it.
+      `run-all -Strict` with the dev CLI after the docs change and a fresh build: twelve suites, all
+      passed, no SKIP, no FAIL — `.ralphex/p5-t5-runall.log`.)
+- ➕ Task 5 notes. The skill's section is now "A command over the window, or over ONE pane": the
+  rule quoted from the vocabulary section (pointing at this plan as the one full copy), the pane
+  arm (`open` answers the id; every refusal of the table as a bullet with agwinterm's sentence;
+  `close` / `result` / `copy` / `text` with their three states), the exit-status rule of vocabulary
+  bullet (c), `tree`'s `paneOverlays`, the chord and the cover refusal, then the session-wide slot's
+  paragraph unchanged in substance plus the bare `result` / `text` / `copy` (the popup's `copy` =
+  `no selection`, said), then `text`'s two flags on both verbs; the frontmatter description, the
+  Detect section (a program inside a pane overlay holds the overlay's id, so a bare `session overlay
+  close` inside one closes it), the "Find out what happened" `session text` lines and the
+  foreground sentence (a pane overlay is in-window and raises nothing) follow. The old wording
+  ("a popup over the window", "one popup per window ... whichever session it names") survives only
+  as the session-wide slot's own sentence, labelled as such; the sweep of `src/`, `README.md`,
+  `qa/`, `docs/` finds "the whole buffer" only where gate 2 means it. README: the Terminals bullet
+  names the pane overlay and its badge, the Scriptable bullet carries the P5 paragraph after P4's,
+  the "What is saved" sentence covers the pane overlay, the Tests paragraph names the #250 probe;
+  48 verbs stays (no new `cmd ==` arm). `qa/panes.md` gains the intro's "A covered pane" paragraph
+  and the case, driven end to end by `qa/fixtures/pane-overlay.ps1` (the P4 fixture's shape: probe
+  the client, sandbox, `covered` split vertical, the overlay opened on the right with `echo
+  P5-OVERLAY-MARKER; Start-Sleep 300`, the left pane typed into by the session id, the four reads,
+  `PrintWindow` to `%TEMP%\agliteterm-pane-overlay\covered.png`, the close, the no-orphan check
+  on the overlay's own `powershell.exe`): 20/20 on the first run; the capture is
+  `docs/img/qa-p5-pane-overlay.png` — the left box with `echo P5-LEFT-MARKER` and its echo at the
+  prompt, the caret after it, the right box with `P5-OVERLAY-MARKER` on its first row and no prompt
+  (the command sleeps), the divider where it was, the `overlay` badge framed top-right, no framed
+  popup. `qa/control-honesty.md` gains the surface-reads case (its "Last run" is that fixture run);
+  `qa/selection.md` the drag-inside-an-overlay case (not run here — it needs the `PostMessage` drag
+  and eyes on the highlight; the automated half is the honesty block's `overlay copy` checks).
+- ➕ The `lite-parity.md` P5 entry, for the agwinterm docs PR after this merges (replacing "To be
+  mirrored: what P5 ... owes lite — P5-lite pending"):
+  "### Mirrored: what P5 (agwinterm #250) owed lite — P5-lite shipped. lite has pane overlays: a
+  pane overlay is IN-WINDOW, one more hidden `Session` hung on the shell it covers
+  (`Session::overlay`), sized to the shell's grid, painted in the pane's box instead of the shell
+  and reached by `focusedSession()` / `hitTest` as that pane's surface while it is open — not a
+  popup sized to the pane rect (a popup's `g_focusOverride` takes every key, so the sibling pane
+  could not stay interactive, the rule's one hard property), and not a recorded divergence: the
+  contract's four P5 steps and three refusals run the same on both products. `--pane left|right`
+  (`left` = slot 0, `right` = slot 1 whatever the axis, the slots `session focus` names), `open` /
+  `close` / `result` / `copy` / `text` on the slot with agwinterm's sentences verbatim
+  (`OverlayPanes.cs`), `paneOverlays` in `tree` as the same array of words, `session text --all` /
+  `--lines N`, the overlay id as `AGWINTERM_SESSION_ID` of the program inside, the chord closing the
+  focused pane's overlay first, the slot moving with its shell on a swap and dying with its pane —
+  all mirrored. What differs, each recorded in the P5-lite plan
+  (`docs/plans/completed/2026-09-07-p5-lite-mirror.md` there): (a) the session-wide slot is a
+  popup over the window, not a cover inside the content region (P2-lite, unchanged; `copy` on it
+  is always `no selection` — the popup paints no selection and takes no drag, lite's selection gap);
+  (b) `session text` and `overlay text` default to the WHOLE buffer (scrollback + screen) — `--all`
+  is the explicit spelling of lite's bare form, `--lines N` the last N lines of that text and
+  `--lines 0` the screen — where agwinterm's and agterm's bare `session text` is the screen only:
+  lite's skill promised "the whole buffer" and its suites read markers from history through it, so
+  the default stays and the flags give a caller the screen when it wants one; (c) `exit N` is the
+  exit status of the command `open` ran as PowerShell reports it (`$LASTEXITCODE` for a native
+  program, else 0 / 1 from `$?`), carried in an FTCS `OSC 133;D;<code>` mark the overlay's own
+  command line emits — read off the FIRST mark with an exit in that overlay; the pty-host protocol
+  carries no exit code and is frozen; a command that never completed leaves the slot's result as it
+  was, and `overlay still running` / `no overlay result` are refusals as in agwinterm; (d) the
+  session-wide `open` keeps accepting any target that resolves (P2-lite) where agwinterm refuses a
+  pane id of a split without `--pane` (#213) — except a pane overlay's own id, which names its slot
+  on both products; (e) `open --pane` answers the overlay's id (a lite session id, `<prefix>-<seq>`;
+  the program inside holds it) because the slot is created inline the way `session split on` is,
+  while the popup keeps its status word (created after the reply is written) — the contract's step
+  notes both spellings. Lite has no `--wait` / `--block` (the overlay stays up until closed, P2-lite)
+  and no `overlay not realized` / `OverlayIdGoneRefusal` (the emulator is built before `newSession`
+  returns; the slot's verbs run inline under one lock — documented, not emitted). Under "What is
+  deliberately different" add: **`session text` reads the whole buffer in lite** (screen + scrollback,
+  `--all` its explicit spelling) and the screen only in agwinterm and agterm; `--lines N` is the same
+  reader on both, and a script wanting the screen passes `--lines 0` / reads `--lines N` on either."
 
 ### Task 6: [Final] Verify acceptance criteria
 - [ ] `test/run-all.ps1 -Strict` green with `AGWINTERMCTL` = the P5 dev CLI; `check-contract`

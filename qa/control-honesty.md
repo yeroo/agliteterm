@@ -3,6 +3,9 @@
 `session overlay open --size-percent N`, `sidebar width N`, and the two popup verbs an agent loop
 calls all day (`quick on`/`off`, `session overlay open`/`close`). lite's half of parity batch P2
 (agwinterm #226, `qa/control-honesty.md` there is the sibling), with lite's own #24 riding along.
+P5 (agwinterm #250) adds the pane slot — `session overlay open <cmd> --pane left|right` and the
+reads on it (`result`, `copy`, `text`) — and the last case here is its picture: which surface each
+read really answers about.
 
 **The rule:** a call that answers `ok` did *what was asked*, and a call that will not do it answers
 `ok:false` and leaves the world untouched. `test/control-honesty.ps1` pins every reply and every
@@ -214,3 +217,57 @@ would stop); the popup's `WM_CLOSE`/`WM_DESTROY` regain their `SetForegroundWind
 with the foreground).
 
 **Cleanup:** close Notepad; `Stop-Sandbox $s`, always in a `finally`.
+
+---
+
+## `overlay text` reads the overlay; `session text --target <pane>` reads the shell under it
+
+**Guards:** the surface rule of P5-lite (`docs/plans/2026-09-07-p5-lite-mirror.md`, the vocabulary
+section): while a pane overlay is open, `--target active` on the focused pane and the overlay's own
+id reach the OVERLAY, and the pane's own id reaches the shell UNDERNEATH. The first run of the
+automated block found the reader lying about both: `dumpBufferRange` read `paintPane`'s snapshot of
+the grid, which is refreshed only when THAT session is painted, so a shell under an overlay answered
+its last painted screen as `ok` and an overlay on a session not on screen answered empty as `ok`.
+The reader now reads the emulator's live grid. `test/control-honesty.ps1` pins the three reads
+against markers; this case is the eyes: that what `overlay text` returns is what the right box
+SHOWS, and what `session text --target <pane>` returns is what the box shows once the overlay is
+closed — a command typed into the covered shell really ran there, unseen.
+
+**Setup:** the sandbox, one session, `session split on`; note the session id `$sid` and the split
+shell's id `$sp` (the reply). Every ctl call through `Send-Ctl`.
+
+**Steps:**
+1. `Overlay @('open','echo P5-HONEST-OV;','Start-Sleep','300','--pane','right','--target',$sid)`;
+   keep the reply as `$ov`. Wait ~2 s.
+2. `Send-Ctl $s @('session','type',"echo P5-HONEST-UNDER`r",'--target',$sp)` — the shell under the
+   overlay, by its own id. Wait ~1 s.
+3. Read four ways: `Overlay @('text','--pane','right','--target',$sid)`;
+   `Send-Ctl $s @('session','text','--target',$ov)`; `Send-Ctl $s @('session','text','--target',$sp)`;
+   `Send-Ctl $s @('session','focus','right')` then `Send-Ctl $s @('session','text')`.
+4. `Overlay @('text','--pane','right','--lines','2','--target',$sid)`.
+5. Capture the main window with `PrintWindow`.
+6. `Overlay @('close','--pane','right','--target',$sid)`. Wait ~1 s. `Send-Ctl $s @('session','text','--target',$sp)`;
+   `Overlay @('text','--pane','right','--target',$sid)`. Capture again.
+
+**Expect:**
+- step 3: `overlay text` answers `{"text": …}` and its `text` equals the overlay id's `session text`
+  byte for byte; both hold `P5-HONEST-OV` and NOT `P5-HONEST-UNDER`. The split shell's id holds
+  `P5-HONEST-UNDER` and NOT `P5-HONEST-OV`. The bare `session text` with slot 1 focused is the
+  overlay's text (the surface), not the shell's;
+- step 4: exactly two lines, the last two of the overlay's buffer (its marker and what follows);
+- step 5: the RIGHT box shows `P5-HONEST-OV`, no `P5-HONEST-UNDER`
+  anywhere in the window, the `overlay` badge in the right box's corner; the left box its own prompt;
+- step 6: `closed`. The split shell's id now reads `P5-HONEST-UNDER` at its prompt — the command
+  typed while covered ran in the shell underneath — and the second capture shows exactly that in
+  the right box, the badge gone. `overlay text --pane right` is refused `no overlay: --pane right
+  names which slot, and nothing is open in it` (`ok:false`, not an empty `text`).
+
+**Fails when:** `readSurfaceText` goes back to the painted snapshot (step 3's shell read is stale
+after the split's relayout, or the overlay reads empty); `resolveTarget` answers `surfaceOf` for a
+pane id (the shell can no longer be read while covered); `focusedSession()` stops returning the
+surface (step 3's bare read is the shell); or an empty slot's `text` answers `ok` with `""`.
+
+**Last run:** 2026-09-07, branch `feat/p5-lite-mirror`, dev `agwintermctl` (post-#250): the four
+reads and the two captures are what `qa/fixtures/pane-overlay.ps1` drives (its markers are the
+panes case's; the covered-shell read is `session text --target <split id>` holding its prompt and
+not the overlay's marker), PASS; the capture is `docs/img/qa-p5-pane-overlay.png`.
