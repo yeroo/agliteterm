@@ -32,7 +32,7 @@ $started = @()   # every window this run launched, for the teardown: the only on
 $born = @{}      # pid -> start time, read while the window is alive (an exited Process may refuse it)
 function Start-Lite([string]$inst, [string]$root) {
     $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru -Environment @{ LOCALAPPDATA = $root }
-    $script:started += $p; $script:born[$p.Id] = $p.StartTime
+    Pin-Owned $p; $script:started += $p; $script:born[$p.Id] = $p.StartTime   # pinned: its exit bounds the host it spawned
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         if (((& $ctl tree --json --pipe $inst 2>&1) -join '') -match '"ok":true') { return $p }
@@ -87,7 +87,7 @@ try {
 } finally {
     # Only the windows this run started (test/owned-procs.ps1). A sweep by exe path took every window
     # launched from this bin\ - a sibling suite's sandbox under run-all, or another agent's.
-    foreach ($q in $started) { try { $q.Refresh(); if (-not $q.HasExited) { Stop-Process -Id $q.Id -Force } } catch { } }
+    foreach ($q in $started) { try { if (-not $q.HasExited) { $q.Kill(); [void]$q.WaitForExit(5000) } } catch { } }
     Start-Sleep -Seconds 1
     # The pty-host outlives the UI by design, and it is ONE per machine: every lite window - the user's
     # own, another agent's sandbox - connects to the same `--pipe agliteterm` host, and only the first
@@ -95,7 +95,7 @@ try {
     # fails copying over it - which is how this suite broke the build once. So: stop a host only if one
     # of OUR windows spawned it (its proven child), and only while no lite window is left alive to be
     # using it; otherwise say so and leave it, since killing it ends every session on the machine.
-    $hosts = @(); foreach ($q in $started) { $hosts += Get-OwnedChildren $q.Id $born[$q.Id] 'agwinterm-ptyhost.exe' }
+    $hosts = @(); foreach ($q in $started) { $hosts += Get-OwnedChildren $q.Id $born[$q.Id] 'agwinterm-ptyhost.exe' (Exit-Of $q) }
     $windows = @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'")
     foreach ($h in $hosts) {
         if ($windows.Count) { "        (NOT stopping pty-host pid $($h.ProcessId), spawned by this run: $($windows.Count) lite window(s) still running may be attached to it)" }

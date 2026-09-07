@@ -103,18 +103,19 @@ function Start-Lite($inst) {
 }
 
 function Stop-Lite($p, [switch]$Kill) {
-    if ($Kill) { Stop-Process -Id $p.Id -Force; Start-Sleep -Seconds 2; return }
+    if ($Kill) { $p.Kill(); Start-Sleep -Seconds 2; return }
     $p.CloseMainWindow() | Out-Null
     for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $p.Refresh(); if ($p.HasExited) { break } }
-    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    if (-not $p.HasExited) { $p.Kill() }
     Start-Sleep -Seconds 1
 }
 
 # Best-effort teardown for a cell that threw part-way. A leaked instance keeps the pipe name, so the
-# NEXT run of that cell would connect to the stale process and test nothing.
+# NEXT run of that cell would connect to the stale process and test nothing. Both stop through the
+# Process object's own handle (Start-Process holds one), never by re-opening the pid.
 function Stop-Leftover($p) {
     if (-not $p) { return }
-    try { $p.Refresh(); if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; Start-Sleep -Seconds 1 } } catch { }
+    try { $p.Refresh(); if (-not $p.HasExited) { $p.Kill(); Start-Sleep -Seconds 1 } } catch { }
 }
 
 # A cell's fingerprint: workspace names (prefixed '#') and the session names inside them, in tree
@@ -483,13 +484,16 @@ function Lite-Pids { @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.e
 # order), never by name or command line - a window that merely LOOKS like ours (same exe, same --pipe)
 # is another agent's copy of this suite or the user's own, and is reported, not stopped. The relay
 # cmd.exe lives about a second (the ping), so it is collected while the old instance is on its way out
-# and remembered by pid + birth once it has gone; the relaunched window names that pid as its parent.
-function Restart-Relays([int]$oldId, [datetime]$oldBorn, $seen) {
-    foreach ($c in Get-OwnedChildren $oldId $oldBorn 'cmd.exe') { $seen[[int]$c.ProcessId] = $c.CreationDate }
+# - bounded by the old instance's own exit, since its pid is free once it is gone - and tracked with a
+# pinned handle (New-Tracked): the relaunched window must name the relay's pid as its parent AND be born
+# while the relay lived. Without the exit bound a relay pid that Windows hands to the next process
+# would make that process's windows "ours".
+function Restart-Relays([int]$oldId, [datetime]$oldBorn, $seen, [datetime]$oldExit = [datetime]::MaxValue) {
+    foreach ($c in Get-OwnedChildren $oldId $oldBorn 'cmd.exe' $oldExit) { if (-not $seen.ContainsKey([int]$c.ProcessId)) { $seen[[int]$c.ProcessId] = New-Tracked $c } }
     $seen
 }
 function Relaunched-Lites($relays) {
-    @($relays.GetEnumerator() | ForEach-Object { Get-OwnedChildren ([int]$_.Key) $_.Value 'agliteterm.exe' })
+    @($relays.Values | ForEach-Object { Get-OwnedChildren $_.Pid $_.Born 'agliteterm.exe' (Tracked-Exit $_) })
 }
 
 # The regression this cell exists to catch is also the regression that makes it dangerous: if
@@ -498,8 +502,22 @@ function Relaunched-Lites($relays) {
 # cell's pipe wait never sees it answer $inst and throws, so this is where it must be stopped - and it
 # can be, because the ownership chain reaches it regardless of what command line it came up with.
 # A window that the chain does not reach is reported by pid and left alone.
+#
+# A relay still alive is a launch still queued (`ping & start`): a window it starts AFTER this sweep
+# would outlive the cell, and the suite token. So the relays go first - stopped through their pinned
+# handles, then waited for - and only then are their children swept, twice, since the `start` may
+# have raced the stop. A relay that will not die makes the teardown INCOMPLETE, and the cell fails on
+# that word even if its assertions passed: nobody may read a PASS as "nothing of ours is left".
 function Stop-Owned-Relaunch($relays, [string]$inst, $known) {
+    foreach ($t in $relays.Values) {
+        if (-not (Tracked-Alive $t)) { continue }
+        "        (stopping relay cmd.exe pid $($t.Pid) before it can start a window: $($t.CommandLine))"
+        try { $t.Proc.Kill() } catch { }
+        if (-not $t.Proc.WaitForExit(5000)) { "        TEARDOWN INCOMPLETE: relay cmd.exe pid $($t.Pid) is still alive and may yet start a window"; $script:teardownIncomplete += "relay pid $($t.Pid)" }
+    }
     foreach ($l in Relaunched-Lites $relays) { Stop-OwnedRow $l 'owned relaunch' }
+    Start-Sleep -Milliseconds 700   # a window `start` had just begun shows up in Win32_Process late
+    foreach ($l in Relaunched-Lites $relays) { Stop-OwnedRow $l 'owned relaunch (late)' }
     Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'" |
         Where-Object { $known -notcontains $_.ProcessId -and $_.CommandLine -match [regex]::Escape($inst) } |
         ForEach-Object { "        (NOT stopping pid $($_.ProcessId): answers to $inst but is not proven ours: $($_.CommandLine))" }
@@ -512,10 +530,12 @@ function Restart-Cell {
     Reset-Cell $inst
     $before = ''; $after = ''; $err = ''
     $p = $null; $p2 = $null
-    $relays = @{}                             # relay cmd.exe pid -> its birth: the proof of the relaunch
+    $relays = @{}                             # relay cmd.exe pid -> New-Tracked record: the proof of the relaunch
     $known = Lite-Pids                        # includes the user's own lite, which must NOT be touched
+    $script:teardownIncomplete = @()
     try {
         $p = Start-Lite $inst
+        Pin-Owned $p                          # its exit time bounds the relays it may have started
         $known += $p.Id
         & $ctl session new --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -532,7 +552,7 @@ function Restart-Cell {
         # destroys its window); once more after, since the relay outlives its parent by the ping.
         for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $relays = Restart-Relays $oldId $oldBorn $relays; $p.Refresh(); if ($p.HasExited) { break } }
         if (-not $p.HasExited) { throw 'the old instance never exited after Restart everything' }
-        $relays = Restart-Relays $oldId $oldBorn $relays
+        $relays = Restart-Relays $oldId $oldBorn $relays (Exit-Of $p)
         if ($relays.Count -eq 0) { throw 'no relay cmd.exe was ever seen under the old instance: nothing can prove which window is the relaunch' }
 
         # The relaunch is a detached grandchild (cmd /c ping & start): wait for a window the relay
@@ -556,6 +576,7 @@ function Restart-Cell {
         $p = $null   # already exited: that is what this cell just asserted
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2; Stop-Owned-Relaunch $relays $inst $known }
+    if ($script:teardownIncomplete.Count -and -not $err) { $err = "TEARDOWN INCOMPLETE: $($script:teardownIncomplete -join ', ')" }
 
     if (-not $err -and $after -eq $before -and (SessionCount $before) -ge 2) {
         "  PASS  {0,-22} [{1}]" -f $Name, $after
