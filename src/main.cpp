@@ -7374,6 +7374,38 @@ static std::string overlayLinesRefusal(const std::string& raw) {
 // `text`'s `--all` and `--lines` are exclusive, on both verbs alike (one reader, two verbs).
 static const char* const kOverlayAllWithLines =
     "--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.";
+// What `text` reads, on `session text` and `session overlay text` alike (agwinterm's
+// OverlayTextArgs; the words above are its two refusals). Lite's DEFAULT is the whole buffer (gate 2
+// of the P5-lite plan — agwinterm's and agterm's is the screen, recorded in lite-parity.md), so
+// `--all` is the explicit spelling of the bare form here; `--lines N` (N >= 1) is the last N lines
+// of that same text (readSurfaceText), and `--lines 0` the visible screen — the sentence's promise,
+// agwinterm's meaning of 0. `lines` was silently DROPPED before P5 (`--lines 5O` read the buffer and
+// reported success); now anything that is not a whole number is refused, and `all` beside a
+// PRESENT `lines` — whatever its value — is refused naming both: a caller who wrote both meant two
+// different reads and must not get one of them in silence. `all` is a bool the way every bool arg
+// here is (true, "true" or "1"; anything else is the flag not asked for).
+struct TextArgs {
+    bool all = false;      // the whole buffer (lite's bare form too)
+    int64_t lines = -1;    // -1 = not asked (the whole buffer); 0 = the screen; N = the last N lines
+};
+static bool parseTextArgs(const JsonReq& req, TextArgs* out, std::string* refusal) {
+    *out = TextArgs{};
+    const std::string& all = req.get("args.all");
+    out->all = all == "true" || all == "1";
+    auto it = req.fields.find("args.lines");
+    if (it == req.fields.end()) return true;
+    if (out->all) { *refusal = kOverlayAllWithLines; return false; }
+    // Digits only (no sign, no fraction, no exponent). The parser keeps a number as its raw text
+    // and a string as its content, so a quoted "3" arrives as 3 and is accepted — lite cannot see
+    // the JSON kind (the CLI never sends a string; agwinterm refuses one); the value is quoted in
+    // the refusal whatever the kind was, as paneRefusal does it.
+    const std::string& raw = it->second;
+    bool digits = !raw.empty() && raw.size() <= 9;
+    for (char c : raw) if (c < '0' || c > '9') digits = false;
+    if (!digits) { *refusal = overlayLinesRefusal(raw); return false; }
+    out->lines = atoll(raw.c_str());
+    return true;
+}
 // The popup's own refusals (P2-lite), moved here unchanged. An unknown action names every action.
 static std::string overlayActionRefusal(const std::string& action) {
     return "overlay action '" + action + "' is not one of open, close, resize, result, copy, text; nothing done";
@@ -7559,12 +7591,20 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
 // Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
 // scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
 // mark's outputLine..endLine can be handed straight in.
-static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) {
+// `tail` (P5): -1 = the range as given; 0 = the visible screen (the range becomes the screen rows,
+// read under the same hold as the count, so a line the shell prints meanwhile cannot shift it);
+// N >= 1 = the last N lines of the whole buffer AS dumpBufferText RETURNS IT — after the trailing
+// blank rows below the prompt are squashed, so `--lines 3` on a pane whose prompt sits at row 3 of
+// 30 is the prompt and the two lines above it, not three blanks (agwinterm counts screen rows from
+// the bottom; lite's default is the whole buffer, and this is the tail of that — gate 2's reader).
+// One walk; the row logic is not copied.
+static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail) {
     FfiEmuInfo info{};
     std::string out;
     int64_t abs = 0;
     EnterCriticalSection(&g_lock);
     emu_info(s->emu, &info);
+    if (tail == 0) { from = info.historyCount; to = INT64_MAX; }
     std::vector<FfiCell> row(info.cols);
     auto appendRow = [&](const FfiCell* cells) {
         std::string line;
@@ -7601,9 +7641,28 @@ static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) {
             if (wanted(abs)) appendRow(&live[r * info.cols]);
     LeaveCriticalSection(&g_lock);
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
+    if (tail > 0) {
+        // The last `tail` lines of the trimmed text: each line ends in '\n', so the cut is after the
+        // (tail+1)-th newline from the end; fewer lines than asked = the whole text, unchanged.
+        int64_t seen = 0;
+        size_t cut = out.size();
+        while (cut > 0) {
+            if (out[cut - 1] == '\n' && ++seen > tail) break;
+            cut--;
+        }
+        out.erase(0, cut);
+    }
     return out;
 }
+static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) { return dumpBufferLines(s, from, to, -1); }
 static std::string dumpBufferText(Session* s) { return dumpBufferRange(s, -1, -1); }
+// The last N lines of dumpBufferText's answer (N >= 1), or the visible screen (N = 0).
+static std::string dumpBufferTail(Session* s, int64_t n) { return dumpBufferLines(s, -1, -1, n); }
+// THE reader behind `session text` and `session overlay text` (P5, gate 2): bare and `--all` the
+// whole buffer, `--lines N` its tail. parseTextArgs decided the words; this decides nothing.
+static std::string readSurfaceText(Session* s, const TextArgs& a) {
+    return a.lines < 0 ? dumpBufferText(s) : dumpBufferTail(s, a.lines);
+}
 
 // The output of the last COMPLETED command, delimited by the shell's FTCS (OSC 133) marks.
 // This is what an agent needs after asking a terminal to do something: not the whole screen,
@@ -8381,8 +8440,14 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr(res);
     }
     if (cmd == "session.text") {
+        // The whole buffer (history + screen), lite's default and `--all`'s meaning; `--lines N` its
+        // last N lines (P5, gate 2). The flags are refused BEFORE the target is looked at: a usage
+        // error is one whatever the target, and the CLI refused the pair before sending anything.
+        TextArgs ta;
+        std::string taWhy;
+        if (!parseTextArgs(req, &ta, &taWhy)) return ctlErr(taWhy);
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
-        return ctlOkStr(dumpBufferText(target));
+        return ctlOkStr(readSurfaceText(target, ta));
     }
     if (cmd == "surface.cursor") {
         // The caret COLUMN of the pane, as a bare JSON integer: {"ok":true,"result":<int>}. That is
@@ -8488,6 +8553,13 @@ static std::string ctlDispatch(const std::string& line) {
         if (paneIdx != kPaneSessionWide) {
             if (action == "resize") return ctlErr(kOverlayResizeWithPane);
             if (req.fields.count("args.size-percent")) return ctlErr(kOverlaySizeWithPane);
+        }
+        // `text`'s --all / --lines (P5, task 4): the same reader as `session text`, its two usage
+        // refusals here, before any resolve (agwinterm's order: after the size and pane words).
+        TextArgs textArgs;
+        if (action == "text") {
+            std::string textWhy;
+            if (!parseTextArgs(req, &textArgs, &textWhy)) return ctlErr(textWhy);
         }
         // --size-percent (the session-wide slot): validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
         // client area; openOverlay says why that differs from agwinterm's full region). Present ->
@@ -8608,13 +8680,13 @@ static std::string ctlDispatch(const std::string& line) {
                                 // silent-success class); `copy` is the selection made inside the
                                 // overlay (g_sel is keyed by Session*, so a drag in the pane's box
                                 // while it is covered is the overlay's), `no selection` when none;
-                                // `text` the overlay's whole buffer (gate 2; task 4 adds --lines /
-                                // --all). The clipboard is not touched by either.
+                                // `text` the overlay's whole buffer, or its tail with --lines (gate 2;
+                                // readSurfaceText). The clipboard is not touched by either.
                                 if (!shell->overlay) { refused = true; reply = overlayNoneRefusal(paneIdx); }
                                 else if (action == "copy") {
                                     if (!g_sel.isFor(shell->overlay)) { refused = true; reply = kOverlayNoSelection; }
                                     else { reply = selectionText(); isText = true; }   // re-entrant: one hold across the read
-                                } else { reply = dumpBufferText(shell->overlay); isText = true; }
+                                } else { reply = readSurfaceText(shell->overlay, textArgs); isText = true; }
                             }
                         }
                     }
@@ -8664,7 +8736,7 @@ static std::string ctlDispatch(const std::string& line) {
             Session* ov = g_overlaySession;
             if (!ov || !g_overlayHwnd || indexOfSession(ov) < 0) return ctlErr(kOverlayNone);
             if (action == "copy") return g_sel.isFor(ov) ? ctlOk(overlayTextReply(selectionText())) : ctlErr(kOverlayNoSelection);
-            return ctlOk(overlayTextReply(dumpBufferText(ov)));
+            return ctlOk(overlayTextReply(readSurfaceText(ov, textArgs)));
         }
         // g_overlayHwnd is written on the UI thread; this read is the same one close always made.
         // The user can close the popup by hand between this read and the posted message running —

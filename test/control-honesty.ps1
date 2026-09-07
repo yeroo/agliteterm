@@ -2417,6 +2417,113 @@ try {
         Check 'close --target <overlay id> on the right: closed, the words gone, tree fired' ([string](ConvertFrom-Json $raw).result -eq 'closed' -and (Wait-Gone $ovg) -and (Wait-Shell5 'p5-ov-g' $false) -and (Words $aid) -eq '' -and (EvSince $cur 'tree') -ge 1) "raw: $raw, words '$(Words $aid)'"
         $raw = OverlayP @('result', '--pane', 'right', '--target', $aid); $r = ConvertFrom-Json $raw
         Check 'and result --pane right after a close with nothing completed there is still refused: no overlay result' (-not $r.ok -and [string]$r.error -eq 'no overlay result') "raw: $raw"
+        # ---- task 4: `text` with --lines N and --all, on both verbs (gate 2) ------------------------
+        # One reader, two verbs: the bare form and `--all` are the WHOLE buffer (lite's default, a
+        # recorded divergence from agwinterm's screen), `--lines N` the last N lines of that same text
+        # (the trailing blank rows under the prompt squashed first, so N lines come back, not blanks),
+        # `--lines 0` the visible screen (the sentence's promise). `--all` with `--lines` is refused
+        # naming both — by the CLI before anything is sent, and by the server for a raw client with
+        # the same words; a `--lines` that is not a whole number is refused, not dropped (it used to
+        # read the buffer and report success). Both usage refusals come BEFORE the target is resolved.
+        $allWithLines = '--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.'
+        function LinesRefusal([string]$raw) { "--lines needs a whole number of lines (0 = the visible screen), not '$raw'. Nothing read." }
+        function LinesOf([string]$text) {   # the lines of a read: newline-separated, the empty piece after the final newline dropped
+            $a = @(($text -replace "`r", '') -split "`n")
+            if ($a.Count -gt 0 -and $a[-1] -eq '') { $a = @($a | Select-Object -SkipLast 1) }
+            $a   # emitted element by element: every caller wraps the call in @()
+        }
+        function TailOf([string]$text, [int]$n) { ((@(LinesOf $text) | Select-Object -Last $n) -join "`n") + "`n" }
+        function TextArgs([string[]]$rest) { Get-CtlResult $s (@('session', 'text') + $rest) }
+        function RawText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.text","target":"' + $tgt + '","args":{' + $argsJson + '}}') }
+        function RawOvText([string]$tgt, [string]$argsJson) { Send-Raw ('{"cmd":"session.overlay","target":"' + $tgt + '","args":{"action":"text",' + $argsJson + '}}') }
+        # The split shell has its banner, two markers and their prompts: more than three lines, some of
+        # them on the screen with blank rows under the prompt.
+        Check 'setup: two more markers in the split shell, so the buffer has a known tail' ((Mark $sp9 'p5-t4-a') -and (Mark $sp9 'p5-t4-b')) "text: $(Get-PaneText $s $sp9)"
+        Start-Sleep -Milliseconds 400
+        $full = Get-PaneText $s $sp9
+        $fullLines = @(LinesOf $full)
+        Check 'the bare session text has at least four lines to cut a tail from' ($fullLines.Count -ge 4) "lines: $($fullLines.Count)`n$full"
+        Check 'session text --all is the bare form, byte for byte (the whole buffer, gate 2)' ((TextArgs @('--all', '--target', $sp9)) -eq $full) "all:`n$(TextArgs @('--all', '--target', $sp9))`nbare:`n$full"
+        $l3 = TextArgs @('--lines', '3', '--target', $sp9)
+        Check 'session text --lines 3 is exactly three lines' (@(LinesOf $l3).Count -eq 3) "got $(@(LinesOf $l3).Count):`n$l3"
+        Check 'and they are the LAST three of the bare form' ($l3 -eq (TailOf $full 3)) "lines 3:`n$l3`ntail:`n$(TailOf $full 3)"
+        # The count is from the END: the last marker sits some lines above the bottom (the prompt's
+        # lines below it — one, or three on a multi-line prompt), and --lines reaches it at exactly
+        # that depth, one line short of it not.
+        $depth = 0
+        for ($k = $fullLines.Count - 1; $k -ge 0; $k--) { if ($fullLines[$k] -match 'p5-t4-b') { $depth = $fullLines.Count - $k; break } }
+        Check "the last marker is $depth lines from the bottom, and --lines $depth reaches it while --lines $($depth - 1) does not" ($depth -ge 2 -and (TextArgs @('--lines', "$depth", '--target', $sp9)) -match 'p5-t4-b' -and -not ((TextArgs @('--lines', "$($depth - 1)", '--target', $sp9)) -match 'p5-t4-b')) "depth $depth`n$full"
+        $l1 = TextArgs @('--lines', '1', '--target', $sp9)
+        Check '--lines 1 is the last line alone: the prompt, no marker' (@(LinesOf $l1).Count -eq 1 -and $l1 -eq (TailOf $full 1) -and -not ($l1 -match 'p5-t4')) "lines 1: $l1"
+        $l0 = TextArgs @('--lines', '0', '--target', $sp9)
+        $rows = [int](Node $aid).rows
+        Check '--lines 0 is the visible screen: a tail of the bare form, no longer than the grid is tall, the last marker on it' ($l0.Length -gt 0 -and $full.EndsWith($l0) -and @(LinesOf $l0).Count -le $rows -and $l0 -match 'p5-t4-b') "rows $rows, lines $(@(LinesOf $l0).Count):`n$l0"
+        Check '--lines 9999 (more than there are) is the whole buffer, unchanged' ((TextArgs @('--lines', '9999', '--target', $sp9)) -eq $full)
+        # The pair and the bad count: the CLI refuses first (its stderr, nothing sent), the server the same words.
+        $raw = Send-Ctl $s @('session', 'text', '--all', '--lines', '3', '--target', $sp9)
+        Check 'session text --all --lines 3 is refused by the CLI in the server''s words, nothing sent' ($raw -match [regex]::Escape($allWithLines) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = Send-Ctl $s @('session', 'text', '--lines', '5O', '--target', $sp9)
+        Check 'session text --lines 5O (a letter O) is refused by the CLI naming the value, not dropped' ($raw -match [regex]::Escape((LinesRefusal '5O')) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = RawText $sp9 '"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'a raw session.text with all and lines is refused by the server with the same sentence' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawText $sp9 '"all":true,"lines":0'; $r = ConvertFrom-Json $raw
+        Check 'and with lines 0 beside all too: lines PRESENT is what is refused, whatever its value' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawText 'no-such-session-9999' '"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'the usage refusal comes before the resolve: the same sentence on an unknown target' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        foreach ($bad in @(@('"5O"', '5O'), @('-1', '-1'), @('2.5', '2.5'), @('true', 'true'), @('""', ''))) {
+            $raw = RawText $sp9 ('"lines":' + $bad[0]); $r = ConvertFrom-Json $raw
+            Check "a raw lines of $($bad[0]) is refused naming it: --lines needs a whole number" (-not $r.ok -and [string]$r.error -eq (LinesRefusal $bad[1])) "raw: $raw"
+        }
+        $raw = RawText $sp9 '"all":true'; $r = ConvertFrom-Json $raw
+        Check 'a raw all:true alone is the whole buffer, ok' ([bool]$r.ok -and [string]$r.result -eq $full) "raw: $raw"
+        $raw = RawText $sp9 '"all":false,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a raw all:false beside lines is the flag NOT asked for: the tail, ok' ([bool]$r.ok -and [string]$r.result -eq (TailOf $full 2)) "raw: $raw"
+        # The same three on `overlay text`, on a pane slot and on the popup — the same reader.
+        # Three echo lines, so the overlay's buffer has a tail to cut (its command sleeps, so no prompt
+        # follows them); Wait-Shell5 finds the shell by the first `echo <marker>;` on its command line.
+        $ovt = OpenP 'p5-ov-t4; echo p5-ov-t4-b; echo p5-ov-t4-c' 'right' $aid
+        Check 'setup: an overlay on the right for the text flags, its three lines up' ([bool]$ovt -and (Wait-PaneText $ovt 'p5-ov-t4-c') -and (Wait-Shell5 'p5-ov-t4' $true)) "raw: $($script:lastOpen)"
+        Start-Sleep -Milliseconds 600
+        $ovFull = Get-PaneText $s $ovt
+        $ovBare = OvRead @('text', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --pane right (bare) is the overlay''s whole buffer: what session text --target <overlay id> reads' ($ovBare -and $ovBare.ok -and ([string]$ovBare.result.text) -eq $ovFull) "overlay text: $($script:lastRead)`nsession text:`n$ovFull"
+        $ovAll = OvRead @('text', '--all', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --all --pane right equals the bare form' ($ovAll -and $ovAll.ok -and ([string]$ovAll.result.text) -eq $ovFull) "raw: $($script:lastRead)"
+        Check 'the overlay''s buffer is the three echo lines' (@(LinesOf $ovFull).Count -eq 3) "lines: $(@(LinesOf $ovFull).Count)`n$ovFull"
+        $ov2 = OvRead @('text', '--lines', '2', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --lines 2 --pane right is its last two lines: the second and third echo, not the first' ($ov2 -and $ov2.ok -and @(LinesOf ([string]$ov2.result.text)).Count -eq 2 -and ([string]$ov2.result.text) -eq (TailOf $ovFull 2) -and ([string]$ov2.result.text) -eq "p5-ov-t4-b`np5-ov-t4-c`n") "raw: $($script:lastRead)`ntail:`n$(TailOf $ovFull 2)"
+        $ov1 = OvRead @('text', '--lines', '1', '--target', $ovt)
+        Check 'and --lines 1 through the overlay id with --pane omitted (the id names its slot): the last line' ($ov1 -and $ov1.ok -and ([string]$ov1.result.text) -eq (TailOf $ovFull 1)) "raw: $($script:lastRead)"
+        $ov0 = OvRead @('text', '--lines', '0', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --lines 0 is the overlay''s screen: a tail of its buffer, the marker on it' ($ov0 -and $ov0.ok -and $ovFull.EndsWith([string]$ov0.result.text) -and ([string]$ov0.result.text) -match 'p5-ov-t4') "raw: $($script:lastRead)"
+        Check 'the shell UNDER the overlay keeps its own tail: session text --lines 2 --target <right pane id> is that shell''s last two lines, not the overlay''s' ((TextArgs @('--lines', '2', '--target', $sp9)) -eq (TailOf (Get-PaneText $s $sp9) 2))
+        $raw = Send-Ctl $s @('session', 'overlay', 'text', '--all', '--lines', '2', '--pane', 'right', '--target', $aid)
+        Check 'overlay text --all --lines 2 is refused by the CLI, nothing sent' ($raw -match [regex]::Escape($allWithLines) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"right","all":true,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a raw overlay text with all and lines is refused by the server with the same sentence' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"right","lines":"x"'; $r = ConvertFrom-Json $raw
+        Check 'a raw overlay text with lines "x" is refused naming it' (-not $r.ok -and [string]$r.error -eq (LinesRefusal 'x')) "raw: $raw"
+        $raw = RawOvText 'no-such-session-9999' '"pane":"right","all":true,"lines":2'; $r = ConvertFrom-Json $raw
+        Check 'the overlay''s usage refusal comes before the resolve too' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        $raw = RawOvText $aid '"pane":"left","lines":2'; $r = ConvertFrom-Json $raw
+        Check 'a good --lines on an EMPTY slot is still the slot''s refusal: no overlay, naming the slot' (-not $r.ok -and [string]$r.error -eq 'no overlay: --pane left names which slot, and nothing is open in it') "raw: $raw"
+        $raw = OverlayP @('text', '--lines', '2', '--pane', 'top', '--target', $aid); $r = ConvertFrom-Json $raw
+        Check 'and a bad --pane word is refused before the text flags are read' (-not $r.ok -and [string]$r.error -match "^--pane 'top' is not one of") "raw: $raw"
+        # The popup: the same reader on the session-wide slot.
+        $raw = Overlay @('open', 'echo', 'p5-pop-t4;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
+        Check 'setup: the popup opens for the text flags' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-t4')) "raw: $raw"
+        Start-Sleep -Milliseconds 400
+        $popBare = OvRead @('text'); $popText = if ($popBare -and $popBare.ok) { [string]$popBare.result.text } else { '' }
+        $popAll = OvRead @('text', '--all')
+        Check 'overlay text --all on the popup equals the bare form' ($popText.Length -gt 0 -and $popAll -and $popAll.ok -and ([string]$popAll.result.text) -eq $popText) "raw: $($script:lastRead)"
+        $pop1 = OvRead @('text', '--lines', '1')
+        Check 'overlay text --lines 1 on the popup is its last line' ($pop1 -and $pop1.ok -and ([string]$pop1.result.text) -eq (TailOf $popText 1)) "raw: $($script:lastRead)`ntail: $(TailOf $popText 1)"
+        $raw = RawOvText '' '"all":true,"lines":1'; $r = ConvertFrom-Json $raw
+        Check 'a raw popup text with all and lines is refused the same way' (-not $r.ok -and [string]$r.error -eq $allWithLines) "raw: $raw"
+        Overlay @('close') | Out-Null
+        Check 'the popup closed' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        $raw = OverlayP @('close', '--pane', 'right', '--target', $aid)
+        Check 'teardown: the text-flags overlay closed, its id and shell gone' ([string](ConvertFrom-Json $raw).result -eq 'closed' -and (Wait-Gone $ovt) -and (Wait-Shell5 'p5-ov-t4' $false)) "raw: $raw"
         Send-Ctl $s @('session', 'split', 'off', '--target', $aid) | Out-Null
         Check 'teardown: single again, the node count as before' ((Wait-Single $aid) -and (NodeCount) -eq $before) "nodes $(NodeCount) vs $before"
         Check 'nothing of the block is left running: no shell with a p5-ov marker on its command line anywhere' (@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'echo p5-ov-' }).Count -eq 0)

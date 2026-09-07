@@ -420,12 +420,28 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   the VERB left it alone.
 
 ### Task 4: `text` with `--lines` and `--all`, on both verbs
-- [ ] `dumpBufferTail(s, n)`: the last N lines of what `dumpBufferText` returns (one walk; no
+- [x] `dumpBufferTail(s, n)`: the last N lines of what `dumpBufferText` returns (one walk; no
       second copy of the row logic). `session.text`: `lines` (a whole number ≥ 1, else refused with
       agwinterm's `LinesRefusal` sentence) and `all` (bool); both present → `AllWithLines`.
       `session.overlay text` the same three through the same reader. `copy` → `{"text": …}`.
-- [ ] Honesty: `session text --lines 3` is three lines, `--all` equals the bare form, the
+- [x] Honesty: `session text --lines 3` is three lines, `--all` equals the bare form, the
       combination refused through a raw request; the same on `overlay text`.
+- ➕ `--lines 0` is ACCEPTED as the visible screen, not refused: agwinterm's `LinesRefusal` sentence
+  (verbatim here) promises "0 = the visible screen", and a refusal of 0 that names 0 as valid would
+  be a lie; agwinterm's `SurfaceText.Dump` reads 0 as the screen too. So `lines` is a whole number
+  ≥ 0: 0 the screen rows (the range fixed under the same hold as the count), N ≥ 1 the last N lines
+  of the TRIMMED whole-buffer text (the blank rows under the prompt squashed first — agwinterm
+  counts screen rows from the bottom, so its `--lines 3` on a prompt at row 3 of 30 is blanks; lite's
+  is the prompt and what is above it, the tail of gate 2's default). One reader, `dumpBufferLines`,
+  with a `tail` argument; `dumpBufferRange` / `dumpBufferText` / `dumpBufferTail` are its three
+  spellings, `readSurfaceText` the verb-facing one. `all` beside a PRESENT `lines` (any value,
+  `0` too) is `AllWithLines`; `all:false` beside `lines` is the flag not asked for. Both usage
+  refusals come before the target is resolved (an unknown target hears the usage sentence).
+- ➕ The sandbox shell's prompt is three lines (starship: the user / path line wrapped, then `#`), so
+  "the last three lines" of a pane is the prompt with no marker on it; the honesty check finds the
+  marker's depth from the bottom and pins that `--lines <depth>` reaches it while `--lines <depth-1>`
+  does not — prompt-agnostic. An overlay whose command sleeps has NO prompt after its output, so
+  the text-flags overlay echoes three lines to have a tail to cut.
 
 ### Task 5: docs, trackers, tests
 - [ ] Skill: the overlay section rewritten around the two slots — the rule quoted from this plan,
