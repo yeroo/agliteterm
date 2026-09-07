@@ -9087,14 +9087,18 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlOkStr("cleared");
         }
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        bool flagged;
         {   // closed since the resolve (#21's class), then the cover test — see the remap comment
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("flag", target->id, "changed"));
+            // The write under the SAME hold as the re-check (rename's shape): released in between, a
+            // promotion could erase the object and the flag would land where nobody sees it (revmux r4)
+            target->flagged = wantOn(op, target->flagged);
+            flagged = target->flagged;
         }
-        target->flagged = wantOn(op, target->flagged);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
-        return ctlOkStr(target->flagged ? "flagged" : "unflagged");
+        return ctlOkStr(flagged ? "flagged" : "unflagged");
     }
     if (cmd == "session.seen") {   // clear the unread badge
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
@@ -9102,11 +9106,9 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("seen", target->id, "marked"));
+            target->seenDone = completedMarks(target);   // under the same hold as the re-check (revmux r4)
+            target->unread = 0;
         }
-        EnterCriticalSection(&g_lock);
-        target->seenDone = completedMarks(target);
-        target->unread = 0;
-        LeaveCriticalSection(&g_lock);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("seen");
     }

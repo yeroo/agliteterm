@@ -110,8 +110,9 @@ Copied, not re-decided, from the agwinterm plan:
   that never completed (closed early, or a command line that did not parse) leaves the slot's
   result as it was; (d) the session-wide `open` keeps accepting any target that resolves (P2-lite),
   where agwinterm refuses a pane id of a split without `--pane` (#213); (e) `open --pane` answers
-  an id, the popup a status word (gate 4); (f) an overlay's id on a session verb (`flag`, `seen`,
-  `rename`, `status`, `duplicate`, `move`) is REFUSED as a cover naming the session to use, where
+  an id, the popup a status word (gate 4); (f) an overlay's id on a session verb (`flag on`/`off`/
+  `toggle`, `seen`, `rename`, `status`, `duplicate`, `move` — `flag clear` takes no target and
+  unflags every session, in both products) is REFUSED as a cover naming the session to use, where
   agwinterm's `FindSesForTarget` lands a scratch or overlay cover id on the session it covers —
   lite's `session context` refuses every hidden target already (revmux r1), and one refusal family
   is what P4-lite's covers speak (revmux r2).
@@ -551,8 +552,9 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   on both products; (e) `open --pane` answers the overlay's id (a lite session id, `<prefix>-<seq>`;
   the program inside holds it) because the slot is created inline the way `session split on` is,
   while the popup keeps its status word (created after the reply is written) — the contract's step
-  notes both spellings; (f) an overlay's (or any cover's) id on `flag` / `seen` / `rename` /
-  `status` / `duplicate` / `move` is refused naming the session it covers (`session <verb>: '<id>'
+  notes both spellings; (f) an overlay's (or any cover's) id on `flag on`/`off`/`toggle` / `seen` /
+  `rename` / `status` / `duplicate` / `move` (`flag clear` takes no target and unflags every session,
+  in both products) is refused naming the session it covers (`session <verb>: '<id>'
   is a scratch/overlay/quick pane, not a session; … Nothing <done>.`), where agwinterm lands a
   scratch or overlay cover id on the session it covers (`FindSesForTarget`) — a program inside a
   lite overlay that wants the pane's session row names that session's id (`tree`'s `paneOverlays`
@@ -760,6 +762,20 @@ UI thread's own indexing — out of this batch, lite #43). The `Session::overlay
 `active` on an identity verb is "this shell" — right for a pane verb, wrong for a session verb (now
 both halves). `restore capture` open-coded `splitOwnerOf`'s walk (now the helper). Codex was
 mailed each fix commit's hash as it landed; no findings arrived by hub mail during the three rounds.
+
+**What revmux round 4 found** (`.revmux/tasks/p5-lite-mirror/04-after-fix-3`, narrowed to the third
+fix `c2fa22c`): **no Major, no Critical** — two prose Minors and three pre-existing, the round that
+closes the review. The Minors: difference (f)'s two copies in this plan and the `qa/control-honesty.md`
+clause written in `c2fa22c` still said "every other verb" without the `flag clear` carve-out the same
+commit put in the four copies of THE RULE — the sixth and seventh copies now carry it (grep OLD
+wording in every copy, including the ones a fix writes). The pre-existing, one class: the re-check's
+hold released before the write in `flag` and `seen` (a promotion between the two still landed the
+flag on the erased object and answered ok) — both writes moved into the hold that holds the re-check,
+rename's shape, plain-field writes with no call inside; `status` (`setStatus` under `g_statusLock`),
+`duplicate` (`newSession` outside any hold) and `move` (`idxOf` and the reorder walk unheld, then
+`moveSessionTo`'s own hold) cannot move under `g_lock` without restructuring — that is #21's
+dispatcher-wide lock (home: P9-lite), and the round-4 sites are recorded there. No fifth round: the
+code change is two writes moved inside an existing hold, the shape the round endorsed.
 
 ## Technical Details
 
