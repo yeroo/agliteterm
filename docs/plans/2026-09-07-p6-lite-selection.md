@@ -154,8 +154,9 @@ All in `src/main.cpp` unless said (line numbers on `83cffde`, the P5 branch tip)
   agwinterm defect to fix there (follow-up issue; the contract steps then pin `ok:false`).
 - **(b)** `selection finalize` never answers `finalized (copy-on-select off)`: lite's
   release-copies rule has no off switch (a `CopyOnSelect` knob is P10's, the configuration surface).
-- **(c)** `selection all` on any popup (overlay, quick or scratch) is refused `the popup paints no selection`; agwinterm's
-  covers take a selection. P7-lite paints one and lifts this.
+- **(c), retired by P7:** P6 refused `selection all` on popup terminals with
+  `the popup paints no selection`. P7 paints selections and supports mouse/keyboard selection in
+  overlay, quick and scratch popups. The P6 implementation details below remain historical.
 - **(d)** `selection copy`'s clipboard write is posted to the UI thread; the reply counts the text
   posted. A caller reading the clipboard right after waits for the window's next message (the
   suites' 300 ms).

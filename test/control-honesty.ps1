@@ -2406,7 +2406,7 @@ try {
         Check 'the popup opens over a session with a pane overlay' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero) "raw: $raw"
         Check 'overlay text (no --pane) reads the POPUP: {text} with its marker' (Wait-OvText @('text') 'p5-pop-2') "raw: $($script:lastRead)"
         $raw = OverlayP @('copy'); $r = ConvertFrom-Json $raw
-        Check 'overlay copy on the popup is refused: no selection (the popup takes no drag; said in the skill)' (-not $r.ok -and [string]$r.error -eq 'no selection') "raw: $raw"
+        Check 'overlay copy before selecting in the popup is refused: no selection' (-not $r.ok -and [string]$r.error -eq 'no selection') "raw: $raw"
         Check 'and the pane slot is untouched by the popup: paneOverlays still ["right"], text --pane right still the pane overlay' ((Words $aid) -eq 'right' -and (OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -match 'p5-ov-g')
         Overlay @('close') | Out-Null
         Check 'the popup closed' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
@@ -2807,10 +2807,12 @@ try {
         Check 'selection setup has a popup and its id' ($hp -ne [IntPtr]::Zero -and [bool]$popupId)
         Focus-SandboxPopup $hp
         $r = Selection 'all'
-        Check 'all on active after popup logical WM_SETFOCUS refuses without replacing the shell selection' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected)
+        Check 'all on active after popup logical WM_SETFOCUS selects the popup and replaces the shell selection' ($r.ok -and $r.result -eq 'selected all' -and (Selected $sa) -eq '')
         $r = Selection 'all' $popupId
         $popupCopy = ConvertFrom-Json (Overlay @('copy','--target',$sa))
-        Check 'popup all is refused; no invisible selection is installed and shell selection survives' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and -not $popupCopy.ok -and $popupCopy.error -eq 'no selection' -and (Selected $popupId) -eq '' -and (Selected $sa) -eq $selected)
+        Check 'popup all by id selects the same range read by overlay copy' ($r.ok -and $popupCopy.ok -and (Selected $popupId) -eq $popupCopy.result.text -and (Selected $sa) -eq '')
+        Selection 'clear' $popupId | Out-Null
+        Selection 'all' $sa | Out-Null
         foreach ($case in @(@('copy','no selection'), @('clear','cleared'), @('finalize','finalized (empty)'))) {
             $r = Selection $case[0] $popupId
             Check "popup selection $($case[0]) answers $($case[1]) without changing the shell selection" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected)
@@ -2818,7 +2820,7 @@ try {
         Overlay @('close','--target',$sa) | Out-Null
         [void](Wait-Overlay $false)
 
-        # Quick and scratch share paintPopup's -1 sentinel with the overlay popup. The quick
+        # Quick and scratch share popup selection painting with the overlay popup. The quick
         # session is the one the earlier quick checks created (off hides it without unlisting).
         foreach ($kind in 'quick','scratch') {
             $cursor = [long](Get-CtlResult $s @('events')).cursor
@@ -2835,7 +2837,7 @@ try {
             Focus-SandboxPopup $coverHwnd
             foreach ($target6 in @('active', $coverId)) {
                 $r = Selection 'all' $target6
-                Check "$kind popup all ($target6) refuses and leaves the shell selection intact" (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected -and (Selected $coverId) -eq '')
+                Check "$kind popup all ($target6) selects its own surface, not the shell" ($r.ok -and $r.result -eq 'selected all' -and (Selected $sa) -eq '')
             }
             if ($kind -eq 'quick') { Send-Ctl $s @('quick','off') | Out-Null }
             else { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }

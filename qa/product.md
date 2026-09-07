@@ -71,31 +71,22 @@ can go green having driven nothing; it happened while writing agwinterm's copy o
 
 ## Where lite differs from agwinterm, on purpose
 
-Cases must not assume the main app's behaviour. As of 0.17.11:
+Cases must not assume the main app's behaviour. As of P7 (2026-09-07):
 
 - **A split is a hidden session, not a pane object.** It has no tree row and no name; `session split`
   hands back its id, which is the only handle on it. The full app models panes inside a session
   instead. Behaviour matches: the split belongs to its session either way.
-- **No mark mode, no drag-autoscroll.** Select All exists only as the `selection all` verb (no chord).
 - **Selection API differences:** (a) unresolved targets are `ok:false`, with lite's usual missing
   or ambiguous-target sentence (agwinterm currently answers `ok:true` / `no session`);
-  (b) finalize always uses release-copy, with no off mode; (c) `selection all` on a popup (overlay,
-  quick or scratch) is
-  refused `the popup paints no selection`, because it paints no highlight; (d) clipboard writes
-  are posted, so wait for the UI message (the suites use 300 ms); (e) Select All pins to the app's
-  screen on the alt screen, but the wheel and drag still reach main-screen history until P7.
+  (b) finalize always uses release-copy, with no off mode; (d) API clipboard writes
+  are posted, so wait for the UI message (the suites use 300 ms). P7 retires the popup refusal (c)
+  and the alt-screen history gap (e): painting, wheel, drag and mark mode all pin to the app's screen.
+  The configured mark chord toggles off as well as on; a screen/surface change ends mark mode
+  before the next key is routed. Select All has a seeded, rebindable Ctrl+Shift+A chord.
   Also, `copied N chars` counts UTF-8 bytes here and UTF-16 code units in agwinterm; the text is
   the same, but N differs for non-ASCII selections.
 - **Scrollback is not configurable** — lite does not call `agwcore_emu_set_scrollback` yet, so there
   is no `scrollback-lines = 0` case here.
-- **The wheel and drag on the alt screen still reach main-screen history.** `paintPane` composes the history tail
-  above the live grid using `scrollOff` on *either* screen, and `hitTest` maps clicks through the
-  same offset. So wheeling up inside a full-screen app shows real scrollback, and a selection there
-  copies what is displayed. agwinterm pins the offset to 0 on the alt screen instead, and had a bug
-  where only the renderer did — highlight and clipboard disagreed. Here they agree, so this is a
-  difference, not a defect. Recorded as a MANUAL case: neither a posted `WM_MOUSEWHEEL` nor
-  Shift+PageUp scrolls the view while a full-screen app is up (0.17.11), so the harness cannot get
-  there — a real wheel can.
 
 ## What is here, and what is still a script
 

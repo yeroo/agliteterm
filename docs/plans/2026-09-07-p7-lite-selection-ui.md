@@ -214,23 +214,23 @@ and one that enters the alt screen (`\e[?1049h`), paints distinct text (`ALT-r` 
 WITHOUT enabling mouse reporting (that is the point of Task 0). Every assertion names the rule it
 pins ("THE PIN: …", "release copies: …"). Checks, in order:
 
-- **Task 0**: main screen, `[LiteUi]::Wheel` up 3 notches → `session text` shows history lines the
-  live grid did not (`session text` reads the composed view; `surface cursor` is NOT a scroll probe —
-  it reports the column regardless, :8736-8740's doc); wheel down → back. Alt screen: wheel up 10 → nothing changes (`session text` identical, `session copy` after
+- **Task 0**: main screen, posted wheel up 3 notches → `PrintWindow` shows older history;
+  wheel down → identical cell-region capture. `session text` reads the whole buffer and cannot
+  observe scrolling; `surface cursor` reports only a column. Alt screen: wheel up 10 → unchanged capture (`session copy` after
   `selection all` has no `MARKER-`). This is the check that replaces `qa/selection.md`'s MANUAL case.
 - **Split**: two panes, focus left, wheel over the RIGHT → the right scrolls, the left does not.
 - **Drag-autoscroll** (`DragHold` from inside the pane to y = pane top − 20, hold 1500 ms): the
   selection's first row is older than the top visible row was (`session copy` contains a `MARKER-`
-  that was not on screen); the view scrolled (`session text` shows it); release copies to the
+  that was not on screen); the view scrolled (`PrintWindow` shows it); release copies to the
   clipboard the same text. On the alt screen: the same drag-hold → `session copy` starts at the top
-  visible row (`ALT-0`) and contains no `MARKER-`; `session text` unchanged. Below the bottom edge:
+  visible row (`ALT-0`) and contains no `MARKER-`. Below the bottom edge:
   symmetric, stops at the last row.
 - **Double-click** on a word of `MARKER-7 word two` → `session copy` is exactly that word; the
   clipboard equals it (release copies). **Triple-click** → the whole line, trailing spaces trimmed.
   Double-click on a blank cell → no selection, clipboard untouched.
 - **Mark mode**: plant a clipboard marker; `Chord('M', shift)` → `StatusPart(2)` ends with `MARK`;
   `Key(VK_RIGHT, 5)`, `Key(VK_DOWN, 1)` → `session copy` is the caret's cell to five cells right and
-  one row down (compute from `surface cursor` and `session text`); `Key(VK_RETURN)` → the clipboard
+  one row down (seed a known caret with VT; the cursor API has no row); `Key(VK_RETURN)` → the clipboard
   equals `session copy`, `session copy` still non-empty (kept), `MARK` gone. Again with `Esc` →
   `session copy` `""`, clipboard untouched. Again with `Chord('M', shift)` twice → off, `""`.
   While on, `Key('X')` reaches no shell (`session text` unchanged after 300 ms). Alt screen: enter
@@ -242,7 +242,7 @@ pins ("THE PIN: …", "release copies: …"). Checks, in order:
 - **Bindings**: `Key_MarkMode` cleared in the registry (restored in `finally`) → `Chord('M', shift)`
   does nothing (no `MARK`); set to Ctrl+Shift+K → that chord enters. The palette and the Keyboard
   dialog are out of the harness's reach: assert the registry round-trip and the chord only.
-- **Popup**: `session overlay open --pane 0` (P5) → `[LiteUi]::Drag` on the overlay's hwnd
+- **Popup**: `session overlay open <command>` WITHOUT `--pane` → `[LiteUi]::Drag` on the overlay's hwnd
   (`Wait-Overlay`) → `overlay copy` returns the dragged text; `selection all --target <overlay id>`
   → `selected all`, `overlay copy` returns everything; wheel in the overlay on its alt screen →
   nothing. `PrintWindow` of the overlay shows an inverted band where the highlight is (compare two
@@ -259,13 +259,13 @@ pins ("THE PIN: …", "release copies: …"). Checks, in order:
 ## Progress Tracking
 
 - [x] Task 0: the posted wheel verified on the main screen; viewport oracle corrected
-- [ ] Task 1: THE PIN — `viewOff`, wheel under the pointer, popup wheel, `KB_SCROLL*`
-- [ ] Task 2: drag-autoscroll (timer 3)
-- [ ] Task 3: double- and triple-click
-- [ ] Task 4: mark mode, Select All, bindings, palette, status bar
-- [ ] Task 5: the popup paints a selection; difference (c) retired
-- [ ] Task 6: tests (`test/selection-ui.ps1`), qa cases
-- [ ] Task 7: docs
+- [x] Task 1: THE PIN — `viewOff`, wheel under the pointer, popup wheel, `KB_SCROLL*`
+- [x] Task 2: drag-autoscroll (timer 3)
+- [x] Task 3: double- and triple-click
+- [x] Task 4: mark mode, Select All, bindings, palette, status bar
+- [x] Task 5: the popup paints a selection; difference (c) retired
+- [x] Task 6: tests (`test/selection-ui.ps1`), qa cases
+- [x] Task 7: docs
 - [ ] Task 8: [Final] verify acceptance criteria
 
 ## Implementation Steps
@@ -273,7 +273,7 @@ pins ("THE PIN: …", "release copies: …"). Checks, in order:
 ### Task 0: the posted wheel
 
 Build `af737e7` (or the P7 branch at its first commit), start a sandbox, plain shell, print 200
-lines, `[LiteUi]::Wheel($s.Hwnd, <x inside the pane>, <y inside the pane>, 3)`, read `session text`.
+lines, post wheel at a point inside the pane and compare `PrintWindow` cell-region captures.
 Record the outcome in this plan (Technical Details) with the check's name. If the wheel reaches:
 rewrite `test/ui-lib.ps1:112-113`, `qa/product.md:91-93`, `qa/selection.md:148-150` — the finding was
 "a wheel posted at a TUI holding mouse mode is forwarded to the TUI", which is correct behaviour, not
@@ -327,14 +327,12 @@ say what it was.
   from the cell row (`emu_copy_history_row` / the live grid, as `selectionText` :4218 reads them):
   `a` = first cell of the run, `b` = one past the last (blank = space or NUL, `rune == ' ' ||
   rune == 0`); nothing on a blank cell; `g_sel = { pane, ss, false, absRow, a, absRow, b, evicted,
-  alt }`; record `g_lastClickMs = GetTickCount()`, `g_clickCount = 2`; copy on the release: since
-  `active` is false, `OnLButtonUp` :6693 would not copy — copy here instead (`copySelection()` after
-  the hold; `postClipboardUtf8` is not needed on the UI thread), the same as agwinterm's
-  `FinalizeSelection` at `:465`.
+  alt }`; record the double-click time, surface and point. Keep `active = true` through the actual
+  corresponding button-up; the shared release handler copies then, not during button-down.
 - Triple: `OnLButtonDown` :6616: when `GetTickCount() - g_lastClickMs < GetDoubleClickTime()` and
   `g_clickCount == 2` → the whole visible line `{absRow, 0, absRow, cols}`, `g_clickCount = 3`,
-  `active = false`, copy; else the drag as today and `g_clickCount = 1`.
-- Lite's rule stays "selected with the mouse → copied on release"; a double/triple-click IS a release.
+  `active = true`, copy on the corresponding button-up; else begin a normal drag.
+- Lite's rule stays "selected with the mouse → copied on release", including double/triple-click.
 
 ### Task 4: mark mode, Select All
 
@@ -430,13 +428,42 @@ say what it was.
 
 ## Technical Details
 
+- **Implementation choices:** `endMarkModeIfMoved()` is the fallback before key routing and on
+  UI status/caret-timer updates, because focus writes have no single choke point. It reconciles
+  both surface identity and screen generation before a key can be swallowed. Popup focus/hide
+  paths invoke it too. Painting does not make focus decisions. Mouse helpers share rectangle,
+  viewport mapping, capture and timer ownership between frame and popup HWNDs.
+- **Initial UI evidence:** 32 checks passed in `selection-ui-20260907T225558-2f9fa0`; generation
+  13 released after owned window/host exit and clipboard/registry verification. The prior run
+  stopped at a transient clipboard read failure (12 checks, generation 12); a bounded read retry
+  fixed the test harness. Further split/popup-family/boundary checks and review are pending.
+- **Expanded harness correction:** WinForms/OLE test clipboard writes could leave a delayed-render
+  owner on the test thread while posted-input helpers blocked that thread. Runs at generations
+  15/16 observed empty clipboard reads and delayed popup startup (41/34 checks, 3/2 failures).
+  Test marker/read operations now use native clipboard cmdlets, while original rich formats are
+  still materialized and restored/verified in cleanup. Popup readiness uses a bounded wait.
+  The repeat passes Ctrl+C, both drag directions, alt-screen bounds, split pointer targeting,
+  popup/quick/scratch release-copy, and cleared/rebound mark bindings. Every attempt retained
+  ownership through teardown and released only after its cleanup report.
+  Run `selection-ui-20260907T230524-1f5193`: **46 checks, 0 failures**, generation 17 released.
+  Fresh build `p7-build-20260907T230717` passed; generation 18 released. The canonical contract
+  check passed (`contract: in step with agwinterm`). Popup/mark and Select All binding extensions
+  are in the next 50-check verification run.
+- **Full-suite constraint:** this worktree still inherits P6's unsafe legacy cleanup paths.
+  Do not run the whole desktop suite until Claude's separately owned cleanup repair is safely
+  integrated; token ownership does not authorize killing another user's window or shared host.
+  The P7 harness performs no sweeps: it holds direct process handles, refuses pre-existing
+  lite/host instances, checks residue without killing unknown processes, restores state, then
+  releases its exact token. Local callers may supply `AGLITETERM_TEST_RECEIPT` to borrow their
+  still-live receipt through all child tests; isolated CI has no hub helper.
+
 - **Why one helper for the offset.** P6's difference (e) existed because three readers of
   `scrollOff` (`paintPane`, `hitTest`, `selectAllOf`) each stated the alt rule or did not; agwinterm's
   own history (`SelectionBoundsTests.cs:14-17`: one rule "reached three times by three different
   doors") is the warning. `viewOff` is the door.
-- **Why the drag copies on a double-click.** `OnLButtonUp` copies only an `active` drag; a
-  double-click's selection is complete at the click, so the copy happens there. The observable rule
-  ("selected with the mouse → on the clipboard when the button comes up") is unchanged.
+- **Why double/triple-click stay active until release.** A complete word/line range is painted at
+  button-down, but the clipboard must remain unchanged until the matching button-up. The shared
+  release handler enforces this rather than copying early in the double-click handler.
 - **Why mark mode's end is a choke point, not nine sites.** Nine `g_focus` writes plus the popup's
   focus override; a mode left on after a focus change swallows the user's keys at the new surface —
   the worst failure this batch can ship. Find the one place every focus change passes through (the
