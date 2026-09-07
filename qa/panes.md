@@ -16,8 +16,10 @@ plan's vocabulary section (`docs/plans/completed/2026-09-06-p4-lite-mirror.md`).
 
 **A covered pane (P5):** a pane may hold a PANE OVERLAY — `session overlay open <cmd> --pane
 left|right` — one more hidden session drawn in that pane's box instead of its shell, badged
-`overlay`, and the pane's SURFACE while it is open (keys, the mouse, `--target active` reach
-it; the pane's own id reaches the shell underneath). `left` is slot 0 and `right` slot 1
+`overlay`, and the pane's SURFACE while it is open (keys, the mouse, and `--target active` on a
+SURFACE verb — `text`, `type`, `copy` — reach it; on a session verb `active` is the session under
+the pane, on a pane verb the pane's shell; the pane's own id reaches the shell underneath). `left`
+is slot 0 and `right` slot 1
 whatever the axis; the slot moves with its shell on a swap and dies with its pane. The rule in
 full is the P5-lite plan's vocabulary section (`docs/plans/completed/2026-09-07-p5-lite-mirror.md`);
 the popup over the whole window is the session-wide slot and is unchanged.

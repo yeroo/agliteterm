@@ -2587,8 +2587,34 @@ try {
         Send-Ctl $s @('session', 'focus', 'right') | Out-Null
         Start-Sleep -Milliseconds 400
         Check 'the duplicate closed, the split session back on screen with its covered pane focused, the overlay still up' ((NodeCount) -eq $before -and [bool](Node $aid).active -and (SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4' -and (Wait-Shell5 'p5-ov-t4' $true 1000)) "nodes $(NodeCount), block '$(SplitBlock $aid)'"
-        # `lines` past int range: the CLI refuses it as not a whole number (its own parse); a raw
-        # client's number saturates to "everything" on the server — neither wraps to a small N.
+        # ---- an EXPLICIT overlay id on the session verbs (revmux r2): refused as a cover ----
+        # `active` is remapped; the overlay's own id is not — and the program inside sends it as
+        # its default target. Before this, `duplicate --target <overlay id>` cloned the FTCS
+        # wrapper's command line into a visible session and the other five answered ok for a write
+        # on an object with no node (r1 listed them; the fix covered `active` only).
+        function IdCover([string]$verb, [string]$id, [string]$nothing) {
+            "session ${verb}: '$id' is a scratch/overlay/quick pane, not a session; it has no sidebar row and no session line in the state file, so there is nothing of it to act on. Name the session it covers (its own id), or dismiss it with ``session scratch off``, ``session overlay close`` or ``quick off``. Nothing $nothing."
+        }
+        $flag0 = [bool](Node $aid).flagged
+        foreach ($case in @(
+            @('duplicate', @('session', 'duplicate', '--target', $ovt), 'created'),
+            @('flag', @('session', 'flag', 'on', '--target', $ovt), 'changed'),
+            @('seen', @('session', 'seen', '--target', $ovt), 'marked'),
+            @('rename', @('session', 'rename', 'p5-cover-renamed', '--target', $ovt), 'renamed'),
+            @('status', @('session', 'status', 'blocked', '--target', $ovt), 'set'),
+            @('move', @('session', 'move', 'up', '--target', $ovt), 'moved'))) {
+            $raw = Send-Ctl $s $case[1]; $r = ConvertFrom-Json $raw
+            Check "session $($case[0]) --target <overlay id> is refused as a cover, naming the verb, the id and the three dismissals" (-not $r.ok -and [string]$r.error -eq (IdCover $case[0] $ovt $case[2])) "raw: $raw"
+        }
+        Start-Sleep -Milliseconds 500
+        Check 'and nothing changed: no node added, one wrapper shell, the name, the flag, the block and the surface as they were' ((NodeCount) -eq $before -and @(Shell5 'p5-ov-t4').Count -eq 1 -and [string](Node $aid).name -eq $name0 -and [bool](Node $aid).flagged -eq $flag0 -and (SplitBlock $aid) -eq $block9 -and (Active) -match 'p5-ov-t4' -and (Resolves $ovt)) "nodes $(NodeCount), shells $(@(Shell5 'p5-ov-t4').Count), name '$((Node $aid).name)', block '$(SplitBlock $aid)'"
+        $raw = Send-Ctl $s @('session', 'flag', 'on', '--target', $sp9); $r = ConvertFrom-Json $raw
+        Check 'while an explicit SPLIT shell id is no cover: flag on --target <split shell id> answers flagged (P4''s meaning, on a shell nobody sees)' ([bool]$r.ok -and [string]$r.result -eq 'flagged') "raw: $raw"
+        Send-Ctl $s @('session', 'flag', 'off', '--target', $sp9) | Out-Null
+        # `lines` past int range: the CLI refuses it as not a whole number (its own int32 parse —
+        # the sentence is the CLI's and is wrong about a valid whole number: agwinterm #254, lite
+        # #42; this pins what the CLI does today, not that it is right); a raw client's number
+        # saturates to "everything" on the server — neither wraps to a small N.
         $raw = Send-Ctl $s @('session', 'text', '--lines', '99999999999', '--target', $sp9)
         Check '--lines 99999999999 is refused by the CLI, nothing sent' ($raw -match [regex]::Escape((LinesRefusal '99999999999')) -and -not ($raw -match '"ok"')) "raw: $raw"
         $raw = RawText $sp9 '"lines":99999999999'; $r = ConvertFrom-Json $raw

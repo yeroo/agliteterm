@@ -390,7 +390,8 @@ struct Session {
     // verb `active` is this shell, see ctlDispatch's remap; `--target <this shell's id>` reaches
     // the shell underneath). The slot hangs on the shell, so a swap or a promotion moves it with the
     // shell by construction and `split close` / `session close` / the shell exiting take it along
-    // (closePaneOverlay is the one primitive). The rule — three slots, `left` = slot 0 and `right`
+    // (unlistOverlayLocked is the one unlisting: closePaneOverlay calls it for the verb, the chord
+    // and closeSessionAt, closeSplitSide for the pane it removes). The rule — three slots, `left` = slot 0 and `right`
     // = slot 1 whatever the axis, the sibling pane interactive throughout — is stated ONCE, in
     // docs/plans/completed/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is
     // written"); nothing here paraphrases it. nullptr = the slot is empty. Written under g_lock.
@@ -1638,8 +1639,8 @@ static bool fitSidebarToClient(int clientW) {
     return true;
 }
 
-// THE SURFACE SEAM (P5). What a pane SHOWS and what its keys, mouse and `--target active` reach:
-// the shell's pane overlay while one is open, else the shell. Every path that draws, hits or types
+// THE SURFACE SEAM (P5). What a pane SHOWS and what its keys, mouse and `--target active` on a
+// surface verb reach: the shell's pane overlay while one is open, else the shell. Every path that draws, hits or types
 // into a pane by its g_pane index asks this (paint, hitTest, mouseReport, the selection anchor,
 // InvalidateCaret, focusedSession — and through it sendBytes, scrollFocused, resolveTarget's
 // `active`; syncPaneSizes sizes BOTH, the shell and its cover, off `overlay` directly); a path that
@@ -6398,9 +6399,14 @@ static void nextBlocked() {
     MessageBeep(MB_OK);   // nothing blocked right now
 }
 static void toggleFlag(Session* s) {
-    if (s && s->hidden) s = splitOwnerOf(s);   // the split shell's pane: its session's flag (a cover has no owner)
-    if (!s || s->hidden) return;   // popup/split shells aren't tree sessions
-    s->flagged = !s->flagged;
+    {   // under g_lock: splitOwnerOf walks g_sessions, which a control thread's `session new` may be
+        // growing under its own hold (revmux r2 of P5-lite: the walk syncPaneSizes locks for the
+        // same reason); the flag flips under the same hold so `tree` never reads it half-way.
+        LockG hold;
+        if (s && s->hidden) s = splitOwnerOf(s);   // the split shell's pane: its session's flag (a cover has no owner)
+        if (!s || s->hidden) return;   // popup/split shells aren't tree sessions
+        s->flagged = !s->flagged;
+    }
     refreshTree();                 // repaints the pennant + persists via saveSessionState
 }
 static void toggleFlagView() {
@@ -7396,7 +7402,7 @@ static std::string overlayDisagree(const std::string& target, int targetIndex, i
            "; --pane " + paneWord(paneIndex) + " names the other one. Nothing opened.";
 }
 // A pane overlay's own id on `--target` with `--pane` omitted names its slot (the rule: the id
-// reaches the overlay from anywhere), so the two usage refusals for that slot name the id the guard
+// reaches the overlay from anywhere on the surface verbs), so the two usage refusals for that slot name the id the guard
 // saw, not a `--pane` the caller never passed.
 static std::string overlayIdResizeRefusal(const std::string& target, int index) {
     return "'" + target + "' is the " + paneWord(index) + " pane's overlay, which is always full-pane and cannot be resized; pass the session id to resize the session-wide overlay. Nothing resized.";
@@ -7487,6 +7493,22 @@ static std::string sessionSelectCover(const std::string& paneId) {
     return "session select: '" + paneId + "' is a scratch/overlay/quick pane, not a session; select the session "
            "it covers (its own id), or dismiss it with `session scratch off`, `session overlay close` or `quick off`. Nothing selected.";
 }
+// `session flag` / `seen` / `rename` / `status` / `duplicate` / `move --target <any cover's id>`:
+// the same family, one sentence (revmux r2 of P5-lite: `duplicate` on a pane overlay's id cloned
+// the FTCS wrapper's command line into a visible session, and the other five answered ok for a
+// write on an object with no node, no row and no state line — one nobody can see; the remap covers
+// `active` only, and a program inside the overlay sends the overlay's own id as its default
+// target). A split shell's id is not a cover and passes (P4's meaning). `verb` is the CLI word,
+// `nothing` the verb's own participle for the "Nothing X." tail.
+static std::string sessionIdentityCover(const char* verb, const std::string& paneId, const char* nothing) {
+    return std::string("session ") + verb + ": '" + paneId + "' is a scratch/overlay/quick pane, not a session; it has no "
+           "sidebar row and no session line in the state file, so there is nothing of it to act on. Name the session it "
+           "covers (its own id), or dismiss it with `session scratch off`, `session overlay close` or `quick off`. Nothing " +
+           nothing + ".";
+}
+// A hidden session no visible session names as its split shell: a cover (closeSessionAt's
+// discriminator, splitOwnerOf's nullptr). Caller holds g_lock.
+static bool isCoverLocked(Session* s) { return s->hidden && !splitOwnerOf(s); }
 // `session focus`'s words (SplitAxes.TryFocusIndex): primary = slot 0 and split = slot 1 on either
 // axis; left/right = slot 0/1 on a VERTICAL split only; top/bottom = slot 0/1 on a HORIZONTAL one
 // only; other = the slot not focused. A direction that does not exist on the axis is refused naming
@@ -8003,11 +8025,13 @@ owner - a flag or a name on its hidden shell is one nobody can see), on a pane v
 close`, the split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a
 focused split pane is the unsplit the chord does) - because the overlay has no identity of its own
 (no node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
-shell's id keeps P4's meaning on every verb; `--target <pane id>` reaches the shell **underneath** (`session
+shell's id keeps P4's meaning on every verb but `session select`, which shows the session the pane
+belongs to (the focus on slot 0); `--target <pane id>` reaches the shell **underneath** (`session
 text` reads the surface underneath); `--target <overlay id>` reaches the overlay from anywhere on
-the surface verbs and is refused as a cover by the structural verbs (`session close`, `select`,
-`context`, `split`, `split close`, `swap`, `restore capture` - each names the verb that dismisses
-it), and on `session overlay` itself names that overlay's slot - the same as passing its `--pane`
+the surface verbs and is refused as a cover by EVERY other verb - the structural ones (`session
+close`, `select`, `context`, `split`, `split close`, `swap`, `restore capture`) and the session
+ones (`flag`, `seen`, `rename`, `status`, `duplicate`, `move`), each naming the verb that
+dismisses it - and on `session overlay` itself names that overlay's slot - the same as passing its `--pane`
 word - for as long as the id resolves (an overlay that closed is reached by `--pane` only); with
 `--pane` naming the other side it is refused. The slot moves with its pane (a swap, a `split close` of the other pane)
 and dies with it (`split close`, `split off`, the shell exiting when that removes the pane - a
@@ -8554,8 +8578,10 @@ static std::string ctlDispatch(const std::string& line) {
     // written on it is one nobody can see), the session that shell belongs to (splitOwnerOf); the
     // PANE-class verbs (`session close`, the split verbs, `restore capture`: P4's rule — a pane id
     // reaches that shell, `close` on the focused split pane is the unsplit the chord does) keep the
-    // shell. An EXPLICIT id keeps its meaning on every verb (a split shell's id reaches that
-    // shell, the cover refusals stand, `--target <overlay id>` reaches the overlay).
+    // shell. An EXPLICIT id keeps its meaning on every verb but one (a split shell's id reaches that
+    // shell — except on `session select`, below, which shows the session the pane belongs to with
+    // the focus on slot 0; `--target <overlay id>` reaches the overlay on the surface verbs and is
+    // refused as a cover by every other verb: the structural refusals and sessionIdentityCover).
     if (target && (targetWord.empty() || targetWord == "active") &&
         cmd != "session.type" && cmd != "session.write" && cmd != "session.output" && cmd != "session.text" &&
         cmd != "surface.cursor" && cmd != "session.copy" && cmd != "session.paste" && cmd != "session.overlay") {
@@ -8707,6 +8733,7 @@ static std::string ctlDispatch(const std::string& line) {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string st = req.get("args.status");
         if (st.empty()) return ctlErr("session status needs a state");
+        { LockG hold; if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("status", target->id, "set")); }
         setStatus(target, st);
         emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -8804,7 +8831,7 @@ static std::string ctlDispatch(const std::string& line) {
             }
         }
         // A pane overlay's OWN id on --target with --pane omitted names its slot (the rule: the id
-        // reaches the overlay from anywhere, and on this verb it is the same as passing its word,
+        // reaches the overlay from anywhere on the surface verbs, and on this one it is the same as passing its word,
         // for as long as the id resolves). Before this arm the id resolved as any hidden session and
         // the popup arm acted on the WINDOW's popup: `close --target <pane overlay id>` closed the
         // popup, or answered ok "no overlay" while the program ran on. The two usage refusals name
@@ -8820,17 +8847,15 @@ static std::string ctlDispatch(const std::string& line) {
         if (paneIdx == kPaneSessionWide && !t.empty() && t != "active" && target && target->hidden) {
             LockG hold;
             if (indexOfSession(target) >= 0)
-                for (Session* sh : g_sessions) if (sh->overlay == target) {
-                    Session* owner = splitOwnerOf(sh);
-                    if (!owner) break;
-                    int slot = sh == owner ? 0 : 1;
-                    if (owner->swapped) slot = 1 - slot;
-                    if (action == "resize") return ctlErr(overlayIdResizeRefusal(t, slot));
-                    if (req.fields.count("args.size-percent")) return ctlErr(overlayIdSizeRefusal(t, slot));
-                    paneIdx = slot;
-                    inferred = true;
-                    break;
-                }
+                if (Session* sh = shellHolding(target))
+                    if (Session* owner = splitOwnerOf(sh)) {   // an overlay on a cover's shell is nothing to infer from
+                        int slot = sh == owner ? 0 : 1;
+                        if (owner->swapped) slot = 1 - slot;
+                        if (action == "resize") return ctlErr(overlayIdResizeRefusal(t, slot));
+                        if (req.fields.count("args.size-percent")) return ctlErr(overlayIdSizeRefusal(t, slot));
+                        paneIdx = slot;
+                        inferred = true;
+                    }
         }
         if (paneIdx != kPaneSessionWide) {
             if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
@@ -8855,8 +8880,7 @@ static std::string ctlDispatch(const std::string& line) {
                 else if (indexOfSession(hit) < 0) { refused = true; reply = kOverlayNoSuchTarget; }   // closed since the resolve (#21)
                 else {
                     // An overlay id: the shell that holds it, remembered for the agreement check.
-                    Session* viaOverlay = nullptr;
-                    if (hit->hidden) for (Session* sh : g_sessions) if (sh->overlay == hit) { viaOverlay = sh; break; }
+                    Session* viaOverlay = shellHolding(hit);
                     Session* shellHit = viaOverlay ? viaOverlay : hit;
                     if (!owner) owner = splitOwnerOf(shellHit);
                     if (!owner) { refused = true; reply = kOverlayNoSuchTarget; }   // a quick / scratch / popup cover is no session
@@ -9039,12 +9063,14 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlOkStr("cleared");
         }
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        { LockG hold; if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("flag", target->id, "changed")); }
         target->flagged = wantOn(op, target->flagged);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr(target->flagged ? "flagged" : "unflagged");
     }
     if (cmd == "session.seen") {   // clear the unread badge
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        { LockG hold; if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("seen", target->id, "marked")); }
         EnterCriticalSection(&g_lock);
         target->seenDone = completedMarks(target);
         target->unread = 0;
@@ -9059,6 +9085,7 @@ static std::string ctlDispatch(const std::string& line) {
         {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
             // reassignment frees the old buffer once the name outgrows the small-string buffer)
             LockG hold;
+            if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("rename", target->id, "renamed"));
             // The name and the context (session.context, below) are two separate fields: a rename
             // writes this one and leaves `context` exactly as it was, and neither is derived from
             // the other.
@@ -9228,6 +9255,7 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        { LockG hold; if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("duplicate", target->id, "created")); }
         int cols, rows; newSessionGrid(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
@@ -9456,6 +9484,7 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "session.move") {   // workspace <sel> = relocate; dir up|down = reorder within its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        { LockG hold; if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("move", target->id, "moved")); }
         int from = idxOf(target);
         std::string wsSel = req.get("args.workspace");
         if (!wsSel.empty()) {
@@ -9799,8 +9828,14 @@ static std::string ctlDispatch(const std::string& line) {
                                     ? g_workspaces[g_activeWs] : g_workspaces[0];
             // The focused pane's SESSION, not its surface (P5): a covered pane's overlay is named
             // `overlay` and is no session; the field names the session the pane belongs to.
-            Session* fs = focusedShell();
-            if (fs) if (Session* owner = splitOwnerOf(fs)) fs = owner;   // a split shell: its session's name
+            std::string activeName;
+            {   // under g_lock: splitOwnerOf walks g_sessions on this control thread while another
+                // connection's `session new` may be growing it (revmux r2 of P5-lite)
+                LockG hold;
+                Session* fs = focusedShell();
+                if (fs) if (Session* owner = splitOwnerOf(fs)) fs = owner;   // a split shell: its session's name
+                if (fs) activeName = narrow(fs->name);
+            }
             return ctlOk(std::string("{") +
                          "\"sidebarVisible\":" + (g_showSidebar ? "true" : "false") +
                          // Always false, and not a stub: this client has no fullscreen mode at all,
@@ -9809,7 +9844,7 @@ static std::string ctlDispatch(const std::string& line) {
                          ",\"maximized\":" + (IsZoomed(w->hwnd) ? "true" : "false") +
                          ",\"quickTerminalVisible\":" + ((g_quickHwnd && IsWindowVisible(g_quickHwnd)) ? "true" : "false") +
                          ",\"activeWorkspace\":\"" + jsonEscape(narrow(aws)) + "\"" +
-                         ",\"activeSession\":\"" + jsonEscape(fs ? narrow(fs->name) : std::string()) + "\"" +
+                         ",\"activeSession\":\"" + jsonEscape(activeName) + "\"" +
                          // Beyond the contract, and kept: the geometry is what a tiling script wants,
                          // and extra fields are allowed.
                          ",\"name\":\"" + jsonEscape(narrow(w->name)) + "\"" +

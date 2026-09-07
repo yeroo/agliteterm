@@ -140,9 +140,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   that pane's box instead of its shell (`left` = slot 0, `right` = slot 1, whatever the axis; a
   one-pane session takes `left`) and **answers the overlay's id**, a session id the program inside
   holds as its `AGWINTERM_SESSION_ID`; the sibling pane keeps rendering and taking input, and the
-  overlay is the covered pane's **surface** — keys, the mouse and `--target active` reach it, the
-  pane's own id reaches the shell underneath, the overlay's id reaches it from anywhere and on
-  `session overlay` names its slot. Refused with nothing opened: a word that is not `left` /
+  overlay is the covered pane's **surface** — keys and the mouse reach it, the pane's own id
+  reaches the shell underneath, and on `session overlay` the overlay's id names its slot (the
+  `--target` rule is below). Refused with nothing opened: a word that is not `left` /
   `right`, `--pane right` on one pane (`pane not visible`), a slot already holding one (`pane
   overlay already open` — no silent replace), a `--target` naming the other side, and
   `--size-percent` / `resize` with `--pane` (a pane overlay is always full-box; the CLI refuses
@@ -162,8 +162,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   focused pane's overlay; `--target active` on a session verb (`select`, `flag`, `rename`,
   `duplicate`, …) is the session under the focused pane, on a pane verb (`close`, the split
   verbs, `restore capture`) the pane's shell, on a surface verb (`type`, `text`, `copy`, …) the
-  overlay; `session close` / `select` on any overlay's id is refused as a cover; nothing of it
-  is persisted.
+  overlay; an overlay's id reaches it on the surface verbs only and is refused as a cover by
+  every other verb (`close`, `select`, `flag`, `rename`, `duplicate`, …); nothing of it is
+  persisted.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's

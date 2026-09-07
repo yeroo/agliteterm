@@ -70,12 +70,14 @@ Copied, not re-decided, from the agwinterm plan:
   split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a focused
   split pane is the unsplit the chord does) — because the overlay has no identity of its own (no
   node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
-  shell's id keeps P4's meaning on every verb; `--target <pane id>` reaches the shell
-  **underneath** (`session
-  text` reads the surface underneath); `--target <overlay id>` reaches the overlay from anywhere on
-  the surface verbs (lite resolves hidden sessions by id already) and is refused as a cover by the
-  structural verbs (`session close`, `select`, `context`, `split`, `split close`, `swap`, `restore
-  capture` — each names the verb that dismisses it), and on `session overlay` itself names that
+  shell's id keeps P4's meaning on every verb but `session select`, which shows the session the
+  pane belongs to (the focus on slot 0); `--target <pane id>` reaches the shell **underneath**
+  (`session text` reads the surface underneath); `--target <overlay id>` reaches the overlay from
+  anywhere on the surface verbs (lite resolves hidden sessions by id already) and is refused as a
+  cover by EVERY other verb — the structural ones (`session close`, `select`, `context`, `split`,
+  `split close`, `swap`, `restore capture`) and the session ones (`flag`, `seen`, `rename`,
+  `status`, `duplicate`, `move`), each naming the verb that dismisses it — and on `session
+  overlay` itself names that
   overlay's slot — the same as passing its `--pane` word — for as long as the id resolves (an
   overlay that closed is reached by `--pane` only); with `--pane` naming the other side it is
   refused. The slot moves with its pane (a swap,
@@ -686,6 +688,39 @@ sidebar widened → the overlay's line wraps; `close` then an immediate `result`
 comment command → `exit 0`; `IDM_CLOSE` with the popup focused closes the popup and leaves the
 pane overlay; `session close --target active` with the covered split pane focused closes that
 pane, the overlay with it, the session survives (the section's teardown).
+
+**What revmux round 2 found** (`.revmux/tasks/p5-lite-mirror/02-after-fix`, narrowed to the fix
+commit `337612d`): **two Majors**, both the fix's own blind spots. (1) The `active` remap closes
+round 1's Major 2 for the WORD only — an EXPLICIT overlay id on the six session verbs still reached
+the hidden object: `session duplicate --target <overlay id>` cloned the FTCS wrapper's command line
+into a visible session (and a program inside the overlay sends that id as its default target, so a
+bare `session duplicate` typed in it did the same), and `flag` / `seen` / `rename` / `status` /
+`move` answered ok for a write nobody can see; the structural verbs already refused a cover by
+name. Fixed with the family's refusal on all six (`sessionIdentityCover`, `isCoverLocked`, under
+`g_lock`), a split shell's id still passing (P4's meaning); THE RULE now states the partition
+whole — an overlay id reaches the overlay on the surface verbs and is refused by EVERY other verb.
+(2) The two `splitOwnerOf` call sites the fix added — `toggleFlag` and `window state` — walked
+`g_sessions` without the hold the helper documents ("Caller holds g_lock"), racing a control
+thread's `session new` push_back (a reallocation frees the buffer a range-for is walking; the
+`syncPaneSizes` comment records the same hazard from an earlier round); both now walk under the
+hold, `window state` copying the name out before it builds the reply. Five Minors, all fixed in
+the same commit: the `Session::overlay` field comment still named `closePaneOverlay` as "the one
+primitive" after the refactor moved the unlisting to `unlistOverlayLocked` (now names both
+callers); "an EXPLICIT id keeps its meaning on every verb" was contradicted eighteen lines below
+by `session select`'s split-shell → owner redirect (the three copies — remap comment, skill, this
+plan — now carry the exception); `shellHolding` had one caller while the overlay arm kept two
+open-coded copies of the walk (both converted; the inference site's two `break`s became one
+nested guard); the README's P5 bullet stated the pre-fix `--target active` / "from anywhere" rule
+at its head and the corrected one twenty lines down (the head now states only what keys and the
+mouse reach, the `--target` rule lives once, below); `qa/panes.md` still stated the pre-fix rule
+(qualified like `qa/control-honesty.md`). Two pre-existing, each a follow-up: the wrapper's `D`
+trailer shares the caller's PowerShell scope, so a command that assigns `$e` / `$b` prints text
+where the mark should be (#41); the honesty check pinning the CLI's "not a whole number" refusal
+of `99999999999` pins a wrong sentence — the CLI's int32 parse, agwinterm #254 / lite #42; the
+check now says so in its comment. Checks added: the six session verbs on `--target <overlay id>`
+each refused naming the verb, the id and the three dismissals; nothing changed after all six (no
+node, one wrapper shell, the name, the flag, the block, the surface); `flag on --target <split
+shell id>` still answers `flagged`.
 
 ## Technical Details
 
