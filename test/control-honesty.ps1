@@ -2611,6 +2611,13 @@ try {
         $raw = Send-Ctl $s @('session', 'flag', 'on', '--target', $sp9); $r = ConvertFrom-Json $raw
         Check 'while an explicit SPLIT shell id is no cover: flag on --target <split shell id> answers flagged (P4''s meaning, on a shell nobody sees)' ([bool]$r.ok -and [string]$r.result -eq 'flagged') "raw: $raw"
         Send-Ctl $s @('session', 'flag', 'off', '--target', $sp9) | Out-Null
+        # `flag clear` is the one op that takes no target (agwinterm: "clear always succeeds"):
+        # an overlay id beside it is ignored, not refused — THE RULE carves it out (revmux r3).
+        Send-Ctl $s @('session', 'flag', 'on', '--target', $aid) | Out-Null
+        $raw = Send-Ctl $s @('session', 'flag', 'clear', '--target', $ovt); $r = ConvertFrom-Json $raw
+        Start-Sleep -Milliseconds 300
+        Check 'flag clear --target <overlay id> is not refused: it takes no target and unflags every session' ([bool]$r.ok -and [string]$r.result -eq 'cleared' -and -not [bool](Node $aid).flagged) "raw: $raw, flagged $((Node $aid).flagged)"
+        if ($flag0) { Send-Ctl $s @('session', 'flag', 'on', '--target', $aid) | Out-Null }
         # `lines` past int range: the CLI refuses it as not a whole number (its own int32 parse —
         # the sentence is the CLI's and is wrong about a valid whole number: agwinterm #254, lite
         # #42; this pins what the CLI does today, not that it is right); a raw client's number

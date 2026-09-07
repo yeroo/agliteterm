@@ -226,7 +226,9 @@ with the foreground).
 section): while a pane overlay is open, `--target active` on the focused pane (on a SURFACE verb —
 `text`, `type`, `copy`; a session verb's `active` is the session under it, a pane verb's the pane's
 shell, revmux r1) and the
-overlay's own id reach the OVERLAY, and the pane's own id reaches the shell UNDERNEATH. The first run of the
+overlay's own id (on a surface verb only — every other verb refuses it as a cover, revmux r2/r3; the
+partition is stated whole in the plan's vocabulary section) reach the OVERLAY, and the pane's own id
+reaches the shell UNDERNEATH. The first run of the
 automated block found the reader lying about both: `dumpBufferRange` read `paintPane`'s snapshot of
 the grid, which is refreshed only when THAT session is painted, so a shell under an overlay answered
 its last painted screen as `ok` and an overlay on a session not on screen answered empty as `ok`.

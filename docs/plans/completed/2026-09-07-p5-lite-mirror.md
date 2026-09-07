@@ -70,14 +70,17 @@ Copied, not re-decided, from the agwinterm plan:
   split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a focused
   split pane is the unsplit the chord does) — because the overlay has no identity of its own (no
   node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
-  shell's id keeps P4's meaning on every verb but `session select`, which shows the session the
-  pane belongs to (the focus on slot 0); `--target <pane id>` reaches the shell **underneath**
-  (`session text` reads the surface underneath); `--target <overlay id>` reaches the overlay from
-  anywhere on the surface verbs (lite resolves hidden sessions by id already) and is refused as a
-  cover by EVERY other verb — the structural ones (`session close`, `select`, `context`, `split`,
-  `split close`, `swap`, `restore capture`) and the session ones (`flag`, `seen`, `rename`,
-  `status`, `duplicate`, `move`), each naming the verb that dismisses it — and on `session
-  overlay` itself names that
+  shell's id keeps P4's meaning on every verb but two: `session select` shows the session the
+  pane belongs to (the focus on slot 0) and `session context` refuses every hidden id (a split
+  shell has no row and no session line to keep a context in); `--target <pane id>` reaches the
+  shell **underneath** (`session text` reads the surface underneath); `--target <overlay id>`
+  reaches the overlay from anywhere on the surface verbs (lite resolves hidden sessions by id
+  already) and is refused as a cover by EVERY other verb — the structural ones (`session close`,
+  `select`, `context`, `split`, `split close`, `swap`, `restore capture`) and the session ones
+  (`flag on`/`off`/`toggle`, `seen`, `rename`, `status`, `duplicate`, `move`), each naming the
+  verb that dismisses it (`flag clear` is the one op that takes no target: it unflags every
+  session, whoever sends it — agwinterm's `SessionFlag` says "clear always succeeds") — and on
+  `session overlay` itself names that
   overlay's slot — the same as passing its `--pane` word — for as long as the id resolves (an
   overlay that closed is reached by `--pane` only); with `--pane` naming the other side it is
   refused. The slot moves with its pane (a swap,
@@ -633,8 +636,8 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
 
 **What revmux round 1 found** (`.revmux/tasks/p5-lite-mirror/01-initial`, full branch at
 `1ba058d`; the Codex reviewer `codex-agwinterm` was mailed the same scope with the live-probe half
-of the attack list — its findings, when they arrive, are folded into the next fix and credited
-here): **two Majors**, one shape — `active` resolved through `focusedSession()` for EVERY verb, and
+of the attack list and each fix commit's hash — its findings, when they arrive, are folded into
+the next fix and credited here; none had arrived by the end of round 3): **two Majors**, one shape — `active` resolved through `focusedSession()` for EVERY verb, and
 `focusedSession()` is the SURFACE, so an identity verb on `--target active` (or no target) with
 the focused pane covered acted on the hidden overlay: (1) `session select --target active`
 installed the overlay's index in `g_pane[0]` (a hidden session in the primary slot — the box
@@ -730,6 +733,33 @@ check now says so in its comment. Checks added: the six session verbs on `--targ
 each refused naming the verb, the id and the three dismissals; nothing changed after all six (no
 node, one wrapper shell, the name, the flag, the block, the surface); `flag on --target <split
 shell id>` still answers `flagged`.
+
+**What revmux round 3 found** (`.revmux/tasks/p5-lite-mirror/03-after-fix-2`, narrowed to the
+second fix `7d4b85c` and the docs commit `7b85d4f`): **no Major, no Critical** — four Minors and
+five pre-existing, all fixed in one commit rather than carried, because every one sits in the seam
+this batch wrote. The Minors: (1) THE RULE's "refused by EVERY other verb" had one hole — `session
+flag clear` returns before the target refusals and unflags every session for any caller, overlay id
+or not; that is right (agwinterm's `SessionFlag`: "clear always succeeds", the op takes no target),
+so the rule carves it out in all four copies (skill, remap comment, README, this plan) and the arm's
+comment says which; a check pins `flag clear --target <overlay id>` answering `cleared`. (2) The
+rewritten "every verb but `session select`" sentence missed the second exception: `session context`
+refuses every hidden id, a split shell's included (pre-existing, pinned since P3-lite) — the three
+copies now name both. (3) The six new cover guards skipped the "closed since the resolve" re-check
+every neighbouring cover guard opens with (`indexOfSession(target) < 0` → `session not found`): a
+`split close` promotion between the resolve and the hold erases the object and renames it to its
+pane id, so the refusal named an id the caller never passed — the exact defect the remap comment
+says P5 exists to remove; all six re-check first. (4) `qa/control-honesty.md`'s guards paragraph
+still said an overlay's own id reaches the overlay, unqualified. The pre-existing: `window state`
+bound a `const std::wstring&` into `g_workspaces` outside the hold and read it after — the hold the
+round-2 fix added made that window unbounded (a `workspace new` push_back frees the array); the
+name is now copied under the same hold. `session flag clear`'s walk of `g_sessions` was unheld six
+lines above the guard round 2 added (now held). `toggleFlag(focusedShell())` resolved the shell
+before the hold (from `337612d`): `toggleFocusedFlag` resolves it under the hold that flips the
+flag; the sidebar menu's `g_sessions[si]` keeps its neighbours' shape (`closeSessionAt(si)`, the
+UI thread's own indexing — out of this batch, lite #43). The `Session::overlay` field comment said
+`active` on an identity verb is "this shell" — right for a pane verb, wrong for a session verb (now
+both halves). `restore capture` open-coded `splitOwnerOf`'s walk (now the helper). Codex was
+mailed each fix commit's hash as it landed; no findings arrived by hub mail during the three rounds.
 
 ## Technical Details
 

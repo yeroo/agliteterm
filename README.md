@@ -163,8 +163,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   `duplicate`, …) is the session under the focused pane, on a pane verb (`close`, the split
   verbs, `restore capture`) the pane's shell, on a surface verb (`type`, `text`, `copy`, …) the
   overlay; an overlay's id reaches it on the surface verbs only and is refused as a cover by
-  every other verb (`close`, `select`, `flag`, `rename`, `duplicate`, …); nothing of it is
-  persisted.
+  every other verb (`close`, `select`, `flag`, `rename`, `duplicate`, …; `flag clear` alone takes
+  no target and unflags every session); nothing of it is persisted.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's
