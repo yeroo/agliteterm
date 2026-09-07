@@ -17,6 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
+. "$PSScriptRoot\owned-procs.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $fail = 0
@@ -27,8 +28,11 @@ function Check([string]$n, $ok, [string]$d = '') {
 function Write-State([string]$Path, [string[]]$Lines) {
     [IO.File]::WriteAllText($Path, (($Lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
 }
+$started = @()   # every window this run launched, for the teardown: the only ones it may stop
+$born = @{}      # pid -> start time, read while the window is alive (an exited Process may refuse it)
 function Start-Lite([string]$inst, [string]$root) {
     $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru -Environment @{ LOCALAPPDATA = $root }
+    Pin-Owned $p; $script:started += $p; $script:born[$p.Id] = $p.StartTime   # pinned: its exit bounds the host it spawned
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         if (((& $ctl tree --json --pipe $inst 2>&1) -join '') -match '"ok":true') { return $p }
@@ -81,12 +85,22 @@ try {
     Check 'the alias use is logged' ((Get-Content "$new\agliteterm.log" -Raw) -match 'legacy pipe name')
     Stop-Lite $p3
 } finally {
-    Get-Process -Name 'agliteterm' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -eq (Resolve-Path $Exe).Path } | Stop-Process -Force -ErrorAction SilentlyContinue
-    # The pty-host outlives the UI by design. Left running it holds liteingwinterm-ptyhost.exe
-    # open, and the NEXT build fails copying over it - which is how this suite broke the build once.
+    # Only the windows this run started (test/owned-procs.ps1). A sweep by exe path took every window
+    # launched from this bin\ - a sibling suite's sandbox under run-all, or another agent's.
+    foreach ($q in $started) { try { if (-not $q.HasExited) { $q.Kill(); [void]$q.WaitForExit(5000) } } catch { } }
     Start-Sleep -Seconds 1
-    Get-Process -Name 'agwinterm-ptyhost' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # The pty-host outlives the UI by design, and it is ONE per machine: every lite window - the user's
+    # own, another agent's sandbox - connects to the same `--pipe agliteterm` host, and only the first
+    # window spawns it. Left running by us it holds bin\agwinterm-ptyhost.exe open and the NEXT build
+    # fails copying over it - which is how this suite broke the build once. So: stop a host only if one
+    # of OUR windows spawned it (its proven child), and only while no lite window is left alive to be
+    # using it; otherwise say so and leave it, since killing it ends every session on the machine.
+    $hosts = @(); foreach ($q in $started) { $hosts += Get-OwnedChildren $q.Id $born[$q.Id] 'agwinterm-ptyhost.exe' (Exit-Of $q) }
+    $windows = @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'")
+    foreach ($h in $hosts) {
+        if ($windows.Count) { "        (NOT stopping pty-host pid $($h.ProcessId), spawned by this run: $($windows.Count) lite window(s) still running may be attached to it)" }
+        else { Stop-OwnedRow $h 'pty-host spawned by this run' }
+    }
     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
 }
 
