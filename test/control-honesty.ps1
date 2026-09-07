@@ -537,6 +537,102 @@ try {
     $raw = Overlay @('close')
     Check 'and close after the hand-close answers "no overlay", not "closed"' ([string](ConvertFrom-Json $raw).result -eq 'no overlay') "raw: $raw"
 
+    # ---- P5 (task 1): the popup's `result`, and `session close` on a cover --------------------------
+    # `session overlay result` (bare) is the window-wide exit of the LAST popup's command
+    # (agwinterm's _lastOverlayExit): `no overlay` at start and reset by every open, `exit N` once
+    # the popup closed after its command completed. The exit rides an FTCS mark the overlay's own
+    # command line emits around the command (OSC 133;A / C before, D;<code> after), read off the
+    # popup's session in its WM_DESTROY — so the checks read the world twice: the mark's arrival
+    # through `session output` (which answers the command's output only once a D mark closed it),
+    # then `result` before and after the close. Every popup this block ran before now was `cmd /k`
+    # (never completes), so the value is still the starting one. Any client sends the action word
+    # through, so this needs no client probe.
+    "-- P5: the popup's result, session close on a cover --"
+    $raw = Overlay @('result')
+    $r = ConvertFrom-Json $raw
+    Check 'result with no popup ever completed answers ok "no overlay"' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    function Wait-OverlayCompleted([string]$id, [int]$ms = 8000) {   # the D mark closed the wrapper's command
+        for ($i = 0; $i -lt ($ms / 200); $i++) {
+            $o = [string](Get-CtlResult $s @('session', 'output', '--target', $id))
+            if (-not $o.StartsWith('no completed command marks')) { return $true }
+            Start-Sleep -Milliseconds 200
+        }
+        return $false
+    }
+    function OverlayIdSince([long]$since) {   # the popup's session id, from the session/created event after $since
+        $id = ''
+        for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+            $id = [string](@((ConvertFrom-Json (Send-Ctl $s @('events', '--since', "$since"))).result.events | Where-Object { $_.type -eq 'session' -and $_.info -eq 'created' }) | Select-Object -Last 1).session
+            if (-not $id) { Start-Sleep -Milliseconds 200 }
+        }
+        return $id
+    }
+    # The three exits of the rule: $LASTEXITCODE for a native program, else 0 when $? is true and 1
+    # when it is false. Each open resets the value; each close after completion writes it.
+    foreach ($case in @(@('cmd /c exit 3', 'exit 3', 'a native program'), @("'ok'", 'exit 0', 'an expression that succeeds'), @('Get-Item C:\no-such', 'exit 1', 'a cmdlet that fails'))) {
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        $raw = Overlay (@('open') + ($case[0] -split ' '))
+        $r = ConvertFrom-Json $raw
+        Check "open `"$($case[0])`" ($($case[2])) answers ok" ([bool]$r.ok) "raw: $raw"
+        $hp = Wait-Overlay $true
+        Check 'and the popup is up' ($hp -ne [IntPtr]::Zero)
+        $pid_ = OverlayIdSince $cursor
+        Check 'and its session id arrived as a session/created event' ([bool]$pid_)
+        $raw = Overlay @('result')
+        $r = ConvertFrom-Json $raw
+        Check 'result while the popup is up is "no overlay" (the open reset it; the shell stays up after the command)' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+        Check 'the command completed (a D mark closed it, seen through `session output`)' (Wait-OverlayCompleted $pid_) "output: $(Send-Ctl $s @('session', 'output', '--target', $pid_))"
+        Overlay @('close') | Out-Null
+        $gone = Wait-Overlay $false
+        Check 'the popup closed' ($gone -eq [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 300
+        $raw = Overlay @('result')
+        $r = ConvertFrom-Json $raw
+        Check "and result after the close is `"$($case[1])`"" ([bool]$r.ok -and [string]$r.result -eq $case[1]) "raw: $raw"
+    }
+    # A command that never completes leaves the value as it was: `cmd /k` emits no D mark, so the
+    # open's reset ("no overlay") is what survives its close — not a made-up exit.
+    $raw = Overlay @('open', 'cmd', '/k')
+    Check 'open "cmd /k" (never completes) answers ok' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    Wait-Overlay $true | Out-Null
+    Start-Sleep -Milliseconds 1500
+    Overlay @('close') | Out-Null
+    Wait-Overlay $false | Out-Null
+    Start-Sleep -Milliseconds 300
+    $raw = Overlay @('result')
+    $r = ConvertFrom-Json $raw
+    Check 'result after a popup whose command never completed is the open''s reset, "no overlay", not an invented exit' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    # `result` skips the target check (agwinterm's order): the window-wide value is not about any
+    # session, and the shared "nothing opened, resized or closed" would describe nothing.
+    $raw = Overlay @('result', '--target', 'no-such-session')
+    $r = ConvertFrom-Json $raw
+    Check 'result --target no-such-session still answers the window-wide value (not the target refusal)' ([bool]$r.ok -and [string]$r.result -eq 'no overlay') "raw: $raw"
+    # The action list grew: an unknown action names `result` too.
+    $raw = Overlay @('sideways')
+    Check 'an unknown action names result among the actions' ([string](ConvertFrom-Json $raw).error -match 'result') "raw: $raw"
+
+    # `session close --target <the popup's id>`: a cover, refused with the P4 cover sentence, and
+    # the popup — window and session — is still there afterwards. Before this, the close fell
+    # through to closeSessionAt and destroyed the session under the popup (a dangling pointer).
+    $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+    $cvMarker = 'cover-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $raw = Overlay @('open', 'cmd', '/k', "echo $cvMarker")
+    Check 'setup: a popup opens' ([bool](ConvertFrom-Json $raw).ok) "raw: $raw"
+    $hc = Wait-Overlay $true
+    $pid_ = OverlayIdSince $cursor
+    Check 'setup: its session id is known' ([bool]$pid_)
+    Start-Sleep -Milliseconds 800
+    $raw = Send-Ctl $s @('session', 'close', '--target', $pid_)
+    $r = ConvertFrom-Json $raw
+    Check 'session close --target <the popup''s id> is refused with the cover sentence' (-not $r.ok -and [string]$r.error -eq "session close: '$pid_' is a scratch/overlay/quick pane, not a session; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing closed.") "raw: $raw"
+    Start-Sleep -Milliseconds 500
+    Check 'and the popup is still up, the same window' ((OverlayHwnd) -eq $hc -and [LiteHonesty]::IsWindow($hc))
+    $t = [string](Get-PaneText $s $pid_)
+    Check 'and its session still answers `session text` (the marker the command printed is there)' ($t.Contains($cvMarker)) "text: $t"
+    Overlay @('close') | Out-Null
+    Wait-Overlay $false | Out-Null
+    Check 'setup: the popup closed' ((OverlayHwnd) -eq [IntPtr]::Zero)
+
     # ---- sidebar ---------------------------------------------------------------------------------
     # The world here is the native SysTreeView32 child (the sidebar) — its window rect IS the
     # divider's position, and its visibility IS the toggle's state — plus the active session's grid

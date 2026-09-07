@@ -331,23 +331,23 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
 ## Implementation Steps
 
 ### Task 1: the vocabulary, the refusal block, the command line, `result` and the cover refusal
-- [ ] `// ---- P5: the overlay verbs' refusals ----` beside P4's: the two words, `parsePaneWord`
+- [x] `// ---- P5: the overlay verbs' refusals ----` beside P4's: the two words, `parsePaneWord`
       (absent → -1 = session-wide; anything else refused naming both words and the absent form),
       every sentence of the table as a `static const char* const` / builder, the popup's five inline
       literals moved in unchanged. A comment beside `Session::overlay` (Task 2) points at this
       plan's vocabulary section for the rule; nothing paraphrases it.
-- [ ] `overlayCommandLine(cmd)`: the one command line both slots run — `powershell.exe -NoExit
+- [x] `overlayCommandLine(cmd)`: the one command line both slots run — `powershell.exe -NoExit
       -Command "<A and C marks>; <cmd>; <capture $? then $LASTEXITCODE>; <D;<code> mark>"`, escapes
       as `[char]27` / `[char]7` so PS 5.1 and 7 both emit them; `openOverlay` uses it. The exit
       status rule of vocabulary bullet (c), in a comment.
-- [ ] `overlayExitOf(Session*)`: under `g_lock`, the FIRST `FfiMark` with `hasExit` → `exit N`,
+- [x] `overlayExitOf(Session*)`: under `g_lock`, the FIRST `FfiMark` with `hasExit` → `exit N`,
       else empty. `g_lastOverlayExit` (string, `no overlay` at start and on every popup open) written
       from the popup's `WM_DESTROY` before its session is killed; `session overlay result` (bare) →
       `ctlOkStr(g_lastOverlayExit)`. Action `result` joins `open|close|resize` in the refusal.
-- [ ] `session.close` on a cover (a hidden target `splitOwnerOf` answers `nullptr` for): the cover
+- [x] `session.close` on a cover (a hidden target `splitOwnerOf` answers `nullptr` for): the cover
       sentence, nothing closed (the honesty check: the popup is still up, `g_overlaySession` still
       valid — `session text --target <its id>` still answers).
-- [ ] Honesty: the popup's `result` (`exit 3`, `exit 0`, `no overlay`, the reset on open),
+- [x] Honesty: the popup's `result` (`exit 3`, `exit 0`, `no overlay`, the reset on open),
       `session close --target <popup id>` refused; the existing overlay block still green.
 
 ### Task 2: the slot on the shell, its lifecycle, the surface seam

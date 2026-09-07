@@ -5639,6 +5639,53 @@ static HICON loadAppIcon(bool small_) {
     return (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, w, h, 0);
 }
 
+// ---- P5: the overlay's command line and its exit status ----------------------------------------
+// The ONE command line every overlay slot runs — the popup (the session-wide slot) and a pane slot
+// alike: `powershell.exe -NoExit -Command <this>`, the P2-lite shape (the shell stays up after the
+// command, which is agwinterm's `--wait` without a banner; lite has no `--wait`). The pty-host
+// protocol carries no exit code (EOF is its only signal), and the protocol is frozen for this
+// batch, so the exit status rides INSIDE the terminal stream as an FTCS mark the core already
+// parses: `OSC 133;A` and `C` before the command, `D;<code>` after it — the marks a shell
+// integration would emit, so `session output` on an overlay works as a side effect.
+//
+// The exit status rule (vocabulary bullet (c) of the plan): `exit N` is the exit status of the
+// command as PowerShell reports it — `$LASTEXITCODE` when the command ran a native program, else
+// 0 when `$?` is true and 1 when it is false. `$LASTEXITCODE` is nulled first so a value left by
+// the profile cannot be taken for the command's; `$?` is read as the FIRST statement after the
+// command, before anything else can overwrite it. A command that never completes (closed early,
+// a terminating error, or a command line that does not parse — then NOTHING here runs) emits no
+// `D`, and the slot's result stays what it was. The escapes are built from `[char]27` / `[char]7`,
+// never typed: the host quotes the argument for PowerShell's own command-line parser, and a
+// wrapper with no quote characters in it survives that parser on PS 5.1 and 7 alike.
+static std::string overlayCommandLine(const std::string& cmd) {
+    return "$e=[string][char]27;$b=[string][char]7;[Console]::Write($e+']133;A'+$b+$e+']133;C'+$b);$LASTEXITCODE=$null; "
+           + cmd +
+           "; $q=$?; $c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}; [Console]::Write($e+']133;D;'+$c+$b)";
+}
+// The exit of the command an overlay session ran: `exit N` from the FIRST FTCS mark carrying an
+// exit — the wrapper's; a user's own shell-integration prompts, if any, come after it — or "" when
+// no mark has one yet (still running, or never completed). Takes g_lock itself (the emulator is
+// read under it); g_lock is re-entrant, so a caller already holding it is fine.
+static std::string overlayExitOf(Session* s) {
+    if (!s || !s->emu) return {};
+    FfiEmuInfo info{};
+    EnterCriticalSection(&g_lock);
+    emu_info(s->emu, &info);
+    std::vector<FfiMark> marks(info.markCount ? info.markCount : 1);
+    uint32_t nm = info.markCount ? emu_marks(s->emu, marks.data(), info.markCount) : 0;
+    LeaveCriticalSection(&g_lock);
+    for (uint32_t k = 0; k < nm; k++)
+        if (marks[k].hasExit) return "exit " + std::to_string(marks[k].exitCode);
+    return {};
+}
+// The window-wide last popup exit, what the bare `session overlay result` answers (agwinterm's
+// _lastOverlayExit): "no overlay" at start and on every popup open, `exit N` written from the
+// popup's WM_DESTROY before its session is killed — and left alone when the command there never
+// completed. Written on the UI thread, read on the pipe thread: both under g_lock.
+static std::string g_lastOverlayExit = "no overlay";
+static void setLastOverlayExit(const std::string& v) { LockG hold; g_lastOverlayExit = v; }
+static std::string lastOverlayExit() { LockG hold; return g_lastOverlayExit; }
+
 // ---- Quick / Scratch popup terminals ----
 static void paintPopup(HWND h, Session* s) {
     PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -5711,6 +5758,12 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                            : (h == g_scratchHwnd) ? &g_scratchSession : nullptr;
             if (slot) {   // kill the transient window's session + clear its state
                 if (g_focusOverride == *slot) g_focusOverride = nullptr;
+                // The popup's exit status, read off its marks BEFORE the session is killed (P5):
+                // `exit N` when the command completed, else the window-wide value stays as it was.
+                if (h == g_overlayHwnd && *slot) {
+                    std::string e = overlayExitOf(*slot);
+                    if (!e.empty()) setLastOverlayExit(e);
+                }
                 if (*slot)
                     for (int i = 0; i < (int)g_sessions.size(); i++)
                         if (g_sessions[i] == *slot) { closeSessionAt(i); break; }
@@ -5898,11 +5951,14 @@ static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct) {
     if (g_overlayHwnd) DestroyWindow(g_overlayHwnd);   // one at a time; WM_DESTROY kills the old session + clears state
+    // Every popup open resets the window-wide `result` (agwinterm's rule), AFTER the replaced
+    // popup's WM_DESTROY wrote its own exit: the value is about the popup that is up or was last.
+    setLastOverlayExit("no overlay");   // kOverlayNone's word (the P5 block, declared after this)
     int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
     g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
-    std::vector<std::string> cargs{ "-NoExit", "-Command", command };
+    std::vector<std::string> cargs{ "-NoExit", "-Command", overlayCommandLine(command) };   // P5: the FTCS-wrapped line, both slots' one command line
     g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs);
     if (!g_overlaySession) {
         logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
@@ -7051,6 +7107,122 @@ static std::string swapSinglePane(const std::string& sessionId) {
 static std::string swapCover(const std::string& paneId) {
     return "swap: '" + paneId + "' is a scratch/overlay/quick pane, not a side of a split. Nothing moved.";
 }
+
+// ---- P5: the overlay verbs' refusals, agwinterm's sentences (OverlayPanes.cs), verbatim ----
+// The rule itself — a session's three overlay slots, `left` = slot 0 and `right` = slot 1 whatever
+// the axis, a pane overlay as the pane's SURFACE while it is open — is stated once, in
+// docs/plans/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is written");
+// this block holds the words and the spellings, not a paraphrase of it. Every refusal that has an
+// agterm phrase starts with that phrase VERBATIM, then a colon, then what our guard saw. Each one
+// opens, closes, resizes or reads nothing. The popup's own five refusals (P2-lite) live here too,
+// unchanged — one block for one verb.
+static const char* const kPaneLeft = "left";     // slot 0 — whatever the axis (on a horizontal split, the TOP box)
+static const char* const kPaneRight = "right";   // slot 1 — whatever the axis (on a horizontal split, the BOTTOM box)
+static constexpr int kPaneSessionWide = -1;      // `--pane` omitted: the session-wide slot (lite's popup)
+// The word for a slot, the inverse of parsePaneWord — what the tree spells slot `index` as.
+static const char* paneWord(int index) { return index == 0 ? kPaneLeft : kPaneRight; }
+// A `--pane` word that is neither pane. The CLI sends the word as a string; lite's reader keeps a
+// number as its text and a string as its content, so it is quoted here whatever the JSON kind was
+// (agwinterm quotes a string and shows a non-string raw — a difference no CLI caller reaches).
+static std::string paneRefusal(const std::string& raw) {
+    return "--pane '" + raw + "' is not one of " + kPaneLeft + " (pane 0) or " + kPaneRight +
+           " (pane 1); omit --pane for the session-wide overlay. Nothing opened, closed or read.";
+}
+// Read `args.pane`: absent -> kPaneSessionWide and true (today's behaviour, byte for byte);
+// exactly `left` -> 0, `right` -> 1; anything else (an empty string, `Left`, `top`, a pane id)
+// -> false with *refusal set, and the caller must open, close or read nothing. Case-sensitive:
+// the words are the wire spelling, and a guess accepted here would be a slot the tree read back
+// in a spelling the caller never sent.
+static bool parsePaneWord(const JsonReq& req, int* index, std::string* refusal) {
+    *index = kPaneSessionWide;
+    auto it = req.fields.find("args.pane");
+    if (it == req.fields.end()) return true;
+    if (it->second == kPaneLeft) { *index = 0; return true; }
+    if (it->second == kPaneRight) { *index = 1; return true; }
+    *refusal = paneRefusal(it->second);
+    return false;
+}
+// agterm: the pane the slot names is not on screen. Lite never hides a pane, so the one case is
+// `--pane right` on a session with one pane.
+static std::string overlayNotVisibleRefusal(const std::string& sessionId) {
+    return std::string("pane not visible: session ") + sessionId + " has one pane; pass --pane " + kPaneLeft + " or omit --pane";
+}
+// agterm: `open --pane X` while X holds one. NO silent replace — the session-wide slot replaces
+// (the popup, as today); the pane slot refuses, agterm's rule.
+static std::string overlayAlreadyOpenRefusal(int index) {
+    return std::string("pane overlay already open: close it first (session overlay close --pane ") + paneWord(index) + "), or read it (result / copy / text)";
+}
+// agterm: `copy` / `text` / `close --pane` with nothing in the named slot (`close` answers it ok,
+// the popup's shape). The pane arm names which slot; the session-wide one is the bare phrase.
+static const char* const kOverlayNone = "no overlay";
+static std::string overlayNoneRefusal(int index) {
+    if (index == kPaneSessionWide) return kOverlayNone;
+    return std::string(kOverlayNone) + ": --pane " + paneWord(index) + " names which slot, and nothing is open in it";
+}
+// agterm's `overlay not realized` (a slot whose terminal is not up yet) is documented, not
+// emitted: newSession builds the emulator before it returns (agwinterm's decision, the same).
+// agterm: `copy` with nothing selected inside the overlay.
+static const char* const kOverlayNoSelection = "no selection";
+// agterm: `text` when the emulator read fails; the reason follows.
+static std::string overlayReadFailedRefusal(const std::string& why) { return "failed to read surface buffer: " + why; }
+// agterm: `result --pane X` while X's program is still running.
+static const char* const kOverlayStillRunning = "overlay still running";
+// agterm: `result --pane X` when nothing completed in X since the window opened — also the value a
+// pane slot's last result starts as.
+static const char* const kOverlayNoResult = "no overlay result";
+// Ours: the usage errors, the same words at the CLI (exit 2, "Nothing sent.") and the server (a
+// raw client). A pane overlay is always full-box — agterm has no floating pane overlay.
+static const char* const kOverlaySizeWithPane =
+    "--pane and --size-percent cannot be combined: a pane overlay is always full-pane. Nothing opened.";
+static const char* const kOverlayResizeWithPane =
+    "resize --pane: a pane overlay is always full-pane and cannot be resized; omit --pane to resize the session-wide overlay. Nothing resized.";
+// The agreement check: `--target` may be the session id, either pane id, or a pane overlay's own
+// id, but one that names the OTHER side than `--pane` is refused — the caller named two panes.
+// `overlay`: the target was the overlay's id, not the pane's.
+static std::string overlayDisagree(const std::string& target, int targetIndex, int paneIndex, bool overlay) {
+    return "'" + target + "' is the " + paneWord(targetIndex) + " pane" + (overlay ? "'s overlay" : "") +
+           "; --pane " + paneWord(paneIndex) + " names the other one. Nothing opened.";
+}
+// A pane overlay's own id on `--target` with `--pane` omitted names its slot (the rule: the id
+// reaches the overlay from anywhere), so the two usage refusals for that slot name the id the guard
+// saw, not a `--pane` the caller never passed.
+static std::string overlayIdResizeRefusal(const std::string& target, int index) {
+    return "'" + target + "' is the " + paneWord(index) + " pane's overlay, which is always full-pane and cannot be resized; pass the session id to resize the session-wide overlay. Nothing resized.";
+}
+static std::string overlayIdSizeRefusal(const std::string& target, int index) {
+    return "'" + target + "' is the " + paneWord(index) + " pane's overlay, and a pane overlay is always full-pane: --size-percent does not apply. Nothing opened.";
+}
+// agwinterm's OverlayIdGoneRefusal ("'<id>' no longer names an open pane overlay: it closed, or its
+// pane went, while this call was in flight; read tree, then retry with --pane <its side> ...") is a
+// race between its pipe thread and its UI hop. Lite runs the slot's verbs inline under g_lock, so
+// no path produces it; documented here, not emitted.
+// `--lines` on `session text` and `session overlay text` is a whole number of lines; anything else
+// is refused (it used to be DROPPED, so `--lines 5O` read the buffer and reported success).
+static std::string overlayLinesRefusal(const std::string& raw) {
+    return "--lines needs a whole number of lines (0 = the visible screen), not '" + raw + "'. Nothing read.";
+}
+// `text`'s `--all` and `--lines` are exclusive, on both verbs alike (one reader, two verbs).
+static const char* const kOverlayAllWithLines =
+    "--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.";
+// The popup's own refusals (P2-lite), moved here unchanged. An unknown action names every action.
+static std::string overlayActionRefusal(const std::string& action) {
+    return "overlay action '" + action + "' is not one of open, close, resize, result; nothing done";
+}
+static std::string overlaySizePercentRefusal(const std::string& raw) {
+    return "size-percent " + (raw.empty() ? std::string("\"\"") : raw) +
+           " is not a whole number in 1..100; omit --size-percent to use the default popup size";
+}
+static const char* const kOverlayOpenNeedsCommand = "overlay open needs a command; nothing opened";
+static const char* const kOverlayNoSuchTarget = "no session matches that target; nothing opened, resized or closed";
+static const char* const kOverlayNothingToResize = "no overlay to resize on that target; open one first";
+// `session close --target <any cover's id>`: the P4 cover family (a cover names its own dismissing
+// verb). Before this, a hidden target that was no split shell fell through to closeSessionAt and
+// destroyed the popup's Session under g_overlaySession — a dangling pointer the popup's WM_DESTROY
+// then handed to closeSessionAt again.
+static std::string sessionCloseCover(const std::string& paneId) {
+    return "session close: '" + paneId + "' is a scratch/overlay/quick pane, not a session; `session scratch off`, "
+           "`session overlay close` or `quick off` dismiss those. Nothing closed.";
+}
 // `session focus`'s words (SplitAxes.TryFocusIndex): primary = slot 0 and split = slot 1 on either
 // axis; left/right = slot 0/1 on a VERTICAL split only; top/bottom = slot 0/1 on a HORIZONTAL one
 // only; other = the slot not focused. A direction that does not exist on the axis is refused naming
@@ -8070,7 +8242,14 @@ static std::string ctlDispatch(const std::string& line) {
         {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");   // closed since the resolve (#21)
-            if (target->hidden) owner = splitOwnerOf(target);
+            if (target->hidden) {
+                owner = splitOwnerOf(target);
+                // A cover (P5): a hidden shell no visible session names — the overlay popup's, a
+                // quick or scratch popup's, a pane overlay's. Its dismissing verb closes it; this
+                // one closes nothing. Before this, the fall-through below destroyed the popup's
+                // Session under g_overlaySession (a dangling pointer for its WM_DESTROY).
+                if (!owner) return ctlErr(sessionCloseCover(target->id));
+            }
         }
         if (owner) {
             if (!closeSplitSide(owner, false)) return ctlErr("session not found");
@@ -8087,10 +8266,13 @@ static std::string ctlDispatch(const std::string& line) {
         // through to open; open with no command opened a plain shell; the target was never read;
         // close with nothing open said "closed". The wordings are agwinterm's — the unit suites
         // there assert them, and one API gives one answer.
+        // P5 (task 1): the refusals live in the `P5: the overlay verbs' refusals` block, one spelling
+        // each; `result` (bare: the window-wide last popup exit, agwinterm's _lastOverlayExit)
+        // joins the actions.
         std::string action = req.get("args.action");
         if (action.empty()) action = "open";
-        if (action != "open" && action != "close" && action != "resize")
-            return ctlErr("overlay action '" + action + "' is not one of open, close, resize; nothing done");
+        if (action != "open" && action != "close" && action != "resize" && action != "result")
+            return ctlErr(overlayActionRefusal(action));
         // --size-percent: validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
         // client area; openOverlay says why that differs from agwinterm's full region). Present ->
         // all digits in 1..100, else refused naming the value, the range and the way to get the
@@ -8106,9 +8288,7 @@ static std::string ctlDispatch(const std::string& line) {
             bool digits = !raw.empty() && raw.size() <= 3;
             for (char c : raw) if (c < '0' || c > '9') digits = false;
             int n = digits ? atoi(raw.c_str()) : 0;
-            if (!digits || n < 1 || n > 100)
-                return ctlErr("size-percent " + (raw.empty() ? std::string("\"\"") : raw) +
-                              " is not a whole number in 1..100; omit --size-percent to use the default popup size");
+            if (!digits || n < 1 || n > 100) return ctlErr(overlaySizePercentRefusal(raw));
             sizePct = n;
         }
         // The percentage IN EFFECT: what was asked for — or lite's default when the flag was
@@ -8120,27 +8300,30 @@ static std::string ctlDispatch(const std::string& line) {
         if (rawMin > 0 && rawMin <= 100 && effectivePct < rawMin) effectivePct = rawMin;
         std::string command = req.get("args.command");
         // The command is checked BEFORE the target (agwinterm's order; its fake host asserts it).
-        if (action == "open" && command.empty()) return ctlErr("overlay open needs a command; nothing opened");
-        // A NAMED target (not empty, not `active`) that resolves to no session is refused for all
-        // three actions with one wording: the overlay the caller meant may still be up, and ok
-        // would say it is gone. lite's overlay is a window-level popup, not per-session, so a
-        // target that DOES resolve is accepted whichever session it names — the popup covers the
+        if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
+        // A NAMED target (not empty, not `active`) that resolves to no session is refused for
+        // open, close and resize with one wording: the overlay the caller meant may still be up,
+        // and ok would say it is gone. lite's overlay is a window-level popup, not per-session, so
+        // a target that DOES resolve is accepted whichever session it names — the popup covers the
         // main window either way. Empty / `active` stays accepted even with no active session, so
-        // a bare close in an empty window is not contract-dependent on a session existing.
+        // a bare close in an empty window is not contract-dependent on a session existing. The
+        // bare `result` skips the target check (agwinterm's order: the window-wide value is not
+        // about any session, and "nothing opened, resized or closed" would describe nothing).
         const std::string& tgt = req.get("target");
+        if (action == "result") return ctlOkStr(lastOverlayExit());
         if (!tgt.empty() && tgt != "active" && !target)
-            return ctlErr(targetWhy.empty() ? "no session matches that target; nothing opened, resized or closed" : targetWhy);
+            return ctlErr(targetWhy.empty() ? kOverlayNoSuchTarget : targetWhy);
         // g_overlayHwnd is written on the UI thread; this read is the same one close always made.
         // The user can close the popup by hand between this read and the posted message running —
         // resizeOverlay then does nothing, and the caller's next `resize` is refused truthfully.
         bool open = g_overlayHwnd != nullptr;
         if (action == "close") {
-            if (!open) return ctlOkStr("no overlay");   // idempotent: "no overlay open" is true afterwards
+            if (!open) return ctlOkStr(kOverlayNone);   // idempotent: "no overlay open" is true afterwards
             PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
             return ctlOkStr("closed");
         }
         if (action == "resize") {
-            if (!open) return ctlErr("no overlay to resize on that target; open one first");
+            if (!open) return ctlErr(kOverlayNothingToResize);
             // effectivePct, never 0: with the flag absent it is exactly lite's default (70), so
             // overlayFraction gives the same fraction it always did — and when the floor raised it,
             // the popup is built from the number the reply just named. Posting 0 here meant
