@@ -7376,13 +7376,16 @@ static const char* const kOverlayAllWithLines =
     "--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.";
 // The popup's own refusals (P2-lite), moved here unchanged. An unknown action names every action.
 static std::string overlayActionRefusal(const std::string& action) {
-    return "overlay action '" + action + "' is not one of open, close, resize, result; nothing done";
+    return "overlay action '" + action + "' is not one of open, close, resize, result, copy, text; nothing done";
 }
 static std::string overlaySizePercentRefusal(const std::string& raw) {
     return "size-percent " + (raw.empty() ? std::string("\"\"") : raw) +
            " is not a whole number in 1..100; omit --size-percent to use the default popup size";
 }
 static const char* const kOverlayOpenNeedsCommand = "overlay open needs a command; nothing opened";
+// The reply object of `copy` and `text`, on both slots: {"text": ...} (agterm's result.text, the
+// contract's `fields: [text]`) — not a bare string like `session text`, which is agterm's shape too.
+static std::string overlayTextReply(const std::string& text) { return "{\"text\":\"" + jsonEscape(text) + "\"}"; }
 static const char* const kOverlayNoSuchTarget = "no session matches that target; nothing opened, resized or closed";
 static const char* const kOverlayNothingToResize = "no overlay to resize on that target; open one first";
 // `session close --target <any cover's id>`: the P4 cover family (a cover names its own dismissing
@@ -8126,6 +8129,22 @@ static std::string ctlDispatch(const std::string& line) {
                         sess += std::string(any ? "," : "") + "\"" + jsonEscape(sh->paneId) + "\":\"" + jsonEscape(sh->capturedCmd) + "\"";
                     sess += "}";
                 }
+                // "paneOverlays" (P5): the open PANE slots as agwinterm's words, in SLOT order (slot 0 =
+                // left/top first, whatever the axis), an ARRAY of words — OMITTED when no pane slot
+                // holds one (absence = none, the rule `context` and `capturedCommands` follow) and
+                // independent of the popup (the session-wide slot has no key on lite's node). The
+                // slot of a shell is its pane exchanged by `swapped`, the same map splitBlockFields
+                // reads, so after a swap the covered shell's word follows its box.
+                {
+                    const Session* slot0 = (sh && s->swapped) ? sh : s;
+                    const Session* slot1 = sh ? (s->swapped ? s : sh) : nullptr;
+                    if (slot0->overlay || (slot1 && slot1->overlay)) {
+                        sess += ",\"paneOverlays\":[";
+                        if (slot0->overlay) sess += std::string("\"") + paneWord(0) + "\"";
+                        if (slot1 && slot1->overlay) sess += std::string(slot0->overlay ? "," : "") + "\"" + paneWord(1) + "\"";
+                        sess += "]";
+                    }
+                }
                 // The split block (P4): agwinterm's keys and spellings, present exactly when the
                 // session is split — a single session emits none of them (the orientation of a split
                 // that does not exist is not a fact about the session), with the one exception for
@@ -8452,32 +8471,87 @@ static std::string ctlDispatch(const std::string& line) {
         // joins the actions.
         std::string action = req.get("args.action");
         if (action.empty()) action = "open";
-        if (action != "open" && action != "close" && action != "resize" && action != "result")
+        if (action != "open" && action != "close" && action != "resize" && action != "result" && action != "copy" && action != "text")
             return ctlErr(overlayActionRefusal(action));
         // --pane (P5): read FIRST — a bad word is refused before any resolve, and `left` / `right`
-        // routes to the pane slot (task 2: open / close / result; task 3 completes the family and
-        // the tree). Absent = the session-wide slot, the popup arm below, byte for byte as before.
+        // routes to the pane slot (the pane arm below: open / close / result / copy / text). Absent =
+        // the session-wide slot, the popup arm, byte for byte as before — unless the target is a
+        // pane overlay's own id, which names its slot (the inference below).
         int paneIdx;
         std::string paneWhy;
         if (!parsePaneWord(req, &paneIdx, &paneWhy)) return ctlErr(paneWhy);
+        const std::string& t = req.get("target");
+        std::string command = req.get("args.command");
+        // A pane overlay is always full-box: with a word, the two usage refusals before anything
+        // (the CLI refused first; a raw client hears the same sentence; resize first, since a resize
+        // always carries a size and would otherwise be refused as one, never naming the verb typed).
         if (paneIdx != kPaneSessionWide) {
-            // A pane overlay is always full-box: the two usage refusals before anything (the CLI
-            // refused first; a raw client hears the same sentence).
             if (action == "resize") return ctlErr(kOverlayResizeWithPane);
             if (req.fields.count("args.size-percent")) return ctlErr(kOverlaySizeWithPane);
-            std::string command = req.get("args.command");
+        }
+        // --size-percent (the session-wide slot): validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
+        // client area; openOverlay says why that differs from agwinterm's full region). Present ->
+        // all digits in 1..100, else refused naming the value, the range and the way to get the
+        // default. JsonReq::get answers "" for absent AND empty, so presence is read from the map.
+        // The parser keeps a number as its raw text and a string as its content, so a quoted "60"
+        // arrives as 60 and is accepted — lite cannot see the JSON kind; the CLI never sends a
+        // string (it refuses a non-number client-side, agwinterm Program.cs), and anything that is
+        // not all digits ("sixty", 60.5, -5, true) is refused here.
+        int sizePct = 0;
+        if (paneIdx == kPaneSessionWide) {
+            auto sp = req.fields.find("args.size-percent");
+            if (sp != req.fields.end()) {
+                const std::string& raw = sp->second;
+                bool digits = !raw.empty() && raw.size() <= 3;
+                for (char c : raw) if (c < '0' || c > '9') digits = false;
+                int n = digits ? atoi(raw.c_str()) : 0;
+                if (!digits || n < 1 || n > 100) return ctlErr(overlaySizePercentRefusal(raw));
+                sizePct = n;
+            }
+        }
+        // A pane overlay's OWN id on --target with --pane omitted names its slot (the rule: the id
+        // reaches the overlay from anywhere, and on this verb it is the same as passing its word,
+        // for as long as the id resolves). Before this arm the id resolved as any hidden session and
+        // the popup arm acted on the WINDOW's popup: `close --target <pane overlay id>` closed the
+        // popup, or answered ok "no overlay" while the program ran on. The two usage refusals name
+        // the id the guard saw (agwinterm's OverlayIdResizeRefusal / OverlayIdSizeRefusal), after the
+        // size validation above — agwinterm's order: a size outside 1..100 is refused as one first.
+        // The slot is re-derived under the pane arm's own hold (a swap in between follows the id);
+        // an id that closed in between is unlisted, and the pane arm refuses it as no target. An
+        // EXPLICIT id only: an empty target / `active` resolves through focusedSession(), which is
+        // the overlay itself while the focused pane is covered — and the bare verbs (`close`, `text`,
+        // `open` with no target) mean the popup, byte for byte as before; found by the honesty block
+        // closing the pane overlay where it asked the popup to close.
+        bool inferred = false;
+        if (paneIdx == kPaneSessionWide && !t.empty() && t != "active" && target && target->hidden) {
+            LockG hold;
+            if (indexOfSession(target) >= 0)
+                for (Session* sh : g_sessions) if (sh->overlay == target) {
+                    Session* owner = splitOwnerOf(sh);
+                    if (!owner) break;
+                    int slot = sh == owner ? 0 : 1;
+                    if (owner->swapped) slot = 1 - slot;
+                    if (action == "resize") return ctlErr(overlayIdResizeRefusal(t, slot));
+                    if (req.fields.count("args.size-percent")) return ctlErr(overlayIdSizeRefusal(t, slot));
+                    paneIdx = slot;
+                    inferred = true;
+                    break;
+                }
+        }
+        if (paneIdx != kPaneSessionWide) {
             if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
             // The target names the SESSION whose slot is meant: empty / `active` = the displayed
             // session (not focusedSession(): with the focused pane covered that is the overlay, and
             // the caller means the session's other slot as much as this one); a session id or name;
             // either pane's id — refused when it names the OTHER side than --pane (the caller named
             // two panes: overlayDisagree); a pane overlay's own id — its slot, the same check in the
-            // overlay flavour. Everything below one hold of g_lock: the shell pointers are read off
-            // the list that exists, and the host round trips (open / close) run outside it.
-            const std::string& t = req.get("target");
+            // overlay flavour (and with --pane omitted, `inferred`, the slot the id sits in NOW).
+            // Everything below one hold of g_lock: the shell pointers are read off the list that
+            // exists, the reads (`result`, `copy`, `text`) answer under the same hold, and the host
+            // round trips (open / close) run outside it.
             Session* shell = nullptr;    // the shell whose slot --pane names
-            std::string reply;           // a refusal decided under the hold, or a `result` answer
-            bool refused = false;
+            std::string reply;           // a refusal decided under the hold, or a read's answer
+            bool refused = false, isText = false;
             {
                 LockG hold;
                 Session* owner = nullptr;
@@ -8500,6 +8574,7 @@ static std::string ctlDispatch(const std::string& line) {
                         // so a session not on screen answers the same).
                         auto shellOfSlot = [&](int slot) -> Session* { int pane = owner->swapped ? 1 - slot : slot; return pane == 0 ? owner : split; };
                         auto slotOfShell = [&](const Session* sh) -> int { int pane = sh == owner ? 0 : 1; return owner->swapped ? 1 - pane : pane; };
+                        if (inferred && viaOverlay) paneIdx = slotOfShell(viaOverlay);   // no word was passed: follow the id
                         // The agreement check: a target that named a PANE (the split shell's id, a
                         // pane overlay's id, or the owner's pane id where that differs from the
                         // session id — a promoted session) must name the side --pane names. The
@@ -8515,14 +8590,38 @@ static std::string ctlDispatch(const std::string& line) {
                         } else {
                             shell = shellOfSlot(paneIdx);
                             if (action == "open" && shell->overlay) { refused = true; reply = overlayAlreadyOpenRefusal(paneIdx); }
-                            else if (action == "result")
-                                reply = shell->overlay ? kOverlayStillRunning
-                                      : shell->overlayResult.empty() ? kOverlayNoResult : shell->overlayResult;
+                            else if (action == "result") {
+                                // The slot's own last result: `exit N` (ok) once a program completed
+                                // there; REFUSED `overlay still running` while one is up in it and
+                                // `no overlay result` while nothing completed there since the window
+                                // opened — agterm's phrases, refusals in agwinterm and the contract
+                                // (#252) alike, so a caller branching on ok gets a status only when
+                                // there is one. The bare `result` (the popup arm) stays ok in every
+                                // state, agwinterm's window-wide value.
+                                if (shell->overlay) { refused = true; reply = kOverlayStillRunning; }
+                                else if (shell->overlayResult.empty()) { refused = true; reply = kOverlayNoResult; }
+                                else reply = shell->overlayResult;
+                            }
+                            else if (action == "copy" || action == "text") {
+                                // The slot's reader: an empty slot is refused naming the slot (a read
+                                // that answered "" for a program that is not there would be the
+                                // silent-success class); `copy` is the selection made inside the
+                                // overlay (g_sel is keyed by Session*, so a drag in the pane's box
+                                // while it is covered is the overlay's), `no selection` when none;
+                                // `text` the overlay's whole buffer (gate 2; task 4 adds --lines /
+                                // --all). The clipboard is not touched by either.
+                                if (!shell->overlay) { refused = true; reply = overlayNoneRefusal(paneIdx); }
+                                else if (action == "copy") {
+                                    if (!g_sel.isFor(shell->overlay)) { refused = true; reply = kOverlayNoSelection; }
+                                    else { reply = selectionText(); isText = true; }   // re-entrant: one hold across the read
+                                } else { reply = dumpBufferText(shell->overlay); isText = true; }
+                            }
                         }
                     }
                 }
             }
             if (refused) return ctlErr(reply);
+            if (isText) return ctlOk(overlayTextReply(reply));
             if (action == "result") return ctlOkStr(reply);
             if (action == "close") return ctlOkStr(closePaneOverlay(shell) ? "closed" : kOverlayNone);
             std::string why;
@@ -8531,24 +8630,6 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             return ctlOkStr(ov->id);   // the overlay's id (gate 4): the program inside holds it as AGWINTERM_SESSION_ID
         }
-        // --size-percent: validated, not clamped. Absent -> 0 -> lite's default popup (70 % of the
-        // client area; openOverlay says why that differs from agwinterm's full region). Present ->
-        // all digits in 1..100, else refused naming the value, the range and the way to get the
-        // default. JsonReq::get answers "" for absent AND empty, so presence is read from the map.
-        // The parser keeps a number as its raw text and a string as its content, so a quoted "60"
-        // arrives as 60 and is accepted — lite cannot see the JSON kind; the CLI never sends a
-        // string (it refuses a non-number client-side, agwinterm Program.cs), and anything that is
-        // not all digits ("sixty", 60.5, -5, true) is refused here.
-        int sizePct = 0;
-        auto sp = req.fields.find("args.size-percent");
-        if (sp != req.fields.end()) {
-            const std::string& raw = sp->second;
-            bool digits = !raw.empty() && raw.size() <= 3;
-            for (char c : raw) if (c < '0' || c > '9') digits = false;
-            int n = digits ? atoi(raw.c_str()) : 0;
-            if (!digits || n < 1 || n > 100) return ctlErr(overlaySizePercentRefusal(raw));
-            sizePct = n;
-        }
         // The percentage IN EFFECT: what was asked for — or lite's default when the flag was
         // absent, which is raised by the same rule and was not before (revmux r2) — unless the
         // 30x8-cell popup minimum is bigger, in which case that is what the caller gets and what
@@ -8556,11 +8637,10 @@ static std::string ctlDispatch(const std::string& line) {
         int rawMin = overlayMinPercentRaw();
         int effectivePct = sizePct > 0 ? sizePct : (int)(kOverlayDefaultFraction * 100);
         if (rawMin > 0 && rawMin <= 100 && effectivePct < rawMin) effectivePct = rawMin;
-        std::string command = req.get("args.command");
         // The command is checked BEFORE the target (agwinterm's order; its fake host asserts it).
         if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
         // A NAMED target (not empty, not `active`) that resolves to no session is refused for
-        // open, close and resize with one wording: the overlay the caller meant may still be up,
+        // open, close, resize, copy and text with one wording: the overlay the caller meant may still be up,
         // and ok would say it is gone. lite's overlay is a window-level popup, not per-session, so
         // a target that DOES resolve is accepted whichever session it names — the popup covers the
         // main window either way. Empty / `active` stays accepted even with no active session, so
@@ -8571,6 +8651,21 @@ static std::string ctlDispatch(const std::string& line) {
         if (action == "result") return ctlOkStr(lastOverlayExit());
         if (!tgt.empty() && tgt != "active" && !target)
             return ctlErr(targetWhy.empty() ? kOverlayNoSuchTarget : targetWhy);
+        if (action == "copy" || action == "text") {
+            // The session-wide slot's reader (P5): the popup's session, read under the one hold that
+            // checks it is still listed (its WM_DESTROY unlists it under g_lock), so the slot the
+            // reply describes is the one that existed when the read ran. An empty slot is the bare
+            // `no overlay` (the pane arm names its slot after the colon). `copy` is `no selection`
+            // whenever nothing is selected in the popup — which in lite is always: paintPopup draws
+            // no selection and hitTest never enters the popup, so no drag can make one (said in the
+            // skill; the "selection" gap in lite-parity.md, not this batch's). The clipboard is not
+            // touched.
+            LockG hold;
+            Session* ov = g_overlaySession;
+            if (!ov || !g_overlayHwnd || indexOfSession(ov) < 0) return ctlErr(kOverlayNone);
+            if (action == "copy") return g_sel.isFor(ov) ? ctlOk(overlayTextReply(selectionText())) : ctlErr(kOverlayNoSelection);
+            return ctlOk(overlayTextReply(dumpBufferText(ov)));
+        }
         // g_overlayHwnd is written on the UI thread; this read is the same one close always made.
         // The user can close the popup by hand between this read and the posted message running —
         // resizeOverlay then does nothing, and the caller's next `resize` is refused truthfully.

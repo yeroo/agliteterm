@@ -388,18 +388,36 @@ builds the emulator before it returns, so it is documented, not emitted (agwinte
   orphaned host process (`Get-Process`)" must count shells, not their children.
 
 ### Task 3: the verbs
-- [ ] `session.overlay` reads `pane` first (a bad word refused before any resolve); with a pane: the
+- [x] `session.overlay` reads `pane` first (a bad word refused before any resolve); with a pane: the
       target may be the session id, either pane's id (the agreement check), either pane's overlay id
       (the overlay flavour), a name, `active`; `pane not visible` past the pane count; `open` /
       `close` / `result` / `copy` / `text` on the slot, each refusal from the block; `size-percent`
       present or `resize` with a pane refused before anything; without a pane: the popup arm as
       today plus `result` / `copy` / `text` on the popup (`copy` → `no selection` always, said in the
       skill). `--target <overlay id>` with `--pane` omitted names its slot (the rule).
-- [ ] `tree`: `paneOverlays` in slot order, present iff non-empty, beside the split block.
-- [ ] Conformance: `-Update -Url <#252 raw>`; the `$cliHasP5` probe and the `Needs-NewClient`
+- [x] `tree`: `paneOverlays` in slot order, present iff non-empty, beside the split block.
+- [x] Conformance: `-Update -Url <#252 raw>`; the `$cliHasP5` probe and the `Needs-NewClient`
       rule; `-Strict` green with the dev CLI, SKIPs with the released one.
-- [ ] Honesty: every refusal of the table, `result` in its three states per slot, `tree` words,
+- [x] Honesty: every refusal of the table, `result` in its three states per slot, `tree` words,
       the raw-request refusals for `size-percent` / `resize` with a pane.
+- ➕ `result --pane X` answers `overlay still running` and `no overlay result` as REFUSALS (agwinterm's
+  PaneOverlayAction and #252's errors list both pin them so; task 2 had them as ok), and `exit N` as
+  ok; the bare `result` stays ok in every state (agwinterm's `_lastOverlayExit`). `copy` / `text`
+  answer `{"text": …}` on both slots already (the contract's `fields: [text]` step is in task 3's
+  gate), so task 4 has only `--lines` / `--all` left.
+- ➕ The overlay-id-names-its-slot rule applies to an EXPLICIT `--target <id>` only. An empty target
+  and `active` resolve through `focusedSession()`, which is the overlay itself while the focused pane
+  is covered — the first honesty run had a bare `session overlay close` (no target, the covered pane
+  focused) close the pane overlay where the popup was meant, and `overlay text` read the pane
+  overlay as the popup. The flag omitted means the session-wide slot, byte for byte; a program inside
+  a pane overlay still reaches its own slot because the CLI sends the env id explicitly.
+- ➕ `bingwintermctl.exe` (the released client fetched beside the exe) predates #226, so the
+  conformance run without `AGWINTERMCTL` skips 20 steps and refusals, the four P5 ones among them,
+  each naming the client's shortfall; `-Strict` with the dev CLI passes all 56 steps and every
+  refusal. `check-contract` against `main` reports DRIFT until #252 merges (red by design).
+- ➕ The drag inside a pane overlay auto-copies on release (lite's window convention, not the verb's):
+  the honesty check saves the clipboard, sets a sentinel right before `overlay copy`, and pins that
+  the VERB left it alone.
 
 ### Task 4: `text` with `--lines` and `--all`, on both verbs
 - [ ] `dumpBufferTail(s, n)`: the last N lines of what `dumpBufferText` returns (one walk; no

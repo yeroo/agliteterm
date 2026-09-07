@@ -77,6 +77,16 @@ $cliHasP3 = $probe -match 'usage: agwintermctl restore'
 # P4 steps and errors are skipped on it instead (test/control-honesty.ps1 uses this probe).
 $probe = (& $ctl session swap x --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasP4 = $probe -match 'Nothing sent'
+# And for P5 (`session overlay --pane`, `overlay copy` / `text`, `session text --all` / `--lines`;
+# agwinterm #250, contract #252): a post-#250 client refuses `session overlay resize --pane left` on
+# its own side ("Nothing sent") before any pipe is opened - a pane overlay is always full-pane; the
+# 0.17.13 client drops `--pane` and sends a bare resize to a pipe that is not there. A pre-P5 client
+# would drop `--pane` from the open too (the POPUP would open where a pane overlay was asked for, and
+# the `text --pane left` step would then read it as ok), drop `--all`, and refuse `overlay copy` on
+# its own side - so the P5 steps and errors are skipped on it instead (test/control-honesty.ps1
+# uses this probe).
+$probe = (& $ctl session overlay resize --pane left --pipe 'conform-probe' --json 2>&1) -join ''
+$cliHasP5 = $probe -match 'Nothing sent'
 
 # HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
 # `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
@@ -98,6 +108,11 @@ function Needs-NewClient($argv) {
     if ($a.Count -ge 2 -and -not $cliHasP4 -and $a[0] -eq 'session' -and
         (($a[1] -eq 'split' -and ($a -contains '--axis' -or ($a.Count -ge 3 -and $a[2] -eq 'close'))) -or $a[1] -eq 'swap' -or $a[1] -eq 'focus')) {
         return 'this agwintermctl predates agwinterm #238 and drops `--axis` / refuses `split close`, `swap`, `focus` on its own side - set AGWINTERMCTL to a newer build'
+    }
+    if ($a.Count -ge 2 -and -not $cliHasP5 -and $a[0] -eq 'session' -and
+        (($a[1] -eq 'overlay' -and ($a -contains '--pane' -or ($a.Count -ge 3 -and $a[2] -in 'copy', 'text'))) -or
+         ($a[1] -eq 'text' -and ($a -contains '--all' -or $a -contains '--lines')))) {
+        return 'this agwintermctl predates agwinterm #250 and drops --pane / --all and refuses overlay copy / text on its own side - set AGWINTERMCTL to a newer build'
     }
     return $null
 }
