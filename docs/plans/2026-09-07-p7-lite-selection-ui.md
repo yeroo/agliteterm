@@ -258,7 +258,7 @@ pins ("THE PIN: …", "release copies: …"). Checks, in order:
 
 ## Progress Tracking
 
-- [ ] Task 0: the posted wheel, verified on the main screen; the three sentences corrected
+- [x] Task 0: the posted wheel verified on the main screen; viewport oracle corrected
 - [ ] Task 1: THE PIN — `viewOff`, wheel under the pointer, popup wheel, `KB_SCROLL*`
 - [ ] Task 2: drag-autoscroll (timer 3)
 - [ ] Task 3: double- and triple-click
@@ -447,7 +447,18 @@ say what it was.
   word is `[a, b)`, a line is `[0, cols)`; `selectAllOf` :4326 already does `(int)info.cols`.
 - **Timer id 3.** `OnTimer` :6747 checks `kRelayoutTimer` then `kCaretTimer`; add the third case
   before the caret's `return`.
-- **Task 0 finding:** _(filled in by the executor)_.
+- **Task 0 finding (2026-09-07):** posted wheel reaches the unmodified P6 main-screen handler.
+  Baseline source `af737e7` (plan commit `aef0c8d`), local native assets from the P6 build. Three
+  upward notches moved the first visible marker from 153 to 144; three downward notches restored
+  the view exactly. `PrintWindow` region: 723 pixels changed upward, 0 differed after returning.
+  Run `p7-wheel-20260907T223349`, generation 8, both checks PASS; owned window/host exited,
+  instance geometry restored, clipboard untouched, token released. Earlier probe iterations
+  corrected a helper assembly reference, a wrong HWND and a blank-region pixel comparison;
+  each released only after cleanup. Evidence: `.revmux/p7-wheel-20260907T223349/`.
+  **Testing correction:** contrary to the draft above, `session text` returns the WHOLE buffer,
+  never the composed viewport; scrolling does not change it. Keep this API contract unchanged.
+  Use `PrintWindow` and selections at known cells for all viewport assertions below/above.
+  `surface cursor` returns only a column, not a row; mark-mode fixtures must seed a known caret.
 
 ## Post-Completion
 
