@@ -158,8 +158,12 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   the full app's bare form is the screen only, a recorded difference); the pair is refused. The
   tree node carries `paneOverlays` (`["left"]`, `["right"]`, both, in slot order; absent when
   empty); the slot moves with its pane on a swap and dies with it (`split close`, `split off`,
-  the shell exiting, `session close`); the close chord closes the focused pane's overlay first;
-  `session close` on any overlay's id is refused as a cover; nothing of it is persisted.
+  the shell exiting, `session close`); the close chord closes a focused popup first, then the
+  focused pane's overlay; `--target active` on a session verb (`select`, `flag`, `rename`,
+  `duplicate`, …) is the session under the focused pane, on a pane verb (`close`, the split
+  verbs, `restore capture`) the pane's shell, on a surface verb (`type`, `text`, `copy`, …) the
+  overlay; `session close` / `select` on any overlay's id is refused as a cover; nothing of it
+  is persisted.
 - **Multi-window**: every window is its own tiny process (`--pipe <name>`), all
   sharing one pty-host; `agwintermctl window new/list/select/...` drives them.
 - **CLI**: `-p/--profile`, `-d/--dir`, `--maximized`, `--no-restore`, `--pipe` — the full app's

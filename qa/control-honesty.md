@@ -222,9 +222,11 @@ with the foreground).
 
 ## `overlay text` reads the overlay; `session text --target <pane>` reads the shell under it
 
-**Guards:** the surface rule of P5-lite (`docs/plans/2026-09-07-p5-lite-mirror.md`, the vocabulary
-section): while a pane overlay is open, `--target active` on the focused pane and the overlay's own
-id reach the OVERLAY, and the pane's own id reaches the shell UNDERNEATH. The first run of the
+**Guards:** the surface rule of P5-lite (`docs/plans/completed/2026-09-07-p5-lite-mirror.md`, the vocabulary
+section): while a pane overlay is open, `--target active` on the focused pane (on a SURFACE verb —
+`text`, `type`, `copy`; a session verb's `active` is the session under it, a pane verb's the pane's
+shell, revmux r1) and the
+overlay's own id reach the OVERLAY, and the pane's own id reaches the shell UNDERNEATH. The first run of the
 automated block found the reader lying about both: `dumpBufferRange` read `paintPane`'s snapshot of
 the grid, which is refreshed only when THAT session is painted, so a shell under an overlay answered
 its last painted screen as `ok` and an overlay on a session not on screen answered empty as `ok`.

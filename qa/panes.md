@@ -19,7 +19,7 @@ left|right` — one more hidden session drawn in that pane's box instead of its 
 `overlay`, and the pane's SURFACE while it is open (keys, the mouse, `--target active` reach
 it; the pane's own id reaches the shell underneath). `left` is slot 0 and `right` slot 1
 whatever the axis; the slot moves with its shell on a swap and dies with its pane. The rule in
-full is the P5-lite plan's vocabulary section (`docs/plans/2026-09-07-p5-lite-mirror.md`);
+full is the P5-lite plan's vocabulary section (`docs/plans/completed/2026-09-07-p5-lite-mirror.md`);
 the popup over the whole window is the session-wide slot and is unchanged.
 
 Setup for every case: sandbox instance per `qa/product.md`.

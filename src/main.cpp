@@ -386,13 +386,14 @@ struct Session {
     // P5: THIS SHELL's pane overlay — one more hidden Session (minted by newSession, name `overlay`,
     // never in g_pane, never a tree node, never persisted), drawn in this shell's box instead of the
     // shell while it is open, and the shell's SURFACE meanwhile (surfaceOf: the focused pane's
-    // keys, the mouse in the box and `--target active` reach it; `--target <this shell's id>` reaches
+    // keys, the mouse in the box and `--target active` on a SURFACE verb reach it — on an identity
+    // verb `active` is this shell, see ctlDispatch's remap; `--target <this shell's id>` reaches
     // the shell underneath). The slot hangs on the shell, so a swap or a promotion moves it with the
     // shell by construction and `split close` / `session close` / the shell exiting take it along
     // (closePaneOverlay is the one primitive). The rule — three slots, `left` = slot 0 and `right`
     // = slot 1 whatever the axis, the sibling pane interactive throughout — is stated ONCE, in
-    // docs/plans/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is written");
-    // nothing here paraphrases it. nullptr = the slot is empty. Written under g_lock.
+    // docs/plans/completed/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is
+    // written"); nothing here paraphrases it. nullptr = the slot is empty. Written under g_lock.
     Session* overlay = nullptr;
     // P5: the exit of the LAST overlay that closed in this slot (`exit N`, overlayExitOf's word),
     // what `session overlay result --pane X` answers once the slot is empty again; "" = nothing has
@@ -1638,18 +1639,34 @@ static bool fitSidebarToClient(int clientW) {
 }
 
 // THE SURFACE SEAM (P5). What a pane SHOWS and what its keys, mouse and `--target active` reach:
-// the shell's pane overlay while one is open, else the shell. Every path that draws, hits, sizes or
-// types into a pane by its g_pane index asks this (paint, hitTest, mouseReport, the selection
-// anchor, InvalidateCaret, syncPaneSizes, focusedSession — and through it sendBytes, scrollFocused,
-// resolveTarget's `active`); a path that reaches a shell by ID (resolveTarget's id arms) does not —
-// that is what makes `--target <pane id>` the shell underneath. Reads a pointer written under
-// g_lock; the object is never freed, so a stale read draws the old surface once, as g_sessions'
-// own reads always could.
+// the shell's pane overlay while one is open, else the shell. Every path that draws, hits or types
+// into a pane by its g_pane index asks this (paint, hitTest, mouseReport, the selection anchor,
+// InvalidateCaret, focusedSession — and through it sendBytes, scrollFocused, resolveTarget's
+// `active`; syncPaneSizes sizes BOTH, the shell and its cover, off `overlay` directly); a path that
+// reaches a shell by ID (resolveTarget's id arms) does not — that is what makes `--target <pane id>`
+// the shell underneath. Reads a pointer written under g_lock; the object is never freed, so a
+// stale read draws the old surface once, as g_sessions' own reads always could.
 static Session* surfaceOf(Session* shell) { return shell && shell->overlay ? shell->overlay : shell; }
 static Session* focusedSession() {
     if (g_focusOverride) return g_focusOverride;   // a popup terminal owns input while it's focused
     int idx = g_pane[g_focus];
     return (idx >= 0 && idx < (int)g_sessions.size()) ? surfaceOf(g_sessions[idx]) : nullptr;
+}
+// The other side of the seam: the focused pane's SHELL, whatever covers it (its pane overlay, the
+// popup) — a session, or a split shell. What `active` means to a verb that reaches a session by
+// IDENTITY (select, close, flag, rename, duplicate, the split verbs, the state's activeSession — see
+// ctlDispatch's remap after resolveTarget) and what the Flag chord marks: a cover is never a tree
+// session, and a surface verb is the only kind that means the cover. Reads g_pane as
+// focusedSession does.
+static Session* focusedShell() {
+    int idx = g_pane[g_focus];
+    return (idx >= 0 && idx < (int)g_sessions.size()) ? g_sessions[idx] : nullptr;
+}
+// The shell whose pane overlay `ov` is, else nullptr (a shell, the popup's session, a stranger).
+// Under g_lock (the caller's hold): `overlay` is written under it.
+static Session* shellHolding(Session* ov) {
+    if (ov) for (Session* s : g_sessions) if (s->overlay == ov) return s;
+    return nullptr;
 }
 // The window that displays a session (a popup terminal, else the main window) — repaint target.
 static HWND windowForSession(Session* s) {
@@ -2093,9 +2110,13 @@ static void syncSplitToPrimary() {
     syncPaneSizes();
 }
 
-/// Show a session in the main pane, bringing its own split with it.
+/// Show a session in the main pane, bringing its own split with it. A hidden session (a split shell,
+/// a cover: the popup's session, a pane overlay) is never installed here — g_pane names sessions,
+/// and a cover that lands in it is drawn twice and left stale in g_pane when its own close unlists
+/// it (revmux r1 of P5-lite: `session select --target active` under a covered pane did that).
+/// session.select refuses or redirects before it gets here; this is the belt to that brace.
 static void selectPrimary(int idx) {
-    if (idx < 0 || idx >= (int)g_sessions.size()) return;
+    if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
     g_pane[0] = idx;
     g_focus = 0;
     syncSplitToPrimary();
@@ -2353,6 +2374,27 @@ struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
 static bool closePaneOverlay(Session* shell);   // fwd (P5, defined with the overlay verbs' helpers)
+// Unhook and unlist `shell`'s pane overlay under g_lock (the caller's hold): the slot emptied, the
+// selection and the focus override it may hold cleared, its row erased with g_pane's indices fixed,
+// its `closed` event emitted. Returns the overlay for the caller to KILL outside the lock (a host
+// round trip; the object is never freed — its reader may still hold it), or nullptr when the slot
+// was empty. The one unlisting for the two paths that end a slot with the shell still listed —
+// closePaneOverlay (the verb, the chord, closeSessionAt) and closeSplitSide's victim; before this
+// the second re-implemented the first (revmux r1 of P5-lite).
+static Session* unlistOverlayLocked(Session* shell) {
+    Session* ov = shell->overlay;
+    if (!ov) return nullptr;
+    shell->overlay = nullptr;
+    if (g_sel.sess == ov) g_sel.clear();
+    if (g_focusOverride == ov) g_focusOverride = nullptr;
+    int oi = indexOfSession(ov);
+    if (oi >= 0) {
+        emitEvent("session", ov->id, "closed");
+        g_sessions.erase(g_sessions.begin() + oi);
+        for (int p = 0; p < 2; p++) if (g_pane[p] > oi) g_pane[p]--;
+    }
+    return ov;
+}
 static void closeSessionAt(int idx) {
     if (idx < 0 || idx >= (int)g_sessions.size()) return;
     Session* cs = g_sessions[idx];
@@ -2450,8 +2492,18 @@ static Session* splitOwnerOf(Session* s);                             // fwd (wi
 // is a PROMOTION (the survivor becomes the session) — before P4 it closed the whole session, the
 // one thing no verb could do to the other side. A one-pane session still closes the session.
 static void closeFocused() {
-    // The focused pane's overlay FIRST when one is open (P5, agwinterm's Close Pane rule): the
-    // chord dismisses the cover and the pane stays; pressed again, it closes what it always did.
+    // What is FOCUSED closes first (P5, agwinterm's Close Pane rule: the chord dismisses the cover
+    // and the pane stays; pressed again, it closes what it always did). With a popup focused — the
+    // chord reaches here through popupProc's key handler — that is the popup, the overlay or the
+    // scratch (quick hides itself: its WM_CLOSE); before this the chord in a focused popup went
+    // for the pane UNDER it, and once P5 gave that pane a cover, closed the pane's overlay while the
+    // popup stayed up (revmux r1 of P5-lite). Then the focused pane's own overlay, when one is open.
+    if (g_focusOverride) {
+        HWND popup = (g_focusOverride == g_overlaySession && g_overlayHwnd) ? g_overlayHwnd
+                   : (g_focusOverride == g_scratchSession && g_scratchHwnd) ? g_scratchHwnd
+                   : (g_focusOverride == g_quickSession && g_quickHwnd) ? g_quickHwnd : nullptr;
+        if (popup) { PostMessageW(popup, WM_CLOSE, 0, 0); return; }
+    }
     {
         Session* shell = nullptr;
         {
@@ -2530,18 +2582,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         // pointer exchange above moved the whole object, `overlay` field included, so a promotion
         // carries the surviving shell's slot to slot 0 and syncPaneSizes below re-grids it. Unlisted
         // here, under the same hold and before its shell; killed outside the lock with it.
-        victimOverlay = victim->overlay;
-        victim->overlay = nullptr;
-        if (victimOverlay) {
-            if (g_sel.sess == victimOverlay) g_sel.clear();
-            if (g_focusOverride == victimOverlay) g_focusOverride = nullptr;
-            int ovi = indexOfSession(victimOverlay);
-            if (ovi >= 0) {
-                emitEvent("session", victimOverlay->id, "closed");
-                g_sessions.erase(g_sessions.begin() + ovi);
-                for (int p = 0; p < 2; p++) if (g_pane[p] > ovi) g_pane[p]--;
-            }
-        }
+        victimOverlay = unlistOverlayLocked(victim);
         int vi = indexOfSession(victim);
         g_sessions.erase(g_sessions.begin() + vi);
         // A promoted survivor's selection was in pane 1, which is gone: it comes back at pane 0 or it
@@ -4678,7 +4719,7 @@ static void runKbAction(int a) {
         case KB_QUICK: togglePopupTerminal(false); break;
         case KB_SCRATCH: togglePopupTerminal(true); break;
         case KB_REOPEN: reopenClosed(); break;
-        case KB_FLAG: toggleFlag(focusedSession()); break;
+        case KB_FLAG: toggleFlag(focusedShell()); break;   // the pane's SESSION, whatever covers it (a cover is never flagged)
         case KB_FLAGVIEW: toggleFlagView(); break;
         case KB_ATTENTION: nextBlocked(); break;
         case KB_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;
@@ -5748,11 +5789,15 @@ static HICON loadAppIcon(bool small_) {
 // a terminating error, or a command line that does not parse — then NOTHING here runs) emits no
 // `D`, and the slot's result stays what it was. The escapes are built from `[char]27` / `[char]7`,
 // never typed: the host quotes the argument for PowerShell's own command-line parser, and a
-// wrapper with no quote characters in it survives that parser on PS 5.1 and 7 alike.
+// wrapper with no quote characters in it survives that parser on PS 5.1 and 7 alike. The trailer
+// sits on its OWN LINE: a command ending in a `#` comment ran to the end of the line, and with
+// the trailer on that same line it swallowed the `D` mark — `result` then said `no overlay
+// result` for a command that completed (revmux r1 of P5-lite). A newline is the one separator a
+// comment cannot eat; `$?` is still the first statement after the command.
 static std::string overlayCommandLine(const std::string& cmd) {
     return "$e=[string][char]27;$b=[string][char]7;[Console]::Write($e+']133;A'+$b+$e+']133;C'+$b);$LASTEXITCODE=$null; "
            + cmd +
-           "; $q=$?; $c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}; [Console]::Write($e+']133;D;'+$c+$b)";
+           "\n$q=$?; $c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}; [Console]::Write($e+']133;D;'+$c+$b)";
 }
 // The exit of the command an overlay session ran: `exit N` from the FIRST FTCS mark carrying an
 // exit — the wrapper's; a user's own shell-integration prompts, if any, come after it — or "" when
@@ -5777,6 +5822,7 @@ static std::string overlayExitOf(Session* s) {
 static std::string g_lastOverlayExit = "no overlay";
 static void setLastOverlayExit(const std::string& v) { LockG hold; g_lastOverlayExit = v; }
 static std::string lastOverlayExit() { LockG hold; return g_lastOverlayExit; }
+static bool g_overlayReplacing = false;   // UI thread only: openOverlay is destroying the popup it replaces (its WM_DESTROY holds its exit)
 
 // ---- P5: the pane slot — one hidden Session hung on the shell it covers (Session::overlay) ----
 // Is `shell` on screen right now (either pane of the displayed session)? Caller holds g_lock.
@@ -5836,18 +5882,9 @@ static bool closePaneOverlay(Session* shell) {
     {
         LockG hold;
         if (indexOfSession(shell) < 0 || !shell->overlay) return false;
-        ov = shell->overlay;
-        std::string e = overlayExitOf(ov);   // re-entrant: the emulator is read under g_lock
+        std::string e = overlayExitOf(shell->overlay);   // re-entrant: the emulator is read under g_lock
         if (!e.empty()) shell->overlayResult = e;
-        shell->overlay = nullptr;
-        if (g_sel.sess == ov) g_sel.clear();
-        if (g_focusOverride == ov) g_focusOverride = nullptr;
-        int oi = indexOfSession(ov);
-        if (oi >= 0) {
-            emitEvent("session", ov->id, "closed");
-            g_sessions.erase(g_sessions.begin() + oi);
-            for (int p = 0; p < 2; p++) if (g_pane[p] > oi) g_pane[p]--;
-        }
+        ov = unlistOverlayLocked(shell);
         displayed = shellDisplayed(shell);
         emitEvent("tree");
     }
@@ -5930,7 +5967,8 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (g_focusOverride == *slot) g_focusOverride = nullptr;
                 // The popup's exit status, read off its marks BEFORE the session is killed (P5):
                 // `exit N` when the command completed, else the window-wide value stays as it was.
-                if (h == g_overlayHwnd && *slot) {
+                // Not when openOverlay is replacing this popup (the verb reset the value already).
+                if (h == g_overlayHwnd && *slot && !g_overlayReplacing) {
                     std::string e = overlayExitOf(*slot);
                     if (!e.empty()) setLastOverlayExit(e);
                 }
@@ -6120,10 +6158,13 @@ static void togglePopupTerminal(bool scratch) {
 static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct) {
-    if (g_overlayHwnd) DestroyWindow(g_overlayHwnd);   // one at a time; WM_DESTROY kills the old session + clears state
-    // Every popup open resets the window-wide `result` (agwinterm's rule), AFTER the replaced
-    // popup's WM_DESTROY wrote its own exit: the value is about the popup that is up or was last.
-    setLastOverlayExit("no overlay");   // kOverlayNone's word (the P5 block, declared after this)
+    // One at a time; WM_DESTROY kills the old session + clears state. Every popup open resets the
+    // window-wide `result` (agwinterm's rule) — the VERB already did, when it answered "opened", so
+    // a `result` right after the ack reads `no overlay` and not the replaced popup's exit — and the
+    // replaced popup's WM_DESTROY must not write its exit over that in the instant between: the
+    // flag tells it to hold (revmux r1 of P5-lite: the ack came before the state).
+    if (g_overlayHwnd) { g_overlayReplacing = true; DestroyWindow(g_overlayHwnd); g_overlayReplacing = false; }
+    setLastOverlayExit("no overlay");   // kOverlayNone's word (the P5 block, declared after this); again, for a by-hand caller
     int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
     g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
@@ -6357,6 +6398,7 @@ static void nextBlocked() {
     MessageBeep(MB_OK);   // nothing blocked right now
 }
 static void toggleFlag(Session* s) {
+    if (s && s->hidden) s = splitOwnerOf(s);   // the split shell's pane: its session's flag (a cover has no owner)
     if (!s || s->hidden) return;   // popup/split shells aren't tree sessions
     s->flagged = !s->flagged;
     refreshTree();                 // repaints the pennant + persists via saveSessionState
@@ -7113,7 +7155,7 @@ public:
                 relayout(); saveColors();
                 break;
             }
-            case IDM_FLAG: toggleFlag(focusedSession()); break;
+            case IDM_FLAG: toggleFlag(focusedShell()); break;   // see KB_FLAG
             case IDM_FLAGVIEW: toggleFlagView(); break;
             case IDM_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;   // toggle on active ws
             case IDM_ATTENTION: nextBlocked(); break;
@@ -7281,8 +7323,8 @@ static std::string swapCover(const std::string& paneId) {
 // ---- P5: the overlay verbs' refusals, agwinterm's sentences (OverlayPanes.cs), verbatim ----
 // The rule itself — a session's three overlay slots, `left` = slot 0 and `right` = slot 1 whatever
 // the axis, a pane overlay as the pane's SURFACE while it is open — is stated once, in
-// docs/plans/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is written");
-// this block holds the words and the spellings, not a paraphrase of it. Every refusal that has an
+// docs/plans/completed/2026-09-07-p5-lite-mirror.md ("The vocabulary, fixed before anything is
+// written"); this block holds the words and the spellings, not a paraphrase of it. Every refusal that has an
 // agterm phrase starts with that phrase VERBATIM, then a colon, then what our guard saw. Each one
 // opens, closes, resizes or reads nothing. The popup's own five refusals (P2-lite) live here too,
 // unchanged — one block for one verb.
@@ -7399,11 +7441,20 @@ static bool parseTextArgs(const JsonReq& req, TextArgs* out, std::string* refusa
     // and a string as its content, so a quoted "3" arrives as 3 and is accepted — lite cannot see
     // the JSON kind (the CLI never sends a string; agwinterm refuses one); the value is quoted in
     // the refusal whatever the kind was, as paneRefusal does it.
+    // Any length of digits: a number past int64 is still a whole number of lines and means "all
+    // of them" — it saturates (a `--lines 9999999999` refused as "not a whole number" was a lie,
+    // revmux r1 of P5-lite); a sign, a fraction, an exponent are not.
     const std::string& raw = it->second;
-    bool digits = !raw.empty() && raw.size() <= 9;
+    bool digits = !raw.empty();
     for (char c : raw) if (c < '0' || c > '9') digits = false;
     if (!digits) { *refusal = overlayLinesRefusal(raw); return false; }
-    out->lines = atoll(raw.c_str());
+    int64_t v = 0;
+    for (char c : raw) {
+        int d = c - '0';
+        if (v > (INT64_MAX - d) / 10) { v = INT64_MAX; break; }
+        v = v * 10 + d;
+    }
+    out->lines = v;
     return true;
 }
 // The popup's own refusals (P2-lite), moved here unchanged. An unknown action names every action.
@@ -7427,6 +7478,14 @@ static const char* const kOverlayNothingToResize = "no overlay to resize on that
 static std::string sessionCloseCover(const std::string& paneId) {
     return "session close: '" + paneId + "' is a scratch/overlay/quick pane, not a session; `session scratch off`, "
            "`session overlay close` or `quick off` dismiss those. Nothing closed.";
+}
+// `session select --target <any cover's id>`: the same family. Before this the cover's index went
+// into g_pane[0] (a hidden session drawn as the main pane, and a stale g_pane once its own close
+// unlisted it); an empty target / `active` under a covered pane means the shell now (the remap in
+// ctlDispatch), so only an explicit cover id reaches this.
+static std::string sessionSelectCover(const std::string& paneId) {
+    return "session select: '" + paneId + "' is a scratch/overlay/quick pane, not a session; select the session "
+           "it covers (its own id), or dismiss it with `session scratch off`, `session overlay close` or `quick off`. Nothing selected.";
 }
 // `session focus`'s words (SplitAxes.TryFocusIndex): primary = slot 0 and split = slot 1 on either
 // axis; left/right = slot 0/1 on a VERTICAL split only; top/bottom = slot 0/1 on a HORIZONTAL one
@@ -7580,7 +7639,7 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
     // A pane overlay's program holds the overlay's id (P5): walk to the shell that holds the
     // overlay first, then as any shell — a split shell's owner, or the session itself. A pane
     // overlay is the one hidden session with a workspace a caller CAN see: its shell's.
-    if (hit) for (Session* s : g_sessions) if (s->overlay == hit) { hit = s; break; }
+    if (Session* holder = shellHolding(hit)) hit = holder;
     if (hit) hit = splitOwnerOf(hit);   // a split shell answers with its owner; a cover has no owner: nullptr
     if (!hit || hit->hidden) return -1;
     if (hit->ws < 0 || hit->ws >= (int)g_workspaces.size()) return -1;
@@ -7598,8 +7657,9 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
 // 30 is the prompt and the two lines above it, not three blanks (agwinterm counts screen rows from
 // the bottom; lite's default is the whole buffer, and this is the tail of that — gate 2's reader).
 // One walk; the row logic is not copied.
-static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail) {
+static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail, bool* screenOk = nullptr) {
     FfiEmuInfo info{};
+    if (screenOk) *screenOk = true;
     std::string out;
     int64_t abs = 0;
     EnterCriticalSection(&g_lock);
@@ -7635,10 +7695,15 @@ static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t
     // that its id reads the shell UNDERNEATH), a pane overlay on a session not on screen, a hidden
     // split shell never shown. Before P5 those read as their last painted screen, or as history
     // alone, and reported success (found by the P5 honesty block).
+    // A screen the emulator will not copy (a buffer that does not match its grid — under this hold
+    // it cannot, but the FFI answers false and a false must not read as "the history was all"):
+    // `screenOk` carries it to the `text` verbs' refusal (overlayReadFailedRefusal); the other
+    // callers keep the history-only answer they always had.
     std::vector<FfiCell> live((size_t)info.cols * info.rows);
-    if (!live.empty() && emu_copy_grid(s->emu, live.data(), (uint32_t)live.size()))
+    if (!live.empty() && emu_copy_grid(s->emu, live.data(), (uint32_t)live.size())) {
         for (uint32_t r = 0; r < info.rows; r++, abs++)
             if (wanted(abs)) appendRow(&live[r * info.cols]);
+    } else if (!live.empty() && screenOk) *screenOk = false;
     LeaveCriticalSection(&g_lock);
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
     if (tail > 0) {
@@ -7656,12 +7721,17 @@ static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t
 }
 static std::string dumpBufferRange(Session* s, int64_t from, int64_t to) { return dumpBufferLines(s, from, to, -1); }
 static std::string dumpBufferText(Session* s) { return dumpBufferRange(s, -1, -1); }
-// The last N lines of dumpBufferText's answer (N >= 1), or the visible screen (N = 0).
-static std::string dumpBufferTail(Session* s, int64_t n) { return dumpBufferLines(s, -1, -1, n); }
 // THE reader behind `session text` and `session overlay text` (P5, gate 2): bare and `--all` the
-// whole buffer, `--lines N` its tail. parseTextArgs decided the words; this decides nothing.
-static std::string readSurfaceText(Session* s, const TextArgs& a) {
-    return a.lines < 0 ? dumpBufferText(s) : dumpBufferTail(s, a.lines);
+// whole buffer, `--lines N` its tail (N >= 1), `--lines 0` the visible screen. parseTextArgs decided
+// the words; this decides nothing. false = the emulator did not copy its screen: *text holds
+// agwinterm's `failed to read surface buffer` refusal (a verb that answered the history alone as
+// ok, or "" for a screen it never read, would be the silent-success class; the sentence was
+// declared and never emitted before revmux r1 of P5-lite).
+static bool readSurfaceText(Session* s, const TextArgs& a, std::string* text) {
+    bool screenOk = true;
+    *text = dumpBufferLines(s, -1, -1, a.lines < 0 ? -1 : a.lines, &screenOk);
+    if (!screenOk) *text = overlayReadFailedRefusal("the emulator did not copy its screen (session " + s->id + ")");
+    return screenOk;
 }
 
 // The output of the last COMPLETED command, delimited by the shell's FTCS (OSC 133) marks.
@@ -7915,7 +7985,7 @@ agwintermctl session overlay close|result|copy|text
 ```
 
 **THE RULE**, quoted from the one full copy (the P5-lite plan's vocabulary section,
-`docs/plans/2026-09-07-p5-lite-mirror.md`; every sentence below is decided there, not here): a
+`docs/plans/completed/2026-09-07-p5-lite-mirror.md`; every sentence below is decided there, not here): a
 session has three overlay slots: **one session-wide** (lite's popup over the window, as before - it
 covers every pane and any pane overlay under it, and holds input while focused) and **one per
 pane**. A pane overlay covers **exactly one pane's box** - always the full box, never floating - and
@@ -7924,12 +7994,22 @@ the sibling pane stays visible and interactive. `--pane left|right` names the sl
 axis** - the same slots `session focus left|right` names, whichever shell a swap put there; a
 non-split session accepts `--pane left`; the flag omitted means the session-wide slot - the popup,
 byte for byte as before. A pane overlay is that pane's **surface** while it is open: keys typed into
-the focused pane, the mouse inside the pane's box and `--target active` reach the overlay; `--target
-<pane id>` reaches the shell **underneath** (`session text` reads the surface underneath);
-`--target <overlay id>` reaches the overlay from anywhere (every `session` verb), and on `session
-overlay` itself names that overlay's slot - the same as passing its `--pane` word - for as long as
-the id resolves (an overlay that closed is reached by `--pane` only); with `--pane` naming the
-other side it is refused. The slot moves with its pane (a swap, a `split close` of the other pane)
+the focused pane, the mouse inside the pane's box and `--target active` (or no target) **on a
+surface verb** - `session type` / `write` / `output` / `text` / `copy` / `paste`, `surface cursor`,
+`session overlay` - reach the overlay; on every other verb `active` is what lies UNDER the focused
+pane: on a session verb (`select`, `flag`, `seen`, `rename`, `status`, `context`, `duplicate`,
+`move`, and `window state`'s `activeSession`) the **session** the pane belongs to (a split pane's
+owner - a flag or a name on its hidden shell is one nobody can see), on a pane verb (`session
+close`, the split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a
+focused split pane is the unsplit the chord does) - because the overlay has no identity of its own
+(no node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
+shell's id keeps P4's meaning on every verb; `--target <pane id>` reaches the shell **underneath** (`session
+text` reads the surface underneath); `--target <overlay id>` reaches the overlay from anywhere on
+the surface verbs and is refused as a cover by the structural verbs (`session close`, `select`,
+`context`, `split`, `split close`, `swap`, `restore capture` - each names the verb that dismisses
+it), and on `session overlay` itself names that overlay's slot - the same as passing its `--pane`
+word - for as long as the id resolves (an overlay that closed is reached by `--pane` only); with
+`--pane` naming the other side it is refused. The slot moves with its pane (a swap, a `split close` of the other pane)
 and dies with it (`split close`, `split off`, the shell exiting when that removes the pane - a
 one-pane session keeps an exited shell on screen, and its overlay with it - `session close`, the
 window closing).
@@ -7974,10 +8054,12 @@ so `result` says `overlay still running` until you `close`; a command that never
 early, or a command line that did not parse) leaves the slot's result as it was.
 
 `tree --json`: `paneOverlays` on the session node - `["left"]`, `["right"]` or `["left","right"]`,
-in slot order, ABSENT when empty; the overlay itself has no node, no sidebar row, no name, and is
-never restored. Every open and close emits `tree`. The Close Pane / Session action (the unbound
-`Key_Close` chord, the palette row, File > Close Pane / Session) closes the focused pane's overlay
-FIRST when one is open, then what it closes today. A verb on a session not on screen does the same
+in slot order, ABSENT when empty; the overlay itself has no node, no sidebar row and nothing in the
+state file (its name is the badge's word, `overlay`), and is never restored. Every open and close
+emits `tree`. The Close Pane / Session action (the unbound `Key_Close` chord, the palette row,
+File > Close Pane / Session) closes a focused POPUP first (the session-wide slot, a scratch or a
+quick pane, while it holds the focus), then the focused pane's overlay when one is open, then what
+it closes today. A verb on a session not on screen does the same
 work and moves neither focus nor selection. `session close --target <any overlay's id>` is refused
 as a cover (`session overlay close` dismisses it), the overlay untouched.
 
@@ -7995,7 +8077,9 @@ refused naming the value and the range, and NO popup opens or moves. Omit the fl
 default popup (70 %; the full app's default is the whole region - the contract pins the reply and
 the refusal, not the geometry). `open` with no command is refused; so is an action other than
 `open`, `close`, `resize`, `result`, `copy`, `text`; so is a `--target` that names no session
-(nothing opened, resized or closed). `resize` with no overlay open is refused - open one first;
+(nothing opened, resized or closed) - on `open`, `close`, `resize`, `copy` and `text`; the bare
+`result` is window-wide and answers its value whatever the target says, so it is no test of
+whether a session exists (`session status` is). `resize` with no overlay open is refused - open one first;
 `close` with none open answers `no overlay`, which is true afterwards. The session-wide slot is one
 popup per window, so a target that does resolve is accepted whichever session it names (a recorded
 difference: the full app refuses a pane id of a split without `--pane`) - except a pane overlay's
@@ -8454,9 +8538,48 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr(s->id);
     }
     std::string targetWhy;
-    Session* target = resolveTarget(req.get("target"), &targetWhy);
+    const std::string targetWord = req.get("target");
+    Session* target = resolveTarget(targetWord, &targetWhy);
+    // THE `active` RULE, by verb kind (P5; revmux r1 of P5-lite). An empty target / `active` resolves
+    // through focusedSession(): the focused pane's SURFACE — its pane overlay while one covers it,
+    // the popup while that is focused. That is right for the verbs that read or write a surface
+    // (type, write, output, text, cursor, copy, paste, and `session overlay`, which reads the word
+    // itself) and wrong for every other verb, which reaches a SESSION by identity: before this,
+    // `session select --target active` installed the hidden overlay in g_pane[0], `duplicate` cloned
+    // the wrapper's command line into a visible session, and the cover-guarded verbs (close, context,
+    // the split verbs, restore capture) refused naming an id the caller never passed. So for those
+    // the word means the focused pane's SHELL (focusedShell), and then, for a verb that acts on a
+    // SESSION (select, flag, seen, rename, status, context, duplicate, move — agwinterm's `active`
+    // is always the session; a split shell has no node, no row, no state line, so a flag or a name
+    // written on it is one nobody can see), the session that shell belongs to (splitOwnerOf); the
+    // PANE-class verbs (`session close`, the split verbs, `restore capture`: P4's rule — a pane id
+    // reaches that shell, `close` on the focused split pane is the unsplit the chord does) keep the
+    // shell. An EXPLICIT id keeps its meaning on every verb (a split shell's id reaches that
+    // shell, the cover refusals stand, `--target <overlay id>` reaches the overlay).
+    if (target && (targetWord.empty() || targetWord == "active") &&
+        cmd != "session.type" && cmd != "session.write" && cmd != "session.output" && cmd != "session.text" &&
+        cmd != "surface.cursor" && cmd != "session.copy" && cmd != "session.paste" && cmd != "session.overlay") {
+        LockG hold;
+        if (Session* shell = focusedShell()) {
+            target = shell;
+            const bool paneClass = cmd == "session.close" || cmd == "session.split" || cmd == "session.split.close" ||
+                                   cmd == "session.swap" || cmd == "restore.capture";
+            if (!paneClass) if (Session* owner = splitOwnerOf(shell)) target = owner;
+        }
+    }
     if (cmd == "session.select") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        {   // A hidden target: a split shell's id shows its session (the pane the id names comes
+            // with it); a cover's id shows nothing — refused, not a silent "selected" over a pane
+            // that did not change (selectPrimary drops a hidden index; see it).
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");
+            if (target->hidden) {
+                Session* owner = splitOwnerOf(target);
+                if (!owner) return ctlErr(sessionSelectCover(target->id));
+                target = owner;
+            }
+        }
         for (int i2 = 0; i2 < (int)g_sessions.size(); i2++)
             if (g_sessions[i2] == target) selectPrimary(i2);   // brings that session's own split
         // The sidebar highlight never followed an API select (pre-existing): the tree is rebuilt on
@@ -8545,7 +8668,8 @@ static std::string ctlDispatch(const std::string& line) {
         std::string taWhy;
         if (!parseTextArgs(req, &ta, &taWhy)) return ctlErr(taWhy);
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
-        return ctlOkStr(readSurfaceText(target, ta));
+        std::string text;
+        return readSurfaceText(target, ta, &text) ? ctlOkStr(text) : ctlErr(text);
     }
     if (cmd == "surface.cursor") {
         // The caret COLUMN of the pane, as a bare JSON integer: {"ok":true,"result":<int>}. That is
@@ -8784,7 +8908,8 @@ static std::string ctlDispatch(const std::string& line) {
                                 else if (action == "copy") {
                                     if (!g_sel.isFor(shell->overlay)) { refused = true; reply = kOverlayNoSelection; }
                                     else { reply = selectionText(); isText = true; }   // re-entrant: one hold across the read
-                                } else { reply = readSurfaceText(shell->overlay, textArgs); isText = true; }
+                                } else if (readSurfaceText(shell->overlay, textArgs, &reply)) isText = true;
+                                else refused = true;   // `failed to read surface buffer: …`, the reader's sentence
                             }
                         }
                     }
@@ -8834,7 +8959,8 @@ static std::string ctlDispatch(const std::string& line) {
             Session* ov = g_overlaySession;
             if (!ov || !g_overlayHwnd || indexOfSession(ov) < 0) return ctlErr(kOverlayNone);
             if (action == "copy") return g_sel.isFor(ov) ? ctlOk(overlayTextReply(selectionText())) : ctlErr(kOverlayNoSelection);
-            return ctlOk(overlayTextReply(readSurfaceText(ov, textArgs)));
+            std::string text;
+            return readSurfaceText(ov, textArgs, &text) ? ctlOk(overlayTextReply(text)) : ctlErr(text);
         }
         // g_overlayHwnd is written on the UI thread; this read is the same one close always made.
         // The user can close the popup by hand between this read and the posted message running —
@@ -8842,6 +8968,15 @@ static std::string ctlDispatch(const std::string& line) {
         bool open = g_overlayHwnd != nullptr;
         if (action == "close") {
             if (!open) return ctlOkStr(kOverlayNone);   // idempotent: "no overlay open" is true afterwards
+            {   // The exit the popup has NOW, written before the ack: a `result` right after
+                // "closed" reads it, not the value the posted WM_DESTROY has yet to write (revmux r1
+                // of P5-lite). WM_DESTROY writes again — the same, or an exit that landed between.
+                LockG hold;
+                if (g_overlaySession && indexOfSession(g_overlaySession) >= 0) {
+                    std::string e = overlayExitOf(g_overlaySession);
+                    if (!e.empty()) setLastOverlayExit(e);
+                }
+            }
             PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
             return ctlOkStr("closed");
         }
@@ -8862,6 +8997,7 @@ static std::string ctlDispatch(const std::string& line) {
         }
         auto* rq = new OverlayReq{ command, effectivePct };   // the number the reply names (see resize above)
         if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was opened"); }
+        setLastOverlayExit(kOverlayNone);   // the reset, before the ack (openOverlay's comment); the popup being replaced holds its own
         // A status word carrying the size IN EFFECT, not the overlay's session id: the session does
         // not exist yet when this reply is written (it is created by the posted message). Known gap,
         // written down in the plan; the contract pins only that the reply is a string.
@@ -9661,7 +9797,10 @@ static std::string ctlDispatch(const std::string& line) {
             RECT rc; GetWindowRect(w->hwnd, &rc);
             const std::wstring& aws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size())
                                     ? g_workspaces[g_activeWs] : g_workspaces[0];
-            Session* fs = focusedSession();
+            // The focused pane's SESSION, not its surface (P5): a covered pane's overlay is named
+            // `overlay` and is no session; the field names the session the pane belongs to.
+            Session* fs = focusedShell();
+            if (fs) if (Session* owner = splitOwnerOf(fs)) fs = owner;   // a split shell: its session's name
             return ctlOk(std::string("{") +
                          "\"sidebarVisible\":" + (g_showSidebar ? "true" : "false") +
                          // Always false, and not a stub: this client has no fullscreen mode at all,
