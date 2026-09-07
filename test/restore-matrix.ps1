@@ -26,6 +26,7 @@ $ErrorActionPreference = 'Stop'
 # iteration and every cell fails for a reason that has nothing to do with restore.
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
+. "$PSScriptRoot\owned-procs.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 # agwintermctl defaults its target to $AGWINTERM_SESSION_ID when none is given (conformance.ps1 says
@@ -472,26 +473,36 @@ if (-not $Only -or $Only -eq 'two-windows') {
 # restartApp() used to relaunch the bare exe, so a named window restarted as the DEFAULT instance
 # and read a different sessions file. Nothing crashed; the sessions were simply someone else's.
 
-function Find-Lite($inst) {
-    Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'" |
-        Where-Object { $_.CommandLine -match [regex]::Escape($inst) } |
-        ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
-}
-
-# Every agliteterm.exe alive right now, by pid. Snapshotted before the restart so anything the
-# restart itself produces can be told apart from the user's own running lite.
+# Every agliteterm.exe alive right now, by pid. Snapshotted before the restart so the report at the
+# end can name what appeared during the cell and was NOT proven ours.
 function Lite-Pids { @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'" | ForEach-Object { $_.ProcessId }) }
+
+# Ownership of the relaunch. restartApp() runs `cmd.exe /c ping -n 2 127.0.0.1 >nul & start "" <exe>
+# [--pipe <inst>]`, so the restarted window is the old instance's GRANDCHILD: old lite -> cmd.exe ->
+# agliteterm.exe. Each hop is proven by Get-OwnedChildren (test/owned-procs.ps1: parent pid plus birth
+# order), never by name or command line - a window that merely LOOKS like ours (same exe, same --pipe)
+# is another agent's copy of this suite or the user's own, and is reported, not stopped. The relay
+# cmd.exe lives about a second (the ping), so it is collected while the old instance is on its way out
+# and remembered by pid + birth once it has gone; the relaunched window names that pid as its parent.
+function Restart-Relays([int]$oldId, [datetime]$oldBorn, $seen) {
+    foreach ($c in Get-OwnedChildren $oldId $oldBorn 'cmd.exe') { $seen[[int]$c.ProcessId] = $c.CreationDate }
+    $seen
+}
+function Relaunched-Lites($relays) {
+    @($relays.GetEnumerator() | ForEach-Object { Get-OwnedChildren ([int]$_.Key) $_.Value 'agliteterm.exe' })
+}
 
 # The regression this cell exists to catch is also the regression that makes it dangerous: if
 # restartCommandLine() ever drops the --pipe, "Restart everything" relaunches as the DEFAULT
 # instance, which owns the user's REAL sessions.tsv and would overwrite it on its next save. The
-# cell's own $p2 lookup finds nothing in that case and throws, so nothing else would ever stop it.
-function Stop-Stray-Lite($known) {
+# cell's pipe wait never sees it answer $inst and throws, so this is where it must be stopped - and it
+# can be, because the ownership chain reaches it regardless of what command line it came up with.
+# A window that the chain does not reach is reported by pid and left alone.
+function Stop-Owned-Relaunch($relays, [string]$inst, $known) {
+    foreach ($l in Relaunched-Lites $relays) { Stop-OwnedRow $l 'owned relaunch' }
     Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'" |
-        Where-Object { $known -notcontains $_.ProcessId } | ForEach-Object {
-            "        (stopping stray lite pid $($_.ProcessId): $($_.CommandLine))"
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
+        Where-Object { $known -notcontains $_.ProcessId -and $_.CommandLine -match [regex]::Escape($inst) } |
+        ForEach-Object { "        (NOT stopping pid $($_.ProcessId): answers to $inst but is not proven ours: $($_.CommandLine))" }
 }
 
 function Restart-Cell {
@@ -501,6 +512,7 @@ function Restart-Cell {
     Reset-Cell $inst
     $before = ''; $after = ''; $err = ''
     $p = $null; $p2 = $null
+    $relays = @{}                             # relay cmd.exe pid -> its birth: the proof of the relaunch
     $known = Lite-Pids                        # includes the user's own lite, which must NOT be touched
     try {
         $p = Start-Lite $inst
@@ -509,30 +521,41 @@ function Restart-Cell {
         Start-Sleep -Seconds 2
         $before = Signature $inst
         $oldId = $p.Id
+        $oldBorn = $p.StartTime
 
         # File > Restart everything (IDM_RESTART = 103), posted — never injected globally.
         $p.Refresh()
         if (-not $p.MainWindowHandle -or $p.MainWindowHandle -eq 0) { throw "no main window for $inst" }
         [void][Win32Post]::PostMessageW($p.MainWindowHandle, 0x0111, [IntPtr]103, [IntPtr]::Zero)
 
-        for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $p.Refresh(); if ($p.HasExited) { break } }
+        # Collect the relay while the old instance is still on its way out (it spawns cmd.exe, then
+        # destroys its window); once more after, since the relay outlives its parent by the ping.
+        for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $relays = Restart-Relays $oldId $oldBorn $relays; $p.Refresh(); if ($p.HasExited) { break } }
         if (-not $p.HasExited) { throw 'the old instance never exited after Restart everything' }
+        $relays = Restart-Relays $oldId $oldBorn $relays
+        if ($relays.Count -eq 0) { throw 'no relay cmd.exe was ever seen under the old instance: nothing can prove which window is the relaunch' }
 
-        # The relaunch is a detached grandchild (cmd /c ping & start), so wait for its pipe.
+        # The relaunch is a detached grandchild (cmd /c ping & start): wait for a window the relay
+        # chain proves is ours AND for the pipe it must answer. A proven window that came up WITHOUT
+        # this cell's --pipe is the regression (the default instance): fail now, while it is still ours
+        # to stop in finally, rather than time out on a pipe it will never answer.
         $p2 = $null
         for ($i = 0; $i -lt 40; $i++) {
             Start-Sleep -Milliseconds 500
+            $mine = @(Relaunched-Lites $relays)
+            $wrong = @($mine | Where-Object { $_.CommandLine -notmatch ('--pipe\s+"?' + [regex]::Escape($inst) + '"?') })
+            if ($wrong.Count) { throw "the relaunch came up without --pipe $inst (pid $($wrong[0].ProcessId)): $($wrong[0].CommandLine)" }
             $r = (& $ctl tree --json --pipe $inst 2>&1) -join ''
-            if ($r -match '"ok":true') { $p2 = @(Find-Lite $inst | Where-Object { $_.Id -ne $oldId })[0]; break }
+            if ($r -match '"ok":true' -and $mine.Count) { $p2 = Get-Process -Id $mine[0].ProcessId -ErrorAction SilentlyContinue; if ($p2) { break } }
         }
-        if (-not $p2) { throw 'the restarted instance never answered its control pipe' }
+        if (-not $p2) { throw 'the restarted instance never answered its control pipe as a window proven to be the relaunch' }
         $known += $p2.Id
         Start-Sleep -Seconds 2
         $after = Signature $inst
         Stop-Lite $p2; $p2 = $null
         $p = $null   # already exited: that is what this cell just asserted
     } catch { $err = $_.Exception.Message }
-    finally { Stop-Leftover $p; Stop-Leftover $p2; Stop-Stray-Lite $known }
+    finally { Stop-Leftover $p; Stop-Leftover $p2; Stop-Owned-Relaunch $relays $inst $known }
 
     if (-not $err -and $after -eq $before -and (SessionCount $before) -ge 2) {
         "  PASS  {0,-22} [{1}]" -f $Name, $after
