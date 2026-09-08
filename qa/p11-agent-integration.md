@@ -74,3 +74,18 @@ batch: per-pane binding generations cover every runtime binding writer and stale
 recognized hook key spellings are checked before destination writes. Regression tests cover the clear,
 ABA, and seven wrong-case shapes including unchanged helper/profile/settings destinations. Pure checks
 pass 63 agent/I/O and 44 installer cases. Final candidate CI and narrow confirmation remain required.
+
+Confirmation 04 had no actionable findings; its pre-existing full-upstream-hook-schema coverage gap
+is accepted as nonblocking follow-up #60, not silently labeled fixed. Both sources reported; the
+zero-finding adversarial source has inspection events. However the e1b2310 local run failed one of
+400 checks: after a previous YOLO, one pane acknowledged its update resume but returned to PowerShell's
+fallback prompt without a live resumed agent. This was a real failed dispatch, not just a missing log
+line. All 35 retained children exited and token 79 was released after verified restoration.
+
+The next batch removes native execution from the prompt function: PSConsoleHostReadLine returns an
+authorized command to the host's normal pipeline before invoking the prior reader for ordinary input.
+It does not edit PSReadLine's draft. Only one interrupt is queued; an I/O completion cannot prove that
+the console consumed a second Ctrl+C. Three successive native restarts now precede the two-pane update
+test; failure records both pane screens and events. The fake's shared append log is serialized so
+simultaneous launches cannot overwrite evidence. Unit coverage proves reader preservation, no execution
+inside the boundary function, and no claim during prompt rendering (29 script checks pass).

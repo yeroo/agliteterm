@@ -88,14 +88,16 @@ shells and explicit-argument profiles must explicitly load `agliteterm-prompt.ps
 custom conflicting binding, readonly, covered or ambiguous panes refuse without interruption.
 
 While pending, a per-pane lease refuses editing input (including API type/paste); terminal protocol
-replies remain available. The app sends up to two Ctrl+C bytes only while the verified original agent
+replies remain available. The app sends one Ctrl+C byte only while the verified original agent
 is alive, and authorizes resume only within 30 seconds. If Windows has not completed a canceled
 interrupt I/O, the pane's lease remains reserved until completion is known; an event reports that
 exception and no late resume is authorized. No global agent lock is held during that wait.
-The shell claims a generated, quoted argv only from its prompt,
+The shell claims a generated, quoted argv only at its `PSConsoleHostReadLine` boundary,
 after all retained descendants exited, a new snapshot shows no surviving shell children, and the
 shell reports itself as the sole attached console client (including late orphan checks). Resume
-executes inside the prompt, never by appending executable text to PSReadLine's draft. State changes,
+is returned to PowerShell's normal command pipeline, never executed inside the prompt or appended
+to PSReadLine's draft. The prior readline function handles ordinary input unchanged; unsupported
+alias/script readers are not replaced and do not register the bridge. State changes,
 unknown ownership, timeout or missing claim mean no resume dispatch. No fixed-delay fallback or
 name/PID-only process kill is used. Interrupt I/O has a bounded cancellable wait. Offers and acknowledgements
 are retryable for the same globally unique authorization; the prompt checks expiry and executes it at most once,

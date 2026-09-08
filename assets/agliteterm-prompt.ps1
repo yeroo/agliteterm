@@ -56,21 +56,30 @@ if(-not $global:__agwLiteWrap){
     $global:__agwLiteWrap=$true;$global:__agwLiteP=$function:prompt
     function global:prompt {
         $ec=if($?){0}else{1}
-        # Claim only from the prompt, not from PSReadLine: no command is appended to draft input.
-        # The native owner verifies retained process handles have exited before returning a resume.
-        while($true){
-            $null=Invoke-AgLiteBridgeRequest register
-            $resume=Get-AgLiteResume
-            if(-not $resume){break}
-            try { & ([scriptblock]::Create($resume)) } catch { Write-Error $_ }
-            $ec=if($?){0}else{1}
-            # A resumed agent ran inside this prompt. Its next exit must allow another claim
-            # before returning to ReadLine, including a later version-update restart.
-        }
         $e=[char]27;$b=[char]7
         $location=$executionContext.SessionState.Path.CurrentLocation
         if($location.Provider.Name -eq 'FileSystem'){[Environment]::CurrentDirectory=$location.ProviderPath}
         [Console]::Write("$e]133;D;$ec$b$e]133;A$b")
         if($global:__agwLiteP){& $global:__agwLiteP}else{"PS $($executionContext.SessionState.Path.CurrentLocation)> "}
+    }
+}
+if(-not $global:__agwLiteReadLine){
+    $reader=Get-Command PSConsoleHostReadLine -ErrorAction SilentlyContinue
+    if(-not $reader){
+        try { Import-Module PSReadLine -ErrorAction Stop } catch {}
+        $reader=Get-Command PSConsoleHostReadLine -ErrorAction SilentlyContinue
+    }
+    # Preserve an existing function, including custom readers. Unsupported aliases/scripts are
+    # left untouched and never register a restart capability.
+    if($reader -is [Management.Automation.FunctionInfo]){
+        $global:__agwLiteReadLine=$reader.ScriptBlock
+        function global:PSConsoleHostReadLine {
+            $null=Invoke-AgLiteBridgeRequest register
+            $resume=Get-AgLiteResume
+            # Return to the host's normal command pipeline, never execute inside prompt/readline.
+            # A Ctrl+C that ends a resumed native agent must not cancel an enclosing prompt loop.
+            if($resume){return $resume}
+            & $global:__agwLiteReadLine @args
+        }
     }
 }

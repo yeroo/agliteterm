@@ -100,6 +100,20 @@ if(Get-AgLiteResume){throw 'Expired authorization executed'}
 '@
 $null=Invoke-AgentFixture (". '$prompt';"+$protocol) 0
 Check 'prompt retries lost offer/ack, consumes once and refuses expired authorization' (-not$script:unexpectedConnection)
+$readline=@'
+$global:p11Reads=0;$global:p11Claims=0;$global:p11Executed=$false
+function global:PSConsoleHostReadLine {$global:p11Reads++;'user draft preserved'}
+'@
+$boundary=@'
+function global:Invoke-AgLiteBridgeRequest {}
+function global:Get-AgLiteResume {$global:p11Claims++;if($global:p11Claims-eq 1){'$global:p11Executed=$true'}}
+if((PSConsoleHostReadLine)-cne'$global:p11Executed=$true' -or $global:p11Executed -or $global:p11Reads-ne 0){throw 'Resume executed inside reader or draft reader entered'}
+if((PSConsoleHostReadLine)-cne'user draft preserved' -or $global:p11Reads-ne 1){throw 'Ordinary custom reader not preserved'}
+$claims=$global:p11Claims;$null=prompt
+if($global:p11Claims-ne$claims){throw 'Rendering prompt claimed another command'}
+'@
+$null=Invoke-AgentFixture ($readline+"; . '$prompt';"+$boundary) 0
+Check 'host boundary returns resume without executing it and preserves ordinary reader' (-not$script:unexpectedConnection)
 "agent-scripts-unit: $checks checks, $failed failed; fake CLI only, artifacts $root"
 if($failed){throw 'agent script unit checks failed'}
 exit 0

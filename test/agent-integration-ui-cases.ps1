@@ -165,6 +165,12 @@ Check 'explicit yolo queues, not falsely completes' ($r-match'queued')
 Check 'prompt bridge resumes exact conversation with requested mode' ((P11-Wait {@(P11-Launches).Count-gt$count}) -and ((P11-Launches)[-1]-match("--resume\t"+$sidA)) -and (P11-Launches)[-1]-match'--dangerously-skip-permissions')
 Capture-P11Children
 Check 'sibling conversation was not restarted by targeted yolo' (@(P11-Launches|Where-Object {$_-match$sidB}).Count-eq 1)
+foreach($cycle in 1..3){
+    $before=@(P11-Launches|Where-Object {$_-match$sidA}).Count
+    $null=Selection-Rpc 'claude.yolo' @{} $agentA
+    Check "host boundary permits repeated native-agent restart $cycle" (P11-Wait {@(P11-Launches|Where-Object {$_-match$sidA}).Count-eq$before+1})
+    Capture-P11Children
+}
 $null=Selection-Rpc 'session.bind' @{agent='my-custom-binding --keep'} $agentB
 $r=Selection-Rpc 'claude.yolo' @{} $agentB -AllowError
 Check 'custom binding is preserved and not silently replaced by yolo' (-not$r.ok -and $r.error-match'custom binding')
@@ -217,7 +223,12 @@ foreach($mode in 'fail','noop','new'){
     Check "$mode update reports completion event" (P11-Wait {@((Selection-Rpc 'events' @{since=$cursor}).events|Where-Object type -eq 'agent.update').Count-gt 0} 25)
     (Selection-Rpc 'events' @{since=$cursor})|ConvertTo-Json -Depth 10|Set-Content (Join-Path $script:selectionArtifact "update-$mode-events.json")
     if($mode-eq'new'){
-        Check 'new version restarts both exact conversations' (P11-Wait {@(P11-Launches).Count-ge$count+2})
+        $restarted=P11-Wait {@(P11-Launches).Count-ge$count+2}
+        if(-not$restarted){
+            foreach($agentPane in $agentA,$agentB){[string](Selection-Rpc 'session.text' @{} $agentPane)|Set-Content (Join-Path $script:selectionArtifact "update-missing-$agentPane.txt")}
+            (Selection-Rpc 'events' @{since=$cursor})|ConvertTo-Json -Depth 10|Set-Content (Join-Path $script:selectionArtifact 'update-restart-failure-events.json')
+        }
+        Check 'new version restarts both exact conversations' $restarted
         Capture-P11Children
         $lastA=@(P11-Launches|Where-Object {$_-match$sidA})[-1];$lastB=@(P11-Launches|Where-Object {$_-match$sidB})[-1]
         Check 'update preserves each prior permission mode' ($lastA-match'--dangerously-skip-permissions' -and $lastB-notmatch'--dangerously-skip-permissions')

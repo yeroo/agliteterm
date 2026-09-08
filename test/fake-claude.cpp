@@ -34,9 +34,19 @@ int main(int argc, char** argv) {
     for (int i=1; i+1<argc; ++i) if (std::string(argv[i])=="--session-id" || std::string(argv[i])=="--resume") sid=argv[i+1];
     const bool immediate = std::ifstream(dir+"immediate.txt").good();
     ignore = !sid.empty() && std::ifstream(dir+"ignore-"+sid).good();
+    // Two panes can resume together. CRT append seeks are not an inter-process logging lock.
+    std::string mutexName="Local\\p11-fake-log-"+dir;
+    for(size_t i=6;i<mutexName.size();++i) if(mutexName[i]=='\\' || mutexName[i]=='/' || mutexName[i]==':') mutexName[i]='_';
+    HANDLE logMutex=CreateMutexA(nullptr,FALSE,mutexName.c_str());
+    if(!logMutex) return 10;
+    const auto locked=WaitForSingleObject(logMutex,5000);
+    if(locked!=WAIT_OBJECT_0 && locked!=WAIT_ABANDONED){CloseHandle(logMutex);return 10;}
+    bool logged=false;
     { std::ofstream output(dir+"launch.log",std::ios::app); output << GetCurrentProcessId();
       for (int i = 1; i < argc; ++i) output << '\t' << argv[i];
-      output << '\n'; }
+      output << '\n'; output.flush(); logged=output.good(); }
+    ReleaseMutex(logMutex);CloseHandle(logMutex);
+    if(!logged) return 11;
     std::printf("P11-AGENT-READY\n"); std::fflush(stdout);
     if (immediate) return 0;
     stopped = CreateEventW(nullptr,TRUE,FALSE,nullptr);

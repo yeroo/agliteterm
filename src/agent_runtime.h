@@ -124,15 +124,15 @@ static bool agentStillEligible(const AgentOperation& op) {
 static DWORD WINAPI agentInterruptWorker(void* opaque) {
     std::unique_ptr<std::shared_ptr<AgentOperation>> payload(static_cast<std::shared_ptr<AgentOperation>*>(opaque));
     auto op = *payload; std::string result = "timed out; no resume dispatched";
-    bool first = false, second = false;
+    bool interrupted = false;
     while (GetTickCount64() - op->started < 30000) {
         bool interrupt = false;
-        // Serialize claim/cancellation with Ctrl+C so a second interrupt cannot hit the new agent.
+        // Never queue a second Ctrl+C: pipe completion is not proof the console consumed it.
         {
             std::lock_guard<std::mutex> guard(g_agentMutex);
             if (op->claimed) return 0;
             if (!agentStillEligible(*op)) { result = "pane state changed; no resume dispatched"; break; }
-            if (!op->offered && (!first || (!second && GetTickCount64() - op->started >= 350)) && op->evidence.process->live())
+            if (!op->offered && !interrupted && op->evidence.process->live())
                 op->interrupting = interrupt = true;
         }
         if (interrupt) {
@@ -149,7 +149,7 @@ static DWORD WINAPI agentInterruptWorker(void* opaque) {
             std::lock_guard<std::mutex> guard(g_agentMutex);
             op->interrupting = false;
             if (expired || written != 1) { op->cancelled = true; result = "interrupt completed/cancelled after failure or deadline; no resume dispatched"; break; }
-            if (first) second = true; else first = true;
+            interrupted = true;
         }
         Sleep(50);
     }
