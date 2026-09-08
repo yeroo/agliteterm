@@ -43,14 +43,20 @@ function Pin-Owned($proc) { if ($proc) { [void]$proc.SafeHandle } }
 # When a pinned process exited, or MaxValue while it is alive: the upper bound for its children.
 function Exit-Of($proc) { if ($proc -and $proc.HasExited) { $proc.ExitTime } else { [datetime]::MaxValue } }
 
+# A birth as CIM can say it: CIM keeps a creation time to the microsecond, a handle's StartTime to
+# 100 ns, and WMI truncates (on this box handle - CIM is uniformly 0..9 ticks over every process).
+# Cut to the microsecond the two name the same kernel time or they do not; there is no other
+# tolerance - a birth one millisecond off is another process.
+function UtcMicroTicks([datetime]$t) { $x = $t.ToUniversalTime().Ticks; $x - ($x % 10) }
+
 # Open the process a proven row describes and check it is still THAT process: the handle's own
-# StartTime must be the row's CreationDate (the two agree to a millisecond; a reused pid is off by
+# StartTime must be the row's CreationDate, to the microsecond CIM carries (a reused pid is off by
 # the life of the original). $null when it is gone or reused - it is not ours to touch.
 function Open-Owned($row) {
     $p = Get-Process -Id ([int]$row.ProcessId) -ErrorAction SilentlyContinue
     if (-not $p) { return $null }
     try { Pin-Owned $p; $born = $p.StartTime } catch { return $null }
-    if ([math]::Abs(($born - $row.CreationDate).TotalMilliseconds) -gt 100) { return $null }
+    if ((UtcMicroTicks $born) -ne (UtcMicroTicks $row.CreationDate)) { return $null }
     $p
 }
 
@@ -160,20 +166,22 @@ function Ask-PaneShell([scriptblock]$Type, [scriptblock]$Text, [int]$ms = 8000) 
     throw "the pane never answered AGWSHELL-$nonce=<pid>|<born> within $ms ms; its screen: $seen"
 }
 
-# Track a shell by the identity its pane answered: the pid must be running NOW, and the process
-# running under it must have been born when the answer said (to the 100 ms the two clocks agree
-# to, as Open-Owned) - otherwise the pid has been reused and the answer was another process's.
-# Returns the ledger key.
+# Track a shell by the identity its pane answered: the pid must be running NOW, pinned as the
+# process the snapshot described (Open-Owned), and the PINNED handle's own StartTime must be the
+# very ticks the answer carried - the shell read that value from the same kernel time through the
+# same API, so it is equal or the pid has been reused and the answer was another process's. Nothing
+# is admitted before that holds. Returns the ledger key.
 function Register-OwnedShell([int]$ShellPid, [long]$BornUtcTicks) {
     $row = Get-ProcRow $ShellPid
     if (-not $row) { throw "the pane answered shell pid $ShellPid, which is not running" }
-    $rowBorn = $row.CreationDate.ToUniversalTime().Ticks
-    if ([math]::Abs($rowBorn - $BornUtcTicks) -gt 1000000) {
-        throw "the pane answered shell pid $ShellPid born at $BornUtcTicks, but the process running under pid $ShellPid now was born at ${rowBorn}: a reused pid, not the shell that answered"
-    }
     $k = Ledger-Key $row
-    if (-not $script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] = New-Tracked $row }
-    if (-not (Tracked-Alive $script:ledgerShells[$k])) { throw "shell pid $ShellPid could not be pinned; nothing typed into it can be proven" }
+    $t = if ($script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] } else { New-Tracked $row }
+    if (-not (Tracked-Alive $t)) { throw "shell pid $ShellPid could not be pinned as the process the snapshot described; nothing typed into it can be proven" }
+    $handleBorn = $t.Proc.StartTime.ToUniversalTime().Ticks
+    if ($handleBorn -ne $BornUtcTicks) {
+        throw "the pane answered shell pid $ShellPid born at $BornUtcTicks, but the process pinned under pid $ShellPid was born at ${handleBorn}: a reused pid, not the shell that answered"
+    }
+    $script:ledgerShells[$k] = $t
     $k
 }
 

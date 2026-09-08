@@ -54,6 +54,37 @@ $threw = ''
 try { Register-OwnedShell $PID ($born - 50000000) | Out-Null } catch { $threw = $_.Exception.Message }
 Check 'the same pid with a birth 5 s off is refused as a reused pid, and nothing is admitted' ($threw -match 'reused pid' -and $script:ledgerShells.Count -eq 0) "threw: '$threw'"
 
+# Exactness: the answer carries the kernel time to the tick, so one millisecond - or one tick - off
+# is not this process (Codex's read of 5bab9f2: a 100 ms tolerance admitted a birth 1 ms wrong).
+foreach ($off in @(@(10000, '1 ms'), @(1, '1 tick'))) {
+    $threw = ''
+    try { Register-OwnedShell $PID ($born - $off[0]) | Out-Null } catch { $threw = $_.Exception.Message }
+    Check "the same pid with a birth $($off[1]) off is refused as a reused pid, and nothing is admitted" ($threw -match 'reused pid' -and $script:ledgerShells.Count -eq 0) "threw: '$threw'"
+}
+
+# The row and the handle: CIM says a birth to the microsecond, the handle to the tick. A row cut to
+# the microsecond is this process; a row one microsecond earlier, or one millisecond off, is not.
+function Fake-Row([long]$utcTicks) {
+    [pscustomobject]@{ ProcessId = $PID; ParentProcessId = 1; CreationDate = [datetime]::new($utcTicks, [DateTimeKind]::Utc).ToLocalTime(); CommandLine = 'this pwsh' }
+}
+$cut = $born - ($born % 10)
+$real = Get-ProcRow $PID
+$realBorn = $real.CreationDate.ToUniversalTime().Ticks
+Check 'the real CIM row of this process is its StartTime cut to the microsecond (0..9 ticks under it)' (($born - $realBorn) -ge 0 -and ($born - $realBorn) -le 9 -and $realBorn -eq $cut) "handle $born, row $realBorn"
+Check 'a row carrying the birth cut to the microsecond opens this process' ([bool](Open-Owned (Fake-Row $cut)))
+Check 'a row one microsecond earlier does not open it: not the same process' (-not (Open-Owned (Fake-Row ($cut - 10))))
+Check 'a row one millisecond off does not open it either' (-not (Open-Owned (Fake-Row ($born + 10000))))
+
+# The handle's identity is what is compared with the answer, not the row's: a row that is not the
+# pinned process cannot be admitted even when the answer repeats that row's own birth.
+$script:ledgerShells = @{}
+$realGetProcRow = ${function:Get-ProcRow}
+${function:Get-ProcRow} = { param([int]$ProcId) Fake-Row ($born + 10000) }
+$threw = ''
+try { Register-OwnedShell $PID ($born + 10000) | Out-Null } catch { $threw = $_.Exception.Message }
+${function:Get-ProcRow} = $realGetProcRow
+Check 'a snapshot row 1 ms off the pinned handle is refused even when the answer repeats that row''s birth' ($threw -match 'could not be pinned' -and $script:ledgerShells.Count -eq 0) "threw: '$threw'"
+
 $threw = ''
 try { Register-OwnedShell 2147483646 $born | Out-Null } catch { $threw = $_.Exception.Message }
 Check 'a pid that is not running is refused' ($threw -match 'not running') "threw: '$threw'"
