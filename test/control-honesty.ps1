@@ -164,6 +164,14 @@ public static class LiteHonesty {
 # from its code point so the check does not depend on how this file was decoded.
 $overlayTitle = 'agliteterm ' + [char]0x2014 + ' overlay'
 function OverlayHwnd { [LiteHonesty]::FindWindowW('AgwintermLitePopup', $overlayTitle) }
+function Focus-SandboxPopup([IntPtr]$h) {
+    if ($h -eq [IntPtr]::Zero -or [LiteHonesty]::PidOf($h) -ne $s.Proc.Id) {
+        throw 'refusing to post focus to a window outside this sandbox'
+    }
+    # Opening a background popup intentionally does not focus it. Set up the logical focus
+    # event this scenario requires, on this process only, without taking the real foreground.
+    [void][LiteHonesty]::PostMessageW($h, 0x0007, [IntPtr]::Zero, [IntPtr]::Zero)
+}
 function Wait-Overlay([bool]$present, [int]$ms = 4000) {
     for ($i = 0; $i -lt ($ms / 100); $i++) {
         $h = OverlayHwnd
@@ -2689,10 +2697,11 @@ try {
         Check 'the popup is gone' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
         # ---- the close command with the popup focused closes the POPUP (the P2 rule), the pane overlay stays ----
         $raw = Overlay @('open', 'echo', 'p5-pop-cl;', 'Start-Sleep', '300'); $r = ConvertFrom-Json $raw
-        Check 'setup: a popup over the covered pane, focused' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
+        Check 'setup: a popup over the covered pane' ([bool]$r.ok -and (Wait-Overlay $true) -ne [IntPtr]::Zero -and (Wait-OvText @('text') 'p5-pop-cl')) "raw: $raw"
         Start-Sleep -Milliseconds 300
+        Focus-SandboxPopup (OverlayHwnd)
         [LiteHonesty]::PostMessageW($s.Hwnd, 0x0111, [IntPtr]2, [IntPtr]::Zero) | Out-Null   # IDM_CLOSE: the close chord's command
-        Check 'IDM_CLOSE with the popup focused closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
+        Check 'IDM_CLOSE after the popup logical WM_SETFOCUS closes the popup' ((Wait-Overlay $false) -eq [IntPtr]::Zero)
         Check 'and the pane overlay under it is untouched: still up, still the surface, the block unchanged' ((Resolves $ovt) -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-t4' $true 1000) -and (SplitBlock $aid) -eq $block9 -and (NodeCount) -eq $before) "words '$(Words $aid)' block '$(SplitBlock $aid)' nodes $(NodeCount)"
         Send-Ctl $s @('session', 'focus', 'right') | Out-Null
         Start-Sleep -Milliseconds 300
@@ -2704,6 +2713,152 @@ try {
         Check 'session close --target active with the covered split pane focused closes that PANE: closed, the session single with its own shell, the overlay and its shell gone with the pane' ([bool]$r.ok -and [string]$r.result -eq 'closed' -and (Wait-Single $aid) -and (Wait-Gone $ovt) -and (Wait-Shell5 'p5-ov-t4' $false) -and [bool](Node $aid).active -and (NodeCount) -eq $before) "raw: $raw, block '$(SplitBlock $aid)', nodes $(NodeCount) vs $before"
         Check 'and the survivor is the session''s own shell, uncovered: active reads its marker' ((Active) -match 'p5-mk-left-9' -and (Words $aid) -eq '') "active: $(Get-PaneText $s '')"
         Check 'nothing of the block is left running: no shell with a p5-ov marker on its command line anywhere' (@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'echo p5-ov-' }).Count -eq 0)
+    }
+
+    # ---- P6: selection verbs own one surface, including history and the alt-screen boundary -----
+    '-- selection.* --'
+    $selectionClipboard = Get-Clipboard -Raw
+    $selectionIds = @()
+    try {
+        function Selection([string]$op, [string]$id = 'active') {
+            ConvertFrom-Json (Send-Ctl $s @('selection', $op, '--target', $id))
+        }
+        function Selected([string]$id) { [string](Get-CtlResult $s @('session', 'copy', '--target', $id)) }
+        function Write-SelectionScreen([string]$id, [string]$text) {
+            $r = ConvertFrom-Json (Send-Raw (@{cmd='session.write'; target=$id; args=@{text=$text}} | ConvertTo-Json -Compress))
+            if (-not $r.ok) { throw "selection fixture write: $($r.error)" }
+        }
+        $sa = [string](Get-CtlResult $s @('session', 'new', '--name', 'p6-selection-a'))
+        $selectionIds += $sa
+        $sb = [string](Get-CtlResult $s @('session', 'new', '--name', 'p6-selection-b'))
+        $selectionIds += $sb
+        Start-Sleep -Seconds 2
+        Send-Ctl $s @('session', 'select', '--target', $sa) | Out-Null
+        $fixture = New-ScriptFile -Dir $s.AppDir -Name 'p6-selection.ps1' -Lines @(
+            '1..60 | ForEach-Object { [Console]::WriteLine("MARKER-$_") }',
+            '[Console]::WriteLine("SELECT-ME")'
+        )
+        Send-Ctl $s @('session', 'type', "& '$fixture'`r", '--target', $sa) | Out-Null
+        Check 'selection fixture has finished printing distinct history rows' (Wait-PaneText $sa 'SELECT-ME')
+        Start-Sleep -Milliseconds 500
+        $r = Selection 'all' $sa; $selected = Selected $sa
+        Check 'selection all returns selected all and includes history plus the live grid' ($r.ok -and $r.result -eq 'selected all' -and $selected -match 'MARKER-1\r?\n' -and $selected -match 'MARKER-60' -and $selected -match 'SELECT-ME') "reply $($r | ConvertTo-Json -Compress)"
+        $r = Selection 'clear' $sb
+        Check 'clear on B returns cleared and preserves A selection' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq $selected -and (Selected $sb) -eq '')
+        Set-Clipboard -Value 'P6-CLIPBOARD-SENTINEL'
+        foreach ($case in @(@('copy','no selection'), @('finalize','finalized (empty)'))) {
+            $r = Selection $case[0] $sb
+            Check "selection $($case[0]) on B leaves A selection and clipboard untouched" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+        }
+        foreach ($op in 'all', 'copy', 'clear', 'finalize') {
+            $r = Selection $op 'p6-no-such-session'
+            Check "selection $op refuses a missing target without changing selection or clipboard" (-not $r.ok -and $r.error -eq 'session not found' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+        }
+        $r = Selection 'copy' $sa
+        Start-Sleep -Milliseconds 300
+        $n = [Text.Encoding]::UTF8.GetByteCount($selected)
+        Check 'selection copy reports UTF-8 length, writes precisely session copy text, and clears highlight' ($r.ok -and $r.result -eq "copied $n chars" -and (Get-Clipboard -Raw) -eq $selected -and (Selected $sa) -eq '')
+        $r = Selection 'copy' $sa
+        Check 'selection copy without a selection leaves the clipboard unchanged' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq $selected)
+        $r = Selection 'clear' $sa
+        Check 'selection clear with nothing selected still answers cleared' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq '')
+        $r = ConvertFrom-Json (Send-Raw (@{cmd='selection.all'; target=$sa} | ConvertTo-Json -Compress))
+        Check 'raw JSON selection.all reaches the same handler without the client' ($r.ok -and $r.result -eq 'selected all' -and (Selected $sa) -eq $selected)
+        $r = Selection 'finalize' $sa
+        Start-Sleep -Milliseconds 300
+        Check 'finalize copies and keeps the highlight' ($r.ok -and $r.result -eq 'finalized (copied)' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq $selected)
+        Selection 'clear' $sa | Out-Null
+        $r = Selection 'finalize' $sa
+        Check 'finalize without a selection is empty and leaves clipboard unchanged' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq $selected)
+
+        $ov = [string](Get-CtlResult $s @('session','overlay','open','echo P6-OVERLAY; Start-Sleep 300','--pane','left','--target',$sa))
+        Check 'selection setup has an overlay with its own distinct output' ($ov -and (Wait-PaneText $ov 'P6-OVERLAY'))
+        $r = Selection 'all' $ov
+        $ovText = [string](ConvertFrom-Json (Overlay @('copy','--pane','left','--target',$sa))).result.text
+        Check 'all on overlay id selects the overlay and leaves the shell unselected' ($r.ok -and $r.result -eq 'selected all' -and $ovText -match 'P6-OVERLAY' -and (Selected $sa) -eq '')
+        Selection 'clear' $ov | Out-Null
+        $r = Selection 'all'
+        Check 'all on active with a covered focused pane selects its surface' ($r.ok -and (Selected $ov) -match 'P6-OVERLAY' -and (Selected $sa) -eq '')
+        Overlay @('close','--pane','left','--target',$sa) | Out-Null
+        $r = Selection 'all'
+        Check 'after overlay close, active selects the shell again' ($r.ok -and (Selected $sa) -match 'SELECT-ME')
+        $selected = Selected $sa
+
+        $cursor = [long](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+        Overlay @('open','echo P6-POPUP; Start-Sleep 300','--target',$sa) | Out-Null
+        $hp = Wait-Overlay $true
+        $popupId = OverlayIdSince $cursor
+        Check 'selection setup has a popup and its id' ($hp -ne [IntPtr]::Zero -and [bool]$popupId)
+        Focus-SandboxPopup $hp
+        $r = Selection 'all'
+        Check 'all on active after popup logical WM_SETFOCUS refuses without replacing the shell selection' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected)
+        $r = Selection 'all' $popupId
+        $popupCopy = ConvertFrom-Json (Overlay @('copy','--target',$sa))
+        Check 'popup all is refused; no invisible selection is installed and shell selection survives' (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and -not $popupCopy.ok -and $popupCopy.error -eq 'no selection' -and (Selected $popupId) -eq '' -and (Selected $sa) -eq $selected)
+        foreach ($case in @(@('copy','no selection'), @('clear','cleared'), @('finalize','finalized (empty)'))) {
+            $r = Selection $case[0] $popupId
+            Check "popup selection $($case[0]) answers $($case[1]) without changing the shell selection" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected)
+        }
+        Overlay @('close','--target',$sa) | Out-Null
+        [void](Wait-Overlay $false)
+
+        # Quick and scratch share paintPopup's -1 sentinel with the overlay popup. The quick
+        # session is the one the earlier quick checks created (off hides it without unlisting).
+        foreach ($kind in 'quick','scratch') {
+            $cursor = [long](Get-CtlResult $s @('events')).cursor
+            if ($kind -eq 'quick') { Send-Ctl $s @('quick','on') | Out-Null; $coverId = $quickSid }
+            else {
+                Send-Ctl $s @('session','scratch','on','--target',$sa) | Out-Null
+                $coverId = OverlayIdSince $cursor
+            }
+            $coverHwnd = [IntPtr]::Zero
+            for ($i = 0; $i -lt 40 -and $coverHwnd -eq [IntPtr]::Zero; $i++) {
+                $coverHwnd = [LiteHonesty]::FindWindowW('AgwintermLitePopup', ('agliteterm ' + [char]0x2014 + ' ' + $kind))
+                if ($coverHwnd -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 100 }
+            }
+            Focus-SandboxPopup $coverHwnd
+            foreach ($target6 in @('active', $coverId)) {
+                $r = Selection 'all' $target6
+                Check "$kind popup all ($target6) refuses and leaves the shell selection intact" (-not $r.ok -and $r.error -eq 'the popup paints no selection' -and (Selected $sa) -eq $selected -and (Selected $coverId) -eq '')
+            }
+            if ($kind -eq 'quick') { Send-Ctl $s @('quick','off') | Out-Null }
+            else { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }
+        }
+
+        # Inject exact VT through session.write: no shell prompt races the screen switch/blanking.
+        # The history above remains real output from the fixture's process.
+        $esc = [string][char]27
+        Write-SelectionScreen $sa ($esc + '[?1049h' + $esc + '[2J' + $esc + '[HSELECT-ALT')
+        $r = Selection 'all' $sa; $altText = Selected $sa
+        Check "selection all on the alt screen takes the app's screen only (minRow = historyCount; revert it and MARKER- lines appear)" ($r.ok -and $r.result -eq 'selected all' -and $altText -match 'SELECT-ALT' -and $altText -notmatch 'MARKER-')
+        Write-SelectionScreen $sa ($esc + '[?1049l')
+        Check 'returning to the main screen drops an alt-screen selection' ((Selected $sa) -eq '')
+        Write-SelectionScreen $sa ($esc + '[?1049h' + $esc + '[2J' + $esc + '[HSELECT-BLANK-ME')
+        Selection 'all' $sa | Out-Null
+        Write-SelectionScreen $sa ($esc + '[2J')
+        Set-Clipboard -Value 'P6-BLANK-SENTINEL'
+        $r = Selection 'copy' $sa
+        Check 'copy of live cells blanked by a TUI answers nothing to copy, clears selection and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL' -and (Selected $sa) -eq '')
+        $r = Selection 'copy' $sa
+        Check 'copy after blank copy answers no selection and keeps the clipboard' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Selection 'all' $sa | Out-Null
+        $r = Selection 'finalize' $sa
+        Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Write-SelectionScreen $sa ($esc + '[HSELECTION-STILL-BOUND')
+        Check 'blank finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
+        Write-SelectionScreen $sa ($esc + '[2J' + $esc + '[HCaf' + [char]0xE9 + ' ' + [char]0x4E2D)
+        Selection 'all' $sa | Out-Null
+        $unicodeText = Selected $sa
+        $r = Selection 'copy' $sa
+        Start-Sleep -Milliseconds 300
+        Check 'copied N chars counts UTF-8 bytes on non-ASCII text while clipboard preserves that text' ($r.ok -and $r.result -eq "copied $([Text.Encoding]::UTF8.GetByteCount($unicodeText)) chars" -and [Text.Encoding]::UTF8.GetByteCount($unicodeText) -gt $unicodeText.Length -and (Get-Clipboard -Raw) -eq $unicodeText -and (Selected $sa) -eq '')
+        Write-SelectionScreen $sa ($esc + '[?1049l')
+    } finally {
+        Overlay @('close') | Out-Null
+        Send-Ctl $s @('quick','off') | Out-Null
+        if ($sa) { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }
+        foreach ($id in $selectionIds) { Send-Ctl $s @('session','close','--target',$id) | Out-Null }
+        Set-Clipboard -Value $(if ($null -eq $selectionClipboard) { '' } else { $selectionClipboard })
     }
 
     # ---- #23: two persisted values that cannot coexist ------------------------------------------

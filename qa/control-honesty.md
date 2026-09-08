@@ -224,7 +224,8 @@ with the foreground).
 
 **Guards:** the surface rule of P5-lite (`docs/plans/completed/2026-09-07-p5-lite-mirror.md`, the vocabulary
 section): while a pane overlay is open, `--target active` on the focused pane (on a SURFACE verb —
-`text`, `type`, `copy`; a session verb's `active` is the session under it, a pane verb's the pane's
+`session type` / `write` / `output` / `text` / `copy` / `paste`, `surface cursor`, `session overlay`,
+`selection all` / `copy` / `clear` / `finalize`; a session verb's `active` is the session under it, a pane verb's the pane's
 shell, revmux r1) and the
 overlay's own id (on a surface verb only — every other verb refuses it as a cover, `flag clear`
 alone taking no target, revmux r2/r3; the partition is stated whole in the plan's vocabulary section)

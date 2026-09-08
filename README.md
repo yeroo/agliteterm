@@ -66,8 +66,18 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   itself with **OSC 52**, and terminal queries get answered. Both bindings are on by default; the
   registry escape hatch is `RightClickPaste` / `CopyOnCtrlC` (DWORD `0`) under
   `HKCU\Software\agliteterm`.
+- **Selection API**: `selection all` selects history and screen (only the app's screen on the alt
+  screen); `selection copy` writes the clipboard and clears the highlight; `selection clear`
+  clears it. `copied N chars` counts UTF-8 bytes of the text `session copy` returns, with CRLF
+  between rows and trailing spaces trimmed. The clipboard write is posted to the UI thread;
+  allow its next message before reading it. `selection finalize` is the release-copy testing
+  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Select All
+  is refused on popup terminals (overlay, quick and scratch): `the popup paints no selection`.
+  Blank Copy answers `nothing to copy`, clears the highlight, and leaves the clipboard alone;
+  blank Finalize keeps the highlight. Copy and Finalize can refuse a failed UI enqueue with
+  `the clipboard write could not be queued; selection unchanged`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  48 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
+  52 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -153,7 +163,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   the bare `result` is the window-wide last popup exit. `copy` and `text [--all | --lines N]`
   answer `{text}` on either slot — the selection made inside the overlay (the clipboard
   untouched) and its buffer — refused `no overlay` / `no selection`; the popup's `copy` is always
-  `no selection`, said rather than hidden. `session text` gains the same `--lines N` (the last N
+  `no selection`, and `selection all` on it is refused: `the popup paints no selection`.
+  `session text` gains the same `--lines N` (the last N
   lines; `0` the screen; a non-number refused instead of dropped) and `--all` (lite's bare form —
   the full app's bare form is the screen only, a recorded difference); the pair is refused. The
   tree node carries `paneOverlays` (`["left"]`, `["right"]`, both, in slot order; absent when
@@ -161,7 +172,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   the shell exiting, `session close`); the close chord closes a focused popup first, then the
   focused pane's overlay; `--target active` on a session verb (`select`, `flag`, `rename`,
   `duplicate`, …) is the session under the focused pane, on a pane verb (`close`, the split
-  verbs, `restore capture`) the pane's shell, on a surface verb (`type`, `text`, `copy`, …) the
+  verbs, `restore capture`) the pane's shell, on a surface verb (`session type` / `write` /
+  `output` / `text` / `copy` / `paste`, `surface cursor`, `session overlay`,
+  `selection all` / `copy` / `clear` / `finalize`) the
   overlay; an overlay's id reaches it on the surface verbs only and is refused as a cover by
   every other verb (`close`, `select`, `flag`, `rename`, `duplicate`, …; `flag clear` alone takes
   no target and unflags every session); nothing of it is persisted.
