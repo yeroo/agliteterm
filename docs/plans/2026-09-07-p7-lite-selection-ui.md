@@ -489,6 +489,26 @@ say what it was.
 
 ## Review and verification record
 
+### 2026-09-08 final review and dependency rebase
+
+- `03-final` reviewed `72f9cd2..dbc6542`: 2/2 sources completed, none degraded,
+  no findings/open questions/pre-existing/immaterial entries. Both healthy zero-finding
+  sources read actual source in their archives. No additional broad review is warranted.
+- Rebased the six P7 commits onto merged P6 `cfd7a51`, yielding `6a83a3a` without conflicts.
+  `src/main.cpp` and `test/selection-ui.ps1` are unchanged from reviewed `dbc6542`.
+- Rebased build passed; cleanup fault-injection/callback checks 9/9 and synthetic encrypted
+  snapshot checks 9/9 passed. These headless checks touch no shared clipboard/registry/host.
+- Newly merged agwinterm #256 (`6eea329`) changed the canonical selection floor after the
+  earlier contract check. Mirrored its exact `tests/conformance/control-api.json` here;
+  `tools/check-contract.ps1` now reports in step. The existing shape runner handles these
+  steps; copy/finalize follow clear and do not write the clipboard in the shared contract.
+- Latest live attempt remains the pre-rebase `selection-ui-20260908T080459-65ef5c`:
+  18 pure checks passed, 0 UI checks; Strict refused the pre-existing native PTY host before
+  a sandbox launch or any clipboard/registry mutation. Token generation 37 was released.
+  Host ownership and Claude's #48 cleanup correction remain external acceptance blockers.
+  No subsequent interactive token acquired or live suite launched. Full Strict/CI and
+  independent Claude confirmation of the final fix remain readiness gates, not waived.
+
 - Initial implementation `2fefdcc`: 50 UI checks passed; generation 19 released after cleanup.
 - Revmux `01-initial`, comprehensive: 4/4 sources, no degradation; 4 gating findings
   (3 production-code Major, 1 test-code Major), 5 Minor, 2 pre-existing Minor.
