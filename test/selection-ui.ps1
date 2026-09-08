@@ -1,5 +1,6 @@
 # Keyboard/mouse selection parity. Run locally under the shared hub token; CI is an isolated host.
-param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict)
+param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
+      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER)
 $ErrorActionPreference='Stop'
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
@@ -13,8 +14,9 @@ if(Test-Path $hub){
         $state=& python $hub status|ConvertFrom-Json
         if(-not $state.ok -or -not $state.held -or $state.generation -ne $lease.generation -or $state.owner -ne $lease.owner -or $state.run_id -ne $lease.run_id){throw 'Inherited suite-token receipt does not match the live holder'}
     }else{
+        if([string]::IsNullOrWhiteSpace($TokenOwner)){Skip-Selection 'set -TokenOwner or AGLITETERM_TEST_OWNER to the actual runner before acquiring a suite token'}
         $run=Split-Path $script:selectionArtifact -Leaf
-        $raw=& python $hub acquire --owner codex-agwinterm --run $run --worktree (Split-Path $PSScriptRoot -Parent) --holder-pid $PID --purpose 'P7 selection UI verification'
+        $raw=& python $hub acquire --owner $TokenOwner --run $run --worktree (Split-Path $PSScriptRoot -Parent) --holder-pid $PID --purpose 'P7 selection UI verification'
         $lease=$raw|ConvertFrom-Json
         if($LASTEXITCODE -ne 0 -or -not $lease.ok){Skip-Selection "suite token unavailable: $raw"}
         $ownLease=$true
@@ -92,6 +94,30 @@ try {
     Check 'double-click blank: no selection and clipboard untouched' ((Selected)-eq '' -and (Clip)-eq 'P7-CLIPBOARD-SENTINEL')
     [SelectionUi]::Button($h,0x203,($g.Left+1),$y);[SelectionUi]::Button($h,0x200,($g.Left+2),$y);[SelectionUi]::Button($h,0x202,($g.Left+2),$y);Start-Sleep -Milliseconds 200
     Check 'double-click: first-cell jitter preserves the whole word on release' ((Selected)-eq 'MARKER-7' -and (Clip)-eq 'MARKER-7') (Selected)
+
+    $blankX=$g.Left+70*$g.Cw
+    [SelectionUi]::Button($h,0x203,$blankX,$y);[SelectionUi]::Button($h,0x202,$blankX,$y)
+    [SelectionUi]::Button($h,0x201,$blankX,$y);[SelectionUi]::Button($h,0x202,$blankX,$y);Start-Sleep -Milliseconds 200
+    Check 'triple-click: trailing blank selects and copies the whole line' ((Selected)-eq 'MARKER-7 word two' -and (Clip)-eq (Selected))
+
+    foreach($wide in @([string][char]0x4E2D,[char]::ConvertFromUtf32(0x1F600))){
+        Main-Screen;Write-Screen ($esc+'[H'+$wide+' Z'+$esc+'[H')
+        [SelectionUi]::Button($h,0x203,($g.Left+1),$y);[SelectionUi]::Button($h,0x202,($g.Left+1),$y);Start-Sleep -Milliseconds 200
+        $leadShot=Shot ('wide-lead-'+[int]$wide[0])
+        Check 'wide word: leading cell copies the whole glyph' ((Selected)-eq $wide -and (Clip)-eq $wide)
+        [SelectionUi]::Button($h,0x203,($g.Left+$g.Cw+1),$y);[SelectionUi]::Button($h,0x202,($g.Left+$g.Cw+1),$y);Start-Sleep -Milliseconds 200
+        $trailShot=Shot ('wide-trail-'+[int]$wide[0])
+        Check 'wide word: continuation has the same text and highlight as the lead' ((Selected)-eq $wide -and (Selection-PixelDiff $leadShot $trailShot)-eq 0)
+        [LiteUi]::Chord($h,[int][char]'M',$true);[LiteUi]::Key($h,0x27,1)
+        $markShot=Shot ('wide-mark-'+[int]$wide[0])
+        Check 'wide mark: one Right selects a whole glyph with the word highlight' ((Selected)-eq $wide -and (Selection-PixelDiff $leadShot $markShot)-eq 0)
+        [LiteUi]::Key($h,0x25,1)
+        Check 'wide mark: one Left returns to the lead without a half-cell selection' ((Selected)-eq '')
+        [LiteUi]::Key($h,0x1B,1)
+        Write-Screen ($esc+'[1;2H');[LiteUi]::Chord($h,[int][char]'M',$true);[LiteUi]::Key($h,0x27,1)
+        Check 'wide mark: caret on a continuation anchors at the lead' ((Selected)-eq $wide)
+        [LiteUi]::Key($h,0x1B,1)
+    }
 
     # The timer cancellation door: enter alt while holding an out-of-bounds ordinary drag.
     [SelectionUi]::Button($h,0x201,($g.Left+50),($g.Top+3*$g.Ch));[SelectionUi]::Button($h,0x200,($g.Left+50),($g.Top-20));Start-Sleep -Milliseconds 100

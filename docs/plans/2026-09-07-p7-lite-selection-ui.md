@@ -536,9 +536,25 @@ say what it was.
   Five other candidates were classified immaterial; two were pre-existing; no open questions.
   Counts converge from four executable gating findings in round 1 to zero in round 2.
   Record: `.revmux/tasks/feat-p7-lite-selection-ui/02-after-fix/report.md`.
-  Minor sweep awaits Boris's choice; no fixes were silently made after the clean review.
+  Minor sweep was initially held for Boris's choice; his 2026-09-08 standing delegation and
+  Claude's `20260908T045910Z-claude-agwinterm-7c7f` handoff now authorize the bounded batch below.
   Implementation hash is `bcfeabf`; this record-only update changes no tested code.
   Claude received that hash for independent review; no separate peer verdict has arrived.
+
+- **2026-09-08 batched follow-up (verification pending):** Claude independently reviewed the
+  cumulative implementation: no Major/Critical. Word selection treats wide-glyph continuation
+  cells as part of their lead, and mark-mode anchors/edges stay on glyph boundaries. Blank
+  double-clicks retain the click record so a third click selects the whole line. The suite takes
+  `-TokenOwner` / `AGLITETERM_TEST_OWNER` (required for local self-acquisition); inherited receipts
+  still use their recorded owner. Regressions cover CJK/emoji lead and continuation clicks,
+  right/left motion, a continuation caret, and triple-click on trailing blanks.
+  Stale comments and unused hit-test outputs were folded into the same batch. Local review and
+  recovery artifacts are ignored, not deleted. Optional Alt-menu changes and pre-existing
+  orphan reporting release/dialog layout are deferred; Escape remains the mark-mode exit.
+  Existing bindings win seeded-chord collisions by dispatch order; users may rebind (record this
+  difference in the later agwinterm parity-doc update). Final-profile confirmation checks for
+  blockers; no cosmetic-round loop. Full acceptance still waits for the safe cleanup dependency
+  and main integration. Task 8 remains unchecked until those tests actually pass.
 
 ## Post-Completion
 
