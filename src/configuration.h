@@ -6,7 +6,7 @@
 namespace configuration {
 enum class Id { Theme, CustomColors, Foreground, Background, DosPalette, SidebarFont,
     ShowSidebar, ShowToolbar, ShowStatus, FlagView, RightClickPaste, CopyOnCtrlC,
-    CopyOnSelect, Scrollback };
+    CopyOnSelect, Scrollback, RestoreCommands };
 enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback };
 struct Key { const char* name; const wchar_t* registry; Id id; Kind kind; uint32_t initial; };
 static const Key keys[] = {
@@ -24,6 +24,7 @@ static const Key keys[] = {
     {"copy-on-ctrl-c", L"CopyOnCtrlC", Id::CopyOnCtrlC, Kind::Boolean, 1},
     {"copy-on-select", L"CopyOnSelect", Id::CopyOnSelect, Kind::Boolean, 1},
     {"scrollback-lines", L"ScrollbackLines", Id::Scrollback, Kind::Scrollback, 5000},
+    {"restore-commands", L"RestoreCommands", Id::RestoreCommands, Kind::Boolean, 0},
 };
 inline std::string normalized(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");

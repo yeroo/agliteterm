@@ -101,7 +101,10 @@ Add-Type -Name InputMode -Namespace P9 -MemberDefinition '[System.Runtime.Intero
 '@
     $sinkCommand=$sinkCommand.Replace('__P9_SINK__',$sinkLiteral)+"`r"
     Selection-Rpc 'session.type' @{text=$sinkCommand} $target | Out-Null
-    for($i=0;$i-lt 100 -and -not (Test-Path -LiteralPath $sink);$i++){Start-Sleep -Milliseconds 50}
+    # Add-Type may compile for longer than five seconds on a loaded disposable runner. Observe
+    # its explicit ready file, never infer readiness from the typed command or elapsed delay.
+    $sinkDeadline=[DateTime]::UtcNow.AddSeconds(20)
+    while(-not (Test-Path -LiteralPath $sink) -and [DateTime]::UtcNow-lt $sinkDeadline){Start-Sleep -Milliseconds 50}
     if(-not (Test-Path -LiteralPath $sink)){throw "$tag raw-key sink did not start"}
     Selection-Rpc 'session.type' @{text='Q'} $target | Out-Null
     for($i=0;$i-lt 100 -and [IO.File]::ReadAllText($sink)-eq '';$i++){Start-Sleep -Milliseconds 50}

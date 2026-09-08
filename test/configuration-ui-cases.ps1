@@ -80,7 +80,7 @@ foreach($row in $rows){
 }
 Check 'scrollback setter names new-surface scope' ($reply -match 'applies to new surfaces')
 $list=[string](Selection-Rpc 'config.list')
-Check 'config list contains fourteen supported keys once each' (($list-split "`n").Count-eq 14 -and @($list-split "`n"|Select-Object -Unique).Count-eq 14)
+Check 'config list contains sixteen supported keys once each' (($list-split "`n").Count-eq 16 -and @($list-split "`n"|Select-Object -Unique).Count-eq 16)
 Check 'config key normalization' ((Config-Get ' COPY-ON-SELECT ')-eq 'false')
 foreach($args_ in @(@{key='unknown';value='true'},@{key='font-size';value='16'},@{value='true'},@{key='theme'},
     @{key='copy-on-select';value='toggle'},@{key='scrollback-lines';value='1000001'},@{key='scrollback-lines';value='4294967296'},

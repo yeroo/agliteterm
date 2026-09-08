@@ -124,9 +124,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   **saves before it answers**, and reports per pane — `null` when the shell had nothing but a
   shell running, and null is written too, so a fresh capture replaces an older checkpoint. The
   slots read back as `capturedCommands` from `tree --json`, keyed by pane id, and persist as a
-  `K` line. Its `replayOnRestore` is **always `false`** in lite: it restores launch specs and never
-  types a captured slot back (explicit pins are separate), so a captured command is a checkpoint to
-  read, not a command that will run. An unknown, empty or cover-pane target, or a process query
+  `K` line (lossless `K2` for tabs/newlines). Its `replayOnRestore` reports the **default-off `restore-commands` setting**. With opt-in,
+  fresh restored shells can replay K; bindings B win over pins R, which win over K. Adopted, closed,
+  exited and readonly panes skip replay. An unknown, empty or cover-pane target, or a process query
   that did not run, is refused with nothing written for anyone; a save that did not land is
   refused too, but AFTER the slots were replaced in memory (the reply says so, `tree --json` shows
   them) — that save did not put the checkpoint on disk; a later one may. Parity batch P4 gives a split its
@@ -232,7 +232,8 @@ gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.
   `session bind <agent-command>|none --target PANE` supplies a binding instead (default `claude`).
   Both save before success. Replay waits 2500 ms, uses current values, and skips adopted shells.
-  This delay does not prove shell readiness. Captured commands are separate and never replayed.
+  This delay does not prove shell readiness. Captured commands are separate and replay only with
+  P10b's explicit `restore-commands` opt-in; B/R take precedence.
 - `session resize --split-ratio R` or `--grow-left/right/top/bottom N` moves the active split's
   divider. Wrong-axis/malformed growth refuses; ratios clamp to 0.05..0.95 and persist.
 - `session switch begin|advance|advance-back|commit|cancel` walks a snapshot of session recency.
@@ -270,8 +271,48 @@ With copy-on-select off, mouse release/finalize leave the clipboard alone; expli
 mark-mode Enter/Ctrl+C still copy. Scrollback config affects the local replica, not the host's
 retained history, and is applied before a new/adopted surface receives bytes.
 
-P10b remains: font targeting, custom profiles, OMP and opt-in captured-command replay. These are
-not implemented by P10a. The shared control conformance floor is unchanged.
+P10b adds the shell configuration below. Font targeting remains subject to the no-zoom policy.
+The shared control conformance floor is unchanged.
+
+### Shell profiles, OMP and captured replay (P10b)
+
+`profiles list` reads the current catalog; `profiles reload` validates
+`%LOCALAPPDATA%\agliteterm\profiles.json` and replaces the catalog atomically. A missing file uses
+detected shells in memory. Neither operation writes the file; malformed/unreadable reloads refuse
+and retain the last good catalog. Startup logs malformed files and falls back to detected shells.
+
+```json
+{"default":"Build","profiles":[{"name":"Build","command":"cmd.exe","args":["/k"],"cwd":"C:\\src"}]}
+```
+
+The New Session dialog, `--profile NAME` startup switch, and `session new --profile NAME` use exact
+names (ASCII-case-insensitive). Unknown/empty names refuse; command+profile is ambiguous and refuses.
+An explicit cwd overrides the profile cwd. Running sessions retain their resolved launch spec.
+Supported profile fields are name/command/args/cwd. Nonempty env/icon, elevation and unknown fields
+refuse rather than silently doing nothing. Names max128 UTF-8 bytes; app/cwd max259; at most16 args,
+each max2047 bytes; file max1MiB, 128 profiles. An empty argument array retains PowerShell prompt
+integration; nonempty arrays are passed unchanged.
+Arguments containing control characters refuse because the launch-state TSV format cannot preserve
+them. Captured commands use legacy K records for ordinary lines and lossless K2 records for tabs or
+newlines; older builds ignore K2 records. The API field remains capturedCommands in either case.
+
+`omp list` discovers local `.omp.json` themes, first-directory wins: POSH_THEMES_PATH, normal
+winget/scoop/chocolatey locations, then app-data `omp-themes`. `omp set NAME [--persist]` requests
+initialization only at an observed prompt in a fresh, writable PowerShell pane that has received
+no input. After any input (including a prior OMP request), or adoption, it refuses: terminal marks
+cannot prove an unfinished draft is empty. Use `config set omp-theme` for future shells instead.
+It also refuses
+unknown readiness, alternate-screen/readonly/exited/non-PowerShell panes. A successful reply means
+initialization was written without synchronous error, not that OMP succeeded. Theme content and
+OMP-generated shell code may execute commands; only apply themes you trust.
+
+`config get/set omp-theme` reads or sets the path for eligible new PowerShell shells without
+initializing existing ones; `none` clears it. Persisted initialization is not injected into adopted
+shells or nonempty explicit profile argv. Paths must fit the host's encoded startup argument;
+unsupported/overlong paths refuse. Live write followed by persistence failure reports both outcomes.
+
+`config set restore-commands true` opts into captured K replay on future fresh restore; default false.
+Review captured commands first. This does not immediately execute anything in existing panes.
 
 ## Session restore & the state file
 
@@ -286,7 +327,7 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
 - **Format**: tab-separated UTF-8 text, `V1` header, one record per line — `W` workspace, `S` session
   (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `C` a
   session's context, `P` a session's split shell, `L` a split's layout (its axis and slot order,
-  written only when it is not the default left/right unswapped), `K` a session's captured commands,
+  written only when it is not the default left/right unswapped), `K`/`K2` a session's captured commands,
   `A` active workspace; `C`, `P`, `L` and `K` name their session by its position among the `S` lines
   and are refused wholesale when that count does not add up. The format grows by *adding* line
   types, so a file written by an older build still restores, a line type this build doesn't write

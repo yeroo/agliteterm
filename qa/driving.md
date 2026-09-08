@@ -28,7 +28,8 @@ They are stored by pane role in R/B lines, with JSON-content escapes preserving 
 Fresh restored shells receive their current binding, else their current pin, after one 2500 ms
 delay. This is a delay, not a shell-readiness guarantee. The timer holds pane ids, not commands;
 clearing/changing the value before it fires affects replay. Gone/exited/adopted shells are skipped.
-K captured commands never replay; restore.capture's replayOnRestore stays false.
+K captured commands replay only with P10b's default-off restore-commands setting enabled;
+restore.capture's replayOnRestore reports that policy. B > R > K; readonly also cancels queued replay.
 
 Required restart cases: pin only; binding wins over pin; adopted shell receives neither; clear,
 change and close before the timer fires; split-role persistence and exact backslash/quote/tab

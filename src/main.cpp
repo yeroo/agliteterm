@@ -73,6 +73,8 @@ CAppModule _Module;
 #include "control.h"
 #include "driving.h"
 #include "configuration.h"
+#include "profiles.h"
+#include "shell_configuration.h"
 
 // ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
@@ -163,6 +165,7 @@ static std::string narrow(const std::wstring& w);   // fwd (utf conversions live
 
 // ---- launch arguments (same names as the full app; unknown args are ignored) ------------------
 static std::wstring g_argProfile;         // -p/--profile <name>: profile for the launch session
+static bool g_argProfileSpecified = false;
 static std::string  g_argDir;             // -d/--dir/--startingDirectory <path>: its working dir
 static bool g_argMaximized = false;       // --maximized
 static bool g_argNoRestore = false;       // --no-restore: don't rebuild the saved sessions
@@ -414,13 +417,14 @@ struct Session {
     std::string overlayResult;
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
+    shell_configuration::InputGate inputGate; // sticky PTY input history + per-pane write serialization
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     // restore.capture (P3): the command line of the shell's foreground child as captured by the
-    // last `restore capture`, persisted as a `K` line and read back through `tree --json` as
+    // last `restore capture`, persisted as K (ordinary) or K2 (escaped), read through `tree --json` as
     // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
     // capture replaces an older checkpoint). Pane 0 is the session itself; a split shell is its
-    // own Session and carries its own slot. K is only a checkpoint, never replayed: P9 replays
-    // explicit R pins/B bindings separately, so capture's `replayOnRestore` remains false.
+    // own Session and carries its own slot. K replays only with restore-commands enabled;
+    // explicit B bindings and R pins take precedence. The default remains observation-only.
     std::string capturedCmd;
     std::string restoreCmd;        // explicitly pinned command; distinct from capturedCmd
     std::string agentResume;       // binding takes precedence over restoreCmd on fresh restore
@@ -1170,6 +1174,9 @@ static void updateStatus();
 static bool g_rightClickPaste = true;
 static bool g_copyOnCtrlC = true;
 static std::atomic<bool> g_copyOnSelect{true};
+static std::atomic<bool> g_restoreCommands{false};
+static std::mutex g_ompMutex;
+static std::string g_ompTheme; // UTF-8 absolute local path, persisted separately as REG_SZ
 static bool g_rbtnForwarded = false;   // did the app get the button-2 PRESS? then it gets the release
 
 // ---- command palette: type-to-filter overlay over every action -------------------------------
@@ -1419,15 +1426,36 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
     return INVALID_HANDLE_VALUE;
 }
 
-static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len) {
-    OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
-    DWORD n = 0;
-    if (issued || GetLastError() == ERROR_IO_PENDING) {
-        if (!GetOverlappedResult(h, &ov, &n, TRUE)) n = 0;
+static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
+                  bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr) {
+    Session* inputPane = nullptr;
+    if (write) {
+        LockG hold;
+        for (auto* pane : g_sessions) if (pane->data == h) { inputPane = pane; break; }
     }
-    CloseHandle(ov.hEvent);
+    // Session objects outlive unlisting and their reader; the pointer and mutex remain valid.
+    // Resolve under g_lock, release it, then serialize the entire write. Never reacquire g_lock
+    // inside the gate. The pristine check and its initialization bytes are one operation
+    // relative to human input, API type/paste and restore replay. Non-editing protocol replies
+    // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
+    if (requireUntouched && !inputPane) {
+        if (guardRefused) *guardRefused = true;
+        return 0;
+    }
+    DWORD n = 0;
+    auto transfer = [&] {
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
+        if (issued || GetLastError() == ERROR_IO_PENDING) {
+            if (!GetOverlappedResult(h, &ov, &n, TRUE)) n = 0;
+        }
+        CloseHandle(ov.hEvent);
+    };
+    if (inputPane) {
+        if (!inputPane->inputGate.write(paneInput && len != 0, requireUntouched, transfer) && guardRefused)
+            *guardRefused = true;
+    } else transfer();
     return n;
 }
 
@@ -2012,7 +2040,7 @@ static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
             case 4:   // Respond(reply): the answer to a query - back down the pty, from this thread
                 if (!haStr(buf, len, off, a)) return;
                 if (s->data != INVALID_HANDLE_VALUE && !a.empty())
-                    ovIo(s->data, true, a.data(), nullptr, (DWORD)a.size());
+                    ovIo(s->data, true, a.data(), nullptr, (DWORD)a.size(), false); // protocol response, not editing input
                 break;
             case 5:   // Unhandled(kind, detail): the VT tap. lite's log is the equivalent of
                       // AGWINTERM_VT_LOG - "app misbehaves here but works elsewhere" starts here.
@@ -2081,13 +2109,79 @@ static DWORD WINAPI readerThread(void* param) {
 }
 
 // A launchable shell "voice" for the New Session dialog.
-struct Profile { std::wstring name; std::string app; std::vector<std::string> args; };
+struct Profile { std::wstring name; std::string app; std::vector<std::string> args; std::string cwd; };
+static std::mutex g_profilesMutex;
+static std::mutex g_profilesReloadMutex;
+static profiles::Catalog g_profiles;
 
 static bool isPwshApp(const char* app) {
-    if (!app) return true;
-    std::string a(app);
-    for (char& c : a) c = (char)tolower((unsigned char)c);
-    return a.find("powershell") != std::string::npos || a.find("pwsh") != std::string::npos;
+    return !app || shell_configuration::powershell(app);
+}
+
+static std::string ompTheme() { std::lock_guard<std::mutex> guard(g_ompMutex); return g_ompTheme; }
+static std::wstring ompInitialization(const std::string& path) {
+    // Rewrap the NEW prompt, not the wrapper that init just replaced. No user profile is edited.
+    return widen("oh-my-posh init pwsh --config " + shell_configuration::literal(path) +
+        " | Invoke-Expression; $global:__agwLiteWrap=$false; ") + kPromptWrap;
+}
+static bool validOmpPath(const std::string& path) {
+    return profiles::detail::clean(path, 259) && !path.empty() && base64(ompInitialization(path)).size() < sizeof(agwinterm_ptyhost_Create::args[0]);
+}
+static std::wstring environmentPath(const wchar_t* name) {
+    DWORD count = GetEnvironmentVariableW(name, nullptr, 0);
+    if (!count || count > 32768) return {};
+    std::wstring value(count, L'\0');
+    DWORD read = GetEnvironmentVariableW(name, &value[0], count);
+    if (!read || read >= count) return {};
+    value.resize(read); return value;
+}
+static bool localThemeFile(const std::wstring& path, std::string& resolved) {
+    if (path.empty() || path.find_first_of(L"\r\n") != std::wstring::npos || path.find(L'\0') != std::wstring::npos) return false;
+    wchar_t absolute[32768];
+    DWORD n = GetFullPathNameW(path.c_str(), 32768, absolute, nullptr);
+    if (!n || n >= 32768 || n < 3 || absolute[1] != L':' || absolute[2] != L'\\') return false;
+    std::wstring full(absolute, n);
+    if (full.size() < 9 || _wcsicmp(full.substr(full.size() - 9).c_str(), L".omp.json") != 0) return false;
+    DWORD attr = GetFileAttributesW(full.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    resolved = narrow(full); return validOmpPath(resolved);
+}
+static std::map<std::string, std::pair<std::string, std::string>> ompCatalog() {
+    std::vector<std::wstring> dirs;
+    auto add = [&](const std::wstring& base, const wchar_t* tail) { if (!base.empty()) dirs.push_back(base + tail); };
+    add(environmentPath(L"POSH_THEMES_PATH"), L"");
+    add(environmentPath(L"LOCALAPPDATA"), L"\\Programs\\oh-my-posh\\themes");
+    add(environmentPath(L"USERPROFILE"), L"\\scoop\\apps\\oh-my-posh\\current\\themes");
+    add(environmentPath(L"ProgramData"), L"\\chocolatey\\lib\\oh-my-posh\\tools\\themes");
+    add(stateDir(), L"\\omp-themes");
+    std::map<std::string, std::pair<std::string, std::string>> result;
+    for (const auto& dir : dirs) {
+        WIN32_FIND_DATAW data{}; HANDLE search = FindFirstFileW((dir + L"\\*.omp.json").c_str(), &data);
+        if (search == INVALID_HANDLE_VALUE) continue;
+        size_t seen = 0;
+        do {
+            if (++seen > 4096) break;
+            std::string path;
+            if (!localThemeFile(dir + L"\\" + data.cFileName, path)) continue;
+            auto name = narrow(data.cFileName); name.resize(name.size() - 9);
+            result.emplace(profiles::folded(name), std::make_pair(name, path));
+        } while (FindNextFileW(search, &data));
+        FindClose(search);
+    }
+    return result;
+}
+static bool resolveOmp(const std::string& name, std::string& path) {
+    if (!profiles::detail::clean(name, 259) || name.empty()) return false;
+    if (localThemeFile(widen(name), path)) return true;
+    const auto themes = ompCatalog(); const auto found = themes.find(profiles::folded(name));
+    if (found == themes.end()) return false;
+    path = found->second.second; return true;
+}
+static bool saveOmpTheme(const std::string& path) {
+    const auto wide = widen(path);
+    if (RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"OmpTheme", REG_SZ, wide.c_str(),
+                       static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) return false;
+    std::lock_guard<std::mutex> guard(g_ompMutex); g_ompTheme = path; return true;
 }
 
 // Detected shells on this machine (the "voices"). PowerShell + cmd are always present.
@@ -2106,7 +2200,49 @@ static std::vector<Profile> detectProfiles() {
     return v;
 }
 
-// cols/rows + an optional profile (app/args) and cwd. Default (no app) = PowerShell with the prompt wrap.
+static profiles::Catalog detectedCatalog() {
+    profiles::Catalog catalog; catalog.defaultName = "Windows PowerShell";
+    for (const auto& p : detectProfiles()) catalog.entries.push_back({narrow(p.name), p.app, p.args, p.cwd});
+    return catalog;
+}
+static profiles::Catalog profileSnapshot() {
+    std::lock_guard<std::mutex> guard(g_profilesMutex); return g_profiles;
+}
+// A reload never writes or repairs the user's file. A bad read cannot publish a partial catalog.
+static bool reloadProfiles(std::string& error) {
+    std::lock_guard<std::mutex> reload(g_profilesReloadMutex);
+    const auto dir = stateDir();
+    if (dir.empty()) { error = "app-data directory is unavailable"; return false; }
+    const auto path = dir + L"\\profiles.json";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    profiles::Catalog next;
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
+            error = "profiles.json could not be read (Windows error " + std::to_string(code) + ")"; return false;
+        }
+        next = detectedCatalog();
+    } else {
+        LARGE_INTEGER size{}; DWORD read = 0;
+        const bool bounded = GetFileSizeEx(file, &size) && size.QuadPart >= 0 && size.QuadPart <= 1024 * 1024;
+        std::string contents(bounded ? static_cast<size_t>(size.QuadPart) : 0, '\0');
+        const bool ok = bounded && (contents.empty() || (ReadFile(file, &contents[0], static_cast<DWORD>(contents.size()), &read, nullptr) && read == contents.size()));
+        CloseHandle(file);
+        if (!ok) { error = "profiles.json is unreadable or exceeds 1 MiB"; return false; }
+        if (!profiles::parse(contents, next, error)) return false;
+    }
+    { std::lock_guard<std::mutex> guard(g_profilesMutex); g_profiles = std::move(next); }
+    error.clear(); return true;
+}
+static std::vector<Profile> listedProfiles() {
+    const auto catalog = profileSnapshot(); std::vector<Profile> entries;
+    for (const auto& e : catalog.entries) entries.push_back({widen(e.name), e.command, e.args, e.cwd});
+    return entries;
+}
+
+// cols/rows + an optional resolved launch spec and cwd. Fresh creation with no app uses the
+// catalog default; remembered legacy empty-app specs explicitly select powershell.exe at callers.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
                               bool repaint = false);   // fwd
@@ -2195,6 +2331,14 @@ static void selectPrimary(int idx) {
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
                            const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr) {
+    profiles::Entry defaultProfile;
+    if (!app) {
+        const auto catalog = profileSnapshot();
+        if (const auto* selected = catalog.find(catalog.defaultName)) {
+            defaultProfile = *selected; app = defaultProfile.command.c_str(); pargs = &defaultProfile.args;
+            if (!cwd || !*cwd) cwd = defaultProfile.cwd.c_str();
+        }
+    }
     char idbuf[64];
     // _snprintf_s, not wsprintfA: wsprintfA does not bound its output to the destination, and the
     // prefix comes from --pipe (see parseLaunchArgs, which caps it — this is the second lock).
@@ -2243,7 +2387,11 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     } else if (isPwshApp(useApp)) {                     // PowerShell: keep the interactive prompt wrap
         // -NoExit keeps the shell interactive after the wrap runs; -EncodedCommand runs AFTER the
         // profile so it chains (not replaces) the user's prompt.
-        enc = base64(kPromptWrap);
+        const auto theme = ompTheme();
+        const auto themePath = widen(theme);
+        const DWORD attributes = theme.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(themePath.c_str());
+        enc = base64(validOmpPath(theme) && attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)
+            ? ompInitialization(theme) : std::wstring(kPromptWrap));
         req.cmd.create.args_count = 4;
         strcpy_s(req.cmd.create.args[0], "-NoLogo");
         strcpy_s(req.cmd.create.args[1], "-NoExit");
@@ -2433,10 +2581,11 @@ static void replayRestoredPanes() {
             if (!s) why = "pane gone";
             else if (s->adopted) why = "live shell adopted";
             else if (s->exited || s->data == INVALID_HANDLE_VALUE) why = "pane is not live";
-            else if (s->agentResume.empty() && s->restoreCmd.empty()) why = "pin and binding cleared";
+            else if (s->readOnly) why = "pane is read-only";
+            else if (s->agentResume.empty() && s->restoreCmd.empty() && (!g_restoreCommands.load() || s->capturedCmd.empty())) why = "no enabled replay command";
             else {
-                kind = s->agentResume.empty() ? "pin" : "binding";
-                command = s->agentResume.empty() ? s->restoreCmd : s->agentResume;
+                kind = !s->agentResume.empty() ? "binding" : !s->restoreCmd.empty() ? "pin" : "captured command";
+                command = shell_configuration::replay(s->agentResume, s->restoreCmd, s->capturedCmd, g_restoreCommands.load());
                 data = s->data;
             }
         }
@@ -2585,7 +2734,7 @@ static void reopenClosed() {
     ClosedSpec sp = g_closedStack.back(); g_closedStack.pop_back();
     if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws;
     int c, r; newSessionGrid(g_focus, &c, &r);
-    Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
+    Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
     if (s) {
         { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
@@ -2904,6 +3053,7 @@ static uint32_t configValue(const configuration::Key& key) {
     case Id::CopyOnCtrlC: return g_copyOnCtrlC;
     case Id::CopyOnSelect: return g_copyOnSelect.load();
     case Id::Scrollback: return g_scrollbackLines.load();
+    case Id::RestoreCommands: return g_restoreCommands.load();
     }
     return 0;
 }
@@ -2925,6 +3075,7 @@ static void assignConfig(const configuration::Key& key, uint32_t value) {
     case Id::CopyOnCtrlC: g_copyOnCtrlC = value != 0; break;
     case Id::CopyOnSelect: g_copyOnSelect = value != 0; break;
     case Id::Scrollback: g_scrollbackLines = value; break;
+    case Id::RestoreCommands: g_restoreCommands = value != 0; break;
     }
 }
 static void loadColors() {   // config API and startup share key names, types, validation and defaults
@@ -2933,6 +3084,11 @@ static void loadColors() {   // config API and startup share key names, types, v
         if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, key.registry, RRF_RT_REG_DWORD,
                 nullptr, &value, &sz) != ERROR_SUCCESS || !configuration::valid(key, value)) value = key.initial;
         assignConfig(key, value);
+    }
+    wchar_t theme[512]{}; DWORD themeSize = sizeof(theme);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"OmpTheme", RRF_RT_REG_SZ, nullptr, theme, &themeSize) == ERROR_SUCCESS) {
+        const auto path = narrow(theme);
+        if (validOmpPath(path)) { std::lock_guard<std::mutex> guard(g_ompMutex); g_ompTheme = path; }
     }
     DWORD v, sz;
     // The same range `sidebar width` accepts (kSidebarMinW..kSidebarMaxW): one number set, two readers.
@@ -3094,7 +3250,7 @@ static DWORD livePid(const Session* s) { return s->exited ? 0 : s->childPid; }
 // the shells themselves and the prompt helpers they spawn between commands. This is agwinterm's
 // DEFAULT list (Program.Services.cs LoadDenylist), frozen: agwinterm lets the user extend it
 // through %LOCALAPPDATA%\agwinterm\restore-denylist.conf, lite has no config file and ships the
-// same list as a constant. This list applies to capture only; captured K slots never replay.
+// same list as a constant. This list applies to capture only; K replay additionally requires opt-in.
 // Explicit R pins/B bindings have their own validation and replay policy.
 static const wchar_t* const kRestoreDenylist[] = {
     L"powershell", L"pwsh", L"cmd", L"conhost", L"wsl", L"ssh", L"bash", L"oh-my-posh", L"git", L"windowsterminal",
@@ -3324,7 +3480,8 @@ static bool saveSessionState() {
     // applies them in its own fixed order, so a K above a P restores identically (revmux r1).
     // Additive line type, per the rule in parseStateFile: an older build ignores K and restores
     // the sessions without their slots — and drops them on its next save (the same write-back loss
-    // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
+    // as C). P10b replays captured slots only with opt-in, after explicit B/R. K2 below preserves
+    // exceptional control-character fields losslessly; older builds ignore that additive type.
     std::string capLines;
     std::string replayLines;   // R/B use K's role-based, positional shape
     // "L\t<idx>\t<axis>\t<0|1>" — a split's LAYOUT (P4): the axis word (Session::horizontal's
@@ -3360,8 +3517,13 @@ static bool saveSessionState() {
             }
         }
         const std::string& p1 = sh ? sh->capturedCmd : std::string();
-        if (!owner->capturedCmd.empty() || !p1.empty())
-            capLines += "K" + tab + std::to_string(oi) + tab + tsvField(owner->capturedCmd) + tab + tsvField(p1) + "\n";
+        if (!owner->capturedCmd.empty() || !p1.empty()) {
+            // Executable checkpoints must not turn tabs/newlines into spaces on restore. Preserve
+            // legacy K for ordinary command lines; K2 uses the lossless R/B field codec when needed.
+            const bool encoded = tsvField(owner->capturedCmd) != owner->capturedCmd || tsvField(p1) != p1;
+            capLines += std::string(encoded ? "K2" : "K") + tab + std::to_string(oi) + tab +
+                (encoded ? jsonEscape(owner->capturedCmd) : owner->capturedCmd) + tab + (encoded ? jsonEscape(p1) : p1) + "\n";
+        }
         auto replayLine = [&](const char* tag, std::string Session::*field) {
             const std::string a = owner->*field, b = sh ? sh->*field : std::string();
             if (!a.empty() || !b.empty())
@@ -5484,6 +5646,8 @@ static void showTreeContextMenu() {
     bool isSession = g_ctxParam >= 0;
     int si = isSession ? (int)g_ctxParam : -1;
     int cws = isSession ? (si < (int)g_sessions.size() ? g_sessions[si]->ws : 0) : (int)(-g_ctxParam - 1);
+    Session* duplicateSource = nullptr;
+    { LockG hold; if (isSession && si >= 0 && si < (int)g_sessions.size()) duplicateSource = g_sessions[si]; }
     if (!isSession && (cws < 0 || cws >= (int)g_workspaces.size())) return;   // hint row etc.
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
@@ -5522,10 +5686,21 @@ static void showTreeContextMenu() {
             break;
         }
         case IDM_DUP:
-            if (isSession) {
-                g_activeWs = cws;
+            if (duplicateSource) {
+                std::string app, cwd;
+                std::vector<std::string> args;
+                {
+                    LockG hold;
+                    // The popup pumps messages: an index may now name a different session.
+                    if (indexOfSession(duplicateSource) < 0 ||
+                        (duplicateSource->hidden && !splitOwnerOf(duplicateSource))) break;
+                    g_activeWs = duplicateSource->ws;
+                    app = duplicateSource->app; args = duplicateSource->args; cwd = duplicateSource->cwd;
+                }
                 int c, r; newSessionGrid(g_focus, &c, &r);
-                Session* s = newSession(c, r);
+                // Duplicate the resolved launch, not whichever profile is the new default.
+                Session* s = newSession(c, r, app.empty() ? "powershell.exe" : app.c_str(),
+                                        &args, cwd.empty() ? nullptr : cwd.c_str());
                 if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
             }
             break;
@@ -5680,11 +5855,12 @@ static int pickProfileDialog(const std::vector<Profile>& profs) {
 
 // Open the New Session dialog and create the chosen shell (in an optional folder).
 static void newSessionDialog(const char* cwd) {
-    auto profs = detectProfiles();
+    auto profs = listedProfiles();
     int i = pickProfileDialog(profs);
     if (i < 0 || i >= (int)profs.size()) return;
     int c, r; newSessionGrid(g_focus, &c, &r);
-    Session* s = newSession(c, r, profs[i].app.c_str(), &profs[i].args, cwd);
+    Session* s = newSession(c, r, profs[i].app.c_str(), &profs[i].args,
+                            cwd && *cwd ? cwd : profs[i].cwd.c_str());
     if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 
@@ -7012,6 +7188,7 @@ struct ConfigRequest {
 static std::mutex g_configMutex;
 static std::deque<std::shared_ptr<ConfigRequest>> g_configRequests;
 static bool g_settingsOpenQueued = false; // UI-owned; coalesce requests until the command runs
+static Session* resolveTarget(const std::string& target, std::string* why);
 static std::string configOnUi(const JsonReq& req) {
     using configuration::Id;
     const auto& cmd = req.get("cmd");
@@ -7022,18 +7199,60 @@ static std::string configOnUi(const JsonReq& req) {
             if (!result.empty()) result += '\n';
             result += std::string(key.name) + " = " + configuration::format(key, configValue(key));
         }
+        result += "\nomp-theme = " + ompTheme();
         return ctlOkStr(result);
     }
     const bool theme = cmd == "theme.set";
     const auto name = configuration::normalized(theme ? "theme" : req.get("args.key"));
     const auto* key = configuration::find(name);
     if (cmd == "config.get") {
+        if (name == "omp-theme") return ctlOkStr(ompTheme());
         if (!key) return ctlErr("unknown config key '" + name + "'");
         LockG hold; return ctlOkStr(configuration::format(*key, configValue(*key)));
     }
     // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
     // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
     if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return ctlErr("a modal dialog is open or queued; configuration unchanged");
+    if (cmd == "omp.set") {
+        HANDLE data = INVALID_HANDLE_VALUE;
+        {
+            LockG hold; std::string why;
+            Session* pane = resolveTarget(req.get("target"), &why);
+            if (!pane || pane->paneId != req.get("target")) return ctlErr("omp: target pane disappeared; nothing written or saved");
+            if (pane->readOnly || pane->exited || pane->data == INVALID_HANDLE_VALUE || !isPwshApp(pane->app.c_str()))
+                return ctlErr("omp: requires a live writable PowerShell pane; nothing written or saved");
+            // Marks locate a prompt line, not the PSReadLine buffer. Never append executable text
+            // to a draft. Without shell-side buffer acknowledgement, only a fresh untouched pane
+            // is eligible; output/Enter/Escape cannot reset this conservative lifetime guard.
+            if (pane->adopted)
+                return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
+            FfiEmuInfo info{}; FfiMark last{};
+            if (!pane->emu || !emu_info(pane->emu, &info) || info.isAltScreen || !info.markCount)
+                return ctlErr("omp: shell readiness is unknown; nothing written or saved");
+            std::vector<FfiMark> marks(info.markCount);
+            const auto count = emu_marks(pane->emu, marks.data(), info.markCount);
+            if (!count) return ctlErr("omp: shell readiness is unknown; nothing written or saved");
+            last = marks[count - 1];
+            if (last.promptLine < 0 || last.commandLine >= 0 || last.outputLine >= 0 ||
+                last.promptLine != static_cast<int64_t>(info.historyCount) + info.cursorRow)
+                return ctlErr("omp: pane is not at an observed prompt; nothing written or saved");
+            data = pane->data;
+        }
+        const auto command = narrow(ompInitialization(req.get("args.resolved-theme"))) + "\r";
+        bool guardRefused = false;
+        const DWORD written = ovIo(data, true, command.data(), nullptr, static_cast<DWORD>(command.size()), true, true, &guardRefused);
+        if (guardRefused)
+            return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
+        if (written != command.size()) return ctlErr("omp: initialization write failed or was partial; nothing saved; shell outcome unknown");
+        if (req.get("args.persist") == "true" && !saveOmpTheme(req.get("args.resolved-theme")))
+            return ctlErr("omp: initialization written, but theme could not be saved");
+        return ctlOkStr("oh-my-posh initialization written" + std::string(req.get("args.persist") == "true" ? "; theme saved for eligible new shells" : "") + "; shell success not confirmed");
+    }
+    if (cmd == "config.set" && name == "omp-theme") {
+        const auto& path = req.get("args.resolved-theme");
+        if (!saveOmpTheme(path)) return ctlErr("omp-theme could not be saved; configuration unchanged");
+        return ctlOkStr("omp-theme = " + path + "  (applies to eligible new shells)");
+    }
     if (cmd == "settings.open") {
         if (!PostMessageW(g_hwnd, WM_COMMAND, IDM_PROPERTIES, 0)) return ctlErr("settings could not be queued");
         g_settingsOpenQueued = true;
@@ -8885,15 +9104,15 @@ command line or `null` (the shell had nothing non-denylisted running; null is wr
 fresh capture replaces an older checkpoint, including with nothing); the top-level `captured`
 counts the non-null ones. The slots read back from `tree --json` as `capturedCommands` on the
 owning session node, keyed by pane id - the ids `paneIds` lists, which after a promotion (the
-splits section) are not the session id - and persist as a `K` line. `--target` names one session
+splits section) are not the session id - and persist as K, or lossless K2 for tabs/newlines. `--target` names one session
 (its own shell), either pane's id (that one pane) or `active` (the focused pane). The reply describes a state that is already on
 disk when you read it.
 
-**`replayOnRestore` is always `false` here.** lite restores a session's LAUNCH spec at the next
-start and never types a captured slot back (explicit restore pins are separate), so a captured command is a
-checkpoint you read - from the reply, `tree` or the file - not a command that will run again.
-The field exists so one script reads one shape against both products; it starts reporting a
-toggle the day lite has a replay.
+**`replayOnRestore` reports `restore-commands`, which defaults false.** With it off, K is
+observation-only. Opting in permits K replay after a fresh shell restore; explicit bindings B win
+over pins R, which win over K. Adopted live, removed, exited or readonly panes are skipped.
+This is policy, not proof of execution. Inspect captured commands before enabling replay.
+Enabling it does not type into existing panes.
 
 Refusals, each with nothing written for ANY pane and nothing saved: a `--target` that matches no
 pane or session; a `--target` that is present but empty (omit it to mean every pane); a
@@ -9012,7 +9231,7 @@ an explicit shell id reaches underneath). READ-ONLY appears in the status bar. T
 `session bind <agent-command>|none --target PANE` replays that binding instead (default `claude`).
 Both need an explicit shell id and save before success. Replay waits 2500 ms, then re-reads the
 current value; it never replays into an adopted live shell. A delay is not a readiness check.
-Captured commands remain separate and never replay.
+Captured commands remain separate; P10b replays them only with explicit restore-commands opt-in.
 
 `session resize --split-ratio R` changes slot 0's share (0.05..0.95); whole-cell grow arguments
 move its divider along the split axis. `session switch begin|advance|advance-back|commit|cancel`
@@ -9041,7 +9260,28 @@ re-reads registry bindings, resetting deleted entries to default/unbound and kee
 With copy-on-select off, mouse release and `selection finalize` do not write the clipboard;
 finalize replies `finalized (copy-on-select off)`. Explicit Copy/mark Enter/Ctrl+C still copy.
 Scrollback affects newly created local replicas, including adoption, not existing buffers or the
-host cap. Font targeting, custom profiles, OMP and captured-command replay remain P10b work.
+host cap. P10b adds profiles, OMP and opt-in captured replay; font targeting remains subject to
+the existing no-zoom policy.
+
+## Shell configuration (P10b)
+
+`profiles list/reload` reads the current catalog / reloads `%LOCALAPPDATA%\\agliteterm\\profiles.json`.
+Shape: `{ "default":"Build", "profiles":[{"name":"Build","command":"cmd.exe","args":["/k"],"cwd":"C:\\\\src"}] }`.
+Missing file uses detected shells in memory. Bad reload refuses, retaining the last good catalog;
+neither list nor reload rewrites the file. `session new --profile NAME` and startup `--profile NAME`
+use exact ASCII-case-insensitive names. Unknown names and command+profile refuse before creation.
+The schema supports name/command/args/cwd; nonempty env/icon, elevate:true and unknown fields refuse.
+Args containing control characters refuse because launch-state TSV cannot preserve those bytes.
+
+`omp list` discovers local themes. `omp set NAME [--persist]` writes initialization only into an
+observed-prompt, fresh writable PowerShell pane that has received no input. After any input or
+adoption it refuses: marks cannot prove an empty draft. Use config omp-theme for future shells.
+Success means written, not confirmed executed.
+Use trusted themes only: initialization evaluates OMP-generated shell code. No profiles are edited.
+`config set omp-theme NAME|PATH|none` sets/clears eligible future PowerShell initialization without
+typing into existing panes. Nonempty explicit profile args and adopted shells receive no injection.
+`config set restore-commands true|false` controls captured K replay (default false); inspect K first.
+K2 state records preserve captures with tabs/newlines losslessly; older builds ignore K2 records.
 
 ## What this terminal does NOT have
 
@@ -9050,7 +9290,7 @@ Do not reach for these - they exist in the full agwinterm and will be refused he
 
 `session background` (lite draws no images),
 `command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
-`profiles list|reload`, `omp list|set`, `image show|sixel`,
+`image show|sixel`,
 `font`, `restore clear`, `install hooks|shell|cli`, `claude *`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
@@ -9098,6 +9338,43 @@ static std::string ctlDispatch(const std::string& line) {
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
 
+    if (cmd == "omp.list") {
+        std::string names;
+        for (const auto& item : ompCatalog()) { if (!names.empty()) names += '\n'; names += item.second.first; }
+        return ctlOkStr(names);
+    }
+    if (cmd == "omp.set" || (cmd == "config.set" && configuration::normalized(req.get("args.key")) == "omp-theme")) {
+        std::string resolved;
+        const auto& value = req.get(cmd == "omp.set" ? "args.name" : "args.value");
+        if (cmd == "config.set" && (!req.fields.count("args.value") || value.empty()))
+            return ctlErr("omp-theme requires a value (use none to clear); configuration unchanged");
+        if (!(cmd == "config.set" && value == "none") && !resolveOmp(value, resolved))
+            return ctlErr("oh-my-posh theme not found or path unsupported; nothing written or saved");
+        req.fields["args.resolved-theme"] = resolved;
+        if (cmd == "omp.set") {
+            const auto& persist = req.get("args.persist");
+            if (!persist.empty() && persist != "true" && persist != "false") return ctlErr("omp: persist must be boolean; nothing written or saved");
+            LockG hold; std::string why;
+            auto* pane = resolveTarget(req.get("target"), &why);
+            if (!pane) return ctlErr("omp: target pane not found; nothing written or saved");
+            req.fields["target"] = pane->paneId;
+        }
+        return dispatchConfig(req);
+    }
+    if (cmd == "profiles.list") {
+        const auto catalog = profileSnapshot(); std::string text;
+        for (const auto& p : catalog.entries) {
+            if (!text.empty()) text += '\n';
+            text += (profiles::folded(p.name) == profiles::folded(catalog.defaultName) ? "* " : "  ") + p.name + "\t" + p.command;
+            for (const auto& arg : p.args) text += " " + tsvField(arg);
+        }
+        return ctlOkStr(text);
+    }
+    if (cmd == "profiles.reload") {
+        std::string error;
+        if (!reloadProfiles(error)) return ctlErr("profiles reload: " + error + "; previous catalog retained; file unchanged");
+        return ctlOkStr(std::to_string(profileSnapshot().entries.size()) + " profiles loaded");
+    }
     if (cmd == "config.get" || cmd == "config.list" || cmd == "config.set" ||
         cmd == "theme.list" || cmd == "theme.set" || cmd == "settings.open" || cmd == "keymap.reload")
         return dispatchConfig(req); // app-global: before target resolution, with no g_lock held
@@ -9229,6 +9506,17 @@ static std::string ctlDispatch(const std::string& line) {
         std::string name = req.get("args.name");
         std::string cwd  = req.get("args.cwd");
         std::string command = req.get("args.command");
+        profiles::Entry selectedProfile;
+        const bool namedProfile = req.fields.count("args.profile") != 0;
+        if (namedProfile) {
+            if (!command.empty()) return ctlErr("session.new: command and profile are mutually exclusive; nothing created");
+            const auto catalog = profileSnapshot();
+            const auto* selected = catalog.find(req.get("args.profile"));
+            if (!selected) return ctlErr("session.new: profile not found; nothing created");
+            selectedProfile = *selected;
+            if (cwd.empty()) cwd = selectedProfile.cwd;
+            if (!profiles::detail::clean(cwd, 259)) return ctlErr("session.new: invalid or oversized cwd; nothing created");
+        }
 
         // Which workspace to create into. Same arguments and the same precedence as the full app
         // (Program.ControlHost.cs NewSession, ControlServer.cs session.new), in one place:
@@ -9295,6 +9583,7 @@ static std::string ctlDispatch(const std::string& line) {
             cargs.push_back("-Command");
             cargs.push_back(command);
         }
+        if (namedProfile) { app = selectedProfile.command.c_str(); cargs = selectedProfile.args; }
         Session* s = newSession(cols, rows, app, cargs.empty() ? nullptr : &cargs,
                                 cwd.empty() ? nullptr : cwd.c_str());
         if (!s) return ctlErr("create failed");
@@ -10159,9 +10448,8 @@ static std::string ctlDispatch(const std::string& line) {
         //
         // The reply is agwinterm's RestoreCaptureReply, an object (ctlOk): `captured` = the panes
         // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
-        // (the owner's id) and `captured` (string | null). `replayOnRestore` is a constant FALSE in
-        // lite: this captured K slot is never typed back. Explicit R pins and B bindings are
-        // separate fields; their P9 replay does not change this capture reply.
+        // (the owner's id) and `captured` (string | null). `replayOnRestore` reports the current
+        // restore-commands opt-in; it does not promise any pane ran a command. B > R > K.
         struct CapPane { Session* s; std::string id, owner; DWORD pid; };
         std::vector<CapPane> snap;
         // The target is read from the field map, not from get(): absent is the documented "every
@@ -10255,7 +10543,8 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlErr("restore capture: " + std::to_string(written) + " pane(s) were captured into memory but the state "
                           "file could not be written (see the log) — this save did not put the checkpoint on disk. "
                           "tree --json still shows what was captured.");
-        return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":false,\"panes\":[" + panes + "]}");
+        return ctlOk("{\"captured\":" + std::to_string(captured) + ",\"replayOnRestore\":" +
+            (g_restoreCommands.load() ? "true" : "false") + ",\"panes\":[" + panes + "]}");
     }
     if (cmd == "session.duplicate") {   // clone the target's launch spec into its workspace
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
@@ -10267,7 +10556,7 @@ static std::string ctlDispatch(const std::string& line) {
         int cols, rows; newSessionGrid(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
-        Session* s = newSession(cols, rows, app.empty() ? nullptr : app.c_str(),
+        Session* s = newSession(cols, rows, app.empty() ? "powershell.exe" : app.c_str(),
                                 targs.empty() ? nullptr : &targs, cwd.empty() ? nullptr : cwd.c_str());
         if (!s) return ctlErr("create failed");
         selectIdx((int)g_sessions.size() - 1);
@@ -11049,14 +11338,15 @@ static ParsedState parseStateFile(const std::wstring& path) {
             // spec list only after the whole file is read, under the same count guard as P below.
             ps.contexts.push_back({ atoi(ff[1].c_str()), ff[2] });
         } else if (ff[0] == "K" && ff.size() >= 3) {   // a session's captured commands: S-line index, pane 0, pane 1
-            // Same treatment as C: kept positional and checked against the spec list after the whole
-            // file is read, under the count guard below. The pane-1 field is optional on read (a
-            // hand-shortened line) and empty means none.
-            ps.captures.push_back({ atoi(ff[1].c_str()), ff[2], ff.size() >= 4 ? ff[3] : std::string() });
-        } else if ((ff[0] == "R" || ff[0] == "B") && ff.size() >= 3) {
+            // K is executable with restore-commands enabled. Never coerce a malformed owner to
+            // pane zero (atoi), even for legacy records. The optional pane-1 field remains readable.
+            int owner;
+            if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed K owner - line dropped"); continue; }
+            ps.captures.push_back({ owner, ff[2], ff.size() >= 4 ? ff[3] : std::string() });
+        } else if ((ff[0] == "R" || ff[0] == "B" || ff[0] == "K2") && ff.size() >= 3) {
             int owner;
             if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed %s owner - line dropped", ff[0].c_str()); continue; }
-            auto& lines = ff[0] == "R" ? ps.pins : ps.bindings;
+            auto& lines = ff[0] == "R" ? ps.pins : ff[0] == "B" ? ps.bindings : ps.captures;
             // New line types use JSON string contents inside each TSV field: tabs/newlines,
             // backslashes and quotes round-trip, so replay never silently changes a command.
             std::string a, b;
@@ -11318,7 +11608,7 @@ static bool restoreSessions() {
         std::string want = si < savedIds.size() ? savedIds[si] : std::string();
         Session* s = nullptr;
         if (isAdoptable(want)) {
-            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? nullptr : sp.app.c_str(),
+            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
                               true);   // repaint: the shell already has a screen, ask it to redraw
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
@@ -11330,7 +11620,7 @@ static bool restoreSessions() {
                          "host may still be running the old shell under that id", want.c_str());
         }
         if (!s)
-            s = newSession(cols, rows, sp.app.empty() ? nullptr : sp.app.c_str(),
+            s = newSession(cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                            sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
         if (s) {
             s->name = widen(sp.name); s->flagged = sp.flagged;
@@ -11388,7 +11678,7 @@ static bool restoreSessions() {
     std::vector<Session*> splitOf(byPos.size(), nullptr);   // spec index -> the split shell rebuilt for it
     for (const auto& sp : ps.splits) {
         if (sp.owner < 0 || sp.owner >= (int)bySpec.size() || !bySpec[sp.owner]) continue;
-        Session* sh = newSession(cols, rows, sp.spec.app.empty() ? nullptr : sp.spec.app.c_str(),
+        Session* sh = newSession(cols, rows, sp.spec.app.empty() ? "powershell.exe" : sp.spec.app.c_str(),
                                  sp.spec.args.empty() ? nullptr : &sp.spec.args,
                                  sp.spec.cwd.empty() ? nullptr : sp.spec.cwd.c_str());
         if (!sh) { logWarn("restore: a split shell FAILED to start (app=%s cwd=%s) - its session comes back without it",
@@ -11465,7 +11755,8 @@ static bool restoreSessions() {
     {
         LockG hold;
         for (Session* s : g_sessions) {
-            if (s->restoreCmd.empty() && s->agentResume.empty()) continue;
+            // Queue candidates, not startup policy: the setting may change before dispatch.
+            if (s->restoreCmd.empty() && s->agentResume.empty() && s->capturedCmd.empty()) continue;
             if (s->adopted) { logInfo("replay skipped for %s: live shell adopted", s->paneId.c_str()); continue; }
             if (!s->exited && s->data != INVALID_HANDLE_VALUE) g_replayQueue.push_back(s->paneId);
         }
@@ -11505,7 +11796,7 @@ static void parseLaunchArgs() {
         std::wstring a = argv[i];
         for (auto& c : a) c = (wchar_t)towlower(c);
         const wchar_t* v = (i + 1 < argc) ? argv[i + 1] : nullptr;
-        if ((a == L"-p" || a == L"--profile") && v)                            { g_argProfile = v; i++; }
+        if (a == L"-p" || a == L"--profile")                                  { g_argProfileSpecified = true; if (v) { g_argProfile = v; i++; } }
         else if ((a == L"-d" || a == L"--dir" || a == L"--startingdirectory") && v) { g_argDir = narrow(v); i++; }
         else if (a == L"--maximized")  g_argMaximized = true;
         else if (a == L"--no-restore") g_argNoRestore = true;
@@ -11534,20 +11825,6 @@ static void parseLaunchArgs() {
         g_idPrefix = p.empty() ? "lite" : p;
     }
 }
-// Map -p/--profile onto a detected profile (case-insensitive substring, so "-p pwsh" or
-// "-p PowerShell 7" both land on PowerShell 7). Returns false = default shell.
-static bool resolveLaunchProfile(std::string& app, std::vector<std::string>& args) {
-    if (g_argProfile.empty()) return false;
-    std::wstring want = g_argProfile;
-    for (auto& c : want) c = (wchar_t)towlower(c);
-    for (const auto& p : detectProfiles()) {
-        std::wstring n = p.name;
-        for (auto& c : n) c = (wchar_t)towlower(c);
-        if (n.find(want) != std::wstring::npos) { app = p.app; args = p.args; return true; }
-    }
-    return false;
-}
-
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     _Module.Init(nullptr, inst);   // ATL/WTL module (window class registration lives here)
     parseLaunchArgs();
@@ -11558,6 +11835,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         logInit(argc, argv);
         if (argv) LocalFree(argv);
+    }
+    g_profiles = detectedCatalog();
+    std::string profileError;
+    if (!reloadProfiles(profileError)) logWarn("profiles: %s; using detected shells; file unchanged", profileError.c_str());
+    std::string argApp, argCwd; std::vector<std::string> argAppArgs;
+    const bool haveProf = g_argProfileSpecified;
+    if (haveProf) {
+        const auto catalog = profileSnapshot();
+        const auto* selected = catalog.find(narrow(g_argProfile));
+        if (!selected) { logWarn("startup profile not found; no window or session created"); _Module.Term(); return 2; }
+        argApp = selected->command; argAppArgs = selected->args; argCwd = selected->cwd;
     }
     // Before ANY read of settings or state: loadColors/loadFontSel/loadKeys and restoreSessions
     // all resolve through the new names, so the adoption has to have happened already.
@@ -11706,8 +11994,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     ShowWindow(g_hwnd, (startMax || g_argMaximized) ? SW_SHOWMAXIMIZED : show);
 
-    std::string argApp; std::vector<std::string> argAppArgs;
-    bool haveProf = resolveLaunchProfile(argApp, argAppArgs);
     bool wantLaunch = haveProf || !g_argDir.empty();   // -p/-d ask for a specific session
     bool restored = !g_argNoRestore && restoreSessions();
     reapExitedHostSessions();   // after adoption has had its chance, on every launch path
@@ -11716,7 +12002,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         newSessionGrid(0, &cols, &rows);
         Session* s = newSession(cols, rows, haveProf ? argApp.c_str() : nullptr,
                                 (haveProf && !argAppArgs.empty()) ? &argAppArgs : nullptr,
-                                g_argDir.empty() ? nullptr : g_argDir.c_str());
+                                g_argDir.empty() ? (argCwd.empty() ? nullptr : argCwd.c_str()) : g_argDir.c_str());
         // Only when there is NOTHING to show. restoreSessions() returns false while still having kept
         // the specs it could not start as dead "(failed to start)" entries — the whole point of
         // failedSpecSession — and a window listing them, with the log line naming each one, is far
