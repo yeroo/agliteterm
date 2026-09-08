@@ -9,6 +9,8 @@ function Invoke-SelectionCleanup([scriptblock]$ProcessCleanupStep,[scriptblock]$
     return $ok
 }
 . "$PSScriptRoot/ui-lib.ps1"
+. "$PSScriptRoot/registry-guard.ps1"
+. "$PSScriptRoot/selection-clipboard.ps1"
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 if (-not ('SelectionUi' -as [type])) { Add-Type @'
 using System;
@@ -18,15 +20,18 @@ public static class SelectionUi {
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  [StructLayout(LayoutKind.Sequential)] public struct RECT {public int Left,Top,Right,Bottom;}
  [StructLayout(LayoutKind.Sequential)] public struct POINT {public int X,Y;}
+ [StructLayout(LayoutKind.Sequential)] struct PLACEMENT {public uint Length,Flags,Show;public POINT Min,Max;public RECT Normal;}
  [StructLayout(LayoutKind.Sequential)] struct GUIINFO {public uint Size,Flags;public IntPtr Active,Focus,Capture,MenuOwner,MoveSize,Caret;public RECT CaretRect;}
  [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread,ref GUIINFO info);
  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc c,IntPtr l);
  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h,EnumProc c,IntPtr l);
  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
+ [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder b,int n);
  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out RECT r);
  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,out RECT r);
+ [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h,ref PLACEMENT p);
  [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h,ref POINT p);
  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h,ref POINT p);
  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint f);
@@ -41,6 +46,7 @@ public static class SelectionUi {
  public static IntPtr Window(int pid,string cls){IntPtr result=IntPtr.Zero;EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid && Class(h)==cls && (cls!="AgwintermLitePopup" || IsWindowVisible(h))){result=h;return false;}return true;},IntPtr.Zero);return result;}
  public static IntPtr Child(IntPtr h,string cls){IntPtr result=IntPtr.Zero;EnumChildWindows(h,(c,l)=>{if(Class(c)==cls){result=c;return false;}return true;},IntPtr.Zero);return result;}
  public static RECT Rect(IntPtr h){RECT r;GetClientRect(h,out r);return r;}
+ public static int[] SavedPlacement(IntPtr h){var p=new PLACEMENT{Length=(uint)Marshal.SizeOf<PLACEMENT>()};if(!GetWindowPlacement(h,ref p))throw new InvalidOperationException("Cannot read owned window placement");return new[]{p.Normal.Left,p.Normal.Top,p.Normal.Right-p.Normal.Left,p.Normal.Bottom-p.Normal.Top,(p.Show==3 || (p.Flags&2)!=0)?1:0};}
  public static IntPtr Capture(IntPtr h){uint pid;uint thread=GetWindowThreadProcessId(h,out pid);var info=new GUIINFO{Size=(uint)Marshal.SizeOf<GUIINFO>()};if(thread==0 || !GetGUIThreadInfo(thread,ref info))throw new InvalidOperationException("Cannot read owned window capture");return info.Capture;}
  public static RECT ChildRect(IntPtr parent,string cls){var h=Child(parent,cls);RECT r=new RECT();if(h==IntPtr.Zero)return r;GetWindowRect(h,out r);var a=new POINT{X=r.Left,Y=r.Top};var b=new POINT{X=r.Right,Y=r.Bottom};ScreenToClient(parent,ref a);ScreenToClient(parent,ref b);return new RECT{Left=a.X,Top=a.Y,Right=b.X,Bottom=b.Y};}
  public static string Status(IntPtr h,int part){
@@ -53,7 +59,8 @@ public static class SelectionUi {
   }finally{CloseHandle(p);}
  }
  static IntPtr Point(int x,int y){return (IntPtr)((y<<16)|(x&65535));}
- public static void Button(IntPtr h,uint message,int x,int y){PostMessageW(h,message,message==0x202?IntPtr.Zero:(IntPtr)1,Point(x,y));}
+ public static bool ClipboardOwnedBy(int pid){uint owner;var h=GetClipboardOwner();return h!=IntPtr.Zero && GetWindowThreadProcessId(h,out owner)!=0 && owner==(uint)pid;}
+ public static void Button(IntPtr h,uint message,int x,int y){IntPtr result;if(SendMessageTimeoutW(h,message,message==0x202?IntPtr.Zero:(IntPtr)1,Point(x,y),2,5000,out result)==IntPtr.Zero)throw new InvalidOperationException("Owned button dispatch did not complete");}
  public static void Wheel(IntPtr h,int x,int y,int notches){var p=new POINT{X=x,Y=y};ClientToScreen(h,ref p);for(int i=0;i<Math.Abs(notches);i++){PostMessageW(h,0x20A,(IntPtr)((notches>0?120:-120)<<16),Point(p.X,p.Y));System.Threading.Thread.Sleep(60);}System.Threading.Thread.Sleep(250);}
 }
 '@ }
@@ -71,6 +78,17 @@ function Selection-Rpc([string]$cmd,[hashtable]$args_=@{},[string]$target='activ
 }
 function Start-SelectionSandbox {
     param([string]$Exe,[string]$Profile)
+    # loadKeys deletes these obsolete values. Make that an explicitly guarded fixture write
+    # before launching, rather than adopting whatever is missing after the app has run.
+    foreach($name in 'Key_ZoomIn','Key_ZoomOut','Key_ZoomReset'){
+        Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}
+    }
+    # Even a failed launch can reach OnDestroy. Track these names before launch so an
+    # unexpected native save cannot be silently ignored by restoration as "never touched".
+    foreach($name in 'WinX','WinY','WinW','WinH','WinMax'){
+        $keyName="$name-$script:selectionPipe"
+        Set-SelectionRegistry $keyName $script:selectionRegistry[$keyName].Expected
+    }
     # Caller records the launch immediately; even startup failure is cleaned by its finally.
     $script:selectionProc=Start-Process $Exe -ArgumentList @('--pipe',$script:selectionPipe,'--no-restore') -Environment @{LOCALAPPDATA=$Profile} -WindowStyle Hidden -PassThru
     $script:selectionLaunched=$true
@@ -92,11 +110,19 @@ function Start-SelectionSandbox {
     if($script:selectionHwnd -eq [IntPtr]::Zero){throw 'No sandbox frame'}
     [void][LiteUi]::ShowWindow($script:selectionHwnd,4) # show without activating
     [void][LiteUi]::SetWindowPos($script:selectionHwnd,[IntPtr]::Zero,150,100,1100,700,0x14)
+    Save-SelectionRegistryPlacement
     Start-Sleep -Seconds 3
 }
 function Stop-SelectionSandbox {
+    $registryFault=$null
     if($script:selectionProc -and -not $script:selectionProc.HasExited){
-        [void]$script:selectionProc.CloseMainWindow()
+        try {
+            # OnDestroy saves this same WINDOWPLACEMENT. Seed its intended values through the
+            # guard BEFORE permitting that write, never learn expected ownership from HKCU later.
+            Save-SelectionRegistryPlacement
+        } catch {$registryFault=$_.Exception.Message}
+        # A detected foreign preference/geometry change must not be overwritten by OnDestroy.
+        if($registryFault){$script:selectionProc.Kill()}else{[void]$script:selectionProc.CloseMainWindow()}
         if(-not $script:selectionProc.WaitForExit(10000)){$script:selectionProc.Kill();if(-not $script:selectionProc.WaitForExit(5000)){throw 'Owned window did not exit'}}
     }
     foreach($owned in $script:selectionHosts){if(-not $owned.HasExited){
@@ -108,6 +134,22 @@ function Stop-SelectionSandbox {
     }
     $script:selectionProc=$null;$script:selectionHosts=@()
     $script:selectionLaunched=$false
+    if($registryFault){throw "Registry conflict before window exit: $registryFault"}
+}
+function Set-SelectionRegistry([string]$Name,$State) {
+    $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    try {
+        Set-RegistryGuardValue $script:selectionRegistry $Name $State `
+            {param($n) Read-RegistryGuardValue $key $n} `
+            {param($n,$v) Write-RegistryGuardValue $key $n $v}
+    } finally {$key.Dispose()}
+}
+function Save-SelectionRegistryPlacement {
+    $placement=[SelectionUi]::SavedPlacement($script:selectionHwnd)
+    $names=@('WinX','WinY','WinW','WinH','WinMax')
+    for($i=0;$i-lt $names.Count;$i++){
+        Set-SelectionRegistry "$($names[$i])-$script:selectionPipe" @{Exists=$true;Kind=4;Value=[int]$placement[$i]}
+    }
 }
 function Selection-Geometry {
     $h=$script:selectionHwnd;$rc=[SelectionUi]::Rect($h)
@@ -163,26 +205,14 @@ function Import-SelectionClipboard([string]$path) {
     return $copy
 }
 function Save-SelectionClipboard([string]$RecoveryPath) {
-    # Eagerly materialize every native/registered format before any selection can replace it.
-    # Unknown object types fail closed, while the user's clipboard is still untouched.
-    $source=[Windows.Forms.Clipboard]::GetDataObject();$copy=[Windows.Forms.DataObject]::new()
-    if($source){foreach($format in $source.GetFormats($false)){
-        $data=$source.GetData($format,$false)
-        if($data -is [Drawing.Bitmap]){$data=$data.Clone()}
-        elseif($data -is [IO.MemoryStream]){$data=[IO.MemoryStream]::new($data.ToArray())}
-        elseif($data -is [byte[]] -or $data -is [string[]]){$data=$data.Clone()}
-        elseif($null -ne $data -and $data -isnot [string]){throw "Clipboard format $format has unsupported type $($data.GetType().FullName); no test mutation performed"}
-        if($null -eq $data){throw "Clipboard format $format could not be captured; no test mutation performed"}
-        $copy.SetData($format,$false,$data)
-    }}
     if(-not $RecoveryPath){throw 'Clipboard recovery path required before test mutations'}
-    Export-SelectionClipboard $copy $RecoveryPath
-    $roundtrip=Import-SelectionClipboard $RecoveryPath
-    if($roundtrip.GetFormats($false).Count -ne $copy.GetFormats($false).Count){throw 'Clipboard recovery snapshot format count mismatch'}
-    foreach($format in $copy.GetFormats($false)){
-        if(-not $roundtrip.GetDataPresent($format,$false) -or (Clipboard-Fingerprint $roundtrip.GetData($format,$false)) -cne (Clipboard-Fingerprint $copy.GetData($format,$false))){throw "Clipboard recovery snapshot failed verification: $format"}
-    }
-    return $copy
+    $snapshot=[Agwinterm.Win32ControlTest.ClipboardGuard]::Take()
+    $ledger=New-SelectionClipboardLedger $snapshot
+    $snapshot.Save($RecoveryPath)
+    $roundtrip=[Agwinterm.Win32ControlTest.ClipboardSnapshot]::Load($RecoveryPath)
+    if(-not $snapshot.SameAs($roundtrip)){throw 'Clipboard recovery snapshot failed verification'}
+    $ledger.RecoveryPath=$RecoveryPath
+    return $ledger
 }
 
 function Clipboard-Fingerprint($data) {
@@ -208,10 +238,7 @@ function Clipboard-Fingerprint($data) {
     throw 'Unsupported clipboard value during restoration verification'
 }
 function Restore-SelectionClipboard($saved) {
-    if($saved.GetFormats($false).Count){[Windows.Forms.Clipboard]::SetDataObject($saved,$true)}else{[Windows.Forms.Clipboard]::Clear()}
-    $actual=[Windows.Forms.Clipboard]::GetDataObject()
-    foreach($format in $saved.GetFormats($false)){
-        if(-not $actual -or -not $actual.GetDataPresent($format,$false) -or (Clipboard-Fingerprint $actual.GetData($format,$false)) -cne (Clipboard-Fingerprint $saved.GetData($format,$false))){throw "Clipboard restoration verification failed: $format"}
-    }
-    if(-not $saved.GetFormats($false).Count -and $actual -and $actual.GetFormats($false).Count){throw 'Clipboard was not restored to empty'}
+    Restore-SelectionClipboardLedger $saved
+    # Delete only this run's saved original, after exact restoration (or proven no writes).
+    Remove-Item -LiteralPath $saved.RecoveryPath
 }

@@ -580,9 +580,9 @@ say what it was.
 
 - Claude explicitly assigned the clipboard/registry port to Codex in hub mail
   `20260908T055530Z-claude-agwinterm-8266`; he owns #48/#49 process cleanup separately.
-- **Do not run the current selection-ui fixture yet.** Its old automatic clipboard/registry
-  restoration is unconditional. Historical restoration evidence above does not prove it preserves
-  a newer user change. The old recovery commands are not authorization to overwrite today's clipboard.
+- **Live acceptance remains pending.** The fixture now uses guarded clipboard/registry restoration;
+  the new wiring still needs peer review and a token-held run. Historical restoration evidence above
+  does not validate this wiring. Old recovery commands do not authorize overwriting today's clipboard.
 - Added `registry-guard.ps1`: original/expected values retain kinds, absence and exact array data;
   observed conflicts stop writes, preserve the newer value and fail teardown. All 14 in-memory
   checks pass. Registry value checks are not atomic compare/exchange against arbitrary outside writers.
@@ -591,10 +591,18 @@ say what it was.
   and exact-generation restoration: a newer identical-text copy is preserved, never adopted by content.
   All 10 additional fake checks pass. Unexpected/unreadable owned copies remain unverified and must
   retain recovery evidence; they are not called foreign changes.
-- **Not yet integrated or accepted:** native owner adapter, receipt bracketing of every fixture copy,
-  guarded marker writes, registry fixture wiring (including app-written geometry/obsolete-key cleanup),
-  recovery-file/token lifecycle, peer review, and live Strict acceptance. The helper tests touched no
-  real clipboard, HKCU, windows or processes. No token acquired for this work.
+- Rebased P7 onto #49's squash merge `7cbf269`, preserving both ownership and selection suite entries.
+  Registry wiring covers bindings, obsolete startup-deleted zoom keys and per-pipe geometry. Before
+  graceful shutdown it guards the exact placement the app will save; an observed conflict forces only
+  the owned process to exit without OnDestroy overwriting foreign geometry.
+- Clipboard wiring uses whole-format DPAPI snapshots, unique marker writes, owner/PID receipts for
+  each release/Enter/Ctrl+C, and exact-generation cleanup. Button messages are synchronous to bracket
+  each release independently, including consecutive double/triple clicks. Interrupted/unproven actions
+  retain recovery and fail cleanup; assertions refuse to disclose an unexpected clipboard generation.
+  Added 16 pure lifecycle fault checks; guard suites are included in run-all.
+- **Not yet accepted:** peer review of the new guard wiring, native click timing/ownership evidence,
+  and token-held selection-ui/full run-all Strict acceptance. Helper tests touched no real clipboard,
+  HKCU, windows or processes. No token acquired for this work.
 
 ## Post-Completion
 

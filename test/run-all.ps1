@@ -9,9 +9,9 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $failed = @()
-# Selection UI checks use posted input and PrintWindow; qa/selection.md also records manual cases.
+# Selection UI checks use window-scoped messages and PrintWindow; qa/selection.md also records manual cases.
 # Local token-owning callers pass AGLITETERM_TEST_RECEIPT so selection-ui borrows that live lease.
-foreach ($t in 'owned-procs-checks', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
+foreach ($t in 'owned-procs-checks', 'registry-guard.unit', 'clipboard-guard.tests', 'clipboard-receipt.unit', 'selection-clipboard.unit', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
     $script = Join-Path $PSScriptRoot "$t.ps1"
     if (-not (Test-Path $script)) { continue }
     # Each child sets $ErrorActionPreference = 'Stop', so it can die before reaching its own exit
