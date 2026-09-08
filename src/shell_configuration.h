@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <mutex>
+#include <atomic>
 #include "profiles.h"
 
 namespace shell_configuration {
@@ -9,12 +10,27 @@ namespace shell_configuration {
 class InputGate {
     std::mutex mutex;
     bool written = false;
+    unsigned long long reservation = 0, sequence = 0;
+    std::atomic<bool> editable{true};
 public:
-    template<class Write> bool write(bool editingInput, bool requireUntouched, Write transfer) {
+    void setReadOnly(bool readOnly) { editable = !readOnly; }
+    unsigned long long reserve() {
+        std::lock_guard<std::mutex> hold(mutex);
+        if (reservation) return 0;
+        return reservation = ++sequence;
+    }
+    void release(unsigned long long token) {
+        std::lock_guard<std::mutex> hold(mutex);
+        if (token && token == reservation) reservation = 0;
+    }
+    template<class Write> bool write(bool editingInput, bool requireUntouched, Write transfer,
+                                    unsigned long long token = 0) {
         // Reader-thread terminal replies must not wait behind a possibly backpressured paste:
         // that reader must keep draining shell output so the editing write can finish.
         if (!editingInput && !requireUntouched) { transfer(); return true; }
         std::lock_guard<std::mutex> hold(mutex);
+        if ((reservation && token != reservation) || (token && token != reservation)) return false;
+        if (editingInput && !editable.load()) return false;
         if (requireUntouched && written) return false;
         if (editingInput) written = true; // even a failed/partial write makes emptiness unproven
         transfer();

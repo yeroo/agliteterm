@@ -75,6 +75,7 @@ CAppModule _Module;
 #include "configuration.h"
 #include "profiles.h"
 #include "shell_configuration.h"
+#include "commands.h"
 
 // ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
@@ -419,6 +420,8 @@ struct Session {
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
     shell_configuration::InputGate inputGate; // sticky PTY input history + per-pane write serialization
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
+    ULONGLONG childCreated = 0;    // birth identity captured at attach; agent lifecycle refuses unknown/reused PIDs
+    std::string agentBridgeToken;  // prompt-process capability, not inherited by child agents
     // restore.capture (P3): the command line of the shell's foreground child as captured by the
     // last `restore capture`, persisted as K (ordinary) or K2 (escaped), read through `tree --json` as
     // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
@@ -1017,6 +1020,15 @@ static const KbInfo kKbInfo[KB_COUNT] = {
     { L"Toggle Read-Only Pane", L"Key_ReadOnly" },
 };
 static WORD g_keys[KB_COUNT] = { 0 };
+static commands::Catalog g_commands; // UI-thread owned; pipe access uses dispatchConfig
+static bool g_leaderPending = false;
+static ULONGLONG g_leaderAt = 0;
+static bool loadCommands(std::string& error);
+static bool customKey(WORD combo);
+static std::string commandOnUi(const JsonReq& req);
+static std::string commandAction(const std::string& action);
+static std::wstring widen(const std::string& s);
+static std::string agentUpdateOnUi(const JsonReq& req);
 static bool g_swallowChar = false;   // set when a keydown was consumed by a binding, to drop its WM_CHAR
 // The authentic 16-colour EGA/VGA text palette (0x00/0x55/0xAA/0xFF steps) — dimmer than modern ANSI,
 // the classic MS-DOS look (e.g. Far's blue becomes 0x0000AA, not a bright 0x0000FF). Indexed in ANSI
@@ -1233,6 +1245,7 @@ static constexpr int kPalCount = (int)(sizeof kPalActions / sizeof kPalActions[0
 static constexpr int kPalMaxRows = 12;         // list viewport height (rows)
 static std::wstring g_palQuery;
 static std::vector<int> g_palHits;             // filtered indices into kPalActions, best first
+static std::vector<std::wstring> g_palCustom; // UI snapshot of configured command labels
 static int g_paletteSel = 0;                   // selection: index into g_palHits
 static int g_palTop = 0;                       // first visible row of the viewport
 static RECT g_palBox{}, g_palList{};           // last painted geometry (mouse hit-testing)
@@ -1256,9 +1269,10 @@ static int palScore(const wchar_t* label, const std::wstring& q) {
 
 static void palFilter() {
     g_palHits.clear();
-    int scores[kPalCount];
-    for (int i = 0; i < kPalCount; i++)
-        if ((scores[i] = palScore(kPalActions[i].label, g_palQuery)) >= 0) g_palHits.push_back(i);
+    g_palCustom.clear(); for (const auto& command : g_commands.commands) g_palCustom.push_back(widen(command.label));
+    std::vector<int> scores(kPalCount + g_palCustom.size());
+    for (int i = 0; i < static_cast<int>(scores.size()); i++)
+        if ((scores[i] = palScore(i < kPalCount ? kPalActions[i].label : g_palCustom[i-kPalCount].c_str(), g_palQuery)) >= 0) g_palHits.push_back(i);
     std::stable_sort(g_palHits.begin(), g_palHits.end(),
                      [&](int a, int b) { return scores[a] > scores[b]; });
     g_paletteSel = 0; g_palTop = 0;
@@ -1427,7 +1441,8 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
 }
 
 static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
-                  bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr) {
+                  bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr,
+                  unsigned long long reservation = 0) {
     Session* inputPane = nullptr;
     if (write) {
         LockG hold;
@@ -1438,7 +1453,7 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     // inside the gate. The pristine check and its initialization bytes are one operation
     // relative to human input, API type/paste and restore replay. Non-editing protocol replies
     // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
-    if (requireUntouched && !inputPane) {
+    if ((requireUntouched || reservation) && !inputPane) {
         if (guardRefused) *guardRefused = true;
         return 0;
     }
@@ -1453,7 +1468,7 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
         CloseHandle(ov.hEvent);
     };
     if (inputPane) {
-        if (!inputPane->inputGate.write(paneInput && len != 0, requireUntouched, transfer) && guardRefused)
+        if (!inputPane->inputGate.write(paneInput && len != 0, requireUntouched, transfer, reservation) && guardRefused)
             *guardRefused = true;
     } else transfer();
     return n;
@@ -1964,16 +1979,10 @@ static std::string base64(const std::wstring& s) {
     return out;
 }
 
-static const wchar_t* kPromptWrap =
-    L"if(-not $global:__agwLiteWrap){$global:__agwLiteWrap=$true;$global:__agwLiteP=$function:prompt;"
-    L"function global:prompt{$ec=if($?){0}else{1};$e=[char]27;$b=[char]7;"
-    // Sync the PROCESS cwd to the shell's location: Set-Location alone doesn't move it, and the
-    // process cwd (read from the PEB at save time) is how session restore learns the live dir —
-    // conhost/ConPTY filters cwd OSC sequences (7 and 9;9) out of the stream, so VT can't carry it.
-    L"$l=$executionContext.SessionState.Path.CurrentLocation;"
-    L"if($l.Provider.Name -eq 'FileSystem'){[Environment]::CurrentDirectory=$l.ProviderPath};"
-    L"[Console]::Write(\"$e]133;D;$ec$b$e]133;A$b\");"
-    L"if($global:__agwLiteP){& $global:__agwLiteP}else{\"PS $($executionContext.SessionState.Path.CurrentLocation)> \"}}}";
+static std::wstring widen(const std::string& s);
+static std::wstring promptWrap() {
+    return widen(". " + shell_configuration::literal(narrow(exeDir() + L"\\agliteterm-prompt.ps1")));
+}
 
 // ---- session lifecycle ----
 // Completed FTCS commands (OSC 133 with an end boundary) in the session's buffer. Call under g_lock.
@@ -2122,7 +2131,7 @@ static std::string ompTheme() { std::lock_guard<std::mutex> guard(g_ompMutex); r
 static std::wstring ompInitialization(const std::string& path) {
     // Rewrap the NEW prompt, not the wrapper that init just replaced. No user profile is edited.
     return widen("oh-my-posh init pwsh --config " + shell_configuration::literal(path) +
-        " | Invoke-Expression; $global:__agwLiteWrap=$false; ") + kPromptWrap;
+        " | Invoke-Expression; $global:__agwLiteWrap=$false; ") + promptWrap();
 }
 static bool validOmpPath(const std::string& path) {
     return profiles::detail::clean(path, 259) && !path.empty() && base64(ompInitialization(path)).size() < sizeof(agwinterm_ptyhost_Create::args[0]);
@@ -2391,7 +2400,8 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         const auto themePath = widen(theme);
         const DWORD attributes = theme.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(themePath.c_str());
         enc = base64(validOmpPath(theme) && attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)
-            ? ompInitialization(theme) : std::wstring(kPromptWrap));
+            ? ompInitialization(theme) : promptWrap());
+        if (enc.size() >= sizeof agwinterm_ptyhost_Create::args[0]) return nullptr;
         req.cmd.create.args_count = 4;
         strcpy_s(req.cmd.create.args[0], "-NoLogo");
         strcpy_s(req.cmd.create.args[1], "-NoExit");
@@ -2512,6 +2522,12 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // grid it had; the latch stays 0 so the first layout really does resize it.
     if (!repaint) { s->cols = cols; s->rows = rows; }
     s->childPid = rep.body.attach.child_pid;
+    if (HANDLE child = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, s->childPid)) {
+        FILETIME born{}, exited{}, kernel{}, user{};
+        if (GetProcessTimes(child, &born, &exited, &kernel, &user))
+            s->childCreated = (static_cast<ULONGLONG>(born.dwHighDateTime) << 32) | born.dwLowDateTime;
+        CloseHandle(child);
+    }
     s->data = openPipe(std::wstring(rep.body.attach.pipe, rep.body.attach.pipe + strlen(rep.body.attach.pipe)), 5000, true);
     if (s->data == INVALID_HANDLE_VALUE) { emu_free(s->emu); delete s; return nullptr; }
     // NOTE: AttachReply.scrollback stays callback-decoded (unbounded), so an adopted session comes
@@ -4507,7 +4523,8 @@ static void paint(HDC dc, RECT rc) {
         for (int v = 0; v < rows; v++) {
             int i = g_palTop + v;
             if (i >= n) break;
-            const PalAction& a = kPalActions[g_palHits[i]];
+            const int hit = g_palHits[i];
+            const PalAction a = hit < kPalCount ? kPalActions[hit] : PalAction{g_palCustom[hit-kPalCount].c_str(),0,-1,-1};
             int iy = ly + v * rowH;
             bool cur = (i == g_paletteSel);
             if (cur) {
@@ -4727,7 +4744,7 @@ static void sendBytes(const char* bytes, int len) {
 static void toggleReadOnly() {
     {
         LockG hold;
-        if (Session* s = focusedSession()) s->readOnly = !s->readOnly;
+        if (Session* s = focusedSession()) { s->readOnly = !s->readOnly; s->inputGate.setReadOnly(s->readOnly); }
     }
     PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
@@ -4768,9 +4785,8 @@ static void pasteClipboard() {
             if (!u8.empty()) WideCharToMultiByte(CP_UTF8, 0, w, -1, &u8[0], n, nullptr, nullptr);
             u8 = pasteNormalize(std::move(u8));
             // Bracketed paste when the app enabled it (safer multiline paste), else raw.
-            if (info.bracketedPaste) { ovIo(data, true, "\x1b[200~", nullptr, 6); }
+            if (info.bracketedPaste) u8 = "\x1b[200~" + u8 + "\x1b[201~";
             ovIo(data, true, u8.data(), nullptr, (DWORD)u8.size());
-            if (info.bracketedPaste) { ovIo(data, true, "\x1b[201~", nullptr, 6); }
             GlobalUnlock(h);
         }
     }
@@ -5327,9 +5343,16 @@ static void runKbAction(int a);                  // fwd (palExec dispatches keyb
 // POSTED (never run from inside the key handler — several open dialogs), so the palette closes
 // and repaints first and re-entrancy can't bite.
 static void palExec(int idx) {
-    const PalAction& a = kPalActions[idx];
     g_palette = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
+    if (idx >= kPalCount) {
+        if (idx-kPalCount < static_cast<int>(g_palCustom.size())) {
+            const auto reply = commandAction("command:" + narrow(g_palCustom[idx-kPalCount]));
+            if (reply.find("\"ok\":false") != std::string::npos) logWarn("palette command: %s",reply.c_str());
+        }
+        return;
+    }
+    const PalAction& a = kPalActions[idx];
     if (a.theme >= 0) {
         g_themeMode = a.theme;
         saveConfigValue(configuration::Id::Theme);
@@ -5414,6 +5437,7 @@ static bool handleKeyDown(WPARAM vk) {
     {
         BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
         WORD combo = MAKEWORD((BYTE)vk, mods);
+        if (customKey(combo)) return true;
         if (mods) for (int a = 0; a < KB_COUNT; a++) if (g_keys[a] == combo) { runKbAction(a); return true; }
     }
 
@@ -7192,6 +7216,7 @@ static Session* resolveTarget(const std::string& target, std::string* why);
 static std::string configOnUi(const JsonReq& req) {
     using configuration::Id;
     const auto& cmd = req.get("cmd");
+    if (cmd == "command.list" || (cmd == "command.leader" && req.get("args.op") == "state")) return commandOnUi(req);
     if (cmd == "theme.list") return ctlOkStr("auto\nlight\ndark\nclassic");
     if (cmd == "config.list") {
         LockG hold; std::string result;
@@ -7213,6 +7238,14 @@ static std::string configOnUi(const JsonReq& req) {
     // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
     // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
     if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return ctlErr("a modal dialog is open or queued; configuration unchanged");
+    if (cmd == "agent.update.open") return agentUpdateOnUi(req); // internal dispatch only, not a public control verb
+    if (cmd.rfind("command.", 0) == 0) return commandOnUi(req);
+    if (cmd == "app.update") {
+        if (!updChannelInstalled()) return ctlErr("this copy is not an installed update channel; nothing queued");
+        if (g_updBusy) return ctlErr("app update already running");
+        updCheck(true);
+        return g_updBusy ? ctlOkStr("app update requested; download, verification and restart are not yet confirmed") : ctlErr("app update could not start");
+    }
     if (cmd == "omp.set") {
         HANDLE data = INVALID_HANDLE_VALUE;
         {
@@ -7258,7 +7291,11 @@ static std::string configOnUi(const JsonReq& req) {
         g_settingsOpenQueued = true;
         return ctlOkStr("settings open requested");
     }
-    if (cmd == "keymap.reload") { loadKeys(false); return ctlOkStr("keymap reloaded"); }
+    if (cmd == "keymap.reload") {
+        std::string error;
+        if (!loadCommands(error)) return ctlErr("keymap reload: " + error + "; previous bindings retained");
+        loadKeys(false); return ctlOkStr("keymap reloaded");
+    }
     if (!key) return ctlErr("unknown config key '" + name + "'");
     uint32_t value = 0;
     if (!configuration::parse(*key, req.get(theme ? "args.name" : "args.value"), value))
@@ -9283,15 +9320,41 @@ typing into existing panes. Nonempty explicit profile args and adopted shells re
 `config set restore-commands true|false` controls captured K replay (default false); inspect K first.
 K2 state records preserve captures with tabs/newlines losslessly; older builds ignore K2 records.
 
+## Commands, installers and agents (P11)
+
+`command list/run/leader` reads keymap.conf custom commands and leader bindings. Four modes:
+send/new/overlay/detached. Exact ASCII-case-insensitive labels; unmatched raw text defaults to new.
+Unknown modes/actions or malformed reloads refuse without changing the working catalog. Commands
+also appear in the palette. AGW context tokens expand text and become environment in launched
+processes; send submits one line, requires writable input, and cannot confirm shell success.
+
+`install hooks|shell` is explicit opt-in, preserves unrelated configuration and keeps backups.
+Codex TOML is not edited: hooks installation prints the notify line. `install.cli` adds/removes
+the bundled CLI directory; some shared CLI builds handle this locally, so use the lite pipe verb
+or bundled agliteterm-install.ps1 -Operation cli for an unambiguous lite installation.
+`app update` queues the existing verified updater only on an installed release channel.
+
+`claude adopt` binds only birth-verified process descendants with one explicit conversation UUID,
+never a newest-folder guess; existing bindings and permission modes are preserved. `claude yolo`
+explicitly requests permission-bypassing resume through the bundled PowerShell prompt bridge.
+Old/adopted/explicit-argv shells need that bridge loaded explicitly. Readonly/covered/ambiguous
+panes, custom conflicting bindings and unknown readiness refuse. Pending restarts reserve input;
+Ctrl+C targets the still-live verified process, and only a prompt claim after proven descendant
+exit can dispatch resume. Timeout/state changes cancel; no executable text is appended to a draft.
+`claude update` uses a visible owned overlay; only a proven newer version triggers safe restarts
+of the originally verified eligible panes, preserving each conversation and permission mode.
+Queued/opened is not completed: read agent.update / agent.restart events. Full details and
+compatibility limits: docs/agent-integration.md. Do not invoke these on a peer's pane as a test.
+
 ## What this terminal does NOT have
 
 Do not reach for these - they exist in the full agwinterm and will be refused here with
 "unknown command '<verb>' (lite subset)":
 
 `session background` (lite draws no images),
-`command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
+`notify`, `broadcast`, `dashboard`,
 `image show|sixel`,
-`font`, `restore clear`, `install hooks|shell|cli`, `claude *`.
+`font`, `restore clear`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
 result with `session output` or `session text`.
@@ -9331,6 +9394,10 @@ static std::string installAgentSkill() {
     return "installed the agliteterm skill to " + std::to_string(written) + " location(s): " + where;
 }
 
+
+#include "commands_runtime.h"
+#include "install_runtime.h"
+#include "agent_runtime.h"
 
 static std::string ctlDispatch(const std::string& line) {
     JsonReq req;
@@ -9375,6 +9442,15 @@ static std::string ctlDispatch(const std::string& line) {
         if (!reloadProfiles(error)) return ctlErr("profiles reload: " + error + "; previous catalog retained; file unchanged");
         return ctlOkStr(std::to_string(profileSnapshot().entries.size()) + " profiles loaded");
     }
+    if (cmd == "command.run") {
+        LockG hold; std::string why;
+        auto* pane = resolveTarget(req.get("target"), &why);
+        if (!pane) return ctlErr(why.empty() ? "no command target" : why);
+        req.fields["target"] = pane->paneId;
+    }
+    if (cmd.rfind("command.", 0) == 0 || cmd == "app.update") return dispatchConfig(req);
+    if (cmd == "install.cli" || cmd == "install.hooks" || cmd == "install.shell") return installIntegration(req);
+    if (cmd == "claude.adopt" || cmd == "claude.yolo" || cmd == "claude.update" || cmd == "agent.bridge") return agentDispatch(req);
     if (cmd == "config.get" || cmd == "config.list" || cmd == "config.set" ||
         cmd == "theme.list" || cmd == "theme.set" || cmd == "settings.open" || cmd == "keymap.reload")
         return dispatchConfig(req); // app-global: before target resolution, with no g_lock held
@@ -9826,6 +9902,7 @@ static std::string ctlDispatch(const std::string& line) {
             if (op == "on") target->readOnly = true;
             else if (op == "off") target->readOnly = false;
             else if (op == "toggle") target->readOnly = !target->readOnly;
+            target->inputGate.setReadOnly(target->readOnly);
             on = target->readOnly;
         }
         PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
@@ -9917,8 +9994,9 @@ static std::string ctlDispatch(const std::string& line) {
                 return ctlErr(emsg);
             }
         }
-        if (target->data != INVALID_HANDLE_VALUE)
-            ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size());
+        if (target->data == INVALID_HANDLE_VALUE || target->exited) return ctlErr("session type: pane has no live input");
+        if (ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
+            return ctlErr("session type: input reserved or write failed/partial; shell outcome unknown");
         return ctlOkStr("typed");
     }
     if (cmd == "session.write") {
@@ -10856,10 +10934,11 @@ static std::string ctlDispatch(const std::string& line) {
             EnterCriticalSection(&g_lock);
             emu_info(target->emu, &pinfo);
             LeaveCriticalSection(&g_lock);
-            if (pinfo.bracketedPaste) ovIo(target->data, true, "\x1b[200~", nullptr, 6);
-            ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size());
-            if (pinfo.bracketedPaste) ovIo(target->data, true, "\x1b[201~", nullptr, 6);
+            if (pinfo.bracketedPaste) text = "\x1b[200~" + text + "\x1b[201~";
+            if (ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
+                return ctlErr("session paste: input reserved or write failed/partial; shell outcome unknown");
         }
+        else return ctlErr(text.empty() ? "session paste: no text available; nothing pasted" : "session paste: pane has no live input");
         return ctlOkStr("pasted");
     }
     if (cmd == "session.go") {   // dir: next|prev|first|last|next-attention|prev-attention
@@ -11887,6 +11966,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     buildFontCatalog();
     loadColors();      // Properties->Colors overrides, remembered across restarts
     loadKeys();        // palette, mark and Select All seeded; other bindings start unbound
+    { std::string error; if (!loadCommands(error)) logWarn("keymap.conf: %s", error.c_str()); }
     loadFontSel();     // resolve the remembered face+size (first run -> AGWin Bitmap Complete 16)
     applyFont();       // creates g_fonts + sets g_cw/g_ch (g_hwnd still null, so no relayout yet)
     if (g_faceIdx >= 0 && g_faceIdx < (int)g_catalog.size())

@@ -314,6 +314,15 @@ unsupported/overlong paths refuse. Live write followed by persistence failure re
 `config set restore-commands true` opts into captured K replay on future fresh restore; default false.
 Review captured commands first. This does not immediately execute anything in existing panes.
 
+### Commands and agent integration (P11)
+
+Custom commands now support send/new/overlay/detached modes, keymap bindings and leader chords.
+Opt-in CLI/hook/shell installers preserve unrelated configuration and keep backups of changed files.
+Claude adoption uses exact process conversation evidence; YOLO and post-update resume use a guarded
+prompt bridge, never a guessed transcript or fixed-delay command injection. App updates remain gated
+to the installed release channel. See [commands and agent integration](docs/agent-integration.md) for
+syntax, compatibility differences, refusal conditions and asynchronous outcome events.
+
 ## Session restore & the state file
 
 agliteterm saves its workspaces and sessions whenever the tree changes and on exit, and rebuilds them on
