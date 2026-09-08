@@ -9,7 +9,7 @@ buffer and an index into one names unrelated text in the other.
 
 Lite supports keyboard mark mode, Select All, double/triple-click word/line selection and
 drag-autoscroll in panes and popups. `test/selection-ui.ps1 -Strict` drives these with posted input
-and PrintWindow, under a shared suite token locally. Scrollback size remains non-configurable;
+and PrintWindow, under a shared suite token locally. P10a's scrollback-lines applies to new surfaces;
 see `qa/product.md` for deliberate differences.
 
 Setup for every case: sandbox instance per `qa/product.md`. Fixtures print **distinct** text per
