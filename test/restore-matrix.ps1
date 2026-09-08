@@ -1190,9 +1190,12 @@ if ($cliHasP4) {
             ($tsv -match "(?m)^K`t0`t[^`t]*-n 315 127\.0\.0\.1`t[^`t]*-n 316 127\.0\.0\.1`r?$")
     }
     # The negative case of the proof: a second window on its own pipe - under the same pty-host, since
-    # there is one per machine - types the same marker into a shell this run never asked for its pid.
+    # there is one per machine - types the same marker into a shell the ledger was never told about.
     # The ledger claims only the ping under the shell that answered on OUR pane; the other is named as
-    # foreign and left alone - it is stopped only once its own pane has answered too, as ours. No
+    # foreign and left alone. The other pane's pid is read off its screen BEFORE its ping (a shell
+    # running a ping answers nothing until the ping ends) but not registered until the checks are
+    # done: registering is the act of vouching, and the pid came off a pane of a window this run
+    # started, so vouching for it afterwards is honest - and its ping is then stopped as ours. No
     # restart: this checks the ledger, not the state file, so it is not a Cell.
     if (-not $Only -or $Only -eq 'foreign-shell') {
         $inst = 'rm-foreign-shell'; $inst2 = 'rm-foreign-shell-2'
@@ -1205,6 +1208,10 @@ if ($cliHasP4) {
             $id = LastSessionId $inst; $id2 = LastSessionId $inst2
             $ours = Own-Shell $id $inst
             $shellPid = [int]($ours -split '\|')[0]
+            & $ctl session type $script:shellPidProbe --target $id2 --pipe $inst2 2>&1 | Out-Null
+            $otherPid = $null
+            for ($k = 0; $k -lt 40 -and -not $otherPid; $k++) { Start-Sleep -Milliseconds 200; $otherPid = Find-ShellPid ((& $ctl session text --target $id2 --pipe $inst2 2>&1) -join "`n") }
+            if (-not $otherPid) { throw "the other window's pane never answered AGWSHELL=<pid>" }
             # The other window's ping first: a walk that claimed by descent would find it first too.
             & $ctl session type "ping -n 317 127.0.0.1`n" --target $id2 --pipe $inst2 2>&1 | Out-Null
             & $ctl session type "ping -n 317 127.0.0.1`n" --target $id --pipe $inst 2>&1 | Out-Null
@@ -1213,9 +1220,9 @@ if ($cliHasP4) {
             $owned = @(Get-OwnedPings '317'); $foreign = @(Describe-ForeignPings '317')
             $detail = "owned: $(@($owned | ForEach-Object { "pid $($_.Pid) under shell $($_.ParentPid)" }) -join ', '); foreign: $($foreign -join '; ')"
             $ok = ($owned.Count -eq 1) -and ($owned[0].ParentPid -eq $shellPid) -and ($foreign.Count -eq 1) -and
-                  ($foreign[0] -notmatch "parent pid $shellPid\b")
-            # Now the other pane answers for itself, and its ping is stopped the same way as ours.
-            Own-Shell $id2 $inst2 | Out-Null
+                  ($foreign[0] -match "parent pid $otherPid\b")
+            # Now the other shell is vouched for by the pid its own pane answered, and its ping is ours to stop.
+            Register-OwnedShell $otherPid | Out-Null
             if (@(Get-OwnedPings '317').Count -ne 2) { $ok = $false; $detail += "; after registering the other shell: $(@(Get-OwnedPings '317').Count) owned" }
             $script:cellNotes += @(Stop-AllOwnedPings)   # before the graceful closes: they kill the shells and orphan the pings
             Stop-Lite $p; $p = $null
