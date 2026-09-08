@@ -2,6 +2,7 @@
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly)
 $ErrorActionPreference='Stop'
+if($DrivingOnly -and $ConfigurationOnly){throw 'Choose only one of -DrivingOnly and -ConfigurationOnly'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
 New-Item -ItemType Directory $script:selectionArtifact -Force | Out-Null
@@ -309,7 +310,7 @@ try {
     Check 'bindings: rebound Select All highlights without copying' ((Selected)-match 'SELECT-ALL-REBOUND' -and (Clip)-eq $script:selectionMarker)
     }
     if(-not $ConfigurationOnly -and (Test-Path "$PSScriptRoot/driving-ui-cases.ps1")){. "$PSScriptRoot/driving-ui-cases.ps1"}
-    if(Test-Path "$PSScriptRoot/configuration-ui-cases.ps1"){. "$PSScriptRoot/configuration-ui-cases.ps1"}
+    if(-not $DrivingOnly -and (Test-Path "$PSScriptRoot/configuration-ui-cases.ps1")){. "$PSScriptRoot/configuration-ui-cases.ps1"}
 }catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
     $cleanupOk=Invoke-SelectionCleanup { Stop-SelectionSandbox } {

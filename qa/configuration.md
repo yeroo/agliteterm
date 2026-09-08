@@ -1,6 +1,7 @@
 # Configuration (P10a)
 
 Run `test/selection-ui.ps1 -Strict -ConfigurationOnly -TokenOwner <actual-agent>` locally.
+`-ConfigurationOnly` and `-DrivingOnly` are mutually exclusive; conflicting filters refuse before launch.
 The complete selection-ui invocation also includes these cases after P7/P9. The outer fixture
 acquires the canonical shared token and retains it through proven process/registry/clipboard cleanup.
 Do not substitute the legacy full-suite clipboard fixture on a shared desktop (lite #51).

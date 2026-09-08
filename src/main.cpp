@@ -2965,19 +2965,17 @@ static void saveKeys() {
         RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, kKbInfo[a].reg, REG_DWORD, &v, sizeof(v));
     }
 }
-static void saveColors() {
-    DWORD v;
-    v = g_customColors ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"CustomColors", REG_DWORD, &v, sizeof(v));
-    v = g_defFg; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DefFg", REG_DWORD, &v, sizeof(v));
-    v = g_defBg; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DefBg", REG_DWORD, &v, sizeof(v));
-    v = g_dosPalette ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", REG_DWORD, &v, sizeof(v));
-    v = (DWORD)g_themeMode;   RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", REG_DWORD, &v, sizeof(v));
-    v = g_sidebarWPref; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", REG_DWORD, &v, sizeof(v));   // the ASKED width, never a transient fit
-    v = (DWORD)g_treeFontPt; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", REG_DWORD, &v, sizeof(v));
-    v = g_showSidebar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowSidebar", REG_DWORD, &v, sizeof(v));
-    v = g_showToolbar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", REG_DWORD, &v, sizeof(v));
-    v = g_showStatus ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", REG_DWORD, &v, sizeof(v));
-    v = g_flagView ? 1 : 0;   RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"FlagView", REG_DWORD, &v, sizeof(v));
+// UI actions must not publish unrelated values from this instance's stale HKCU snapshot.
+static void saveConfigValue(configuration::Id id) {
+    for (const auto& key : configuration::keys) if (key.id == id) {
+        DWORD value = configValue(key);
+        RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, key.registry, REG_DWORD, &value, sizeof(value));
+        return;
+    }
+}
+static void saveSidebarWidth() {
+    DWORD value = g_sidebarWPref; // the ASKED width, never a transient fit
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", REG_DWORD, &value, sizeof(value));
 }
 // Window geometry persistence. loadWindowRect resolves the saved rect (clamped onto a visible monitor
 // so an unplugged screen / resolution change can't strand the window off-screen) and is applied at
@@ -5172,7 +5170,7 @@ static void palExec(int idx) {
     InvalidateRect(g_hwnd, nullptr, FALSE);
     if (a.theme >= 0) {
         g_themeMode = a.theme;
-        saveColors();
+        saveConfigValue(configuration::Id::Theme);
         applyTheme();
     } else if (a.idm) {
         PostMessageW(g_hwnd, WM_COMMAND, a.idm, 0);
@@ -5862,7 +5860,19 @@ static void fillSizeCombo(int sel) {   // sizes for the current face; disabled i
     EnableWindow(g_pSizeCombo, e.sizes.size() > 1);
 }
 static void propCommit() {
-    pickFont(g_pFace, g_pSize);   // applies the font, persists face+size
+    // Only edited fields are ours to persist. An unchanged dialog field may be a stale snapshot
+    // of a preference another process has since updated; OK/Apply must leave that registry value.
+    using configuration::Id;
+    const std::pair<Id, uint32_t> pending[] = {
+        {Id::CustomColors, (uint32_t)g_pUse}, {Id::Foreground, g_pFg}, {Id::Background, g_pBg},
+        {Id::DosPalette, (uint32_t)g_pDos}, {Id::SidebarFont, (uint32_t)g_pSidePt},
+        {Id::Theme, (uint32_t)g_pTheme}
+    };
+    std::vector<Id> changed;
+    for (const auto& value : pending)
+        for (const auto& key : configuration::keys)
+            if (key.id == value.first && configValue(key) != value.second) changed.push_back(key.id);
+    if (g_pFace != g_faceIdx || g_pSize != g_sizeIdx) pickFont(g_pFace, g_pSize);
     g_customColors = g_pUse; g_defFg = g_pFg; g_defBg = g_pBg; g_dosPalette = g_pDos;
     if (g_pSidePt != g_treeFontPt) { g_treeFontPt = g_pSidePt; applyTreeFont(); relayout(); }
     if (g_pTheme != g_themeMode) {   // theme switch: re-skin everything live, incl. this open dialog
@@ -5870,7 +5880,7 @@ static void propCommit() {
         applyTheme();
         themeDialog(g_pHwnd);
     }
-    saveColors();
+    for (Id id : changed) saveConfigValue(id);
     InvalidateRect(g_hwnd, nullptr, TRUE);
 }
 static LRESULT CALLBACK propDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -6974,7 +6984,7 @@ static void toggleFlagView() {
     if (g_hwnd) CheckMenuItem(GetMenu(g_hwnd), IDM_FLAGVIEW, MF_BYCOMMAND | (g_flagView ? MF_CHECKED : MF_UNCHECKED));
     if (g_toolbar) SendMessageW(g_toolbar, TB_CHECKBUTTON, IDM_FLAGVIEW, MAKELPARAM(g_flagView, 0));
     refreshTree();
-    saveColors();   // FlagView persists with the other view toggles
+    saveConfigValue(configuration::Id::FlagView);
 }
 // Focus a workspace: the sidebar narrows to it (the full app's focus pill, lite-style — the toggle
 // lives on the workspace's context menu and in View). Focusing again, or focusing -1, unfocuses.
@@ -7040,12 +7050,20 @@ static std::string configOnUi(const JsonReq& req) {
     if (saved != ERROR_SUCCESS)
         return ctlErr("config could not be saved (Windows error " + std::to_string(saved) + "); configuration unchanged");
     { LockG hold; assignConfig(*key, value); }
-    // No broad saveColors here: changing one key must not publish stale unrelated preferences.
+    // Changing one key must not publish stale unrelated preferences, including through UI actions.
     switch (key->id) {
     case Id::Theme: applyTheme(); break;
     case Id::SidebarFont: applyTreeFont(); relayout(); break;
-    case Id::ShowSidebar: case Id::ShowToolbar: case Id::ShowStatus: relayout(); break;
-    case Id::FlagView: refreshTree(); break;
+    case Id::ShowSidebar: case Id::ShowToolbar: case Id::ShowStatus: {
+        const UINT menu = key->id == Id::ShowSidebar ? IDM_TG_SIDEBAR :
+            key->id == Id::ShowToolbar ? IDM_TG_TOOLBAR : IDM_TG_STATUS;
+        CheckMenuItem(GetMenu(g_hwnd), menu, MF_BYCOMMAND | (value ? MF_CHECKED : MF_UNCHECKED));
+        relayout(); break;
+    }
+    case Id::FlagView:
+        CheckMenuItem(GetMenu(g_hwnd), IDM_FLAGVIEW, MF_BYCOMMAND | (value ? MF_CHECKED : MF_UNCHECKED));
+        if (g_toolbar) SendMessageW(g_toolbar, TB_CHECKBUTTON, IDM_FLAGVIEW, MAKELPARAM(value, 0));
+        refreshTree(); break;
     default: break;
     }
     for (HWND h : {g_hwnd, g_quickHwnd, g_scratchHwnd, g_overlayHwnd})
@@ -7287,7 +7305,7 @@ public:
         if (nFlags & MK_LBUTTON) extendSelection(m_hWnd, pt.x, pt.y);
     }
     void OnLButtonUp(UINT, CPoint pt) {
-        if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveColors(); return; }   // persist the new width
+        if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveSidebarWidth(); return; }
         if (g_selWindow == m_hWnd) finishSelection(m_hWnd);
         else mouseReport(pt.x, pt.y, 0, false, false);
     }
@@ -7465,11 +7483,11 @@ public:
     // `sidebar width N` stored g_sidebarW on a control-pipe thread and posted this. The layout runs
     // HERE because relayout() SENDS WM_SIZE — from a pipe thread that is a cross-thread SendMessage,
     // which is never made while g_lock may be held (#20). Hidden: nothing to lay out, the width is
-    // what the next show uses; it is still persisted so it survives a restart. Same save path as
-    // the splitter drag and the View toggles.
+    // what the next show uses; it is still persisted so it survives a restart. Like the splitter
+    // drag, this writes only SidebarW, never unrelated settings from this process's snapshot.
     LRESULT OnSidebarWidth(UINT, WPARAM, LPARAM, BOOL&) {
         if (g_showSidebar) relayout();   // repositions the tree (OnSize) and syncPaneSizes()
-        saveColors();
+        saveSidebarWidth();
         return 0;
     }
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
@@ -7822,7 +7840,9 @@ public:
                 bool& b = id == IDM_TG_SIDEBAR ? g_showSidebar : id == IDM_TG_TOOLBAR ? g_showToolbar : g_showStatus;
                 b = !b;
                 CheckMenuItem(GetMenu(), id, MF_BYCOMMAND | (b ? MF_CHECKED : MF_UNCHECKED));
-                relayout(); saveColors();
+                relayout();
+                saveConfigValue(id == IDM_TG_SIDEBAR ? configuration::Id::ShowSidebar :
+                    id == IDM_TG_TOOLBAR ? configuration::Id::ShowToolbar : configuration::Id::ShowStatus);
                 break;
             }
             case IDM_FLAG: toggleFocusedFlag(); break;

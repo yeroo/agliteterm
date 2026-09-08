@@ -71,22 +71,25 @@ can go green having driven nothing; it happened while writing agwinterm's copy o
 
 ## Where lite differs from agwinterm, on purpose
 
-Cases must not assume the main app's behaviour. As of P7 (2026-09-07):
+Cases must not assume the main app's behaviour. Updated through P10a (2026-09-08):
 
 - **A split is a hidden session, not a pane object.** It has no tree row and no name; `session split`
   hands back its id, which is the only handle on it. The full app models panes inside a session
   instead. Behaviour matches: the split belongs to its session either way.
 - **Selection API differences:** (a) unresolved targets are `ok:false`, with lite's usual missing
   or ambiguous-target sentence (agwinterm currently answers `ok:true` / `no session`);
-  (b) finalize always uses release-copy, with no off mode; (d) API clipboard writes
+  (b) finalize follows `copy-on-select`, on by default; off leaves the clipboard unchanged;
+  (d) API clipboard writes
   are posted, so wait for the UI message (the suites use 300 ms). P7 retires the popup refusal (c)
   and the alt-screen history gap (e): painting, wheel, drag and mark mode all pin to the app's screen.
   The configured mark chord toggles off as well as on; a screen/surface change ends mark mode
   before the next key is routed. Select All has a seeded, rebindable Ctrl+Shift+A chord.
   Also, `copied N chars` counts UTF-8 bytes here and UTF-16 code units in agwinterm; the text is
   the same, but N differs for non-ASCII selections.
-- **Scrollback is not configurable** — lite does not call `agwcore_emu_set_scrollback` yet, so there
-  is no `scrollback-lines = 0` case here.
+- **Scrollback configuration affects new local replicas only**, not existing buffers or the host
+  cap. Zero disables history; positive caps retain the core's 512-row batched-trimming slack.
+  See `qa/configuration.md` for guarded acceptance. The mirrored contract's historical P6 note
+  still describes the pre-P10 off-switch gap; it is not the current configuration contract.
 
 ## What is here, and what is still a script
 

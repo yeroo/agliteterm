@@ -1,18 +1,45 @@
 # Runs inside selection-ui's token/clipboard/registry/process ownership boundary only.
 if(-not $script:selectionProc -or -not $clipboard){throw 'Configuration checks require guarded fixture'}
 '-- P10a guarded configuration acceptance --'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class P10ConfigurationUi {
+ [DllImport("user32.dll")] static extern IntPtr GetMenu(IntPtr window);
+ [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu,uint id,uint flags);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent,IntPtr after,string cls,string title);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
+ public static bool Checked(IntPtr window,uint id) {
+  uint state=GetMenuState(GetMenu(window),id,0);
+  if(state==0xffffffff)throw new InvalidOperationException("Owned menu item absent");
+  return (state&8)!=0;
+ }
+ public static bool ToolbarChecked(IntPtr window,uint id) {
+  IntPtr bar=FindWindowExW(window,IntPtr.Zero,"ToolbarWindow32",null), result;
+  if(bar==IntPtr.Zero || SendMessageTimeoutW(bar,0x40A,(IntPtr)id,IntPtr.Zero,2,5000,out result)==IntPtr.Zero)
+   throw new InvalidOperationException("Owned toolbar query failed");
+  return result!=IntPtr.Zero;
+ }
+ public static void Command(IntPtr window,int id) {
+  IntPtr result;
+  if(SendMessageTimeoutW(window,0x111,(IntPtr)id,IntPtr.Zero,2,5000,out result)==IntPtr.Zero)
+   throw new InvalidOperationException("Owned command did not complete");
+ }
+}
+"@
 Stop-SelectionSandbox
 Start-SelectionSandbox $Exe $profile
 $h=$script:selectionHwnd;$g=Selection-Geometry
 function Config-Get([string]$Name){[string](Selection-Rpc 'config.get' @{key=$Name})}
-function Config-Set([string]$SettingName,[string]$SettingText,[string]$Registry,[int]$Stored,[switch]$ThemeVerb) {
+function Config-Set([string]$SettingName,[string]$SettingText,[string]$Registry,[int]$Stored,[switch]$ThemeVerb,[int]$UiCommand=0) {
     $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
     $prior=$script:selectionRegistry[$Registry].Expected
     try {
         Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
             {param($n) Read-RegistryGuardValue $regKey $n} `
             {param($n,$state)
-                if($ThemeVerb){$script:configReply=Selection-Rpc 'theme.set' @{name=$SettingText}}
+                if($UiCommand){[P10ConfigurationUi]::Command($script:selectionHwnd,$UiCommand);$script:configReply='UI command completed'}
+                elseif($ThemeVerb){$script:configReply=Selection-Rpc 'theme.set' @{name=$SettingText}}
                 else{$script:configReply=Selection-Rpc 'config.set' @{key=$SettingName;value=$SettingText}}
             }
     } catch {
@@ -47,6 +74,9 @@ foreach($row in $rows){
     $reply=Config-Set $row[0] $row[2] $row[1] $row[4]
     Check "config $($row[0]): canonical readback and verified exact registry value" ((Config-Get $row[0])-ceq $row[3])
     Check "config $($row[0]): truthful applied reply" ($reply.StartsWith("$($row[0]) = $($row[3])"))
+    $menuId=@{'show-sidebar'=123;'show-toolbar'=124;'show-status'=125;'flag-view'=127}[$row[0]]
+    if($menuId){Check "config $($row[0]): menu check agrees" ([P10ConfigurationUi]::Checked($h,$menuId)-eq [bool]$row[4])}
+    if($row[0]-eq 'flag-view'){Check 'config flag-view: toolbar check agrees' ([P10ConfigurationUi]::ToolbarChecked($h,127)-eq [bool]$row[4])}
 }
 Check 'scrollback setter names new-surface scope' ($reply -match 'applies to new surfaces')
 $list=[string](Selection-Rpc 'config.list')
@@ -93,6 +123,23 @@ foreach($row in $rows){
         elseif($row[0]-in @('sidebar-font-size','scrollback-lines')){[string]$v}else{if($v){'true'}else{'false'}}
     $null=Config-Set $row[0] $text $row[1] $v
 }
+# Model another instance's successful save without changing this instance's runtime snapshot.
+# Each unrelated human toggle must preserve that exact shared-registry value.
+function Config-RegistryTheme {
+    $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    try {return $key.GetValue('Theme')}finally{$key.Dispose()}
+}
+Set-SelectionRegistry 'Theme' @{Exists=$true;Kind=4;Value=1}
+Check 'stale-instance setup has distinct runtime and persisted themes' ((Config-Get 'theme')-eq 'auto' -and (Config-RegistryTheme)-eq 1)
+foreach($view in @(@('show-sidebar','ShowSidebar',123,0),@('show-toolbar','ShowToolbar',124,0),
+    @('show-status','ShowStatus',125,0),@('flag-view','FlagView',127,1))) {
+    $null=Config-Set $view[0] ([string]$view[3]) $view[1] $view[3] -UiCommand $view[2]
+    Check "UI $($view[0]) preserves another instance's saved theme" ((Config-RegistryTheme)-eq 1)
+    Check "UI $($view[0]) changes its own value" ((Config-Get $view[0])-eq $(if($view[3]){'true'}else{'false'}))
+    $default=[int]$configDefaults[$view[1]]
+    $null=Config-Set $view[0] ([string]$default) $view[1] $default
+}
+$null=Config-Set 'theme' 'auto' 'Theme' 0
 $id=[string](Selection-Rpc 'session.new' @{name='P10-pixels-copy';command=$idle});Config-Ready $id
 $null=Selection-Rpc 'session.select' @{} $id;$g=Selection-Geometry
 Write-Screen ($esc+'[2J'+$esc+'[HP10-COPY word'+$esc+'[?25l')
@@ -172,10 +219,13 @@ for($i=0;$i-lt 40;$i++){$dialog=[SelectionUi]::Window($script:selectionProc.Id,'
 Check 'settings creates the owned Properties dialog' ($dialog-ne [IntPtr]::Zero)
 try {
     $before=Config-Get 'theme'
+    Set-SelectionRegistry 'Theme' @{Exists=$true;Kind=4;Value=1}
     foreach($pair in @(@('config.set',@{key='theme';value='dark'}),@('theme.set',@{name='dark'}),@('keymap.reload',@{}),@('settings.open',@{}))){
         $r=Selection-Rpc $pair[0] $pair[1] -AllowError
         Check "modal editing blocks $($pair[0]) without mutation" (-not $r.ok -and $r.error-match 'modal dialog' -and (Config-Get 'theme')-eq $before)
     }
+    [P10ConfigurationUi]::Command($dialog,1) # OK, with no edited fields
+    Check 'unchanged Properties OK preserves another instance saved theme' ((Config-RegistryTheme)-eq 1)
 } finally {
     if($dialog-ne [IntPtr]::Zero){[void][SelectionUi]::PostMessageW($dialog,0x10,[IntPtr]::Zero,[IntPtr]::Zero)}
     for($i=0;$i-lt 40;$i++){if([SelectionUi]::Window($script:selectionProc.Id,'AgwintermLiteProps')-eq [IntPtr]::Zero){break};Start-Sleep -Milliseconds 50}
