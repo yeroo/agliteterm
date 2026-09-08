@@ -2,7 +2,8 @@
 # back from Start-Process.
 #
 # A suite may stop only a process it can PROVE it created: one it started itself (a Process object,
-# whose pid it holds) or a descendant of one, proven hop by hop through Win32_Process.ParentProcessId
+# whose pid it holds), a pane shell that ANSWERED its own pid on the screen of a window the suite
+# started (the ledger below), or a descendant of one of those, proven hop by hop through Win32_Process.ParentProcessId
 # with birth order - a child is born AFTER the parent it names, and (when the parent's exit is known)
 # before that parent exited. Windows reuses pids, so a bare ParentProcessId match is a claim, not a
 # proof; the birth bounds are what close it.
@@ -57,7 +58,7 @@ function Open-Owned($row) {
 # Exit-Of the handle bounds its children; without a handle (it was gone before it could be pinned)
 # the moment it was seen gone is the bound - it had exited by then, so nothing born later is its child.
 function New-Tracked($row) {
-    $t = @{ Pid = [int]$row.ProcessId; Born = $row.CreationDate; CommandLine = $row.CommandLine; Proc = (Open-Owned $row); Gone = [datetime]::MaxValue }
+    $t = @{ Pid = [int]$row.ProcessId; ParentPid = [int]$row.ParentProcessId; Born = $row.CreationDate; CommandLine = $row.CommandLine; Proc = (Open-Owned $row); Gone = [datetime]::MaxValue }
     if (-not $t.Proc) { $t.Gone = Get-Date }
     $t
 }
@@ -76,20 +77,27 @@ function Stop-OwnedRow($row, [string]$why) {
 # --- The ledger: a foreground child typed into a pane (the capture suites' pings) -----------------
 #
 # A pane's shell is not the lite window's child. The window asks the pty-host (agwinterm-ptyhost.exe,
-# ONE per machine, spawned by the first window that needed it) to start the shell over ConPTY, so a
-# `ping` typed into a pane is proven window -> host -> shell -> ping, one Get-OwnedChildren hop each.
-# The proof has to be taken WHILE the chain is alive: a graceful close kills the shell and orphans
-# the ping, which from then on names a dead pid that nothing can vouch for. So a suite registers
-# every window it starts (Register-OwnedWindow), and the ledger walks the chain each time it is
-# asked, remembering every hop as a New-Tracked record - a pinned handle, whose exit time keeps
-# bounding the next hop after the process is gone. A ping the ledger never saw alive under a shell
-# of ours - a leftover of an aborted run, a peer's sandbox typing the same marker, the user's own
-# window - is reported and left running; Stop-OwnedPings stops only what the ledger holds, and
-# through the handle it holds. The marker (`-n 311 127.0.0.1`) tells the suite's pings apart from
-# each other; it is never the proof that one is the suite's.
-$script:ledgerWindows = @()     # the Process objects a suite started, pinned
-$script:ledgerHosts   = @{}     # "pid|birth" -> tracked pty-host spawned by one of those windows
-$script:ledgerShells  = @{}     # "pid|birth" -> tracked child of a tracked host (a pane's shell)
+# ONE per machine, spawned by the first window that needed it and SHARED by every window after -
+# the user's own, a peer's sandbox) to start the shell over ConPTY. So the host's children are not
+# a proof of anything: a second window opened mid-run has its shells under the same host, and a
+# walk window -> host -> shell would claim them (Codex's read of #49, 2026-09-08). What proves a
+# shell the suite's own is the shell itself: the suite types `AGWSHELL=$PID` into the pane over the
+# sandbox's own control pipe and reads the answer back off that pane's screen (Register-PaneShell).
+# A pid that came out of a pane of a window this run started is that pane's shell, whatever process
+# started it; the ledger pins it there and then (New-Tracked), and from that shell on the chain is
+# proven hop by hop as before - a ping is a PING.EXE child of a tracked shell, born after it and
+# before it exited. A shell that was never registered (a second window's, a peer's) has no record,
+# and nothing under it is ever the suite's. The proof has to be taken WHILE the chain is alive: a
+# graceful close kills the shell and orphans the ping, which from then on names a dead pid that
+# nothing can vouch for - so a shell is registered before anything is typed into it, and the
+# ledger walks shell -> ping each time it is asked, remembering every ping as a New-Tracked record
+# (a pinned handle, whose exit time keeps bounding the record after the process is gone). A ping
+# the ledger never saw alive under a shell of ours - a leftover of an aborted run, a peer's sandbox
+# typing the same marker, the user's own window - is reported and left running; Stop-OwnedPings
+# stops only what the ledger holds, and through the handle it holds. The marker (`-n 311 127.0.0.1`)
+# tells the suite's pings apart from each other; it is never the proof that one is the suite's.
+$script:ledgerWindows = @()     # the Process objects a suite started, pinned (their teardown goes through these)
+$script:ledgerShells  = @{}     # "pid|birth" -> tracked shell that answered $PID in a pane of ours
 $script:ledgerPings   = @{}     # "pid|birth" -> tracked PING.EXE child of a tracked shell
 
 function Register-OwnedWindow($proc) { if ($proc) { Pin-Owned $proc; $script:ledgerWindows += $proc } }
@@ -98,27 +106,48 @@ function Register-OwnedWindow($proc) { if ($proc) { Pin-Owned $proc; $script:led
 # get its own record, not be mistaken for the record whose pid it inherited.
 function Ledger-Key($row) { "$($row.ProcessId)|$($row.CreationDate.Ticks)" }
 
-# One walk down the chain over a single process snapshot; every hop not yet on the ledger is tracked
+# The line a pane's shell prints when asked for its pid, and the pid read back off the screen: the
+# answer line only (`AGWSHELL=` followed by digits to the end of the line), never the echo of the
+# command that asked, which carries `$PID` unexpanded. $null when the screen does not show one yet.
+$script:shellPidProbe = "[Console]::Out.WriteLine('AGWSHELL=' + `$PID)`n"
+function Find-ShellPid([string]$text) {
+    $m = [regex]::Matches($text, '(?m)^AGWSHELL=(\d+)\s*$')
+    if ($m.Count) { [int]$m[$m.Count - 1].Groups[1].Value } else { $null }
+}
+
+# Track a shell by the pid it answered in a pane of ours. The row must be alive now: a pid the pane
+# printed a moment ago and that is gone already is not a shell anything can be typed into.
+function Register-OwnedShell([int]$ShellPid) {
+    $row = Get-ProcRow $ShellPid
+    if (-not $row) { throw "the pane answered shell pid $ShellPid, which is not running" }
+    $k = Ledger-Key $row
+    if (-not $script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] = New-Tracked $row }
+    if (-not (Tracked-Alive $script:ledgerShells[$k])) { throw "shell pid $ShellPid could not be pinned; nothing typed into it can be proven" }
+    $k
+}
+
+# Ask a pane for its shell's pid and register it: $Type types one string into the pane, $Text reads
+# the pane's screen back (both over the sandbox's own control pipe - that is what makes the answer
+# the suite's). Throws, naming the screen, when no answer shows within $ms.
+function Register-PaneShell([scriptblock]$Type, [scriptblock]$Text, [int]$ms = 8000) {
+    & $Type $script:shellPidProbe
+    $seen = ''
+    for ($k = 0; $k -lt ($ms / 200); $k++) {
+        $seen = [string](& $Text)
+        $shellPid = Find-ShellPid $seen
+        if ($shellPid) { return (Register-OwnedShell $shellPid) }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "the pane never answered AGWSHELL=<pid> within $ms ms; its screen: $seen"
+}
+
+# One walk shell -> ping over a single process snapshot; every ping not yet on the ledger is tracked
 # now, while it can still be pinned. Cheap enough to call from a 200 ms poll.
 function Update-OwnedLedger {
-    $all = @(Get-CimInstance Win32_Process)
-    function Kids([int]$ParentPid, [datetime]$ParentBorn, [string]$Name, [datetime]$ParentExit) {
-        @($all | Where-Object { [int]$_.ParentProcessId -eq $ParentPid -and (-not $Name -or $_.Name -eq $Name) -and
-                               $_.CreationDate -gt $ParentBorn -and $_.CreationDate -lt $ParentExit })
-    }
-    foreach ($w in $script:ledgerWindows) {
-        $born = try { $w.StartTime } catch { continue }
-        foreach ($h in Kids $w.Id $born 'agwinterm-ptyhost.exe' (Exit-Of $w)) {
-            $k = Ledger-Key $h; if (-not $script:ledgerHosts.ContainsKey($k)) { $script:ledgerHosts[$k] = New-Tracked $h }
-        }
-    }
-    foreach ($h in @($script:ledgerHosts.Values)) {
-        foreach ($c in Kids $h.Pid $h.Born '' (Tracked-Exit $h)) {
-            $k = Ledger-Key $c; if (-not $script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] = New-Tracked $c }
-        }
-    }
+    $all = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'")
     foreach ($sh in @($script:ledgerShells.Values)) {
-        foreach ($g in Kids $sh.Pid $sh.Born 'PING.EXE' (Tracked-Exit $sh)) {
+        $exit = Tracked-Exit $sh
+        foreach ($g in @($all | Where-Object { [int]$_.ParentProcessId -eq $sh.Pid -and $_.CreationDate -gt $sh.Born -and $_.CreationDate -lt $exit })) {
             $k = Ledger-Key $g; if (-not $script:ledgerPings.ContainsKey($k)) { $script:ledgerPings[$k] = New-Tracked $g }
         }
     }
@@ -146,4 +175,14 @@ function Stop-OwnedPings([string]$n) {
         try { $t.Proc.Kill(); [void]$t.Proc.WaitForExit(3000) } catch { "        (could not stop pid $($t.Pid): $($_.Exception.Message))" }
     }
     foreach ($line in Describe-ForeignPings $n) { "        (NOT stopping $line)" }
+}
+
+# Every ping the ledger holds, whatever its marker: a teardown that runs after a throw does not know
+# which markers the block got as far as typing. Only the ledger's, only through their handles.
+function Stop-AllOwnedPings {
+    Update-OwnedLedger
+    foreach ($t in @($script:ledgerPings.Values | Where-Object { Tracked-Alive $_ })) {
+        "        (stopping owned ping pid $($t.Pid): $($t.CommandLine))"
+        try { $t.Proc.Kill(); [void]$t.Proc.WaitForExit(3000) } catch { "        (could not stop pid $($t.Pid): $($_.Exception.Message))" }
+    }
 }

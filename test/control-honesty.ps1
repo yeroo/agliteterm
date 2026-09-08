@@ -1501,8 +1501,10 @@ try {
         $stateFile = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
         function KLines { @((Get-Content $stateFile -Raw) -split "`n" | Where-Object { $_ -like "K`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
         # The pings: `-n 3xx 127.0.0.1` is the marker that tells them apart; the ledger in
-        # test/owned-procs.ps1 is what proves one the sandbox's own (window -> pty-host -> shell ->
-        # ping, walked while alive), and the only thing a stop goes through. A marker ping it cannot
+        # test/owned-procs.ps1 is what proves one the sandbox's own (the pane's shell answers its own
+        # $PID on the sandbox's screen - Own-Shell - then shell -> ping, walked while alive; the
+        # pty-host is one per machine and shared, so descent from it proves nothing), and the only
+        # thing a stop goes through. A marker ping it cannot
         # vouch for - a peer's sandbox, a leftover of an aborted run - is reported and left alone, and
         # Wait-Ping does not count it: the check that says "a ping is running under the cap-a shell"
         # is then false, and its detail names what was found instead.
@@ -1513,6 +1515,10 @@ try {
         }
         function Stop-Ping([string]$n) { Stop-OwnedPings $n; [void](Wait-Ping $n $false) }
         function Foreign([string]$n) { (Describe-ForeignPings $n) -join '; ' }
+        function Own-Shell([string]$id) {
+            Register-PaneShell { param($t) Send-Ctl $s @('session', 'type', $t, '--target', $id) | Out-Null } `
+                               { [string](Get-CtlResult $s @('session', 'text', '--target', $id)) }
+        }
         $capId = [string](Get-CtlResult $s @('session', 'new', '--name', 'cap-a'))
         Start-Sleep -Milliseconds 800
         Check 'setup: a fresh session for the capture checks' ([bool]$capId -and [bool](CapNode $capId)) "id '$capId'"
@@ -1523,6 +1529,7 @@ try {
         Start-Sleep -Milliseconds 1500
         Check 'setup: cap-a has a split shell, addressed by the id session split answered' ([bool]$capSplit -and -not (CapNode $capSplit)) "split '$capSplit'"
         Stop-Ping '303'; Stop-Ping '305'   # a leftover from an aborted run would be found under the wrong shell
+        Own-Shell $capId | Out-Null
         Send-Ctl $s @('session', 'type', "ping -n 303 127.0.0.1`n", '--target', $capId) | Out-Null
         Check 'setup: a ping is running under the cap-a shell' (Wait-Ping '303' $true) (Foreign '303')
         Start-Sleep -Milliseconds 500
@@ -1560,6 +1567,7 @@ try {
         Check 'and the tree still reads the slot back' ((CapsOf $capId) -match "-n 303 127\.0\.0\.1$") "caps: $(CapsOf $capId)"
 
         # -- one pane by id: the split --
+        Own-Shell $capSplit | Out-Null
         Send-Ctl $s @('session', 'type', "ping -n 305 127.0.0.1`n", '--target', $capSplit) | Out-Null
         Check 'setup: a second ping is running under the split shell' (Wait-Ping '305' $true) (Foreign '305')
         Start-Sleep -Milliseconds 500
@@ -2941,11 +2949,11 @@ try {
     Check 'and the sandbox is still alive' (Alive)
 }
 finally {
+    # The capture block's pings first, while their shells are alive to vouch for them (a check that
+    # threw leaves them running for minutes): only the ledger's, only through the handles it holds -
+    # a marker sweep would take a peer's sandbox's ping, or the user's, with them (Codex's read of #49).
+    Stop-AllOwnedPings
     if ($s) { Stop-Sandbox $s }
-    # The capture block's pings (a check that threw leaves them running for minutes under a shell
-    # that is about to be killed); found by the marker argument, never by name alone.
-    Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n (30[35]|4) 127\.0\.0\.1' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     # The second sandbox's geometry values are its own; they were seeded here, so they go.
     foreach ($n in 'WinX', 'WinY', 'WinW', 'WinH', 'WinMax') {
         if (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name "$n-ctlhonesty23" -ErrorAction SilentlyContinue }
