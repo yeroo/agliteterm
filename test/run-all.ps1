@@ -1,5 +1,5 @@
-# Run every lite check. These drive the BUILT exe (lite has no C++ unit-test harness), so build
-# first: ./build.ps1
+# Run every lite check. Integration checks drive the built exe; driving.unit compiles its
+# in-process C++ harness. Build first: ./build.ps1 (MSVC is also required by driving.unit).
 param(
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
     # Passed through to the checks that can skip (they need agwintermctl). In CI a skip is a
@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Continue'
 $failed = @()
 # Selection UI checks use window-scoped messages and PrintWindow; qa/selection.md also records manual cases.
 # Local token-owning callers pass AGLITETERM_TEST_RECEIPT so selection-ui borrows that live lease.
-foreach ($t in 'owned-procs-checks', 'registry-guard.unit', 'clipboard-guard.tests', 'clipboard-receipt.unit', 'selection-clipboard.unit', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
+foreach ($t in 'driving.unit', 'owned-procs-checks', 'registry-guard.unit', 'clipboard-guard.tests', 'clipboard-receipt.unit', 'selection-clipboard.unit', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
     $script = Join-Path $PSScriptRoot "$t.ps1"
     if (-not (Test-Path $script)) { continue }
     # Each child sets $ErrorActionPreference = 'Stop', so it can die before reaching its own exit

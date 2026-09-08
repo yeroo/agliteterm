@@ -4,3 +4,5 @@
 /.native
 /installer/Output
 /installer/stage
+.revmux/
+.ralphex/
