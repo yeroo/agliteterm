@@ -64,14 +64,18 @@ function Invoke-AgentFixture([string]$Body,[int]$Requests){
 }
 $assets=Join-Path $repo 'assets'
 $wrapper=(Join-Path $assets 'agliteterm-claude.ps1').Replace("'","''")
-$requests=@(Invoke-AgentFixture ". '$wrapper';claude --fixture-exit;claude --fixture-exit" 2)
+[IO.File]::WriteAllText((Join-Path $root 'immediate.txt'),'private fixture behavior')
+$requests=@(Invoke-AgentFixture ". '$wrapper';claude;claude" 2)
 $binding=$requests[0].args.agent
 Check 'wrapper binds explicit generated UUID and reuses successful conversation' ($requests.Count-eq2 -and $requests[0].cmd-eq'session.bind' -and $requests[0].target-eq'private-test-pane' -and $binding-match'^claude --resume [0-9a-f-]{36}$' -and $requests[1].args.agent-eq$binding)
 $log=@(Get-Content (Join-Path $root 'launch.log'))
 Check 'wrapper first launch uses session-id, next uses resume, no implicit YOLO' ($log[-2]-match'--session-id' -and $log[-1]-match'--resume' -and ($log-join' ')-notmatch'dangerously-skip')
 $explicit=[guid]::NewGuid().ToString()
-$null=Invoke-AgentFixture ". '$wrapper';claude --resume $explicit --fixture-exit" 0
+$null=Invoke-AgentFixture ". '$wrapper';claude --resume $explicit" 0
 Check 'explicit resume passes through without generated replacement UUID' ((Get-Content (Join-Path $root 'launch.log'))[-1]-match("--resume\t"+$explicit))
+$null=Invoke-AgentFixture ". '$wrapper';claude --append-system-prompt '--session-id' $explicit;claude remote-control" 0
+$log=@(Get-Content (Join-Path $root 'launch.log'))
+Check 'wrapper leaves opaque arguments and new subcommands unchanged' ($log[-2]-match("--append-system-prompt\t--session-id\t"+$explicit+'$') -and $log[-1]-match'\tremote-control$')
 $notify=(Join-Path $assets 'agliteterm-codex-notify.ps1').Replace("'","''")
 $request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`"}'" 1)
 Check 'Codex completion notify uses exact event and pane' ($request[0].cmd-eq'session.status' -and $request[0].args.status-eq'completed' -and $request[0].target-eq'private-test-pane')

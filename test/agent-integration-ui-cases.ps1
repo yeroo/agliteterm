@@ -49,7 +49,7 @@ $pane=[string](Selection-Rpc 'session.new' @{profile='P11';name='P11-command'})
 P11-Ready $pane;Capture-P11Children
 $keymap=Join-Path $profile 'agliteterm/keymap.conf';$sink=Join-Path $script:selectionArtifact 'command-context.txt'
 $send="[IO.File]::WriteAllText("+(P11-Literal $sink)+",'{AGW_SESSION_ID}|{AGW_PANE_ID}|{AGW_PANE}|{AGW_SESSION}')"
-$keytext="command Send = $send`ncommand [new] Fresh = Write-Output 'P11-NEW-RESULT'`ncommand [overlay] Cover = Write-Output 'P11-OVERLAY-RESULT'`nleader = ctrl+k`nmap leader b = command:Send`nmap ctrl+f9 = command:Send`n"
+$keytext="command Send = $send`ncommand [new] Fresh = Write-Output 'P11-NEW-RESULT'`ncommand [overlay] Cover = Write-Output 'P11-OVERLAY-RESULT'`nleader = ctrl+k`nmap leader b = command:Send`nmap ctrl+f9 = command:Send`nmap ctrl+f10 = action_palette`n"
 [IO.File]::WriteAllText($keymap,$keytext)
 Check 'keymap reload publishes command catalog' ((Selection-Rpc 'keymap.reload')-eq'keymap reloaded')
 $list=[string](Selection-Rpc 'command.list')
@@ -78,7 +78,7 @@ $null=Selection-Rpc 'session.select' @{} $pane
 [LiteUi]::Chord($script:selectionHwnd,0x78,$false)
 Check 'posted actual Ctrl+F9 binding executes custom command' (P11-Wait {[IO.File]::ReadAllText($sink)-ne'BEFORE-KEY'})
 [IO.File]::WriteAllText($sink,'BEFORE-PALETTE')
-[LiteUi]::Chord($script:selectionHwnd,[int][char]'O',$true)
+[LiteUi]::Chord($script:selectionHwnd,0x79,$false)
 foreach($character in 'Send'.ToCharArray()){[void][LiteUi]::PostMessageW($script:selectionHwnd,0x102,[IntPtr][int]$character,[IntPtr]1)}
 Start-Sleep -Milliseconds 200
 [LiteUi]::Key($script:selectionHwnd,13,1)
@@ -160,7 +160,9 @@ $r=Selection-Rpc 'claude.yolo' @{} $agentB -AllowError
 Check 'custom binding is preserved and not silently replaced by yolo' (-not$r.ok -and $r.error-match'custom binding')
 $null=Selection-Rpc 'session.bind' @{agent='none'} $agentB
 $null=Selection-Rpc 'claude.adopt' @{} $agentB
-$ignore=P11-Agent 'P11-agent-ignore' ([guid]::NewGuid().ToString()) '--fixture-ignore'
+$ignoreId=[guid]::NewGuid().ToString()
+[IO.File]::WriteAllText((Join-Path $fakeDir "ignore-$ignoreId"),'private fixture behavior')
+$ignore=P11-Agent 'P11-agent-ignore' $ignoreId
 $null=Selection-Rpc 'claude.yolo' @{} $ignore
 $r=Selection-Rpc 'session.type' @{text='MUST-NOT-TYPE'} $ignore -AllowError
 Check 'pending restart reserves API editing input' (-not$r.ok -and $r.error-match'reserved')
@@ -174,6 +176,23 @@ $null=Selection-Rpc 'claude.yolo' @{} $ignore
 Check 'noninterruptible agent times out without fixed-delay relaunch' ((P11-Wait {@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$ignore -and $_.info-match'timed out'}).Count-gt 0} 34) -and @(P11-Launches).Count-eq$count)
 Check 'timeout releases editing-input reservation' ((Selection-Rpc 'session.type' @{text='q'} $ignore)-eq'typed')
 $null=Selection-Rpc 'session.close' @{} $ignore
+$lateId=[guid]::NewGuid().ToString()
+[IO.File]::WriteAllText((Join-Path $fakeDir "late-$lateId"),'private late orphan fixture')
+$late=P11-Agent 'P11-agent-late-child' $lateId
+$parentPid=[int]((P11-Launches)[-1]-split "`t")[0]
+$parent=@($script:p11Children.Values|Where-Object Id -eq $parentPid)[0]
+if(-not$parent -or $parent.HasExited){throw 'Late fixture lacks retained parent identity'}
+$count=@(P11-Launches).Count
+$null=Selection-Rpc 'claude.yolo' @{} $late
+$proof=Join-Path $fakeDir "late-proof-$lateId"
+if(-not(P11-Wait {(Test-Path $proof) -and $parent.HasExited})){throw 'Late fixture child proof unavailable'}
+$proofFields=[IO.File]::ReadAllText($proof)-split "`t"
+$child=Get-Process -Id ([int]$proofFields[0]) -ErrorAction Stop;[void]$child.SafeHandle
+$born=$child.StartTime.ToUniversalTime()
+if($child.HasExited -or $born.ToFileTimeUtc()-ne[long]$proofFields[1] -or $born-lt$parent.StartTime.ToUniversalTime() -or $born-gt$parent.ExitTime.ToUniversalTime()){throw 'Late fixture child lifetime proof failed; token retained'}
+$script:p11Children["$($child.Id)|$($born.Ticks)"]=$child
+Check 'late console orphan prevents lifecycle resume even after parent exits' ((P11-Wait {@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$late -and $_.info-match'timed out'}).Count-gt 0} 34) -and @(P11-Launches).Count-eq$count -and -not$child.HasExited)
+$null=Selection-Rpc 'session.close' @{} $late
 foreach($mode in 'fail','noop','new'){
     [IO.File]::WriteAllText((Join-Path $fakeDir 'version.txt'),'1.0.0');[IO.File]::WriteAllText((Join-Path $fakeDir 'update-mode.txt'),$mode)
     $count=@(P11-Launches).Count;$cursor=(Selection-Rpc 'events').cursor

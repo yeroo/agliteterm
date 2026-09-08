@@ -4,21 +4,11 @@ if($env:TERM_PROGRAM -eq 'agliteterm' -and -not $global:__agliteClaude){
     function global:claude {
         $real=Get-Command claude -CommandType Application,ExternalScript -ErrorAction SilentlyContinue|Select-Object -First 1
         if(-not $real){Write-Error 'claude executable not found';return}
-        $pass=$false;$dangerous=$false;$explicit=$null
-        if($args.Count -gt 0 -and "$($args[0])" -match '^(update|doctor|mcp|config|install|migrate-installer|setup-token|plugin|agents|auth)$'){$pass=$true}
-        for($i=0;$i-lt$args.Count;$i++){
-            $arg=[string]$args[$i]
-            if($arg -match '^(--resume|--session-id|-r)(=|$)'){
-                $pass=$true
-                $candidate=if($arg.Contains('=')){$arg.Substring($arg.IndexOf('=')+1)}elseif($i+1-lt$args.Count){[string]$args[$i+1]}else{''}
-                $parsed=[guid]::Empty;if([guid]::TryParseExact($candidate,'D',[ref]$parsed)){$explicit=$parsed.ToString()}
-            }
-            if($arg -match '^(--continue|--print|-c|-p)(=|$)'){$pass=$true}
-            if($arg -eq '--dangerously-skip-permissions'){$dangerous=$true}
-        }
-        if($pass -or -not $env:AGWINTERM_SESSION_ID -or -not $env:AGWINTERM_PIPE){
+        # Only decorate bare launches (optionally the explicit bypass flag). All other argv,
+        # including future subcommands, option values, fork/resume and prompts pass untouched.
+        $dangerous=$args.Count-eq 1 -and [string]$args[0]-ceq'--dangerously-skip-permissions'
+        if(($args.Count -gt 0 -and -not $dangerous) -or -not $env:AGWINTERM_SESSION_ID -or -not $env:AGWINTERM_PIPE){
             & $real.Source @args
-            if($LASTEXITCODE -eq 0 -and $explicit){$global:__agliteConversation=$explicit}
             return
         }
         $resume=!!$global:__agliteConversation

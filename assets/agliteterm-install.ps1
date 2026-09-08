@@ -39,10 +39,17 @@ function Set-InstallText([string]$Path,[string]$Text,[string]$Expected){
 }
 function Add-InstallBlock([string]$Existing,[string]$Label,[string]$Body){
     $begin='# >>> agliteterm '+$Label+' >>>';$end='# <<< agliteterm '+$Label+' <<<'
-    $first=$Existing.IndexOf($begin,[StringComparison]::Ordinal);$last=$Existing.IndexOf($end,[StringComparison]::Ordinal)
+    # Only real comment tokens are sentinels. Quoted examples and here-strings are user data.
+    $tokens=$null;$errors=$null
+    [void][Management.Automation.Language.Parser]::ParseInput($Existing,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Profile has parse errors; file unchanged'}
+    $starts=@($tokens|Where-Object {$_.Kind-eq'Comment' -and $_.Text-ceq$begin})
+    $ends=@($tokens|Where-Object {$_.Kind-eq'Comment' -and $_.Text-ceq$end})
+    $first=if($starts.Count){$starts[0].Extent.StartOffset}else{-1}
+    $last=if($ends.Count){$ends[0].Extent.StartOffset}else{-1}
     $block=$begin+"`r`n"+$Body+"`r`n"+$end
     if($first -lt 0 -and $last -lt 0){return $Existing+$(if($Existing){"`r`n`r`n"}else{''})+$block+"`r`n"}
-    if($first -lt 0 -or $last -lt $first -or $Existing.IndexOf($begin,$first+$begin.Length,[StringComparison]::Ordinal)-ge 0 -or $Existing.IndexOf($end,$last+$end.Length,[StringComparison]::Ordinal)-ge 0){throw "Corrupt or duplicate $Label profile block; file unchanged"}
+    if($starts.Count-ne 1 -or $ends.Count-ne 1 -or $last-lt$first){throw "Corrupt or duplicate $Label profile block; file unchanged"}
     return $Existing.Substring(0,$first)+$block+$Existing.Substring($last+$end.Length)
 }
 function Test-InstallJsonShape([string]$Text){

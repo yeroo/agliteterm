@@ -23,8 +23,26 @@ int main() {
         Identity id; check(!identify("claude.exe",args,id), "unknown/headless/ambiguous invocation refused");
     }
     Identity node;
+    for (const auto& args : std::vector<std::vector<std::string>>{
+        {"claude.exe","--resume",sid,"--fork-session"},
+        {"claude.exe","--append-system-prompt","--session-id",sid},
+        {"claude.exe","--","--session-id",sid},
+        {"claude.exe","update","--session-id",sid},
+        {"claude.exe","--resume",sid,"--unknown-option"},
+        {"claude.exe","--resume",sid,"--background"}}) {
+        Identity id; check(!identify("claude.exe",args,id), "fork, option values, maintenance and unknown lifecycle refuse");
+    }
+    {
+        Identity id;
+        std::vector<std::string> args{"claude.exe","--session-id",sid,"--append-system-prompt","--dangerously-skip-permissions","--permission-mode","plan","initial user request"};
+        check(identify("claude.exe",args,id) && !id.dangerous, "opaque option value is not a permission flag");
+        check(resumeArgs(args,id,false) == std::vector<std::string>({"--append-system-prompt","--dangerously-skip-permissions","--permission-mode","plan","--resume",sid}), "update preserves explicit options but never replays initial prompt");
+        check(resumeArgs(args,id,true) == std::vector<std::string>({"--append-system-prompt","--dangerously-skip-permissions","--resume",sid,"--dangerously-skip-permissions"}), "explicit yolo replaces permission mode without rewriting opaque value");
+        args={"claude.exe","--session-id",sid,"--","--fork-session"};
+        check(identify("claude.exe",args,id) && resumeArgs(args,id,false)==std::vector<std::string>({"--resume",sid}), "option terminator keeps prompt opaque and unreplayed");
+    }
     check(identify("C:/node/node.exe",{"node.exe","C:/npm/node_modules/@anthropic-ai/claude-code/cli.js","--resume",sid},node) && node.executableArgs == 2, "exact npm CLI script accepted");
-    for (const auto& path : {"cli.js", "C:/npm/claude-code/cli.js", "C:/npm/node_modules/@other/claude-code/cli.js", "C:/npm/node_modules/@anthropic-ai/claude-code/cli.js.evil"}) {
+    for (const auto& path : {"cli.js", "relative/node_modules/@anthropic-ai/claude-code/cli.js", "C:/npm/claude-code/cli.js", "C:/npm/node_modules/@other/claude-code/cli.js", "C:/npm/node_modules/@anthropic-ai/claude-code/cli.js.evil"}) {
         Identity id; check(!identify("node.exe",{"node.exe",path,"--resume",sid},id), "lookalike node script refused");
     }
     for (const auto& image : {"powershell.exe", "my-claude.exe", "claude.exe.bat"}) {
@@ -43,6 +61,7 @@ int main() {
     check(!gate.write(true,false,[&]{++calls;},second), "released token cannot write");
     check(calls == 3, "only authorized transfers executed");
     gate.setReadOnly(true);
+    check(gate.write(true,false,[]{}), "explicit API typing remains permitted in readonly pane");
     const auto readonlyLease = gate.reserve();
     check(!gate.write(true,false,[&]{++calls;},readonlyLease), "readonly transition refuses even reserved interrupt");
     check(gate.write(false,false,[]{}), "readonly still permits protocol replies");

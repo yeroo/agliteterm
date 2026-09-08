@@ -1,5 +1,8 @@
 # Per-process launch integration, never installed into or written to a user profile.
 if(-not $global:__agliteBridgeToken){$global:__agliteBridgeToken=[guid]::NewGuid().ToString('D')}
+if(-not ('AgLitePromptConsole' -as [type])){
+    Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AgLitePromptConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetConsoleProcessList([Out] uint[] processes, uint count); }'
+}
 function global:Invoke-AgLiteBridgeRequest([string]$Op){
     if($env:TERM_PROGRAM -ne 'agliteterm' -or -not $env:AGWINTERM_PIPE -or -not $env:AGWINTERM_SESSION_ID){return}
     $client=$null
@@ -7,7 +10,16 @@ function global:Invoke-AgLiteBridgeRequest([string]$Op){
         $client=New-Object IO.Pipes.NamedPipeClientStream('.', $env:AGWINTERM_PIPE, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
         $client.Connect(300)
         $writer=New-Object IO.StreamWriter($client);$writer.AutoFlush=$true
-        $writer.WriteLine((@{cmd='agent.bridge';target=$env:AGWINTERM_SESSION_ID;args=@{op=$Op;token=$global:__agliteBridgeToken;pid="$PID"}}|ConvertTo-Json -Compress))
+        $fields=@{op=$Op;token=$global:__agliteBridgeToken;pid="$PID"}
+        if($Op-eq'claim'){
+            $clients=New-Object 'uint32[]' 64
+            $count=[AgLitePromptConsole]::GetConsoleProcessList($clients,64)
+            # Fail closed on no console, overflow, or any other attached client (including
+            # a late orphan whose parent agent exited before the native process snapshot).
+            if($count-ne 1 -or $clients[0]-ne$PID){return}
+            $fields['console-pids']="$PID"
+        }
+        $writer.WriteLine((@{cmd='agent.bridge';target=$env:AGWINTERM_SESSION_ID;args=$fields}|ConvertTo-Json -Compress))
         $reader=New-Object IO.StreamReader($client)
         $read=$reader.ReadLineAsync()
         if(-not $read.Wait(1000)){return}

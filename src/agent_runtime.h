@@ -185,6 +185,8 @@ static std::string agentBridge(const JsonReq& req) {
         const auto found = g_agentOperations.find(pane->paneId);
         if (found == g_agentOperations.end()) return ctlOkStr("");
         op = found->second;
+        if (req.get("args.console-pids") != std::to_string(op->evidence.shell->pid))
+            return ctlErr("prompt has not proved sole console ownership; no resume dispatched");
         if (!agentStillEligible(*op) || GetTickCount64() - op->started >= 30000) return ctlErr("restart no longer eligible");
         for (const auto& child : op->evidence.descendants) if (WaitForSingleObject(child->handle, 0) != WAIT_OBJECT_0)
             return ctlErr("agent descendants have not all exited; no resume dispatched");

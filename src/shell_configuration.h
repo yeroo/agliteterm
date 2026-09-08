@@ -30,7 +30,9 @@ public:
         if (!editingInput && !requireUntouched) { transfer(); return true; }
         std::lock_guard<std::mutex> hold(mutex);
         if ((reservation && token != reservation) || (token && token != reservation)) return false;
-        if (editingInput && !editable.load()) return false;
+        // Read-only is an interaction policy, not a ban on session.type (P9 contract).
+        // Reserved lifecycle interrupts must additionally honor a later readonly transition.
+        if (editingInput && token && !editable.load()) return false;
         if (requireUntouched && written) return false;
         if (editingInput) written = true; // even a failed/partial write makes emptiness unproven
         transfer();

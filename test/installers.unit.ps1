@@ -46,6 +46,13 @@ foreach($bad in @('# >>> agliteterm hooks >>>', '# <<< agliteterm hooks <<<', "#
     $r=Install hooks
     Check 'corrupt profile sentinels refuse without mutation' (-not$r.ok -and [IO.File]::ReadAllText($profile)-ceq$bad -and [IO.File]::ReadAllText($settings)-ceq$saved)
 }
+foreach($example in @("`$example = '# >>> agliteterm hooks >>>'; `$other = '# <<< agliteterm hooks <<<'", "`$example = @'`n# >>> agliteterm hooks >>>`nimportant user text`n# <<< agliteterm hooks <<<`n'@")){
+    [IO.File]::WriteAllText($profile,$example)
+    $r=Install hooks
+    Check 'quoted and here-string marker examples survive installation' ($r.ok -and [IO.File]::ReadAllText($profile).StartsWith($example))
+    $preserved=[IO.File]::ReadAllText($profile);$r=Install hooks
+    Check 'real sentinel refresh preserves marker examples and is idempotent' ($r.ok -and [IO.File]::ReadAllText($profile)-ceq$preserved)
+}
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"
 if($failures){throw 'installer unit checks failed'}
 exit 0 # Negative helper cases intentionally returned nonzero; do not leak their exit into run-all.

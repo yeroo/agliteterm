@@ -69,14 +69,18 @@ download, verification or installation succeeded. Nothing in P11 publishes a rel
 
 `claude.adopt` with no target examines this window's real panes; an explicit target narrows it.
 It requires a live, birth-verified descendant: native claude.exe, or node.exe executing the exact
-`node_modules/@anthropic-ai/claude-code/cli.js` path suffix, with one explicit UUID supplied through
-`--resume`, `--session-id` or `-r`. Bare/continue/headless, inaccessible, ambiguous or unrelated
+absolute `node_modules/@anthropic-ai/claude-code/cli.js` path suffix, with one explicit UUID supplied through
+`--resume`, `--session-id` or `-r`. Bare/continue/headless/fork-session, unknown or variadic flags,
+inaccessible, ambiguous or unrelated
 background descendants refuse. It never guesses the newest same-folder transcript. Existing bindings
 are preserved; adoption does not interrupt input or enable permission bypass.
 
 The opt-in Claude wrapper gives bare launches an explicit conversation UUID. Lite pane IDs are not
-Claude UUIDs. A successful completed invocation can resume that conversation on the next bare launch;
-explicit/headless/maintenance arguments pass through. Installation never invokes the real CLI.
+Claude UUIDs. A successful completed bare invocation can resume that conversation on the next bare
+launch. Only bare calls, optionally with the explicit bypass flag, are decorated; every other argument
+list passes through unchanged and does not change the wrapper's remembered UUID. Installation never
+invokes the real CLI. Native adoption accepts conservative known option arities; identity-looking
+option values are opaque. An initial positional prompt must follow the UUID and is never replayed.
 
 `claude.yolo --target PANE` explicitly requests resume with `--dangerously-skip-permissions`.
 It requires the per-process prompt bridge bundled into default PowerShell launches. Existing/adopted
@@ -86,7 +90,8 @@ custom conflicting binding, readonly, covered or ambiguous panes refuse without 
 While pending, a per-pane lease refuses editing input (including API type/paste); terminal protocol
 replies remain available. The app sends up to two Ctrl+C bytes only while the verified original agent
 is alive, and waits at most 30 seconds. The shell claims a generated, quoted argv only from its prompt,
-after all retained descendants exited and a new snapshot shows no surviving shell children. Resume
+after all retained descendants exited, a new snapshot shows no surviving shell children, and the
+shell reports itself as the sole attached console client (including late orphan checks). Resume
 executes inside the prompt, never by appending executable text to PSReadLine's draft. State changes,
 unknown ownership, timeout or missing claim mean no resume dispatch. No fixed-delay fallback or
 name/PID-only process kill is used. `agent.bridge` is the capability-checked shell integration protocol,
@@ -95,8 +100,9 @@ not a command API for callers to supply executable text.
 `claude.update` opens an owned pane overlay and probes versions around `claude update`. Failed, unknown,
 unchanged or older versions restart nothing and leave the overlay for inspection. A proven newer
 version closes that completed overlay and requests safe restarts only for the window's originally
-verified eligible panes using that executable/script. Each keeps its conversation and prior permission
-mode. Closed, changed, custom-bound or newly ineligible panes are skipped; new agents are not discovered
+verified eligible panes using that executable/script. Each keeps its conversation and explicit startup
+permission arguments; interactive permission-mode changes inside Claude cannot be inferred from argv.
+Closed, changed, custom-bound or newly ineligible panes are skipped; new agents are not discovered
 and interrupted after the update. The supervisor expires after five minutes without killing the updater.
 
 Replies say queued/opened, not completed. Read `agent.update` and `agent.restart` events for outcomes;

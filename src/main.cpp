@@ -9342,7 +9342,9 @@ panes, custom conflicting bindings and unknown readiness refuse. Pending restart
 Ctrl+C targets the still-live verified process, and only a prompt claim after proven descendant
 exit can dispatch resume. Timeout/state changes cancel; no executable text is appended to a draft.
 `claude update` uses a visible owned overlay; only a proven newer version triggers safe restarts
-of the originally verified eligible panes, preserving each conversation and permission mode.
+of the originally verified eligible panes, preserving each conversation and explicit startup
+permission arguments (not later interactive mode changes). Initial prompt text is not replayed;
+fork-session, unknown option arities and relative npm script paths refuse adoption.
 Queued/opened is not completed: read agent.update / agent.restart events. Full details and
 compatibility limits: docs/agent-integration.md. Do not invoke these on a peer's pane as a test.
 
