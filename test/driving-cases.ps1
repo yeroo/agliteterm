@@ -87,6 +87,13 @@ try {
     Check 'switch typo refuses' (-not (P9 'session.switch' '' @{op='bogus'}).ok)
     P9 'session.switch' '' @{op='commit'} | Out-Null
 
+    # Search needs a stable buffer: the earlier interactive shell can still repaint its prompt
+    # after injected display text. An owned startup command acknowledges readiness, then emits
+    # nothing until teardown. Keep every search count/wrap assertion unchanged.
+    $searchPane=P9 'session.new' '' @{name='P9-search';command='[Console]::WriteLine(''P9-SEARCH-READY''); while($true){Start-Sleep -Seconds 60}'}
+    if(-not $searchPane.ok -or -not [string]$searchPane.result){throw 'P9 search fixture launch failed'}
+    $a=[string]$searchPane.result;$p9Ids.Add($a)
+    Check 'search fixture reaches its silent process' (P9WaitText $a 'P9-SEARCH-READY')
     P9 'session.select' $a | Out-Null
     $esc = [string][char]27
     P9 'session.write' $a @{text="$esc[3J$esc[2J$esc[H" + "xx игла yy`r`n漢字 needle`r`nNEEDLE$esc[?25l"} | Out-Null

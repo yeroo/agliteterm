@@ -124,7 +124,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   **saves before it answers**, and reports per pane — `null` when the shell had nothing but a
   shell running, and null is written too, so a fresh capture replaces an older checkpoint. The
   slots read back as `capturedCommands` from `tree --json`, keyed by pane id, and persist as a
-  `K` line. Its `replayOnRestore` reports the **default-off `restore-commands` setting**. With opt-in,
+  `K` line (lossless `K2` for tabs/newlines). Its `replayOnRestore` reports the **default-off `restore-commands` setting**. With opt-in,
   fresh restored shells can replay K; bindings B win over pins R, which win over K. Adopted, closed,
   exited and readonly panes skip replay. An unknown, empty or cover-pane target, or a process query
   that did not run, is refused with nothing written for anyone; a save that did not land is
@@ -232,7 +232,8 @@ gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.
   `session bind <agent-command>|none --target PANE` supplies a binding instead (default `claude`).
   Both save before success. Replay waits 2500 ms, uses current values, and skips adopted shells.
-  This delay does not prove shell readiness. Captured commands are separate and never replayed.
+  This delay does not prove shell readiness. Captured commands are separate and replay only with
+  P10b's explicit `restore-commands` opt-in; B/R take precedence.
 - `session resize --split-ratio R` or `--grow-left/right/top/bottom N` moves the active split's
   divider. Wrong-axis/malformed growth refuses; ratios clamp to 0.05..0.95 and persist.
 - `session switch begin|advance|advance-back|commit|cancel` walks a snapshot of session recency.
@@ -297,7 +298,10 @@ newlines; older builds ignore K2 records. The API field remains capturedCommands
 
 `omp list` discovers local `.omp.json` themes, first-directory wins: POSH_THEMES_PATH, normal
 winget/scoop/chocolatey locations, then app-data `omp-themes`. `omp set NAME [--persist]` requests
-initialization in the targeted live writable PowerShell pane only at an observed prompt. It refuses
+initialization only at an observed prompt in a fresh, writable PowerShell pane that has received
+no input. After any input (including a prior OMP request), or adoption, it refuses: terminal marks
+cannot prove an unfinished draft is empty. Use `config set omp-theme` for future shells instead.
+It also refuses
 unknown readiness, alternate-screen/readonly/exited/non-PowerShell panes. A successful reply means
 initialization was written without synchronous error, not that OMP succeeded. Theme content and
 OMP-generated shell code may execute commands; only apply themes you trust.
@@ -323,7 +327,7 @@ the next launch (`--no-restore` starts empty instead). Everything about that is 
 - **Format**: tab-separated UTF-8 text, `V1` header, one record per line — `W` workspace, `S` session
   (workspace index, name, app, cwd, then args), `F` flagged indices, `D` host session ids, `C` a
   session's context, `P` a session's split shell, `L` a split's layout (its axis and slot order,
-  written only when it is not the default left/right unswapped), `K` a session's captured commands,
+  written only when it is not the default left/right unswapped), `K`/`K2` a session's captured commands,
   `A` active workspace; `C`, `P`, `L` and `K` name their session by its position among the `S` lines
   and are refused wholesale when that count does not add up. The format grows by *adding* line
   types, so a file written by an older build still restores, a line type this build doesn't write

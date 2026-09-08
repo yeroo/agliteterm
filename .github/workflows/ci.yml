@@ -51,7 +51,9 @@ jobs:
       # than a unit suite and get a generous timeout.
       - name: Test (drives the built client)
         shell: pwsh
-        timeout-minutes: 30
+        # P10b adds guarded shell/restart cases after the legacy matrix and P7/P9/P10a checks.
+        # Keep a finite budget for the larger suite; no checks or Strict gates are skipped.
+        timeout-minutes: 45
         env:
           AGWINTERMCTL: ${{ github.workspace }}\bin\agwintermctl.exe
         run: ./test/run-all.ps1 -Strict

@@ -58,7 +58,11 @@ Discover installed `.omp.json` files with deterministic case-insensitive names a
 priority. Name or explicit existing local path resolves without running content. Reject newline/NUL
 in inputs; quote paths as PowerShell literals. No network or theme execution during list/validation.
 Live initialization requires an exact PowerShell executable identity, a live writable pane, and a
-known shell-ready state; do not type into a running child. Say initialization was written/requested,
+known shell-ready state; do not type into a running child or an unfinished draft. Since terminal
+marks do not expose the shell's edit buffer, live set is conservatively restricted to fresh panes
+with no prior input. The guard is sticky across commands; adopted panes also refuse. Configuring
+future shells remains available. Broader live switching needs shell-side empty-buffer confirmation.
+Say initialization was written/requested,
 not successfully applied. Check synchronous write length. Persist only when requested; report any
 partial outcome if a write or persistence fails. Persisted theme applies only to eligible fresh
 implicit PowerShell prompt setup, not adopted shells or explicit arbitrary profile args.

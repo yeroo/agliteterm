@@ -417,9 +417,10 @@ struct Session {
     std::string overlayResult;
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
+    bool inputWritten = false;    // g_lock; sticky: terminal marks cannot prove a draft was cleared
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     // restore.capture (P3): the command line of the shell's foreground child as captured by the
-    // last `restore capture`, persisted as a `K` line and read back through `tree --json` as
+    // last `restore capture`, persisted as K (ordinary) or K2 (escaped), read through `tree --json` as
     // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
     // capture replaces an older checkpoint). Pane 0 is the session itself; a split shell is its
     // own Session and carries its own slot. K replays only with restore-commands enabled;
@@ -1425,7 +1426,11 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
     return INVALID_HANDLE_VALUE;
 }
 
-static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len) {
+static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len, bool paneInput = true) {
+    if (write && len && paneInput) {
+        LockG hold;
+        for (auto* pane : g_sessions) if (pane->data == h) { pane->inputWritten = true; break; }
+    }
     OVERLAPPED ov{};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
@@ -2018,7 +2023,7 @@ static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
             case 4:   // Respond(reply): the answer to a query - back down the pty, from this thread
                 if (!haStr(buf, len, off, a)) return;
                 if (s->data != INVALID_HANDLE_VALUE && !a.empty())
-                    ovIo(s->data, true, a.data(), nullptr, (DWORD)a.size());
+                    ovIo(s->data, true, a.data(), nullptr, (DWORD)a.size(), false); // protocol response, not editing input
                 break;
             case 5:   // Unhandled(kind, detail): the VT tap. lite's log is the equivalent of
                       // AGWINTERM_VT_LOG - "app misbehaves here but works elsewhere" starts here.
@@ -2219,7 +2224,8 @@ static std::vector<Profile> listedProfiles() {
     return entries;
 }
 
-// cols/rows + an optional profile (app/args) and cwd. Default (no app) = PowerShell with the prompt wrap.
+// cols/rows + an optional resolved launch spec and cwd. Fresh creation with no app uses the
+// catalog default; remembered legacy empty-app specs explicitly select powershell.exe at callers.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
                               bool repaint = false);   // fwd
@@ -2711,7 +2717,7 @@ static void reopenClosed() {
     ClosedSpec sp = g_closedStack.back(); g_closedStack.pop_back();
     if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws;
     int c, r; newSessionGrid(g_focus, &c, &r);
-    Session* s = newSession(c, r, sp.app.empty() ? nullptr : sp.app.c_str(),
+    Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
     if (s) {
         { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
@@ -3457,7 +3463,8 @@ static bool saveSessionState() {
     // applies them in its own fixed order, so a K above a P restores identically (revmux r1).
     // Additive line type, per the rule in parseStateFile: an older build ignores K and restores
     // the sessions without their slots — and drops them on its next save (the same write-back loss
-    // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
+    // as C). P10b replays captured slots only with opt-in, after explicit B/R. K2 below preserves
+    // exceptional control-character fields losslessly; older builds ignore that additive type.
     std::string capLines;
     std::string replayLines;   // R/B use K's role-based, positional shape
     // "L\t<idx>\t<axis>\t<0|1>" — a split's LAYOUT (P4): the axis word (Session::horizontal's
@@ -7184,6 +7191,11 @@ static std::string configOnUi(const JsonReq& req) {
             if (!pane || pane->paneId != req.get("target")) return ctlErr("omp: target pane disappeared; nothing written or saved");
             if (pane->readOnly || pane->exited || pane->data == INVALID_HANDLE_VALUE || !isPwshApp(pane->app.c_str()))
                 return ctlErr("omp: requires a live writable PowerShell pane; nothing written or saved");
+            // Marks locate a prompt line, not the PSReadLine buffer. Never append executable text
+            // to a draft. Without shell-side buffer acknowledgement, only a fresh untouched pane
+            // is eligible; output/Enter/Escape cannot reset this conservative lifetime guard.
+            if (pane->adopted || pane->inputWritten)
+                return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
             FfiEmuInfo info{}; FfiMark last{};
             if (!pane->emu || !emu_info(pane->emu, &info) || info.isAltScreen || !info.markCount)
                 return ctlErr("omp: shell readiness is unknown; nothing written or saved");
@@ -9059,7 +9071,7 @@ command line or `null` (the shell had nothing non-denylisted running; null is wr
 fresh capture replaces an older checkpoint, including with nothing); the top-level `captured`
 counts the non-null ones. The slots read back from `tree --json` as `capturedCommands` on the
 owning session node, keyed by pane id - the ids `paneIds` lists, which after a promotion (the
-splits section) are not the session id - and persist as a `K` line. `--target` names one session
+splits section) are not the session id - and persist as K, or lossless K2 for tabs/newlines. `--target` names one session
 (its own shell), either pane's id (that one pane) or `active` (the focused pane). The reply describes a state that is already on
 disk when you read it.
 
@@ -9186,7 +9198,7 @@ an explicit shell id reaches underneath). READ-ONLY appears in the status bar. T
 `session bind <agent-command>|none --target PANE` replays that binding instead (default `claude`).
 Both need an explicit shell id and save before success. Replay waits 2500 ms, then re-reads the
 current value; it never replays into an adopted live shell. A delay is not a readiness check.
-Captured commands remain separate and never replay.
+Captured commands remain separate; P10b replays them only with explicit restore-commands opt-in.
 
 `session resize --split-ratio R` changes slot 0's share (0.05..0.95); whole-cell grow arguments
 move its divider along the split axis. `session switch begin|advance|advance-back|commit|cancel`
@@ -9229,7 +9241,9 @@ The schema supports name/command/args/cwd; nonempty env/icon, elevate:true and u
 Args containing control characters refuse because launch-state TSV cannot preserve those bytes.
 
 `omp list` discovers local themes. `omp set NAME [--persist]` writes initialization only into an
-observed-prompt, live writable PowerShell pane. Success means written, not confirmed executed.
+observed-prompt, fresh writable PowerShell pane that has received no input. After any input or
+adoption it refuses: marks cannot prove an empty draft. Use config omp-theme for future shells.
+Success means written, not confirmed executed.
 Use trusted themes only: initialization evaluates OMP-generated shell code. No profiles are edited.
 `config set omp-theme NAME|PATH|none` sets/clears eligible future PowerShell initialization without
 typing into existing panes. Nonempty explicit profile args and adopted shells receive no injection.
@@ -9243,7 +9257,7 @@ Do not reach for these - they exist in the full agwinterm and will be refused he
 
 `session background` (lite draws no images),
 `command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
-`profiles list|reload`, `omp list|set`, `image show|sixel`,
+`image show|sixel`,
 `font`, `restore clear`, `install hooks|shell|cli`, `claude *`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
@@ -9299,7 +9313,9 @@ static std::string ctlDispatch(const std::string& line) {
     if (cmd == "omp.set" || (cmd == "config.set" && configuration::normalized(req.get("args.key")) == "omp-theme")) {
         std::string resolved;
         const auto& value = req.get(cmd == "omp.set" ? "args.name" : "args.value");
-        if (!(cmd == "config.set" && (value.empty() || value == "none")) && !resolveOmp(value, resolved))
+        if (cmd == "config.set" && (!req.fields.count("args.value") || value.empty()))
+            return ctlErr("omp-theme requires a value (use none to clear); configuration unchanged");
+        if (!(cmd == "config.set" && value == "none") && !resolveOmp(value, resolved))
             return ctlErr("oh-my-posh theme not found or path unsupported; nothing written or saved");
         req.fields["args.resolved-theme"] = resolved;
         if (cmd == "omp.set") {
@@ -10507,7 +10523,7 @@ static std::string ctlDispatch(const std::string& line) {
         int cols, rows; newSessionGrid(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
-        Session* s = newSession(cols, rows, app.empty() ? nullptr : app.c_str(),
+        Session* s = newSession(cols, rows, app.empty() ? "powershell.exe" : app.c_str(),
                                 targs.empty() ? nullptr : &targs, cwd.empty() ? nullptr : cwd.c_str());
         if (!s) return ctlErr("create failed");
         selectIdx((int)g_sessions.size() - 1);
@@ -11289,10 +11305,11 @@ static ParsedState parseStateFile(const std::wstring& path) {
             // spec list only after the whole file is read, under the same count guard as P below.
             ps.contexts.push_back({ atoi(ff[1].c_str()), ff[2] });
         } else if (ff[0] == "K" && ff.size() >= 3) {   // a session's captured commands: S-line index, pane 0, pane 1
-            // Same treatment as C: kept positional and checked against the spec list after the whole
-            // file is read, under the count guard below. The pane-1 field is optional on read (a
-            // hand-shortened line) and empty means none.
-            ps.captures.push_back({ atoi(ff[1].c_str()), ff[2], ff.size() >= 4 ? ff[3] : std::string() });
+            // K is executable with restore-commands enabled. Never coerce a malformed owner to
+            // pane zero (atoi), even for legacy records. The optional pane-1 field remains readable.
+            int owner;
+            if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed K owner - line dropped"); continue; }
+            ps.captures.push_back({ owner, ff[2], ff.size() >= 4 ? ff[3] : std::string() });
         } else if ((ff[0] == "R" || ff[0] == "B" || ff[0] == "K2") && ff.size() >= 3) {
             int owner;
             if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed %s owner - line dropped", ff[0].c_str()); continue; }
@@ -11558,7 +11575,7 @@ static bool restoreSessions() {
         std::string want = si < savedIds.size() ? savedIds[si] : std::string();
         Session* s = nullptr;
         if (isAdoptable(want)) {
-            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? nullptr : sp.app.c_str(),
+            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
                               true);   // repaint: the shell already has a screen, ask it to redraw
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
@@ -11570,7 +11587,7 @@ static bool restoreSessions() {
                          "host may still be running the old shell under that id", want.c_str());
         }
         if (!s)
-            s = newSession(cols, rows, sp.app.empty() ? nullptr : sp.app.c_str(),
+            s = newSession(cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                            sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
         if (s) {
             s->name = widen(sp.name); s->flagged = sp.flagged;
@@ -11628,7 +11645,7 @@ static bool restoreSessions() {
     std::vector<Session*> splitOf(byPos.size(), nullptr);   // spec index -> the split shell rebuilt for it
     for (const auto& sp : ps.splits) {
         if (sp.owner < 0 || sp.owner >= (int)bySpec.size() || !bySpec[sp.owner]) continue;
-        Session* sh = newSession(cols, rows, sp.spec.app.empty() ? nullptr : sp.spec.app.c_str(),
+        Session* sh = newSession(cols, rows, sp.spec.app.empty() ? "powershell.exe" : sp.spec.app.c_str(),
                                  sp.spec.args.empty() ? nullptr : &sp.spec.args,
                                  sp.spec.cwd.empty() ? nullptr : sp.spec.cwd.c_str());
         if (!sh) { logWarn("restore: a split shell FAILED to start (app=%s cwd=%s) - its session comes back without it",
@@ -11705,7 +11722,8 @@ static bool restoreSessions() {
     {
         LockG hold;
         for (Session* s : g_sessions) {
-            if (s->restoreCmd.empty() && s->agentResume.empty() && (!g_restoreCommands.load() || s->capturedCmd.empty())) continue;
+            // Queue candidates, not startup policy: the setting may change before dispatch.
+            if (s->restoreCmd.empty() && s->agentResume.empty() && s->capturedCmd.empty()) continue;
             if (s->adopted) { logInfo("replay skipped for %s: live shell adopted", s->paneId.c_str()); continue; }
             if (!s->exited && s->data != INVALID_HANDLE_VALUE) g_replayQueue.push_back(s->paneId);
         }
