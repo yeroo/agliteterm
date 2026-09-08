@@ -31,6 +31,7 @@ function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  $name â
 "== control-honesty =="
 
 . "$PSScriptRoot\ui-lib.ps1"
+. "$PSScriptRoot\owned-procs.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
 $exe = Resolve-Lite $Exe
@@ -1499,13 +1500,19 @@ try {
         function AnyCaps { [bool](Nodes | Where-Object { $_.PSObject.Properties['capturedCommands'] }) }
         $stateFile = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
         function KLines { @((Get-Content $stateFile -Raw) -split "`n" | Where-Object { $_ -like "K`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
-        # The pings: `-n 3xx 127.0.0.1` is the marker each one is found and stopped by.
-        function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+        # The pings: `-n 3xx 127.0.0.1` is the marker that tells them apart; the ledger in
+        # test/owned-procs.ps1 is what proves one the sandbox's own (window -> pty-host -> shell ->
+        # ping, walked while alive), and the only thing a stop goes through. A marker ping it cannot
+        # vouch for - a peer's sandbox, a leftover of an aborted run - is reported and left alone, and
+        # Wait-Ping does not count it: the check that says "a ping is running under the cap-a shell"
+        # is then false, and its detail names what was found instead.
+        Register-OwnedWindow $s.Proc
         function Wait-Ping([string]$n, [bool]$present, [int]$ms = 8000) {
-            for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Ping-Procs $n).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
+            for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Get-OwnedPings $n).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
             return $false
         }
-        function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; [void](Wait-Ping $n $false) }
+        function Stop-Ping([string]$n) { Stop-OwnedPings $n; [void](Wait-Ping $n $false) }
+        function Foreign([string]$n) { (Describe-ForeignPings $n) -join '; ' }
         $capId = [string](Get-CtlResult $s @('session', 'new', '--name', 'cap-a'))
         Start-Sleep -Milliseconds 800
         Check 'setup: a fresh session for the capture checks' ([bool]$capId -and [bool](CapNode $capId)) "id '$capId'"
@@ -1517,7 +1524,7 @@ try {
         Check 'setup: cap-a has a split shell, addressed by the id session split answered' ([bool]$capSplit -and -not (CapNode $capSplit)) "split '$capSplit'"
         Stop-Ping '303'; Stop-Ping '305'   # a leftover from an aborted run would be found under the wrong shell
         Send-Ctl $s @('session', 'type', "ping -n 303 127.0.0.1`n", '--target', $capId) | Out-Null
-        Check 'setup: a ping is running under the cap-a shell' (Wait-Ping '303' $true)
+        Check 'setup: a ping is running under the cap-a shell' (Wait-Ping '303' $true) (Foreign '303')
         Start-Sleep -Milliseconds 500
 
         # -- the bare call: every real pane --
@@ -1554,7 +1561,7 @@ try {
 
         # -- one pane by id: the split --
         Send-Ctl $s @('session', 'type', "ping -n 305 127.0.0.1`n", '--target', $capSplit) | Out-Null
-        Check 'setup: a second ping is running under the split shell' (Wait-Ping '305' $true)
+        Check 'setup: a second ping is running under the split shell' (Wait-Ping '305' $true) (Foreign '305')
         Start-Sleep -Milliseconds 500
         $raw = Cap @('--target', $capSplit); $r = ConvertFrom-Json $raw
         Check 'restore capture --target <split id> captures that ONE pane: one entry, pane = the split, session = cap-a' `
@@ -1634,7 +1641,7 @@ try {
         # to say so - a pid that vanishes between the snapshot and the PEB read is the case.
         Stop-Ping '4'
         Send-Ctl $s @('session', 'type', "ping -n 4 127.0.0.1`n", '--target', $capId) | Out-Null
-        Check 'setup: a 4-count ping is running under the cap-a shell' (Wait-Ping '4' $true)
+        Check 'setup: a 4-count ping is running under the cap-a shell' (Wait-Ping '4' $true) (Foreign '4')
         $replies = @(); $bad = @(); $sawCmd = 0; $sawNull = 0
         $deadline = (Get-Date).AddSeconds(15)
         while ((Get-Date) -lt $deadline) {
@@ -1644,10 +1651,10 @@ try {
             elseif ($null -eq $r.result.panes[0].captured) { $sawNull++ }
             elseif ([string]$r.result.panes[0].captured -match '-n 4 127\.0\.0\.1$') { $sawCmd++ }
             else { $bad += $raw }
-            if (@(Ping-Procs '4').Count -eq 0 -and $sawNull -gt 0) { break }
+            if (@(Get-OwnedPings '4').Count -eq 0 -and $sawNull -gt 0) { break }
         }
         Check "every capture across the child's exit answered ok with the command or null ($sawCmd command, $sawNull null, $(@($replies).Count) in all)" (@($bad).Count -eq 0 -and $sawCmd -ge 1 -and $sawNull -ge 1) "bad: $($bad -join ' / ')"
-        Check 'the ping ended on its own and the last capture read null' (@(Ping-Procs '4').Count -eq 0 -and $sawNull -gt 0) "null seen $sawNull"
+        Check 'the ping ended on its own and the last capture read null' (@(Get-OwnedPings '4').Count -eq 0 -and $sawNull -gt 0) "null seen $sawNull"
         Check 'and the sandbox is alive: ping answers and the process is running' ([bool](ConvertFrom-Json (Send-Ctl $s @('ping'))).ok -and -not $s.Proc.HasExited)
         Check 'and with the child gone the slot is empty again (no K line)' (-not (AnyCaps) -and @(KLines).Count -eq 0) "caps: $(CapsOf $capId); K: $((KLines) -join ' / ')"
         Send-Ctl $s @('session', 'split', 'off') | Out-Null

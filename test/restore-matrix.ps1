@@ -94,6 +94,7 @@ function LastSessionId($inst) { @(SessionsOf $inst | ForEach-Object { $_.id })[-
 
 function Start-Lite($inst) {
     $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru
+    Register-OwnedWindow $p                   # the root of the proof for anything typed into its panes
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         $r = (& $ctl tree --json --pipe $inst 2>&1) -join ''
@@ -187,7 +188,7 @@ function Cell {
     $inst = "rm-$Name"
     Reset-Cell $inst
     $before = ''; $after = ''; $err = ''; $ok = $false
-    $p = $null; $p2 = $null
+    $p = $null; $p2 = $null; $script:cellNotes = @()
     try {
         $p = Start-Lite $inst
         & $Setup $inst
@@ -216,6 +217,7 @@ function Cell {
         "        after:  [$after]"
         "        log:    $(Restore-Verdict $inst)"
     }
+    $script:cellNotes | Select-Object -Unique  # what the cell stopped on the way out, or left alone
 }
 
 "== restore matrix =="
@@ -1022,14 +1024,25 @@ if ($cliHasP3) {
 # The captured-command slots, written as `K\t<S-index>\t<pane0>\t<pane1>` after the P lines and read
 # back onto the session (pane 0) and onto the split the P line rebuilds (pane 1). The Signature
 # carries them as `name^cmd0;cmd1`, so the assertion is on the tree after the restart. The foreground
-# child is a `ping` typed into the pane, found and stopped by its marker argument (`-n 31x`): a
-# graceful close kills the shell and can orphan the ping, so every cell stops its own on the way out.
-function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+# child is a `ping` typed into the pane, told apart by its marker argument (`-n 31x`) and PROVEN the
+# cell's own by the ledger in test/owned-procs.ps1 (window -> pty-host -> shell -> ping, walked while
+# the chain is alive): a graceful close kills the shell and orphans the ping, so every cell stops its
+# own on the way out - through the handle the ledger pinned, never by the marker, which any other
+# run of this suite on the machine would match too. A marker ping the ledger cannot vouch for is
+# reported and left alone; Wait-Ping does not count it, so it cannot stand in for the cell's own.
 function Wait-Ping([string]$n, [int]$ms = 8000) {
-    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Ping-Procs $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
+    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Get-OwnedPings $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
     return $false
 }
-function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+# The stop's report is kept for the verdict line, not returned: a Setup's or an Assert's output is
+# the cell's, and a string among an Assert's output would cast to $true - a FAIL read as PASS.
+function Stop-Ping([string]$n) { $script:cellNotes += @(Stop-OwnedPings $n) }
+# The Setup's throw when a ping never showed up under a shell of ours: names the foreign one if the
+# marker IS running somewhere, which is the case the old marker sweep used to hide.
+function Describe-NoPing([string]$what, [string[]]$ns) {
+    $foreign = @($ns | ForEach-Object { Describe-ForeignPings $_ })
+    if ($foreign.Count) { "$what; $($foreign -join '; ')" } else { $what }
+}
 if ($cliHasP3) {
     # Captured over the API, saved by the verb itself, back after a graceful close — and re-written
     # by the build that loaded it (the file inspected AFTER the second run).
@@ -1039,7 +1052,7 @@ if ($cliHasP3) {
         $id = LastSessionId $i
         & $ctl session rename cap-keeper --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 311 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '311')) { throw 'the ping never started under the pane shell' }
+        if (-not (Wait-Ping '311')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('311')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1057,7 +1070,7 @@ if ($cliHasP3) {
         $id = LastSessionId $i
         & $ctl session rename cap-survivor --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 312 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '312')) { throw 'the ping never started under the pane shell' }
+        if (-not (Wait-Ping '312')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('312')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1080,7 +1093,7 @@ if ($cliHasP3) {
         Start-Sleep -Seconds 2
         & $ctl session type "ping -n 313 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 314 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw 'a ping never started under its pane shell' }
+        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw (Describe-NoPing 'a ping never started under its pane shell' @('313', '314')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1147,7 +1160,7 @@ if ($cliHasP4) {
         Start-Sleep -Seconds 2
         & $ctl session type "ping -n 315 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 316 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '315') -or -not (Wait-Ping '316')) { throw 'a ping never started under its pane shell' }
+        if (-not (Wait-Ping '315') -or -not (Wait-Ping '316')) { throw (Describe-NoPing 'a ping never started under its pane shell' @('315', '316')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 1

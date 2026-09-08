@@ -72,3 +72,78 @@ function Stop-OwnedRow($row, [string]$why) {
     "        (stopping $why pid $($row.ProcessId): $($row.CommandLine))"
     try { $p.Kill() } catch { "        (could not stop pid $($row.ProcessId): $($_.Exception.Message))" }
 }
+
+# --- The ledger: a foreground child typed into a pane (the capture suites' pings) -----------------
+#
+# A pane's shell is not the lite window's child. The window asks the pty-host (agwinterm-ptyhost.exe,
+# ONE per machine, spawned by the first window that needed it) to start the shell over ConPTY, so a
+# `ping` typed into a pane is proven window -> host -> shell -> ping, one Get-OwnedChildren hop each.
+# The proof has to be taken WHILE the chain is alive: a graceful close kills the shell and orphans
+# the ping, which from then on names a dead pid that nothing can vouch for. So a suite registers
+# every window it starts (Register-OwnedWindow), and the ledger walks the chain each time it is
+# asked, remembering every hop as a New-Tracked record - a pinned handle, whose exit time keeps
+# bounding the next hop after the process is gone. A ping the ledger never saw alive under a shell
+# of ours - a leftover of an aborted run, a peer's sandbox typing the same marker, the user's own
+# window - is reported and left running; Stop-OwnedPings stops only what the ledger holds, and
+# through the handle it holds. The marker (`-n 311 127.0.0.1`) tells the suite's pings apart from
+# each other; it is never the proof that one is the suite's.
+$script:ledgerWindows = @()     # the Process objects a suite started, pinned
+$script:ledgerHosts   = @{}     # "pid|birth" -> tracked pty-host spawned by one of those windows
+$script:ledgerShells  = @{}     # "pid|birth" -> tracked child of a tracked host (a pane's shell)
+$script:ledgerPings   = @{}     # "pid|birth" -> tracked PING.EXE child of a tracked shell
+
+function Register-OwnedWindow($proc) { if ($proc) { Pin-Owned $proc; $script:ledgerWindows += $proc } }
+
+# Keyed by pid AND birth: a dead hop's pid comes back on something else, and that something must
+# get its own record, not be mistaken for the record whose pid it inherited.
+function Ledger-Key($row) { "$($row.ProcessId)|$($row.CreationDate.Ticks)" }
+
+# One walk down the chain over a single process snapshot; every hop not yet on the ledger is tracked
+# now, while it can still be pinned. Cheap enough to call from a 200 ms poll.
+function Update-OwnedLedger {
+    $all = @(Get-CimInstance Win32_Process)
+    function Kids([int]$ParentPid, [datetime]$ParentBorn, [string]$Name, [datetime]$ParentExit) {
+        @($all | Where-Object { [int]$_.ParentProcessId -eq $ParentPid -and (-not $Name -or $_.Name -eq $Name) -and
+                               $_.CreationDate -gt $ParentBorn -and $_.CreationDate -lt $ParentExit })
+    }
+    foreach ($w in $script:ledgerWindows) {
+        $born = try { $w.StartTime } catch { continue }
+        foreach ($h in Kids $w.Id $born 'agwinterm-ptyhost.exe' (Exit-Of $w)) {
+            $k = Ledger-Key $h; if (-not $script:ledgerHosts.ContainsKey($k)) { $script:ledgerHosts[$k] = New-Tracked $h }
+        }
+    }
+    foreach ($h in @($script:ledgerHosts.Values)) {
+        foreach ($c in Kids $h.Pid $h.Born '' (Tracked-Exit $h)) {
+            $k = Ledger-Key $c; if (-not $script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] = New-Tracked $c }
+        }
+    }
+    foreach ($sh in @($script:ledgerShells.Values)) {
+        foreach ($g in Kids $sh.Pid $sh.Born 'PING.EXE' (Tracked-Exit $sh)) {
+            $k = Ledger-Key $g; if (-not $script:ledgerPings.ContainsKey($k)) { $script:ledgerPings[$k] = New-Tracked $g }
+        }
+    }
+}
+
+# The ledger's pings that carry a marker and are still alive (tracked records: Pid, Born, Proc).
+function Get-OwnedPings([string]$n) {
+    Update-OwnedLedger
+    @($script:ledgerPings.Values | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" -and (Tracked-Alive $_) })
+}
+
+# Pings carrying the marker that the ledger cannot vouch for: one line each, for the report or the
+# error that says why a cell could not find its own.
+function Describe-ForeignPings([string]$n) {
+    @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" } |
+        Where-Object { -not $script:ledgerPings.ContainsKey((Ledger-Key $_)) } |
+        ForEach-Object { "ping pid $($_.ProcessId) (parent pid $($_.ParentProcessId), born $($_.CreationDate.ToString('HH:mm:ss.fff'))) carries -n $n but is not under a shell this run can prove its own" })
+}
+
+# Stop the ledger's pings with a marker, each through the handle that was checked when it was
+# tracked; wait for each to go. Then say what carried the marker and was left alone.
+function Stop-OwnedPings([string]$n) {
+    foreach ($t in Get-OwnedPings $n) {
+        "        (stopping owned ping pid $($t.Pid): $($t.CommandLine))"
+        try { $t.Proc.Kill(); [void]$t.Proc.WaitForExit(3000) } catch { "        (could not stop pid $($t.Pid): $($_.Exception.Message))" }
+    }
+    foreach ($line in Describe-ForeignPings $n) { "        (NOT stopping $line)" }
+}
