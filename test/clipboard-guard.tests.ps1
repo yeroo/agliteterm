@@ -3,7 +3,7 @@
 # real one was wrong in review (#256 round 5): a user copy between the snapshot and the sentinel,
 # a user copy after the sentinel, a partial put on the restore, a sentinel write that fails after
 # the empty; and round 6's two: a restore refused five times after a successful write, and a datum
-# that could not be read taken for someone else's copy. Runs in CI before win32-control.ps1.
+# that could not be read taken for someone else's copy. Included by lite's run-all.ps1.
 param([string]$Exe,[switch]$Strict)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'clipboard-guard.ps1')

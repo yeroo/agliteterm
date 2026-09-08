@@ -315,7 +315,7 @@ finally{
     } {
         if($null -ne $clipboard){Restore-SelectionClipboard $clipboard}
     }
-    if($cleanupOk){'Cleanup verified: owned windows/hosts exited; captured clipboard formats and touched registry values restored; no queued launches.'}
+    if($cleanupOk){'Cleanup verified: owned windows/hosts exited; clipboard restored or proven untouched by fixture; touched registry values restored; no queued launches.'}
     if($ownLease -and $cleanupOk){
         $raw=& python $hub release --owner $lease.owner --token $lease.token --cleanup-confirmed
         $raw|Set-Content "$script:selectionArtifact/release.json";$raw

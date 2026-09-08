@@ -30,6 +30,11 @@ function Write-SelectionClipboardMarker($Ledger,[string]$Text) {
         $Ledger.Receipt.State='written';$Ledger.Receipt.Sequence=$receipt.Sequence
         $Ledger.Sequence=$receipt.Sequence;$Ledger.Touched=$true;$Ledger.Pending=$false
         throw 'Marker write failed; prior contents were put back with proof'
+    }elseif($receipt.State -in @('failed','unopened')){
+        # Both states prove this action made no write. Keep the prior ownership receipt;
+        # cleanup still checks its generation if an earlier action touched the clipboard.
+        $Ledger.Pending=$false
+        throw "Marker write failed without mutation ($($receipt.State))"
     }else{throw "Marker write unproven ($($receipt.State)); retain recovery snapshot"}
 }
 function Invoke-SelectionClipboardCopy($Ledger,[scriptblock]$Action,[scriptblock]$Expected,[Func[bool]]$Owner) {
@@ -41,14 +46,18 @@ function Invoke-SelectionClipboardCopy($Ledger,[scriptblock]$Action,[scriptblock
     $receipt=[Agwinterm.Win32ControlTest.ClipboardGuard]::ConfirmCopy($text,$before,$Owner)
     if($receipt.State -eq 'written'){
         $Ledger.Receipt=$receipt;$Ledger.Sequence=$receipt.Sequence;$Ledger.Touched=$true;$Ledger.Pending=$false
+        # Preserve the receipt for teardown even when the application's write was a defect.
+        if($text.Length -eq 0){throw 'Empty/cancelled selection unexpectedly wrote the clipboard'}
     }elseif($receipt.State -eq 'unchanged' -and $text.Length -eq 0){
         # Empty/cancelled selection is explicitly a no-copy action, not a new receipt.
         $Ledger.Pending=$false
     }else{throw "App copy unproven ($($receipt.State)); retain recovery snapshot"}
 }
 function Restore-SelectionClipboardLedger($Ledger) {
-    Assert-SelectionClipboardGeneration $Ledger
+    if($Ledger.Pending){throw 'Previous clipboard action is unproven; recovery required'}
+    # A proven no-write run has no clipboard ownership to restore, even if someone copied.
     if(-not $Ledger.Touched){return}
+    Assert-SelectionClipboardGeneration $Ledger
     $result=[Agwinterm.Win32ControlTest.ClipboardGuard]::RestoreExact($Ledger.Before,$Ledger.Receipt)
     if($result.State -ne 'restored'){throw "Clipboard restore unproven ($($result.State)); retain recovery snapshot"}
     $Ledger.Sequence=$result.Sequence;$Ledger.Touched=$false;$Ledger.Receipt=$null

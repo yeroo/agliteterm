@@ -26,10 +26,31 @@ try {
 
     Fixture;$sets=$fake.Sets;Restore-SelectionClipboardLedger $ledger
     Check 'untouched ledger performs no writes' ($fake.Sets -eq $sets)
+    Fixture;AppCopy 'foreign';$sets=$fake.Sets;Restore-SelectionClipboardLedger $ledger
+    Check 'untouched ledger permits cleanup while preserving a newer copy' ($fake.Sets -eq $sets -and -not $ledger.Touched)
+    Fixture
+    Check 'empty owned copy fails the no-copy assertion' (Refused {Invoke-SelectionClipboardCopy $ledger {AppCopy ''} {''} ([Func[bool]]{$true})})
+    Check 'unexpected empty write keeps a usable receipt' ($ledger.Touched -and -not $ledger.Pending -and $ledger.Receipt.Sequence -eq $fake.Seq)
+    Restore-SelectionClipboardLedger $ledger
+    Check 'unexpected empty write can still restore original data' ($ledger.Before.SameAs($guard::Take()))
+    foreach($priorWrite in @($false,$true)){
+        Fixture;if($priorWrite){Write-SelectionClipboardMarker $ledger 'prior'}
+        $priorReceipt=$ledger.Receipt;$priorSequence=$ledger.Sequence;$fake.EmptyFails=$true
+        Check "refused EmptyClipboard fails marker (prior write=$priorWrite)" (Refused {Write-SelectionClipboardMarker $ledger 'next'})
+        Check "proven failed marker preserves prior receipt (prior write=$priorWrite)" (-not $ledger.Pending -and $ledger.Sequence -eq $priorSequence -and $ledger.Receipt -eq $priorReceipt)
+        $fake.EmptyFails=$false;Restore-SelectionClipboardLedger $ledger
+        Check "cleanup after no-op marker restores or leaves baseline (prior write=$priorWrite)" ($ledger.Before.SameAs($guard::Take()))
+    }
     Fixture;Invoke-SelectionClipboardCopy $ledger {} {''} ([Func[bool]]{throw 'no owner check for no-copy'})
     Check 'empty no-copy action preserves prior receipt' (-not $ledger.Pending -and $null -eq $ledger.Receipt)
     Check 'missing nonempty copy remains unproven' (Refused {Invoke-SelectionClipboardCopy $ledger {} {'expected'} ([Func[bool]]{$true})})
     Check 'unproven copy blocks cleanup and later marker' ((Refused {Restore-SelectionClipboardLedger $ledger}) -and (Refused {Write-SelectionClipboardMarker $ledger 'later'}))
+
+    Fixture;Write-SelectionClipboardMarker $ledger 'prior';$priorReceipt=$ledger.Receipt
+    $fake.FailOpensAfter=$fake.Opens+1 # allow marker snapshot, refuse the writer's open
+    Check 'unopened marker retains the earlier proven receipt without pending mutation' ((Refused {Write-SelectionClipboardMarker $ledger 'next'}) -and -not $ledger.Pending -and $ledger.Receipt -eq $priorReceipt)
+    $fake.FailOpensAfter=0;Restore-SelectionClipboardLedger $ledger
+    Check 'earlier write restores after marker open refusal' ($ledger.Before.SameAs($guard::Take()))
 
     Fixture;Write-SelectionClipboardMarker $ledger 'marker';AppCopy 'marker';$sets=$fake.Sets
     Check 'assertion refuses to read newer contents' (Refused {Read-SelectionClipboardText $ledger})

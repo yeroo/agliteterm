@@ -533,12 +533,12 @@ say what it was.
   values independently verified clean. Exact latest pre-run clipboard-history item restored and
   its text compared in memory; its timestamp matched generation 19 restoration. No content logged.
   Recovery details: `.revmux/selection-ui-20260907T234218-fc1f4a/recovery.md`.
-- Harness recovery now materializes supported formats, writes a CurrentUser-DPAPI encrypted
-  snapshot, and verifies its round trip BEFORE any test mutation. An exited runner can recover
-  using `Import-SelectionClipboard <artifact>/clipboard-before.dpapi` followed by
-  `Restore-SelectionClipboard`, under the still-held lease. Synthetic tests cover text/empty text,
-  bytes, stream, string arrays (empty/single/multiple), bitmap pixels, and an empty clipboard;
-  no real clipboard is used by these unit tests. All nine snapshot cases and nine cleanup cases pass.
+- Historical harness recovery used a WinForms snapshot (nine synthetic cases). The guard port below
+  supersedes that file format and its import/restore commands. Current recovery, only after the user
+  explicitly elects to overwrite today's clipboard and while retaining the suite token: dot-source
+  `test/clipboard-guard.ps1`, then run `Restore-ClipboardFile <artifact>/clipboard-before.dpapi`.
+  This native format is not compatible with old WinForms recovery files; never guess a file's format
+  or automatically force recovery. Current tests cover the actual native DPAPI Save/Load mechanism.
 - Fresh build `p7-build-20260907T235550` passed; generation 23 released. Run
   `selection-ui-20260907T235623-62faf8`: 59 checks, one fixture failure; generation 24 cleanly released.
   Eviction must use real shell output: display-only `session.write` bypasses PTY-reader bookkeeping.
@@ -605,6 +605,18 @@ say what it was.
   HKCU, windows or processes. No token acquired for this work.
 
 ## Post-Completion
+
+### Guard review disposition (04-guards, edd0422)
+
+- Four healthy sources; one Major and seven Minors. No open questions, pre-existing or immaterial items.
+- Fixed: untouched/no-pending clipboard cleanup now preserves any newer clipboard without attempting
+  restoration; failed/unopened marker writes clear pending without discarding an earlier receipt;
+  owned empty copies fail no-copy checks but retain the proven receipt for restoration.
+- Replaced orphan WinForms snapshot helpers and their tests with eight native DPAPI round-trip and
+  overwrite-protection checks. Corrected both recovery instructions and documented the new API states.
+- Deferred: unused `LiteUi::DragHold` removal is dead-code cleanup, not a runtime/acceptance blocker.
+- Verification: 28 ledger checks and eight native snapshot checks pass. Live Strict acceptance and
+  narrow Codex-only confirmation remain pending; no new live test or token acquisition claimed.
 
 - agwinterm docs PR: `docs/lite-parity.md`, the batch index P6+P7 shipped, differences (a)–(i).
 - agwinterm follow-up issues: difference (f) (Ctrl+Shift+M swallowed in mark mode; `Keymap.cs:97-101`).

@@ -1,7 +1,7 @@
 # Ported from agwinterm #256 (6eea329), with lite's per-copy receipt / exact-generation restore.
 # The clipboard guard: a test that must write the user's clipboard takes it whole first, writes only
 # while it still holds what was taken, and puts it back proven — or says, in one word, what state it
-# left the clipboard in. Dot-sourced by win32-control.ps1; exercised against a fake by
+# left the clipboard in. Dot-sourced by selection-clipboard.ps1; exercised against a fake by
 # clipboard-guard.tests.ps1 (no clipboard access there).
 #
 # The states, by CONDITION, once (every caller quotes these words, none invents its own):
@@ -64,7 +64,7 @@
 #                                             and an EMPTY clipboard is `changed`). Nothing touched, never
 #                                             retried, never taken for either side — CLIPBOARD NOT
 #                                             RESTORED for the run, the snapshot file kept; the human
-#                                             decides with -RestoreClipboard.
+#                                             decides whether to recover explicitly.
 #                               `restored`  — the snapshot is back, PROVEN by a read-back under the same
 #                                             open.
 #                               `mutated`   — the snapshot is not back: the clipboard was emptied and
@@ -77,7 +77,17 @@
 # RESTORED for the run: the case FAILs regardless of -Strict, the snapshot file is kept, and the run's
 # teardown is not proven (no `--cleanup-confirmed` release).
 # The snapshot file is DPAPI-protected for the current user (CryptProtectData): a plain temp file would
-# be a second copy of whatever the user last copied. Recovery: win32-control.ps1 -RestoreClipboard <file>.
+# be a second copy of whatever the user last copied. Explicit recovery (overwrites current clipboard):
+# dot-source test/clipboard-guard.ps1, then Restore-ClipboardFile <artifact>/clipboard-before.dpapi.
+# Recovery requires the held suite token and the user's explicit decision; never automatic teardown.
+#
+# Lite per-copy APIs (these do not use Restore's content fallback):
+#   ConfirmCopy(text, before, owner) returns unopened on open refusal; unchanged if no new generation;
+#   changed if the new owner is foreign; written if owner and expected data are proven; unverified
+#   if our owner wrote data that cannot be proven. It never writes the clipboard.
+#   RestoreExact(snap, receipt) returns unread for an invalid snapshot/receipt, unopened on open
+#   refusal, changed for any newer generation (including identical text), restored on proven read-back,
+#   or mutated on restoration failure. Unknown copies retain recovery; no arbitrary receipt adoption.
 
 # Add-Type cannot replace a loaded type: a ClipboardGuard from an older run of this file in the same
 # shell would run its old C# under the new source with no warning. Revision below is bumped with every

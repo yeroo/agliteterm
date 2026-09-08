@@ -170,40 +170,6 @@ function Selection-Capture([IntPtr]$h,[string]$name,[int]$left,[int]$top,[int]$w
 }
 function Selection-PixelDiff($a,$b){$n=0;for($i=0;$i -lt $a.Length;$i++){if($a[$i] -ne $b[$i]){$n++}};return $n}
 
-function Export-SelectionClipboard($snapshot,[string]$path) {
-    # Recovery survives a crashed runner. DPAPI keeps clipboard contents local to this user.
-    $records=@(foreach($format in $snapshot.GetFormats($false)){
-        $data=$snapshot.GetData($format,$false)
-        $kind=if($data -is [Drawing.Bitmap]){'Bitmap'}elseif($data -is [IO.MemoryStream]){'Stream'}elseif($data -is [byte[]]){'Bytes'}elseif($data -is [string[]]){'Strings'}else{'Text'}
-        $value=if($kind-eq 'Bitmap'){
-            $stream=[IO.MemoryStream]::new()
-            try{$data.Save($stream,[Drawing.Imaging.ImageFormat]::Png);[Convert]::ToBase64String($stream.ToArray())}finally{$stream.Dispose()}
-        }else{Clipboard-Fingerprint $data}
-        @{Format=$format;Kind=$kind;Value=$value}
-    })
-    $plain=[Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $records -Depth 5 -Compress))
-    try {
-        $encrypted=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
-        [IO.File]::WriteAllBytes($path,$encrypted)
-    } finally {[Array]::Clear($plain,0,$plain.Length)}
-}
-function Import-SelectionClipboard([string]$path) {
-    $plain=[Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($path),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
-    try {$records=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString($plain))}finally{[Array]::Clear($plain,0,$plain.Length)}
-    $copy=[Windows.Forms.DataObject]::new()
-    foreach($record in $records){
-        $data=switch($record.Kind){
-            'Bitmap' {$stream=[IO.MemoryStream]::new([Convert]::FromBase64String($record.Value));try{$bitmap=[Drawing.Bitmap]::new($stream);try{[Drawing.Bitmap]::new($bitmap)}finally{$bitmap.Dispose()}}finally{$stream.Dispose()}}
-            'Stream' {[IO.MemoryStream]::new([Convert]::FromBase64String($record.Value))}
-            'Bytes' {,[Convert]::FromBase64String($record.Value)}
-            'Strings' {,[string[]](ConvertFrom-Json -NoEnumerate $record.Value)}
-            'Text' {[string]$record.Value}
-            default {throw 'Invalid encrypted clipboard snapshot kind'}
-        }
-        $copy.SetData($record.Format,$false,$data)
-    }
-    return $copy
-}
 function Save-SelectionClipboard([string]$RecoveryPath) {
     if(-not $RecoveryPath){throw 'Clipboard recovery path required before test mutations'}
     $snapshot=[Agwinterm.Win32ControlTest.ClipboardGuard]::Take()
@@ -215,28 +181,6 @@ function Save-SelectionClipboard([string]$RecoveryPath) {
     return $ledger
 }
 
-function Clipboard-Fingerprint($data) {
-    if($data -is [Drawing.Bitmap]) {
-        # PNG codec metadata may change on decode. Compare dimensions and exact ARGB pixels.
-        $rect=[Drawing.Rectangle]::new(0,0,$data.Width,$data.Height)
-        $normalized=$data.Clone($rect,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
-        try {
-            $bits=$normalized.LockBits($rect,[Drawing.Imaging.ImageLockMode]::ReadOnly,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
-            try {
-                $bytes=[byte[]]::new($data.Width*$data.Height*4)
-                for($row=0;$row-lt $data.Height;$row++){
-                    [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($bits.Scan0,$row*$bits.Stride),$bytes,$row*$data.Width*4,$data.Width*4)
-                }
-                return "$($data.Width)x$($data.Height):$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)))"
-            }finally{$normalized.UnlockBits($bits)}
-        }finally{$normalized.Dispose()}
-    }
-    if($data -is [IO.MemoryStream]){return [Convert]::ToBase64String($data.ToArray())}
-    if($data -is [byte[]]){return [Convert]::ToBase64String($data)}
-    if($data -is [string[]]){return ConvertTo-Json -InputObject $data -Compress}
-    if($data -is [string]){return $data}
-    throw 'Unsupported clipboard value during restoration verification'
-}
 function Restore-SelectionClipboard($saved) {
     Restore-SelectionClipboardLedger $saved
     # Delete only this run's saved original, after exact restoration (or proven no writes).
