@@ -18,6 +18,7 @@ static std::shared_ptr<AgentHandle> agentHandle(DWORD pid, bool memory = false) 
 struct AgentEvidence {
     Session* pane = nullptr;
     std::string paneId, binding, bridge, image;
+    unsigned long long bindingGeneration = 0;
     std::shared_ptr<AgentHandle> shell, process;
     std::vector<std::shared_ptr<AgentHandle>> descendants;
     std::vector<std::string> argv;
@@ -29,6 +30,7 @@ static bool agentEvidence(Session* pane, AgentEvidence& out, std::string& why) {
         LockG hold;
         if (!pane || indexOfSession(pane) < 0 || pane->exited || isCoverLocked(pane)) { why = "requires a live shell pane"; return false; }
         out.pane = pane; out.paneId = pane->paneId; out.binding = pane->agentResume; out.bridge = pane->agentBridgeToken;
+        out.bindingGeneration = pane->agentResumeGeneration;
         pid = pane->childPid; born = pane->childCreated;
     }
     out.shell = agentHandle(pid);
@@ -116,6 +118,7 @@ static bool agentStillEligible(const AgentOperation& op) {
     LockG hold; const auto* pane = op.evidence.pane;
     return indexOfSession(pane) >= 0 && !pane->exited && !pane->readOnly && !pane->overlay &&
         pane->paneId == op.evidence.paneId && pane->agentResume == op.evidence.binding &&
+        pane->agentResumeGeneration == op.evidence.bindingGeneration &&
         pane->agentBridgeToken == op.evidence.bridge && op.evidence.shell->live() && IsWindowEnabled(g_hwnd);
 }
 static DWORD WINAPI agentInterruptWorker(void* opaque) {
@@ -209,7 +212,7 @@ static std::string agentBridge(const JsonReq& req) {
         if (action == "received") {
             if (!op->acknowledged) return ctlErr("bridge offer was not acknowledged");
             op->claimed = true; g_agentOperations.erase(found);
-            { LockG hold; agent_integration::publishBinding(pane->agentResume,op->evidence.binding,op->command); }
+            { LockG hold; agent_integration::publishBinding(pane->agentResume,pane->agentResumeGeneration,op->evidence.bindingGeneration,op->command); }
         } else {
         if (req.get("args.console-pids") != std::to_string(op->evidence.shell->pid))
             return ctlErr("prompt has not proved sole console ownership; no resume dispatched");
@@ -429,9 +432,11 @@ static std::string agentDispatch(const JsonReq& req) {
         if (cmd == "claude.yolo") return agentQueueRestart(std::move(evidence), true);
         {
             LockG hold;
-            if (indexOfSession(pane) < 0 || pane->exited || !evidence.process->live()) return ctlErr("agent changed during adoption; nothing bound");
+            if (indexOfSession(pane) < 0 || pane->exited || !evidence.process->live() || pane->agentResumeGeneration != evidence.bindingGeneration)
+                return ctlErr("agent or binding changed during adoption; nothing bound");
             if (!pane->agentResume.empty()) { result += pane->paneId + ": existing binding preserved\n"; continue; }
             pane->agentResume = agentResume(evidence, false);
+            ++pane->agentResumeGeneration;
         }
         if (!saveSessionState()) return ctlErr("adopted in memory but binding save failed; see log");
         result += evidence.paneId + ": adopted " + evidence.identity.conversation + " (permission mode unchanged)\n";

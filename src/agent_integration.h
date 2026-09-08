@@ -28,9 +28,10 @@ struct Identity {
 inline bool optionIn(const std::string& arg, const std::string& choices) {
     return choices.find("|" + arg + "|") != std::string::npos;
 }
-inline bool publishBinding(std::string& current, const std::string& expected, const std::string& next) {
-    if (current != expected) return false;
-    current = next; return true;
+inline bool publishBinding(std::string& current, unsigned long long& generation,
+        unsigned long long expectedGeneration, const std::string& next) {
+    if (generation != expectedGeneration) return false;
+    current = next; ++generation; return true;
 }
 // Identity comes from a live, owned process's real image and argv, not its title or cwd.
 // Bare/continue/headless invocations deliberately cannot be adopted by guessing a transcript.

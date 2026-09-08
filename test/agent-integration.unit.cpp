@@ -25,9 +25,15 @@ int main() {
     }
     Identity node;
     std::string binding="original";
-    check(publishBinding(binding,"original","resume") && binding=="resume","acknowledged binding publishes against original value");
-    binding="later custom binding";
-    check(!publishBinding(binding,"original","resume") && binding=="later custom binding","late receipt cannot overwrite newer user binding");
+    unsigned long long bindingGeneration = 0;
+    check(publishBinding(binding,bindingGeneration,0,"resume") && binding=="resume" && bindingGeneration==1,"acknowledged binding publishes against original generation");
+    binding="later custom binding"; ++bindingGeneration;
+    check(!publishBinding(binding,bindingGeneration,1,"resume") && binding=="later custom binding","late receipt cannot overwrite newer user binding");
+    binding.clear(); ++bindingGeneration; const auto emptyGeneration=bindingGeneration;
+    binding.clear(); ++bindingGeneration;
+    check(!publishBinding(binding,bindingGeneration,emptyGeneration,"yolo resume") && binding.empty(),"same-value clear supersedes pending publication");
+    const auto beforeABA=bindingGeneration; binding="temporary"; ++bindingGeneration; binding.clear(); ++bindingGeneration;
+    check(!publishBinding(binding,bindingGeneration,beforeABA,"yolo resume") && binding.empty(),"ABA binding writes supersede pending publication");
     for (const auto& args : std::vector<std::vector<std::string>>{
         {"claude.exe","--resume",sid,"--fork-session"},
         {"claude.exe","--append-system-prompt","--session-id",sid},

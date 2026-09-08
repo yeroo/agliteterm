@@ -181,6 +181,11 @@ Check 'pending restart reserves entire bracketed paste' (-not$r.ok -and $r.error
 $null=Selection-Rpc 'session.readonly' @{op='on'} $ignore
 Check 'readonly transition cancels restart without relaunch' (P11-Wait {@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$ignore -and $_.info-match'pane state changed'}).Count-gt 0})
 $null=Selection-Rpc 'session.readonly' @{op='off'} $ignore
+$changedBefore=@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$ignore -and $_.info-match'pane state changed'}).Count
+$count=@(P11-Launches).Count
+$null=Selection-Rpc 'claude.yolo' @{} $ignore
+$null=Selection-Rpc 'session.bind' @{agent='none'} $ignore
+Check 'same-value binding clear cancels pending restart without relaunch' ((P11-Wait {@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$ignore -and $_.info-match'pane state changed'}).Count-gt$changedBefore}) -and @(P11-Launches).Count-eq$count)
 $count=@(P11-Launches).Count
 $null=Selection-Rpc 'claude.yolo' @{} $ignore
 Check 'noninterruptible agent times out without fixed-delay relaunch' ((P11-Wait {@((Selection-Rpc 'events').events|Where-Object {$_.type-eq'agent.restart' -and $_.session-eq$ignore -and $_.info-match'timed out'}).Count-gt 0} 34) -and @(P11-Launches).Count-eq$count)

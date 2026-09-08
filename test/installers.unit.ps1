@@ -46,6 +46,21 @@ foreach($bad in @('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"not-array"
     Check 'malformed settings refuse without profile/settings change' (-not$r.ok -and $installExit-ne 0 -and [IO.File]::ReadAllText($settings)-ceq$bad -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
 }
 [IO.File]::WriteAllText($settings,$saved)
+$wrongCase=@(
+    '{"Hooks":{}}','{"hooks":{"stop":[]}}','{"hooks":{"Stop":[{"Hooks":[]}]}}',
+    '{"hooks":{"Stop":[{"Matcher":"x","hooks":[]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"Type":"command","Command":"keep-me"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"command","Command":"keep-me"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-me","Timeout":10}]}]}}'
+)
+foreach($bad in $wrongCase){
+    [IO.File]::WriteAllText($settings,$bad)
+    $before=@(Get-ChildItem $data -File|ForEach-Object {$_.Name+':'+(Get-FileHash $_.FullName).Hash}) -join ';'
+    $r=Install hooks
+    $after=@(Get-ChildItem $data -File|ForEach-Object {$_.Name+':'+(Get-FileHash $_.FullName).Hash}) -join ';'
+    Check 'wrong-case hook fields refuse before any destination write' (-not$r.ok -and $installExit-ne 0 -and $r.error-match'Wrong-case' -and [IO.File]::ReadAllText($settings)-ceq$bad -and [IO.File]::ReadAllText($profile)-ceq$profileSaved -and $before-ceq$after -and $r.error.EndsWith('completed writes: '))
+}
+[IO.File]::WriteAllText($settings,$saved)
 $variants='{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"https://example.invalid/hook","headers":{"X":"v"}},{"type":"mcp_tool","server":"local","tool":"check","input":{"x":1}},{"type":"prompt","prompt":"check","model":"unchanged"},{"type":"agent","prompt":"check","timeout":15}]}]}}'
 [IO.File]::WriteAllText($settings,$variants);$r=Install hooks
 $kept=Get-Content -Raw $settings|ConvertFrom-Json

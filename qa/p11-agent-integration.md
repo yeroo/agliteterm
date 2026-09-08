@@ -64,3 +64,13 @@ GUID authorization independent of the numeric gate token. It also compare-publis
 receipt cannot overwrite a newer user value. Pure checks pass 61 agent/I/O, 37 installer and 28 script
 cases. The preceding cde398d combined run passed 396/396, with 33 retained descendants exited and token
 77 released after restoration; a new exact-candidate run and blocker-only confirmation remain required.
+
+At eb4e7fb the combined suite passed 399/399; all 35 retained descendants exited, restoration passed,
+no queued launches remained, and token 78 was released. Confirmation 03 reported 2/2 sources with no
+degradation; adversarial returned zero findings (its event archive records source inspection).
+Two confirmed defects remained: value-only publication missed a newer same-value/ABA binding clear,
+and PowerShell's case-folded lookup accepted wrong-case hook schema keys. Both are included in the next
+batch: per-pane binding generations cover every runtime binding writer and stale adoption/restart;
+recognized hook key spellings are checked before destination writes. Regression tests cover the clear,
+ABA, and seven wrong-case shapes including unchanged helper/profile/settings destinations. Pure checks
+pass 63 agent/I/O and 44 installer cases. Final candidate CI and narrow confirmation remain required.

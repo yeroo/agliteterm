@@ -52,6 +52,14 @@ function Add-InstallBlock([string]$Existing,[string]$Label,[string]$Body){
     if($starts.Count-ne 1 -or $ends.Count-ne 1 -or $last-lt$first){throw "Corrupt or duplicate $Label profile block; file unchanged"}
     return $Existing.Substring(0,$first)+$block+$Existing.Substring($last+$end.Length)
 }
+function Test-InstallKeyCase($Object,[string[]]$Known){
+    # PowerShell lookup folds case; JSON consumers do not. Reject aliases before using dot lookup.
+    foreach($property in $Object.PSObject.Properties){
+        if($Known -contains $property.Name -and $Known -cnotcontains $property.Name){
+            throw "Wrong-case Claude hook field '$($property.Name)'; unchanged"
+        }
+    }
+}
 function Test-InstallJsonShape([string]$Text){
     if($Text.Length -gt 1048576){throw 'Claude settings exceeds 1 MiB; unchanged'}
     # ConvertFrom-Json collapses duplicate keys (including case-only collisions in PS 5.1).
@@ -110,14 +118,18 @@ try {
             Test-InstallJsonShape $settings
             $root=if($settings.Trim()){$settings|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}
             if($root -isnot [pscustomobject]){throw 'Claude settings root is not an object; unchanged'}
+            Test-InstallKeyCase $root @('hooks')
             if(-not $root.PSObject.Properties['hooks']){$root|Add-Member hooks ([pscustomobject]@{})}
             if($root.hooks -isnot [pscustomobject]){throw 'Claude hooks is not an object; unchanged'}
+            Test-InstallKeyCase $root.hooks @('UserPromptSubmit','PostToolUse','Stop','Notification')
             foreach($eventProperty in $root.hooks.PSObject.Properties){
                 if($eventProperty.Value -isnot [Array]){throw 'Claude hook event is not an array; unchanged'}
                 foreach($entry in $eventProperty.Value){
+                    Test-InstallKeyCase $entry @('hooks','matcher')
                     if($entry -isnot [pscustomobject] -or $entry.hooks -isnot [Array]){throw 'Claude hook entry/hooks has invalid shape; unchanged'}
                     if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw 'Claude hook matcher is not text; unchanged'}
                     foreach($hook in $entry.hooks){
+                        Test-InstallKeyCase $hook @('type','command','url','server','tool','prompt','model','if','statusMessage','shell','once','async','asyncRewake','args','allowedEnvVars','timeout','headers','input')
                         if($hook -isnot [pscustomobject] -or $hook.type -isnot [string]){throw 'Claude hook/type has invalid shape; unchanged'}
                         # Documented handler union: https://code.claude.com/docs/en/hooks#hook-handler-fields
                         $required=switch -CaseSensitive ($hook.type){

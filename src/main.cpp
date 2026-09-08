@@ -431,6 +431,7 @@ struct Session {
     std::string capturedCmd;
     std::string restoreCmd;        // explicitly pinned command; distinct from capturedCmd
     std::string agentResume;       // binding takes precedence over restoreCmd on fresh restore
+    unsigned long long agentResumeGeneration = 0; // every binding write, including an unchanged clear
     bool adopted = false;          // a live shell must never receive restore replay
     void* emu = nullptr;
     HANDLE data = INVALID_HANDLE_VALUE;
@@ -9853,7 +9854,7 @@ static std::string ctlDispatch(const std::string& line) {
             Session* owner = splitOwnerOf(target);
             session = owner ? owner->id : target->id;
             if (pin) target->restoreCmd = command;
-            else target->agentResume = command;
+            else { target->agentResume = command; ++target->agentResumeGeneration; }
         }
         if (!saveSessionState())
             return ctlErr(std::string(pin ? "session restore" : "session bind") + ": value changed in memory but this save could not write the state file; see the log");
