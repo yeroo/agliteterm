@@ -21,7 +21,7 @@ function Check([string]$name, [bool]$cond, [string]$detail = '') {
 # --- A fresh challenge, answered or not -----------------------------------------------------------
 # The screen a pane might show: an answer to some EARLIER challenge (a restored screen, a probe typed
 # twice), a prompt, and the echo of whatever was just typed - which carries `$PID` unexpanded.
-$stale = "AGWSHELL-deadbeef=77777|123456789`nPS C:\> "
+$stale = "AGWSHELL-deadbeef=77777|123456789|END`nPS C:\> "
 
 # (a) an old answer is not an answer: the pane never printed this call's nonce.
 $script:typed = @()
@@ -36,9 +36,19 @@ $script:typed = @(); $script:reads = 0
 $a = Ask-PaneShell { param($t) $script:typed += $t } {
     $script:reads++
     $n = if ($script:typed[0] -match 'AGWSHELL-([0-9a-f]{8})=') { $Matches[1] } else { 'none' }
-    if ($script:reads -lt 3) { $stale + $script:typed[0] } else { $stale + $script:typed[0] + "`nAGWSHELL-$n=4242|999`nPS C:\> " }
+    if ($script:reads -lt 3) { $stale + $script:typed[0] } else { $stale + $script:typed[0] + "`nAGWSHELL-$n=4242|999|END`nPS C:\> " }
 } 3000
 Check 'a fresh answer that arrives on the third read is taken, with ITS pid and birth' ($a.Pid -eq 4242 -and $a.BornUtcTicks -eq 999 -and $script:reads -eq 3) "pid $($a.Pid) born $($a.BornUtcTicks) after $($script:reads) reads"
+
+# (c) the screen is rows: a narrow pane wraps the answer (CI's 36-column sandbox cut the birth at
+# its 13th digit and the first row passed for the whole - the 5bab9f2 CI red). The first row alone is
+# not an answer; the two rows together, wherever the wrap fell, are.
+$wrapped = "AGWSHELL-cafe0001=6916|6392444783830   `n49130|END   `nPS C:\> "
+Check 'the first row of a wrapped answer, its birth cut short, is not an answer' (-not (Find-ShellAnswer 'AGWSHELL-cafe0001=6916|6392444783830' 'cafe0001'))
+$a = Find-ShellAnswer $wrapped 'cafe0001'
+Check 'the wrapped answer is read whole: pid and the full 18-digit birth' ($a.Pid -eq 6916 -and $a.BornUtcTicks -eq 639244478383049130L) "pid $($a.Pid) born $($a.BornUtcTicks)"
+$a = Find-ShellAnswer "AGWSH`nELL-cafe0001=69`n16|63924447838304913`n0|E`nND" 'cafe0001'
+Check 'a wrap that fell inside the marker, the pid, the birth and the end still reads whole' ($a.Pid -eq 6916 -and $a.BornUtcTicks -eq 639244478383049130L) "pid $($a.Pid) born $($a.BornUtcTicks)"
 
 # --- The identity behind the answer ---------------------------------------------------------------
 # This pwsh is the shell: its pid is running, and its start time is what a real answer would carry.
@@ -93,7 +103,7 @@ Check 'a pid that is not running is refused' ($threw -match 'not running') "thre
 $script:ledgerShells = @{}; $script:typed = @()
 $k = Register-PaneShell { param($t) $script:typed += $t } {
     $n = if ($script:typed[0] -match 'AGWSHELL-([0-9a-f]{8})=') { $Matches[1] } else { 'none' }
-    $stale + $script:typed[0] + "`nAGWSHELL-$n=$PID|$born`nPS C:\> "
+    $stale + $script:typed[0] + "`nAGWSHELL-$n=$PID|$born|END`nPS C:\> "
 } 2000
 Check 'Register-PaneShell admits the process that answered its own challenge, pinned' ($script:ledgerShells.Count -eq 1 -and (Tracked-Alive $script:ledgerShells[$k]) -and $script:ledgerShells[$k].Pid -eq $PID) "key $k"
 

@@ -136,15 +136,19 @@ function Teardown-Failed([string]$what) {
 function Take-TeardownFailures { $f = @($script:teardownFailures); $script:teardownFailures = @(); $f }
 
 # A fresh challenge each time, and the line the pane's shell prints to answer it: the nonce, its own
-# pid, and its own start time (UTC ticks - the kernel's creation time of THAT process, which a reused
-# pid does not inherit). The echo of the typed command carries `$PID` unexpanded and never matches
-# the answer's shape (digits right after `=`); an answer to another nonce is not this call's.
+# pid, its own start time (UTC ticks - the kernel's creation time of THAT process, which a reused
+# pid does not inherit), and an end. The echo of the typed command carries `$PID` unexpanded and
+# never matches the answer's shape (digits right after `=`); an answer to another nonce is not this
+# call's. The screen is rows, and a pane narrower than the answer wraps it across two - CI's runner
+# did, and the first row, ending in a truncated birth, passed for the whole - so the screen is read
+# with every whitespace removed (the answer has none, a wrap joins back seamlessly wherever it fell)
+# and an answer is one only with its own end on it.
 function New-ShellNonce { -join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
 function Shell-Challenge([string]$nonce) {
-    "[Console]::Out.WriteLine('AGWSHELL-$nonce=' + `$PID + '|' + (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)`n"
+    "[Console]::Out.WriteLine('AGWSHELL-$nonce=' + `$PID + '|' + (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks + '|END')`n"
 }
 function Find-ShellAnswer([string]$text, [string]$nonce) {
-    $m = [regex]::Matches($text, "(?m)^AGWSHELL-$nonce=(\d+)\|(\d+)\s*$")
+    $m = [regex]::Matches(($text -replace '\s', ''), "AGWSHELL-$nonce=(\d+)\|(\d+)\|END")
     if ($m.Count) { @{ Pid = [int]$m[$m.Count - 1].Groups[1].Value; BornUtcTicks = [long]$m[$m.Count - 1].Groups[2].Value } } else { $null }
 }
 
@@ -163,7 +167,7 @@ function Ask-PaneShell([scriptblock]$Type, [scriptblock]$Text, [int]$ms = 8000) 
         if ($a) { return $a }
         Start-Sleep -Milliseconds 200
     }
-    throw "the pane never answered AGWSHELL-$nonce=<pid>|<born> within $ms ms; its screen: $seen"
+    throw "the pane never answered AGWSHELL-$nonce=<pid>|<born>|END within $ms ms; its screen: $seen"
 }
 
 # Track a shell by the identity its pane answered: the pid must be running NOW, pinned as the
