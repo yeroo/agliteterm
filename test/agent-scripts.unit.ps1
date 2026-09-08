@@ -79,3 +79,4 @@ $null=Invoke-AgentFixture "& '$notify' '{`"type`":`"other`"}'" 0
 Check 'unknown Codex event is inert' $true
 "agent-scripts-unit: $checks checks, $failed failed; fake CLI only, artifacts $root"
 if($failed){throw 'agent script unit checks failed'}
+exit 0

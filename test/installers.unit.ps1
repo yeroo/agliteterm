@@ -48,3 +48,4 @@ foreach($bad in @('# >>> agliteterm hooks >>>', '# <<< agliteterm hooks <<<', "#
 }
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"
 if($failures){throw 'installer unit checks failed'}
+exit 0 # Negative helper cases intentionally returned nonzero; do not leak their exit into run-all.
