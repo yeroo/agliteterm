@@ -32,9 +32,15 @@ static std::string installIntegration(const JsonReq& req) {
         CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job); CloseHandle(read);
         return ctlErr("installer ownership could not be established; helper was not resumed");
     }
-    ResumeThread(process.hThread); CloseHandle(process.hThread);
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        TerminateJobObject(job, 1); WaitForSingleObject(process.hProcess, 5000);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job); CloseHandle(read);
+        return ctlErr("installer helper could not be resumed; no installation code ran");
+    }
+    CloseHandle(process.hThread);
     std::string output; bool timedOut = false; auto start = GetTickCount64();
     for (;;) {
+        if (GetTickCount64() - start > 20000) { timedOut = true; break; }
         DWORD available = 0;
         if (PeekNamedPipe(read, nullptr, 0, nullptr, &available, nullptr) && available) {
             char bytes[4096]; DWORD got = 0;

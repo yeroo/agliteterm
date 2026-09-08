@@ -112,13 +112,28 @@ try {
             if($root -isnot [pscustomobject]){throw 'Claude settings root is not an object; unchanged'}
             if(-not $root.PSObject.Properties['hooks']){$root|Add-Member hooks ([pscustomobject]@{})}
             if($root.hooks -isnot [pscustomobject]){throw 'Claude hooks is not an object; unchanged'}
+            foreach($eventProperty in $root.hooks.PSObject.Properties){
+                if($eventProperty.Value -isnot [Array]){throw 'Claude hook event is not an array; unchanged'}
+                foreach($entry in $eventProperty.Value){
+                    if($entry -isnot [pscustomobject] -or $entry.hooks -isnot [Array]){throw 'Claude hook entry/hooks has invalid shape; unchanged'}
+                    if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw 'Claude hook matcher is not text; unchanged'}
+                    foreach($hook in $entry.hooks){
+                        if($hook -isnot [pscustomobject] -or $hook.type -isnot [string]){throw 'Claude hook/type has invalid shape; unchanged'}
+                        if($hook.PSObject.Properties['command'] -and $hook.command -isnot [string]){throw 'Claude hook command is not text; unchanged'}
+                        if($hook.type-eq'command' -and $hook.command -isnot [string]){throw 'Claude command hook has no command text; unchanged'}
+                    }
+                }
+            }
             $wrapper=Join-Path $DataRoot 'agliteterm-agent-status.ps1'
             foreach($item in @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt'))){
                 $event=$item[0];$command='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'+$wrapper+'" '+$item[1]
                 if(-not $root.hooks.PSObject.Properties[$event]){$root.hooks|Add-Member $event @()}
                 if($root.hooks.$event -isnot [Array]){throw "Claude hook $event is not an array; unchanged"}
                 $exists=$false
-                foreach($entry in $root.hooks.$event){foreach($hook in $entry.hooks){if($hook.command -ceq $command){$exists=$true}}}
+                foreach($entry in $root.hooks.$event){
+                    if([string]$entry.matcher -cne $item[2]){continue}
+                    foreach($hook in $entry.hooks){if($hook.type-ceq'command' -and $hook.command -ceq $command){$exists=$true}}
+                }
                 if(-not $exists){$entry=@{hooks=@(@{type='command';command=$command})};if($item[2]){$entry.matcher=$item[2]};$root.hooks.$event=@($root.hooks.$event)+@([pscustomobject]$entry)}
             }
             $merged=$root|ConvertTo-Json -Depth 100

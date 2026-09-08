@@ -2,25 +2,27 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include "profiles.h"
 
 namespace shell_configuration {
 // Serialize a complete editing-input write with the no-prior-input decision. The callback must not take
 // the global session lock: callers resolve stable session identity before entering this gate.
 class InputGate {
-    std::mutex mutex;
+    std::timed_mutex mutex;
     bool written = false;
     unsigned long long reservation = 0, sequence = 0;
     std::atomic<bool> editable{true};
 public:
     void setReadOnly(bool readOnly) { editable = !readOnly; }
     unsigned long long reserve() {
-        std::lock_guard<std::mutex> hold(mutex);
+        std::unique_lock<std::timed_mutex> hold(mutex,std::defer_lock);
+        if (!hold.try_lock_for(std::chrono::milliseconds(1000))) return 0;
         if (reservation) return 0;
         return reservation = ++sequence;
     }
     void release(unsigned long long token) {
-        std::lock_guard<std::mutex> hold(mutex);
+        std::lock_guard<std::timed_mutex> hold(mutex);
         if (token && token == reservation) reservation = 0;
     }
     template<class Write> bool write(bool editingInput, bool requireUntouched, Write transfer,
@@ -28,7 +30,9 @@ public:
         // Reader-thread terminal replies must not wait behind a possibly backpressured paste:
         // that reader must keep draining shell output so the editing write can finish.
         if (!editingInput && !requireUntouched) { transfer(); return true; }
-        std::lock_guard<std::mutex> hold(mutex);
+        std::unique_lock<std::timed_mutex> hold(mutex,std::defer_lock);
+        if (token) { if (!hold.try_lock_for(std::chrono::milliseconds(1000))) return false; }
+        else hold.lock();
         if ((reservation && token != reservation) || (token && token != reservation)) return false;
         // Read-only is an interaction policy, not a ban on session.type (P9 contract).
         // Reserved lifecycle interrupts must additionally honor a later readonly transition.

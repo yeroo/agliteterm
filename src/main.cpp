@@ -1440,9 +1440,10 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
     return INVALID_HANDLE_VALUE;
 }
 
+#include "bounded_pipe_write.h"
 static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
                   bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr,
-                  unsigned long long reservation = 0) {
+                  unsigned long long reservation = 0, DWORD timeout = INFINITE) {
     Session* inputPane = nullptr;
     if (write) {
         LockG hold;
@@ -1459,6 +1460,7 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     }
     DWORD n = 0;
     auto transfer = [&] {
+        if (write && timeout != INFINITE) { n = bounded_pipe_write::write(h,wbuf,len,timeout); return; }
         OVERLAPPED ov{};
         ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);

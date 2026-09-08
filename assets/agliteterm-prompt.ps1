@@ -3,15 +3,15 @@ if(-not $global:__agliteBridgeToken){$global:__agliteBridgeToken=[guid]::NewGuid
 if(-not ('AgLitePromptConsole' -as [type])){
     Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AgLitePromptConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetConsoleProcessList([Out] uint[] processes, uint count); }'
 }
-function global:Invoke-AgLiteBridgeRequest([string]$Op){
+function global:Invoke-AgLiteBridgeRequest([string]$Op,[string]$Lease='', [switch]$NoReply){
     if($env:TERM_PROGRAM -ne 'agliteterm' -or -not $env:AGWINTERM_PIPE -or -not $env:AGWINTERM_SESSION_ID){return}
     $client=$null
     try {
         $client=New-Object IO.Pipes.NamedPipeClientStream('.', $env:AGWINTERM_PIPE, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
         $client.Connect(300)
         $writer=New-Object IO.StreamWriter($client);$writer.AutoFlush=$true
-        $fields=@{op=$Op;token=$global:__agliteBridgeToken;pid="$PID"}
-        if($Op-eq'claim'){
+        $fields=@{op=$Op;token=$global:__agliteBridgeToken;pid="$PID";lease=$Lease}
+        if($Op-eq'claim' -or $Op-eq'ack'){
             $clients=New-Object 'uint32[]' 64
             $count=[AgLitePromptConsole]::GetConsoleProcessList($clients,64)
             # Fail closed on no console, overflow, or any other attached client (including
@@ -20,12 +20,37 @@ function global:Invoke-AgLiteBridgeRequest([string]$Op){
             $fields['console-pids']="$PID"
         }
         $writer.WriteLine((@{cmd='agent.bridge';target=$env:AGWINTERM_SESSION_ID;args=$fields}|ConvertTo-Json -Compress))
+        if($NoReply){return}
         $reader=New-Object IO.StreamReader($client)
         $read=$reader.ReadLineAsync()
         if(-not $read.Wait(1000)){return}
         $reply=$read.Result|ConvertFrom-Json
-        if($reply.ok){return $reply.result}
+        return $reply
     }catch{}finally{if($client){$client.Dispose()}}
+}
+function global:Get-AgLiteResume {
+    $offer=$null
+    for($attempt=0;$attempt-lt 5;$attempt++){
+        $reply=Invoke-AgLiteBridgeRequest claim
+        if($reply -and $reply.ok){if(-not$reply.result){return};$offer=$reply.result|ConvertFrom-Json;break}
+        Start-Sleep -Milliseconds 100
+    }
+    if(-not$offer){return}
+    for($attempt=0;$attempt-lt 5;$attempt++){
+        if([DateTime]::UtcNow.ToFileTimeUtc()-ge[long]$offer.deadline){return}
+        $reply=Invoke-AgLiteBridgeRequest ack $offer.lease
+        if($reply -and $reply.ok -and $reply.result){
+            $accepted=$reply.result|ConvertFrom-Json
+            if($accepted.lease-cne$offer.lease -or $accepted.command-cne$offer.command -or [DateTime]::UtcNow.ToFileTimeUtc()-ge[long]$accepted.deadline){return}
+            if($global:__agliteExecutedLease-ceq$accepted.lease){return}
+            $global:__agliteExecutedLease=$accepted.lease
+            # Receipt notification is not on the executable path's disk-I/O acknowledgement.
+            $null=Invoke-AgLiteBridgeRequest received $accepted.lease -NoReply
+            return $accepted.command
+        }
+        if($reply -and -not$reply.ok){return}
+        Start-Sleep -Milliseconds 100
+    }
 }
 if(-not $global:__agwLiteWrap){
     $global:__agwLiteWrap=$true;$global:__agwLiteP=$function:prompt
@@ -35,7 +60,7 @@ if(-not $global:__agwLiteWrap){
         # The native owner verifies retained process handles have exited before returning a resume.
         while($true){
             $null=Invoke-AgLiteBridgeRequest register
-            $resume=Invoke-AgLiteBridgeRequest claim
+            $resume=Get-AgLiteResume
             if(-not $resume){break}
             try { & ([scriptblock]::Create($resume)) } catch { Write-Error $_ }
             $ec=if($?){0}else{1}

@@ -25,6 +25,7 @@ int main() {
         check(!parse(bad) && catalog.commands[0].text==before,"bad reload preserves previous catalog");
     }
     check(!parse(std::string(1048577,' ')),"oversized input refuses");
+    check(!parse("map x=command:missing\ncommand X=ok\n# final line") && error.find("line 1:")==0,"deferred error identifies binding source line");
     check(!parse(std::string("command X=a\0b",13)),"NUL refuses");
     check(parse("\xef\xbb\xbf# bom\r\ncommand X = hi\r\nmap x=command:X\r\nmap x=select_all"),"BOM CRLF and replacement binding");
     check(catalog.binding(commands::chord("x"),false)->action=="select_all","last binding wins");

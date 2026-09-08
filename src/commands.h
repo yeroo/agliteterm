@@ -36,7 +36,7 @@ inline uint16_t chord(const std::string& text) {
     return static_cast<uint16_t>(key | (mods << 8));
 }
 struct Command { std::string label, text, mode; };
-struct Binding { uint16_t key; std::string spelling, action; bool leader; };
+struct Binding { uint16_t key; std::string spelling, action; bool leader; int line = 0; };
 struct Catalog {
     std::vector<Command> commands;
     std::vector<Binding> bindings;
@@ -79,10 +79,11 @@ inline bool parse(const std::string& input, const std::map<std::string,int>& act
             auto action = lower(value);
             if (action.rfind("command:", 0) == 0) value = "command:" + trim(value.substr(8));
             else { if (!actions.count(action)) return bad("unsupported action"); value = action; }
-            result.bindings.push_back({key, lower(head), value, second});
+            result.bindings.push_back({key, lower(head), value, second, number});
         } else return bad("expected map, command or leader");
     }
     for (const auto& b : result.bindings) {
+        number = b.line;
         if (b.leader && !result.leader) return bad("leader binding without leader");
         if (b.action.rfind("command:", 0) == 0 && !result.find(b.action.substr(8))) return bad("undefined command");
     }

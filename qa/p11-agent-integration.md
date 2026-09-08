@@ -34,6 +34,22 @@ their exact leases (generations 69–72); these failures are not presented as pa
 
 ## Merge gates
 
+Broad review `01-initial` covered 174b3b1..5669da4: 4/4 Codex sources, no degradation, 7 major
+code findings and 5 minor code/test findings; no open questions, pre-existing or immaterial entries.
+All are accepted. The late-console-child and dropped-wrapper-option mechanisms were addressed in
+fd02bc6 (the wrapper now decorates only bare calls, with documented passthrough for other argv).
+The review-fix batch adds nested hook shape/matcher validation, retryable bridge offers/acknowledgements,
+bounded cancellable interrupt I/O outside the agent mutex, updater exclusion beyond supervisor expiry,
+modifier-aware leader dispatch, source-line diagnostics, ResumeThread failure handling and non-vacuous
+leader/unknown-notify assertions. Final confirmation and exact-head CI remain required.
+
+Self-review regression coverage at fd02bc6: combined local run
+`selection-ui-20260908T210557-f4a554` passed 390/390; 29 retained descendants exited, clipboard and
+touched registry restored, no queued launches; token generation 76 released. Focused generation 75
+passed 51/51 and proved refusal for a late orphan attached to the same console. Pure tests after the
+review fixes pass 87 command, 59 agent/I/O, 30 installer and 28 script checks. The next combined run
+also exercises the actual five-minute update-supervision expiry; those pending results are not claimed.
+
 Record the exact candidate, Codex-only revmux completeness/dispositions, combined local counts,
 full Windows CI run and implementation/companion-doc PRs in the final PR delivery note. This document
 does not claim those pending gates have passed. No release/tag is authorized or produced by P11.

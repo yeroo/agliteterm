@@ -1,5 +1,6 @@
 #include "../src/agent_integration.h"
 #include "../src/shell_configuration.h"
+#include "../src/bounded_pipe_write.h"
 #include <cstdio>
 static int checks = 0, failed = 0;
 static void check(bool good, const char* label) { ++checks; if (!good) ++failed; std::printf("%s %s\n", good ? "PASS" : "FAIL", label); }
@@ -67,5 +68,18 @@ int main() {
     check(gate.write(false,false,[]{}), "readonly still permits protocol replies");
     gate.release(readonlyLease); gate.setReadOnly(false);
     check(gate.write(true,false,[]{}), "readonly off restores normal input");
+    const auto pipeName = "\\\\.\\pipe\\p11-bounded-unit-" + std::to_string(GetCurrentProcessId());
+    HANDLE server=CreateNamedPipeA(pipeName.c_str(),PIPE_ACCESS_OUTBOUND|FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE|PIPE_WAIT,1,4096,4096,0,nullptr);
+    HANDLE client=CreateFileA(pipeName.c_str(),GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr);
+    check(server!=INVALID_HANDLE_VALUE && client!=INVALID_HANDLE_VALUE,"private bounded-write pipe opens");
+    if (server!=INVALID_HANDLE_VALUE && client!=INVALID_HANDLE_VALUE) {
+        check(bounded_pipe_write::write(server,"abc",3,100)==3,"bounded write reports full delivered bytes");
+        std::string blocked(1024*1024,'x'); const auto started=GetTickCount64();
+        check(bounded_pipe_write::write(server,blocked.data(),static_cast<DWORD>(blocked.size()),50)==0 && GetTickCount64()-started<2000,
+              "non-draining pipe cancels within deadline, no false write success");
+    }
+    if(client!=INVALID_HANDLE_VALUE) CloseHandle(client);
+    if(server!=INVALID_HANDLE_VALUE) CloseHandle(server);
     std::printf("agent-integration-unit: %d checks, %d failed\n", checks, failed); return failed ? 1 : 0;
 }

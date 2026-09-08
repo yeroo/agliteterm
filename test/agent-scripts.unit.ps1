@@ -56,6 +56,7 @@ function Invoke-AgentFixture([string]$Body,[int]$Requests){
         }
         if(-not$client.WaitForExit(5000)){throw 'Fixture subprocess did not exit'}
         if($client.ExitCode-ne0){throw "Fixture failed: $($stderr.Result)"}
+        $script:unexpectedConnection=$Requests-eq 0 -and $accept.IsCompleted -and -not$accept.IsFaulted -and -not$accept.IsCanceled
         return $answers
     }finally{
         $server.Dispose()
@@ -80,7 +81,23 @@ $notify=(Join-Path $assets 'agliteterm-codex-notify.ps1').Replace("'","''")
 $request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`"}'" 1)
 Check 'Codex completion notify uses exact event and pane' ($request[0].cmd-eq'session.status' -and $request[0].args.status-eq'completed' -and $request[0].target-eq'private-test-pane')
 $null=Invoke-AgentFixture "& '$notify' '{`"type`":`"other`"}'" 0
-Check 'unknown Codex event is inert' $true
+Check 'unknown Codex event is inert (no pipe connection)' (-not$script:unexpectedConnection)
+$prompt=(Join-Path $assets 'agliteterm-prompt.ps1').Replace("'","''")
+$protocol=@'
+$global:p11Claims=0;$global:p11Acks=0;$global:p11Receipts=0
+$global:p11Offer=@{lease='77';deadline=[string][DateTime]::UtcNow.AddSeconds(20).ToFileTimeUtc();command='p11-command'}|ConvertTo-Json -Compress
+function global:Invoke-AgLiteBridgeRequest([string]$Op,[string]$Lease='', [switch]$NoReply){
+    if($Op-eq'claim'){$global:p11Claims++;if($global:p11Claims-eq 1){return};return [pscustomobject]@{ok=$true;result=$global:p11Offer}}
+    if($Op-eq'ack'){$global:p11Acks++;if($global:p11Acks-eq 1){return};return [pscustomobject]@{ok=$true;result=$global:p11Offer}}
+    if($Op-eq'received'){$global:p11Receipts++;return}
+}
+if((Get-AgLiteResume)-cne'p11-command' -or $global:p11Claims-ne 2 -or $global:p11Acks-ne 2 -or $global:p11Receipts-ne 1){throw 'Lost reply retry/receipt failed'}
+if((Get-AgLiteResume) -or $global:p11Receipts-ne 1){throw 'Duplicate lease executed twice'}
+$global:p11Offer=@{lease='78';deadline=[string][DateTime]::UtcNow.AddSeconds(-1).ToFileTimeUtc();command='expired'}|ConvertTo-Json -Compress
+if(Get-AgLiteResume){throw 'Expired authorization executed'}
+'@
+$null=Invoke-AgentFixture (". '$prompt';"+$protocol) 0
+Check 'prompt retries lost offer/ack, consumes once and refuses expired authorization' (-not$script:unexpectedConnection)
 "agent-scripts-unit: $checks checks, $failed failed; fake CLI only, artifacts $root"
 if($failed){throw 'agent script unit checks failed'}
 exit 0

@@ -45,6 +45,8 @@ static bool customKey(WORD combo) {
     if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return false;
     if (g_leaderPending && GetTickCount64() - g_leaderAt > 2000) g_leaderPending = false;
     if (g_leaderPending) {
+        if (LOBYTE(combo) == VK_SHIFT || LOBYTE(combo) == VK_CONTROL || LOBYTE(combo) == VK_MENU ||
+            (LOBYTE(combo) >= VK_LSHIFT && LOBYTE(combo) <= VK_RMENU)) return true;
         g_leaderPending = false;
         if (LOBYTE(combo) != VK_ESCAPE) {
             if (const auto* binding = g_commands.binding(combo, true)) {

@@ -35,11 +35,19 @@ Check 'suggested notify command has complete argv' ($argv.Count-eq6 -and $argv[0
 $saved=[IO.File]::ReadAllText($settings);$profileSaved=[IO.File]::ReadAllText($profile)
 $r=Install hooks
 Check 'hooks install idempotent' ($r.ok -and [IO.File]::ReadAllText($settings)-ceq$saved -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
-foreach($bad in @('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"not-array"}}','{"unrelated":1,"unrelated":2}','{"unrelated":{"X":1,"x":2}}','{"key":1,"\u006bey":2}')){
+foreach($bad in @('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"not-array"}}','{"unrelated":1,"unrelated":2}','{"unrelated":{"X":1,"x":2}}','{"key":1,"\u006bey":2}',
+    '{"hooks":{"Stop":[{"hooks":"not-an-array"}]}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}',
+    '{"hooks":{"Stop":[{"hooks":["command"]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","command":false}]}]}}')){
     [IO.File]::WriteAllText($settings,$bad)
     $r=Install hooks
     Check 'malformed settings refuse without profile/settings change' (-not$r.ok -and $installExit-ne 0 -and [IO.File]::ReadAllText($settings)-ceq$bad -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
 }
+[IO.File]::WriteAllText($settings,$saved)
+$scoped=$saved|ConvertFrom-Json
+$scoped.hooks.Notification[0].matcher='idle_prompt'
+[IO.File]::WriteAllText($settings,($scoped|ConvertTo-Json -Depth 100))
+$r=Install hooks;$scoped=Get-Content -Raw $settings|ConvertFrom-Json
+Check 'same hook command with other matcher does not suppress permission hook' ($r.ok -and @($scoped.hooks.Notification|Where-Object matcher -eq 'permission_prompt').Count-eq 1 -and @($scoped.hooks.Notification|Where-Object matcher -eq 'idle_prompt').Count-eq 1)
 [IO.File]::WriteAllText($settings,$saved)
 foreach($bad in @('# >>> agliteterm hooks >>>', '# <<< agliteterm hooks <<<', "# >>> agliteterm hooks >>>`n# >>> agliteterm hooks >>>`n# <<< agliteterm hooks <<<")){
     [IO.File]::WriteAllText($profile,$bad)

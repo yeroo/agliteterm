@@ -22,6 +22,10 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "update") {
         std::ifstream input(dir+"update-mode.txt"); std::string mode; std::getline(input,mode);
         if (mode == "fail") return 7;
+        if (mode == "slow") {
+            while (!std::ifstream(dir+"update-release.txt").good()) Sleep(100);
+            std::ofstream output(dir+"version.txt"); output << "1.0.2";
+        }
         if (mode == "new") { std::ofstream output(dir+"version.txt"); output << "1.0.1"; }
         if (mode == "downgrade") { std::ofstream output(dir+"version.txt"); output << "0.9.0"; }
         std::printf("P11 fake update %s\n", mode.c_str()); return 0;

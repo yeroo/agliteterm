@@ -94,7 +94,10 @@ after all retained descendants exited, a new snapshot shows no surviving shell c
 shell reports itself as the sole attached console client (including late orphan checks). Resume
 executes inside the prompt, never by appending executable text to PSReadLine's draft. State changes,
 unknown ownership, timeout or missing claim mean no resume dispatch. No fixed-delay fallback or
-name/PID-only process kill is used. `agent.bridge` is the capability-checked shell integration protocol,
+name/PID-only process kill is used. Interrupt I/O has a bounded cancellable wait. Offers and acknowledgements
+are retryable for the same lease; the prompt checks expiry and executes each lease at most once. Receipt
+notification and binding persistence do not block authorization replies. An unconfirmed acknowledgement
+is reported as such, never as completed startup. `agent.bridge` is the capability-checked shell integration protocol,
 not a command API for callers to supply executable text.
 
 `claude.update` opens an owned pane overlay and probes versions around `claude update`. Failed, unknown,
@@ -104,6 +107,7 @@ verified eligible panes using that executable/script. Each keeps its conversatio
 permission arguments; interactive permission-mode changes inside Claude cannot be inferred from argv.
 Closed, changed, custom-bound or newly ineligible panes are skipped; new agents are not discovered
 and interrupted after the update. The supervisor expires after five minutes without killing the updater.
+It continues to exclude another update until that owned updater ends; late completion never restarts agents.
 
 Replies say queued/opened, not completed. Read `agent.update` and `agent.restart` events for outcomes;
 resume dispatch and binding persistence are distinct from successful agent startup. Receipt files in

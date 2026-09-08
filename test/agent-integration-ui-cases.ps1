@@ -71,8 +71,18 @@ Check 'leader begin arms' ((Selection-Rpc 'command.leader' @{op='begin'})-eq'pen
 Check 'leader cancel clears' ((Selection-Rpc 'command.leader' @{op='cancel'})-eq'idle')
 $null=Selection-Rpc 'command.leader' @{op='begin'};Start-Sleep -Milliseconds 2100
 Check 'leader timeout clears' ((Selection-Rpc 'command.leader' @{op='state'})-eq'idle')
+[IO.File]::WriteAllText($sink,'BEFORE-LEADER-API')
 $null=Selection-Rpc 'command.leader' @{op='key:b'}
-Check 'leader key executes configured command' ((Selection-Rpc 'command.leader' @{op='state'})-eq'idle')
+Check 'leader key executes configured command' ((Selection-Rpc 'command.leader' @{op='state'})-eq'idle' -and (P11-Wait {[IO.File]::ReadAllText($sink)-ne'BEFORE-LEADER-API'}))
+$keytext+="map leader shift+b = command:Send`n"
+[IO.File]::WriteAllText($keymap,$keytext);$null=Selection-Rpc 'keymap.reload'
+$null=Selection-Rpc 'session.select' @{} $pane
+[IO.File]::WriteAllText($sink,'BEFORE-LEADER-KEY')
+[LiteUi]::Chord($script:selectionHwnd,[int][char]'K',$false)
+[LiteUi]::Key($script:selectionHwnd,0x10,1)
+Check 'physical modifier keydown preserves pending leader' ((Selection-Rpc 'command.leader' @{op='state'})-eq'pending')
+[LiteUi]::KeyMods($script:selectionHwnd,[int][char]'B',$false,$true,1)
+Check 'physical leader then Shift+B executes custom command' (P11-Wait {[IO.File]::ReadAllText($sink)-ne'BEFORE-LEADER-KEY'})
 [IO.File]::WriteAllText($sink,'BEFORE-KEY')
 $null=Selection-Rpc 'session.select' @{} $pane
 [LiteUi]::Chord($script:selectionHwnd,0x78,$false)
@@ -211,5 +221,17 @@ foreach($mode in 'fail','noop','new'){
         $null=Selection-Rpc 'session.overlay' @{action='close'} $updateCover
     }
 }
+[IO.File]::WriteAllText((Join-Path $fakeDir 'update-mode.txt'),'slow')
+$count=@(P11-Launches).Count;$cursor=(Selection-Rpc 'events').cursor
+$reply=[string](Selection-Rpc 'claude.update' @{} $pane);$slowCover=($reply-split' ')[6].TrimEnd(';')
+Capture-P11Children
+Check 'running updater refuses another update' (-not(Selection-Rpc 'claude.update' @{} $agentA -AllowError).ok)
+'Waiting for the real five-minute updater-supervision deadline; private fake updater only.'
+Check 'slow updater reaches real supervision timeout' (P11-Wait {@((Selection-Rpc 'events' @{since=$cursor}).events|Where-Object {$_.type-eq'agent.update' -and $_.info-match'update timed out'}).Count-gt 0} 310)
+$r=Selection-Rpc 'claude.update' @{} $agentA -AllowError
+Check 'expired supervisor still excludes a concurrent updater' (-not$r.ok -and $r.error-match'already running')
+[IO.File]::WriteAllText((Join-Path $fakeDir 'update-release.txt'),'allow owned fake updater to finish')
+Check 'updater exit releases exclusion without late restarts' ((P11-Wait {@((Selection-Rpc 'events' @{since=$cursor}).events|Where-Object {$_.type-eq'agent.update' -and $_.info-match'exclusion released'}).Count-gt 0}) -and @(P11-Launches).Count-eq$count)
+$null=Selection-Rpc 'session.overlay' @{action='close'} $slowCover
 Capture-P11Children
 'P11 fixtures used only the locally compiled fake claude.exe; no real Claude, profile installer or release updater invoked.'
