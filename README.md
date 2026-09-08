@@ -77,13 +77,14 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   clears it. `copied N chars` counts UTF-8 bytes of the text `session copy` returns, with CRLF
   between rows and trailing spaces trimmed. The clipboard write is posted to the UI thread;
   allow its next message before reading it. `selection finalize` is the release-copy testing
-  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Popup terminals
+  hook: it copies and keeps the highlight when copy-on-select is on (the default); when off it
+  answers `finalized (copy-on-select off)` without writing. Popup terminals
   (overlay, quick and scratch) support selection too.
   Blank Copy answers `nothing to copy`, clears the highlight, and leaves the clipboard alone;
   blank Finalize keeps the highlight. Copy and Finalize can refuse a failed UI enqueue with
   `the clipboard write could not be queued; selection unchanged`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  58 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
+  65 verbs covering sessions, workspaces, windows, configuration, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -243,6 +244,34 @@ gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
   History is never scrolled into on the alt screen.
 
 `session background` remains unavailable: lite draws no images. See [driving checks](qa/driving.md).
+
+## Configuration (P10a)
+
+`config list` reports supported keys and current values; `config get KEY` reads one;
+`config set KEY VALUE` saves only that registry value under `HKCU\Software\agliteterm` and
+applies it to this instance. Other running instances are not changed; future launches read the
+saved values. Unknown keys and invalid values refuse without changing settings. Writes also
+refuse while a modal dialog is open/queued, protecting its unsaved edits. A timed-out request
+already executing reports an unknown outcome: read back before retrying.
+
+| Keys | Values |
+| --- | --- |
+| theme | auto, dark, light, classic (lite's UI modes, not the full app's theme catalog) |
+| custom-colors, dos-palette, show-sidebar, show-toolbar, show-status, flag-view | true/false (also on/off or1/0) |
+| right-click-paste, copy-on-ctrl-c, copy-on-select | true/false (also on/off or1/0) |
+| foreground, background | #RRGGBB; used when custom-colors is true |
+| sidebar-font-size | 0 for system default, or6..24 |
+| scrollback-lines | 0..1000000; default5000; new surfaces only, no live eviction; positive caps allow 512 rows of batched-trim slack |
+
+`theme list/set` uses the same four modes. `settings` requests the Properties dialog without
+raising the terminal; its reply is `settings open requested`. `keymap reload` reloads registry
+bindings: deleted entries return to their default/unbound state, explicit zero stays unbound.
+With copy-on-select off, mouse release/finalize leave the clipboard alone; explicit Copy and
+mark-mode Enter/Ctrl+C still copy. Scrollback config affects the local replica, not the host's
+retained history, and is applied before a new/adopted surface receives bytes.
+
+P10b remains: font targeting, custom profiles, OMP and opt-in captured-command replay. These are
+not implemented by P10a. The shared control conformance floor is unchanged.
 
 ## Session restore & the state file
 

@@ -1,7 +1,8 @@
 # Keyboard/mouse selection parity. Run locally under the shared hub token; CI is an isolated host.
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
-      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly)
+      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly)
 $ErrorActionPreference='Stop'
+if($DrivingOnly -and $ConfigurationOnly){throw 'Choose only one of -DrivingOnly and -ConfigurationOnly'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
 New-Item -ItemType Directory $script:selectionArtifact -Force | Out-Null
@@ -16,7 +17,7 @@ if(Test-Path $hub){
     }else{
         if([string]::IsNullOrWhiteSpace($TokenOwner)){Skip-Selection 'set -TokenOwner or AGLITETERM_TEST_OWNER to the actual runner before acquiring a suite token'}
         $run=Split-Path $script:selectionArtifact -Leaf
-        $raw=& python $hub acquire --owner $TokenOwner --run $run --worktree (Split-Path $PSScriptRoot -Parent) --holder-pid $PID --purpose 'P7 selection UI verification'
+        $raw=& python $hub acquire --owner $TokenOwner --run $run --worktree (Split-Path $PSScriptRoot -Parent) --holder-pid $PID --purpose 'Guarded selection/driving/configuration verification'
         $lease=$raw|ConvertFrom-Json
         if($LASTEXITCODE -ne 0 -or -not $lease.ok){Skip-Selection "suite token unavailable: $raw"}
         $ownLease=$true
@@ -36,11 +37,16 @@ try {
     $clipboard=Save-SelectionClipboard "$script:selectionArtifact/clipboard-before.dpapi"
     $reg=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regPath)
     $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
+    $configDefaults=@{Theme=0;CustomColors=0;DefFg=0xC0C0C0;DefBg=0;DosPalette=1;SidebarFontPt=0;
+        ShowSidebar=1;ShowToolbar=1;ShowStatus=1;FlagView=0;RightClickPaste=1;CopyOnCtrlC=1;
+        CopyOnSelect=1;ScrollbackLines=5000}
+    $names+=@($configDefaults.Keys)+@('Key_Copy','P10UntouchedSentinel')
     $script:selectionRegistry=New-RegistryGuard $names {param($n) Read-RegistryGuardValue $reg $n}
     if($reg){$reg.Dispose()};$geoSaved=$true
     $script:selectionRegistry|ConvertTo-Json -Depth 8|Set-Content "$script:selectionArtifact/registry-before.json"
     # Deterministic defaults, even if the user's dialog previously cleared/rebound these actions.
     foreach($name in 'Key_MarkMode','Key_SelectAll'){Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}}
+    foreach($name in $configDefaults.Keys){Set-SelectionRegistry $name @{Exists=$true;Kind=4;Value=[int]$configDefaults[$name]}}
     $profile=Join-Path $script:selectionArtifact profile;New-Item -ItemType Directory $profile|Out-Null
     Start-SelectionSandbox $Exe $profile
     $h=$script:selectionHwnd;$g=Selection-Geometry
@@ -82,7 +88,7 @@ try {
         Write-Screen ($esc+'[6;3H') # known caret; surface.cursor exposes only a column
     }
     function Shot([string]$name){Selection-Capture $h $name $g.Left $g.Top ([math]::Min(350,$g.Right-$g.Left)) ([math]::Min(200,$g.Bottom-$g.Top))}
-    if(-not $DrivingOnly){
+    if(-not $DrivingOnly -and -not $ConfigurationOnly){
     Seed-Main
     $before=Shot 'wheel-before';[SelectionUi]::Wheel($h,($g.Left+100),($g.Top+60),3);$after=Shot 'wheel-after'
     Check 'wheel: posted main-screen wheel changes the viewport' ((Selection-PixelDiff $before $after)-gt 100)
@@ -303,7 +309,8 @@ try {
     Write-Screen ($esc+'[2J'+$esc+'[HSELECT-ALL-REBOUND');Set-Marker;[LiteUi]::Chord($h,[int][char]'L',$true)
     Check 'bindings: rebound Select All highlights without copying' ((Selected)-match 'SELECT-ALL-REBOUND' -and (Clip)-eq $script:selectionMarker)
     }
-    if(Test-Path "$PSScriptRoot/driving-ui-cases.ps1"){. "$PSScriptRoot/driving-ui-cases.ps1"}
+    if(-not $ConfigurationOnly -and (Test-Path "$PSScriptRoot/driving-ui-cases.ps1")){. "$PSScriptRoot/driving-ui-cases.ps1"}
+    if(-not $DrivingOnly -and (Test-Path "$PSScriptRoot/configuration-ui-cases.ps1")){. "$PSScriptRoot/configuration-ui-cases.ps1"}
 }catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
     $cleanupOk=Invoke-SelectionCleanup { Stop-SelectionSandbox } {

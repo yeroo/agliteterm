@@ -36,6 +36,8 @@
 #include <vector>
 #include <deque>
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
+#include <atomic>
+#include <mutex>
 #include <map>        // captureForeground: shell pid -> the newest non-denylisted child's command line
 #include <tlhelp32.h> // CreateToolhelp32Snapshot: the parent-pid walk behind restore.capture (P3)
 
@@ -70,6 +72,7 @@ CAppModule _Module;
 #include "proto/pb_decode.h"
 #include "control.h"
 #include "driving.h"
+#include "configuration.h"
 
 // ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
@@ -96,6 +99,8 @@ struct FfiMark {   // FTCS / OSC 133 boundary; lines are buffer-absolute, -1 = u
 };
 static uint32_t (*core_abi)();
 static void* (*emu_new)(uint32_t, uint32_t);
+static bool (*emu_set_scrollback)(void*, uint32_t);
+static std::atomic<uint32_t> g_scrollbackLines{5000}; // core default; new replicas only
 static void (*emu_free)(void*);
 static bool (*emu_feed)(void*, const uint8_t*, uint32_t);
 static bool (*emu_resize)(void*, uint32_t, uint32_t);
@@ -1061,6 +1066,7 @@ enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
 #define WM_APP_PANEEXIT    (WM_APP + 10)  // reader thread -> UI thread: a shell hit EOF (lParam = Session*); a split side collapses to its survivor (P4)
 #define WM_APP_UPDATESTATUS (WM_APP + 11) // any thread -> UI thread: a pane's grid changed; redraw the status bar's cols x rows (lite #25)
+#define WM_APP_CONFIG       (WM_APP + 12) // drain owned configuration requests on the UI thread
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
@@ -1163,6 +1169,7 @@ static void updateStatus();
 // rest - HKCU\Software\agliteterm, DWORD 0 to turn either off.
 static bool g_rightClickPaste = true;
 static bool g_copyOnCtrlC = true;
+static std::atomic<bool> g_copyOnSelect{true};
 static bool g_rbtnForwarded = false;   // did the app get the button-2 PRESS? then it gets the release
 
 // ---- command palette: type-to-filter overlay over every action -------------------------------
@@ -1436,6 +1443,7 @@ static void loadCore() {
     if (!m) fatal(L"agwinterm_core.dll not found next to the exe");
     core_abi = (decltype(core_abi))GetProcAddress(m, "agwcore_abi_version");
     emu_new = (decltype(emu_new))GetProcAddress(m, "agwcore_emu_new");
+    emu_set_scrollback = (decltype(emu_set_scrollback))GetProcAddress(m, "agwcore_emu_set_scrollback");
     emu_free = (decltype(emu_free))GetProcAddress(m, "agwcore_emu_free");
     emu_feed = (decltype(emu_feed))GetProcAddress(m, "agwcore_emu_feed");
     emu_resize = (decltype(emu_resize))GetProcAddress(m, "agwcore_emu_resize");
@@ -1446,7 +1454,7 @@ static void loadCore() {
     emu_get_text = (decltype(emu_get_text))GetProcAddress(m, "agwcore_emu_get_text");
     emu_take_host_actions = (decltype(emu_take_host_actions))GetProcAddress(m, "agwcore_emu_take_host_actions");
     core_free_buf = (decltype(core_free_buf))GetProcAddress(m, "agwcore_free_buf");
-    if (!core_abi || !emu_new || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !emu_take_host_actions || !core_free_buf)
+    if (!core_abi || !emu_new || !emu_set_scrollback || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !emu_take_host_actions || !core_free_buf)
         fatal(L"agwinterm_core.dll: exports missing");
     // Name BOTH numbers. The old message hardcoded "need v15", so it went stale on every bump and
     // never said what the dll actually reported — the one fact you need when the exe and the core
@@ -2345,6 +2353,10 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->cwd = cwd ? cwd : "";
     s->ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_activeWs : 0;   // into the active workspace
     s->emu = emu_new(cols, rows);
+    if (!emu_set_scrollback(s->emu, g_scrollbackLines.load())) {
+        if (s->emu) emu_free(s->emu);
+        delete s; return nullptr;
+    }
     // A CREATED session's host and emulator are both at this grid, so the latch says so: the first
     // syncPaneSizes at the same geometry is then the no-op it should be (it used to forward a
     // 0 -> N "change" the host reflowed on), and a session created while the window is minimised
@@ -2875,29 +2887,62 @@ static void loadFontSel() {
     }
     setDefaultFont();
 }
-static void loadColors() {   // Properties->Colors overrides (default fg/bg + on/off), persisted like the font
+static uint32_t configValue(const configuration::Key& key) {
+    using configuration::Id;
+    switch (key.id) {
+    case Id::Theme: return g_themeMode;
+    case Id::CustomColors: return g_customColors;
+    case Id::Foreground: return g_defFg;
+    case Id::Background: return g_defBg;
+    case Id::DosPalette: return g_dosPalette;
+    case Id::SidebarFont: return g_treeFontPt;
+    case Id::ShowSidebar: return g_showSidebar;
+    case Id::ShowToolbar: return g_showToolbar;
+    case Id::ShowStatus: return g_showStatus;
+    case Id::FlagView: return g_flagView;
+    case Id::RightClickPaste: return g_rightClickPaste;
+    case Id::CopyOnCtrlC: return g_copyOnCtrlC;
+    case Id::CopyOnSelect: return g_copyOnSelect.load();
+    case Id::Scrollback: return g_scrollbackLines.load();
+    }
+    return 0;
+}
+// Assignment only: startup before threads, or UI handler under g_lock. Effects run after unlock.
+static void assignConfig(const configuration::Key& key, uint32_t value) {
+    using configuration::Id;
+    switch (key.id) {
+    case Id::Theme: g_themeMode = value; break;
+    case Id::CustomColors: g_customColors = value != 0; break;
+    case Id::Foreground: g_defFg = value; break;
+    case Id::Background: g_defBg = value; break;
+    case Id::DosPalette: g_dosPalette = value != 0; break;
+    case Id::SidebarFont: g_treeFontPt = value; break;
+    case Id::ShowSidebar: g_showSidebar = value != 0; break;
+    case Id::ShowToolbar: g_showToolbar = value != 0; break;
+    case Id::ShowStatus: g_showStatus = value != 0; break;
+    case Id::FlagView: g_flagView = value != 0; break;
+    case Id::RightClickPaste: g_rightClickPaste = value != 0; break;
+    case Id::CopyOnCtrlC: g_copyOnCtrlC = value != 0; break;
+    case Id::CopyOnSelect: g_copyOnSelect = value != 0; break;
+    case Id::Scrollback: g_scrollbackLines = value; break;
+    }
+}
+static void loadColors() {   // config API and startup share key names, types, validation and defaults
+    for (const auto& key : configuration::keys) {
+        DWORD value = key.initial, sz = sizeof(value);
+        if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, key.registry, RRF_RT_REG_DWORD,
+                nullptr, &value, &sz) != ERROR_SUCCESS || !configuration::valid(key, value)) value = key.initial;
+        assignConfig(key, value);
+    }
     DWORD v, sz;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"CustomColors", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_customColors = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DefFg", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_defFg = v & 0xFFFFFF;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DefBg", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_defBg = v & 0xFFFFFF;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_dosPalette = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= TH_CLASSIC) g_themeMode = (int)v;
     // The same range `sidebar width` accepts (kSidebarMinW..kSidebarMaxW): one number set, two readers.
     // In range is not the same as fitting the window this instance saved (WinW-<instance>, read
     // later by loadWindowRect): the pair is checked against each other at the first WM_SIZE, once
     // the client width exists — fitSidebarToClient, from OnSize.
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (int)v >= kSidebarMinW && (int)v <= kSidebarMaxW) g_sidebarW = g_sidebarWPref = v;
-    // 0 = follow the shell. The range is clamped rather than trusted: this is a font height, and a
-    // hand-edited 2000 would make the sidebar a single unreadable row.
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (v == 0 || (v >= 6 && v <= 24))) g_treeFontPt = (int)v;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowSidebar", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showSidebar = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showToolbar = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_showStatus = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"FlagView", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_flagView = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"RightClickPaste", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_rightClickPaste = v != 0;
-    sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"CopyOnCtrlC", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_copyOnCtrlC = v != 0;
 }
-static void loadKeys() {   // configurable key bindings; absent = unbound (0)
+static void loadKeys(bool cleanupObsolete = true) {   // absent = seeded default or unbound (0)
+    std::fill(std::begin(g_keys), std::end(g_keys), (WORD)0);
     // Seeded defaults: palette and keyboard selection. Explicit registry zero still means unbound.
     // Any saved Keyboard settings override it — the dialog writes every action, including 0s.
     g_keys[KB_PALETTE] = MAKEWORD('P', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
@@ -2910,8 +2955,9 @@ static void loadKeys() {   // configurable key bindings; absent = unbound (0)
     // Font zoom was removed (raster faces only exist at their pack's strike sizes). The Keyboard
     // dialog wrote every action, so these linger in the registry on any machine that saved keys;
     // sweep them so an inspected key list matches the actions lite actually has.
-    for (const wchar_t* dead : { L"Key_ZoomIn", L"Key_ZoomOut", L"Key_ZoomReset" })
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegKey, dead);
+    if (cleanupObsolete)
+        for (const wchar_t* dead : { L"Key_ZoomIn", L"Key_ZoomOut", L"Key_ZoomReset" })
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, kRegKey, dead);
 }
 static void saveKeys() {
     for (int a = 0; a < KB_COUNT; a++) {
@@ -2919,19 +2965,17 @@ static void saveKeys() {
         RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, kKbInfo[a].reg, REG_DWORD, &v, sizeof(v));
     }
 }
-static void saveColors() {
-    DWORD v;
-    v = g_customColors ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"CustomColors", REG_DWORD, &v, sizeof(v));
-    v = g_defFg; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DefFg", REG_DWORD, &v, sizeof(v));
-    v = g_defBg; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DefBg", REG_DWORD, &v, sizeof(v));
-    v = g_dosPalette ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"DosPalette", REG_DWORD, &v, sizeof(v));
-    v = (DWORD)g_themeMode;   RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"Theme", REG_DWORD, &v, sizeof(v));
-    v = g_sidebarWPref; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", REG_DWORD, &v, sizeof(v));   // the ASKED width, never a transient fit
-    v = (DWORD)g_treeFontPt; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarFontPt", REG_DWORD, &v, sizeof(v));
-    v = g_showSidebar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowSidebar", REG_DWORD, &v, sizeof(v));
-    v = g_showToolbar ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowToolbar", REG_DWORD, &v, sizeof(v));
-    v = g_showStatus ? 1 : 0; RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ShowStatus", REG_DWORD, &v, sizeof(v));
-    v = g_flagView ? 1 : 0;   RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"FlagView", REG_DWORD, &v, sizeof(v));
+// UI actions must not publish unrelated values from this instance's stale HKCU snapshot.
+static void saveConfigValue(configuration::Id id) {
+    for (const auto& key : configuration::keys) if (key.id == id) {
+        DWORD value = configValue(key);
+        RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, key.registry, REG_DWORD, &value, sizeof(value));
+        return;
+    }
+}
+static void saveSidebarWidth() {
+    DWORD value = g_sidebarWPref; // the ASKED width, never a transient fit
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", REG_DWORD, &value, sizeof(value));
 }
 // Window geometry persistence. loadWindowRect resolves the saved rect (clamped onto a visible monitor
 // so an unplugged screen / resolution change can't strand the window off-screen) and is applied at
@@ -4784,7 +4828,7 @@ static void finishSelection(HWND h) {
         LockG lk;
         if (g_selWindow == h) {
             stopSelAuto();
-            if (g_sel.active) text = selectionText();
+            if (g_sel.active && g_copyOnSelect.load()) text = selectionText();
             g_sel.active = false; g_selWindow = nullptr; g_selFixedSpan = false;
         }
     }
@@ -5126,7 +5170,7 @@ static void palExec(int idx) {
     InvalidateRect(g_hwnd, nullptr, FALSE);
     if (a.theme >= 0) {
         g_themeMode = a.theme;
-        saveColors();
+        saveConfigValue(configuration::Id::Theme);
         applyTheme();
     } else if (a.idm) {
         PostMessageW(g_hwnd, WM_COMMAND, a.idm, 0);
@@ -5816,7 +5860,19 @@ static void fillSizeCombo(int sel) {   // sizes for the current face; disabled i
     EnableWindow(g_pSizeCombo, e.sizes.size() > 1);
 }
 static void propCommit() {
-    pickFont(g_pFace, g_pSize);   // applies the font, persists face+size
+    // Only edited fields are ours to persist. An unchanged dialog field may be a stale snapshot
+    // of a preference another process has since updated; OK/Apply must leave that registry value.
+    using configuration::Id;
+    const std::pair<Id, uint32_t> pending[] = {
+        {Id::CustomColors, (uint32_t)g_pUse}, {Id::Foreground, g_pFg}, {Id::Background, g_pBg},
+        {Id::DosPalette, (uint32_t)g_pDos}, {Id::SidebarFont, (uint32_t)g_pSidePt},
+        {Id::Theme, (uint32_t)g_pTheme}
+    };
+    std::vector<Id> changed;
+    for (const auto& value : pending)
+        for (const auto& key : configuration::keys)
+            if (key.id == value.first && configValue(key) != value.second) changed.push_back(key.id);
+    if (g_pFace != g_faceIdx || g_pSize != g_sizeIdx) pickFont(g_pFace, g_pSize);
     g_customColors = g_pUse; g_defFg = g_pFg; g_defBg = g_pBg; g_dosPalette = g_pDos;
     if (g_pSidePt != g_treeFontPt) { g_treeFontPt = g_pSidePt; applyTreeFont(); relayout(); }
     if (g_pTheme != g_themeMode) {   // theme switch: re-skin everything live, incl. this open dialog
@@ -5824,7 +5880,7 @@ static void propCommit() {
         applyTheme();
         themeDialog(g_pHwnd);
     }
-    saveColors();
+    for (Id id : changed) saveConfigValue(id);
     InvalidateRect(g_hwnd, nullptr, TRUE);
 }
 static LRESULT CALLBACK propDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -5840,7 +5896,7 @@ static LRESULT CALLBACK propDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case PID_SIDEFONT:
                     if (HIWORD(w) == CBN_SELCHANGE) {
                         int i = (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
-                        g_pSidePt = (i <= 0) ? 0 : 8 + i - 1;   // item 0 is "System default"
+                        g_pSidePt = (i <= 0) ? 0 : 6 + i - 1;   // item 0 is "System default"
                     }
                     break;
                 case PID_FONTLIST:
@@ -5922,7 +5978,7 @@ static LRESULT CALLBACK propDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     return DefWindowProcW(h, m, w, l);
 }
-static void showPropertiesDialog() {
+static void showPropertiesDialog(bool activate = true) {
     static bool reg = false;
     HINSTANCE inst = GetModuleHandleW(nullptr);
     if (!reg) {
@@ -5974,27 +6030,26 @@ static void showPropertiesDialog() {
     mk(L"STATIC", L"Sidebar text:", 0, 16, 372, 80, 16, 0);
     g_pSideFontCombo = mk(L"COMBOBOX", L"", WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, 100, 368, 156, 220, PID_SIDEFONT);
     SendMessageW(g_pSideFontCombo, CB_ADDSTRING, 0, (LPARAM)L"System default");
-    for (int pt = 8; pt <= 20; pt++) {
+    for (int pt = 6; pt <= 24; pt++) {
         wchar_t lbl[16]; wsprintfW(lbl, L"%d pt", pt);
         SendMessageW(g_pSideFontCombo, CB_ADDSTRING, 0, (LPARAM)lbl);
     }
     g_pSidePt = g_treeFontPt;
-    SendMessageW(g_pSideFontCombo, CB_SETCURSEL, g_pSidePt ? (g_pSidePt - 8 + 1) : 0, 0);
+    SendMessageW(g_pSideFontCombo, CB_SETCURSEL, g_pSidePt ? (g_pSidePt - 6 + 1) : 0, 0);
     SetWindowSubclass(g_pSideFontCombo, comboProc, 1, 0);
     mk(L"BUTTON", L"OK", BS_OWNERDRAW, 120, 436, 78, 26, IDOK);
     mk(L"BUTTON", L"Cancel", BS_OWNERDRAW, 204, 436, 78, 26, IDCANCEL);
     mk(L"BUTTON", L"Apply", BS_OWNERDRAW, 288, 436, 78, 26, PID_APPLY);
     themeDialog(g_pHwnd);   // dark title bar + DarkMode styles when the dark theme is active
     EnableWindow(g_hwnd, FALSE);
-    ShowWindow(g_pHwnd, SW_SHOW);
+    ShowWindow(g_pHwnd, activate ? SW_SHOW : SW_SHOWNOACTIVATE);
     MSG msg;
     while (IsWindow(g_pHwnd)) {
         if (!GetMessageW(&msg, nullptr, 0, 0)) { PostQuitMessage((int)msg.wParam); break; }
         if (!IsDialogMessageW(g_pHwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     EnableWindow(g_hwnd, TRUE);
-    SetForegroundWindow(g_hwnd);
-    SetFocus(g_hwnd);
+    if (activate) { SetForegroundWindow(g_hwnd); SetFocus(g_hwnd); }
 }
 
 // ---- Keyboard bindings dialog (native hotkey controls; every binding can be cleared) ----
@@ -6929,7 +6984,7 @@ static void toggleFlagView() {
     if (g_hwnd) CheckMenuItem(GetMenu(g_hwnd), IDM_FLAGVIEW, MF_BYCOMMAND | (g_flagView ? MF_CHECKED : MF_UNCHECKED));
     if (g_toolbar) SendMessageW(g_toolbar, TB_CHECKBUTTON, IDM_FLAGVIEW, MAKELPARAM(g_flagView, 0));
     refreshTree();
-    saveColors();   // FlagView persists with the other view toggles
+    saveConfigValue(configuration::Id::FlagView);
 }
 // Focus a workspace: the sidebar narrows to it (the full app's focus pill, lite-style — the toggle
 // lives on the workspace's context menu and in View). Focusing again, or focusing -1, unfocuses.
@@ -6944,6 +6999,111 @@ static void toggleFocusWs(int w) {
 // CFrameWindowImpl gives the frame window traits, class registration and the message-map plumbing;
 // the sidebar tree / toolbar / status bar are WTL control wrappers over the same native controls.
 // Message crackers (MSG_WM_*) replace the old hand-rolled switch — the semantics are unchanged.
+// Configuration work is owned by a queue, not by a raw LPARAM. A timed-out caller can safely
+// leave while the UI finishes. Pending cancellation wins before any side effect; a running
+// timeout explicitly makes no promise about the result. Never wait here while holding g_lock.
+struct ConfigRequest {
+    JsonReq request;
+    std::string result;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<int> state{0}; // pending, running, done, cancelled
+    ~ConfigRequest() { if (done) CloseHandle(done); }
+};
+static std::mutex g_configMutex;
+static std::deque<std::shared_ptr<ConfigRequest>> g_configRequests;
+static bool g_settingsOpenQueued = false; // UI-owned; coalesce requests until the command runs
+static std::string configOnUi(const JsonReq& req) {
+    using configuration::Id;
+    const auto& cmd = req.get("cmd");
+    if (cmd == "theme.list") return ctlOkStr("auto\nlight\ndark\nclassic");
+    if (cmd == "config.list") {
+        LockG hold; std::string result;
+        for (const auto& key : configuration::keys) {
+            if (!result.empty()) result += '\n';
+            result += std::string(key.name) + " = " + configuration::format(key, configValue(key));
+        }
+        return ctlOkStr(result);
+    }
+    const bool theme = cmd == "theme.set";
+    const auto name = configuration::normalized(theme ? "theme" : req.get("args.key"));
+    const auto* key = configuration::find(name);
+    if (cmd == "config.get") {
+        if (!key) return ctlErr("unknown config key '" + name + "'");
+        LockG hold; return ctlOkStr(configuration::format(*key, configValue(*key)));
+    }
+    // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
+    // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
+    if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return ctlErr("a modal dialog is open or queued; configuration unchanged");
+    if (cmd == "settings.open") {
+        if (!PostMessageW(g_hwnd, WM_COMMAND, IDM_PROPERTIES, 0)) return ctlErr("settings could not be queued");
+        g_settingsOpenQueued = true;
+        return ctlOkStr("settings open requested");
+    }
+    if (cmd == "keymap.reload") { loadKeys(false); return ctlOkStr("keymap reloaded"); }
+    if (!key) return ctlErr("unknown config key '" + name + "'");
+    uint32_t value = 0;
+    if (!configuration::parse(*key, req.get(theme ? "args.name" : "args.value"), value))
+        return ctlErr(theme ? "theme not found" : "invalid value for config key '" + name + "'");
+    DWORD stored = value;
+    const LSTATUS saved = RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, key->registry,
+                                        REG_DWORD, &stored, sizeof(stored));
+    if (saved != ERROR_SUCCESS)
+        return ctlErr("config could not be saved (Windows error " + std::to_string(saved) + "); configuration unchanged");
+    { LockG hold; assignConfig(*key, value); }
+    // Changing one key must not publish stale unrelated preferences, including through UI actions.
+    switch (key->id) {
+    case Id::Theme: applyTheme(); break;
+    case Id::SidebarFont: applyTreeFont(); relayout(); break;
+    case Id::ShowSidebar: case Id::ShowToolbar: case Id::ShowStatus: {
+        const UINT menu = key->id == Id::ShowSidebar ? IDM_TG_SIDEBAR :
+            key->id == Id::ShowToolbar ? IDM_TG_TOOLBAR : IDM_TG_STATUS;
+        CheckMenuItem(GetMenu(g_hwnd), menu, MF_BYCOMMAND | (value ? MF_CHECKED : MF_UNCHECKED));
+        relayout(); break;
+    }
+    case Id::FlagView:
+        CheckMenuItem(GetMenu(g_hwnd), IDM_FLAGVIEW, MF_BYCOMMAND | (value ? MF_CHECKED : MF_UNCHECKED));
+        if (g_toolbar) SendMessageW(g_toolbar, TB_CHECKBUTTON, IDM_FLAGVIEW, MAKELPARAM(value, 0));
+        refreshTree(); break;
+    default: break;
+    }
+    for (HWND h : {g_hwnd, g_quickHwnd, g_scratchHwnd, g_overlayHwnd})
+        if (h) InvalidateRect(h, nullptr, FALSE);
+    if (theme) return ctlOkStr("theme set");
+    return ctlOkStr(name + " = " + configuration::format(*key, value) +
+        (key->id == Id::Scrollback ? "  (applies to new surfaces)" : ""));
+}
+static void drainConfigRequests() {
+    std::deque<std::shared_ptr<ConfigRequest>> requests;
+    { std::lock_guard<std::mutex> guard(g_configMutex); requests.swap(g_configRequests); }
+    for (auto& call : requests) {
+        int pending = 0;
+        if (!call->state.compare_exchange_strong(pending, 1)) continue;
+        try { call->result = configOnUi(call->request); }
+        catch (...) { call->result = ctlErr("configuration request failed; outcome unknown; read back the setting"); }
+        call->state = 2; SetEvent(call->done);
+    }
+}
+static std::string dispatchConfig(const JsonReq& req) {
+    auto call = std::make_shared<ConfigRequest>(); call->request = req;
+    if (!call->done) return ctlErr("configuration request could not be created");
+    {
+        std::lock_guard<std::mutex> guard(g_configMutex);
+        if (g_configRequests.size() >= 64) return ctlErr("configuration queue is full; nothing queued");
+        g_configRequests.push_back(call);
+        if (!PostMessageW(g_hwnd, WM_APP_CONFIG, 0, 0)) {
+            g_configRequests.pop_back(); return ctlErr("the window is closing; configuration unchanged");
+        }
+    }
+    if (WaitForSingleObject(call->done, 5000) == WAIT_OBJECT_0) return call->result;
+    int pending = 0; const bool cancelled = call->state.compare_exchange_strong(pending, 3);
+    {
+        std::lock_guard<std::mutex> guard(g_configMutex);
+        g_configRequests.erase(std::remove(g_configRequests.begin(), g_configRequests.end(), call), g_configRequests.end());
+    }
+    return ctlErr(cancelled ? "configuration request timed out before execution; configuration unchanged" :
+        "configuration request timed out; outcome unknown; read back the setting");
+}
+
 class CMainFrame : public CFrameWindowImpl<CMainFrame> {
 public:
     DECLARE_FRAME_WND_CLASS_EX(L"AgwintermLite", 0, CS_DBLCLKS, COLOR_WINDOW)
@@ -6984,6 +7144,7 @@ public:
         MESSAGE_HANDLER(WM_APP_HOSTACT, OnHostAction)
         MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
         MESSAGE_HANDLER(WM_APP_PANEEXIT, OnPaneExit)
+        MESSAGE_HANDLER(WM_APP_CONFIG, OnConfig)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -7144,7 +7305,7 @@ public:
         if (nFlags & MK_LBUTTON) extendSelection(m_hWnd, pt.x, pt.y);
     }
     void OnLButtonUp(UINT, CPoint pt) {
-        if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveColors(); return; }   // persist the new width
+        if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveSidebarWidth(); return; }
         if (g_selWindow == m_hWnd) finishSelection(m_hWnd);
         else mouseReport(pt.x, pt.y, 0, false, false);
     }
@@ -7306,6 +7467,7 @@ public:
         return 0;
     }
     LRESULT OnUpdateStatus(UINT, WPARAM, LPARAM, BOOL&) { updateStatus(); return 0; }   // hostResize's post (lite #25)
+    LRESULT OnConfig(UINT, WPARAM, LPARAM, BOOL&) { drainConfigRequests(); return 0; }
     LRESULT OnTray(UINT, WPARAM, LPARAM lp, BOOL&) {
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) showTrayMenu();
         else if (LOWORD(lp) == WM_LBUTTONDBLCLK) showMainWindow();
@@ -7321,11 +7483,11 @@ public:
     // `sidebar width N` stored g_sidebarW on a control-pipe thread and posted this. The layout runs
     // HERE because relayout() SENDS WM_SIZE — from a pipe thread that is a cross-thread SendMessage,
     // which is never made while g_lock may be held (#20). Hidden: nothing to lay out, the width is
-    // what the next show uses; it is still persisted so it survives a restart. Same save path as
-    // the splitter drag and the View toggles.
+    // what the next show uses; it is still persisted so it survives a restart. Like the splitter
+    // drag, this writes only SidebarW, never unrelated settings from this process's snapshot.
     LRESULT OnSidebarWidth(UINT, WPARAM, LPARAM, BOOL&) {
         if (g_showSidebar) relayout();   // repositions the tree (OnSize) and syncPaneSizes()
-        saveColors();
+        saveSidebarWidth();
         return 0;
     }
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
@@ -7663,7 +7825,11 @@ public:
                 refreshTree();
                 break;
             }
-            case IDM_PROPERTIES: showPropertiesDialog(); break;
+            case IDM_PROPERTIES: {
+                bool api = g_settingsOpenQueued; g_settingsOpenQueued = false;
+                if (::IsWindowEnabled(g_hwnd)) showPropertiesDialog(!api);
+                break;
+            }
             case IDM_KEYBOARD: showKeyboardDialog(); break;
             case IDM_PALETTE: togglePalette(); break;
             case IDM_READONLY: toggleReadOnly(); break;
@@ -7674,7 +7840,9 @@ public:
                 bool& b = id == IDM_TG_SIDEBAR ? g_showSidebar : id == IDM_TG_TOOLBAR ? g_showToolbar : g_showStatus;
                 b = !b;
                 CheckMenuItem(GetMenu(), id, MF_BYCOMMAND | (b ? MF_CHECKED : MF_UNCHECKED));
-                relayout(); saveColors();
+                relayout();
+                saveConfigValue(id == IDM_TG_SIDEBAR ? configuration::Id::ShowSidebar :
+                    id == IDM_TG_TOOLBAR ? configuration::Id::ShowToolbar : configuration::Id::ShowStatus);
                 break;
             }
             case IDM_FLAG: toggleFocusedFlag(); break;
@@ -8814,7 +8982,8 @@ popup terminals (overlay, quick and scratch). It highlights without copying. Ctr
 seeded chord; Ctrl+Shift+M toggles mark mode at the caret (both rebindable/clearable in File → Keyboard).
 In mark mode arrows and Home/End extend; Enter or Ctrl+C copies, exits and keeps the highlight;
 Esc or the configured mark chord clears and exits. A surface/screen change also ends the mode.
-Double/triple-click selects a word/line and copies on button release; dragging beyond the edge
+Double/triple-click selects a word/line and copies on button release when copy-on-select is on
+(the default); dragging beyond the edge
 auto-scrolls. Wheel, drag and mark mode never expose main-screen history on the alt screen.
 `selection copy` posts the selected text to the Windows clipboard and clears the highlight; `copied N chars`
 counts UTF-8 bytes, unlike the full app's UTF-16 count. Allow the next UI message before reading
@@ -8854,6 +9023,26 @@ but does not redirect v1 search). Unicode matches are highlighted in cells, the 
 and others amber, with FIND in the status bar. Counts are as of the last call; changed rows do not
 paint stale highlights. The alt screen never scrolls into history. No find bar or Ctrl+F binding.
 
+## Configuration (P10a)
+
+`config list` returns supported `key = value` lines; `config get KEY` reads a value;
+`config set KEY VALUE` validates and saves only that HKCU setting, applying to this instance.
+Other running instances are unchanged. Unknown keys/invalid values refuse. Mutations also refuse
+while a modal dialog is open or queued, preserving its unsaved edits. A running request that
+times out reports an unknown outcome: read back before retrying.
+
+Keys: `theme` (auto/dark/light/classic), `foreground`/`background` (#RRGGBB, used with custom-colors),
+`sidebar-font-size` (0 or6..24), `scrollback-lines` (0..1000000, default5000, new surfaces only),
+and booleans `custom-colors`, `dos-palette`, `show-sidebar`, `show-toolbar`, `show-status`,
+`flag-view`, `right-click-paste`, `copy-on-ctrl-c`, `copy-on-select` (true/false/on/off/1/0).
+`theme list/set` exposes lite's four UI modes, not the full terminal-theme catalog. `settings`
+requests Properties without raising the terminal (`settings open requested`). `keymap reload`
+re-reads registry bindings, resetting deleted entries to default/unbound and keeping explicit zero.
+With copy-on-select off, mouse release and `selection finalize` do not write the clipboard;
+finalize replies `finalized (copy-on-select off)`. Explicit Copy/mark Enter/Ctrl+C still copy.
+Scrollback affects newly created local replicas, including adoption, not existing buffers or the
+host cap. Font targeting, custom profiles, OMP and captured-command replay remain P10b work.
+
 ## What this terminal does NOT have
 
 Do not reach for these - they exist in the full agwinterm and will be refused here with
@@ -8861,8 +9050,8 @@ Do not reach for these - they exist in the full agwinterm and will be refused he
 
 `session background` (lite draws no images),
 `command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
-`config get|set|list`, `profiles list|reload`, `theme list|set`, `omp list|set`, `image show|sixel`,
-`font`, `keymap reload`, `restore clear`, `install hooks|shell|cli`, `claude *`.
+`profiles list|reload`, `omp list|set`, `image show|sixel`,
+`font`, `restore clear`, `install hooks|shell|cli`, `claude *`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
 result with `session output` or `session text`.
@@ -8908,6 +9097,10 @@ static std::string ctlDispatch(const std::string& line) {
     size_t i = 0;
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
+
+    if (cmd == "config.get" || cmd == "config.list" || cmd == "config.set" ||
+        cmd == "theme.list" || cmd == "theme.set" || cmd == "settings.open" || cmd == "keymap.reload")
+        return dispatchConfig(req); // app-global: before target resolution, with no g_lock held
 
     // The compiled version, never a literal: `agwintermctl version` reports the app serving the pipe
     // from this reply (the way agwinterm's ping says "agwinterm " + AppVersion()), and the About box
@@ -10341,6 +10534,7 @@ static std::string ctlDispatch(const std::string& line) {
         }
         syncSelection();
         bool finalize = cmd == "selection.finalize";
+        if (finalize && !g_copyOnSelect.load()) return ctlOkStr("finalized (copy-on-select off)");
         if (!g_sel.isFor(target)) return ctlOkStr(finalize ? "finalized (empty)" : "no selection");
         std::string text = selectionText();
         if (text.find_first_not_of("\r\n ") == std::string::npos) {
@@ -11006,6 +11200,7 @@ static Session* failedSpecSession(const RestoreSpec& sp, int cols, int rows) {
     s->failed = true;
     s->cols = cols; s->rows = rows;
     s->emu = emu_new(cols, rows);
+    if (s->emu) emu_set_scrollback(s->emu, g_scrollbackLines.load());
     // Say it in the pane as well as the tree: the terminal is where the user looks first, and "why
     // is this session dead?" has to be answerable without opening the log.
     std::string msg = "\r\n  [agliteterm] this session could not be restored on this machine.\r\n"
