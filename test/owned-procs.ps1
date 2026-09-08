@@ -81,10 +81,16 @@ function Stop-OwnedRow($row, [string]$why) {
 # the user's own, a peer's sandbox) to start the shell over ConPTY. So the host's children are not
 # a proof of anything: a second window opened mid-run has its shells under the same host, and a
 # walk window -> host -> shell would claim them (Codex's read of #49, 2026-09-08). What proves a
-# shell the suite's own is the shell itself: the suite types `AGWSHELL=$PID` into the pane over the
-# sandbox's own control pipe and reads the answer back off that pane's screen (Register-PaneShell).
-# A pid that came out of a pane of a window this run started is that pane's shell, whatever process
-# started it; the ledger pins it there and then (New-Tracked), and from that shell on the chain is
+# shell the suite's own is the shell itself: the suite types a FRESH challenge (a nonce this call
+# made up) into the pane over the sandbox's own control pipe and reads back, off that pane's
+# screen, the one line that answers THAT nonce with the shell's own pid AND its own start time
+# (Ask-PaneShell). An answer to any earlier challenge - a screen restored from a previous run, a
+# probe typed twice - names no nonce of this call and is not an answer; and the start time is what
+# ties the pid to one process: the ledger admits the pid only if the process running under it now
+# was born when the answer said (Register-OwnedShell), so a pid Windows reused since cannot be
+# admitted on the strength of a line an earlier owner of it printed. A pid that came out of a pane
+# of a window this run started, checked so, is that pane's shell, whatever process started it; the
+# ledger pins it there and then (New-Tracked), and from that shell on the chain is
 # proven hop by hop as before - a ping is a PING.EXE child of a tracked shell, born after it and
 # before it exited. A shell that was never registered (a second window's, a peer's) has no record,
 # and nothing under it is ever the suite's. The proof has to be taken WHILE the chain is alive: a
@@ -96,6 +102,12 @@ function Stop-OwnedRow($row, [string]$why) {
 # typing the same marker, the user's own window - is reported and left running; Stop-OwnedPings
 # stops only what the ledger holds, and through the handle it holds. The marker (`-n 311 127.0.0.1`)
 # tells the suite's pings apart from each other; it is never the proof that one is the suite's.
+#
+# A stop that did not happen is a FAILURE of the suite, not a note in its output: a kill that threw,
+# a process still alive after the wait, a ledger walk that could not enumerate - each is recorded
+# (Teardown-Failed) and the suite's verdict reads the record (Take-TeardownFailures) before it says
+# PASS or "all passed". The stop helpers never throw: a teardown stage that dies must not take the
+# stages after it (the sandbox, the registry) down with it, so they catch, record, and go on.
 $script:ledgerWindows = @()     # the Process objects a suite started, pinned (their teardown goes through these)
 $script:ledgerShells  = @{}     # "pid|birth" -> tracked shell that answered $PID in a pane of ours
 $script:ledgerPings   = @{}     # "pid|birth" -> tracked PING.EXE child of a tracked shell
@@ -106,43 +118,74 @@ function Register-OwnedWindow($proc) { if ($proc) { Pin-Owned $proc; $script:led
 # get its own record, not be mistaken for the record whose pid it inherited.
 function Ledger-Key($row) { "$($row.ProcessId)|$($row.CreationDate.Ticks)" }
 
-# The line a pane's shell prints when asked for its pid, and the pid read back off the screen: the
-# answer line only (`AGWSHELL=` followed by digits to the end of the line), never the echo of the
-# command that asked, which carries `$PID` unexpanded. $null when the screen does not show one yet.
-$script:shellPidProbe = "[Console]::Out.WriteLine('AGWSHELL=' + `$PID)`n"
-function Find-ShellPid([string]$text) {
-    $m = [regex]::Matches($text, '(?m)^AGWSHELL=(\d+)\s*$')
-    if ($m.Count) { [int]$m[$m.Count - 1].Groups[1].Value } else { $null }
+# Teardown failures: what a stop helper could not do. Recorded, never thrown (a throw would skip
+# the cleanup after it); the suite takes the record into its verdict. A stop helper that returns
+# normally has therefore NOT necessarily stopped everything - the record says.
+$script:teardownFailures = @()
+function Teardown-Failed([string]$what) {
+    $script:teardownFailures += $what
+    "        TEARDOWN INCOMPLETE: $what"
+}
+# The failures recorded since the last take, and a clean slate for the next cell.
+function Take-TeardownFailures { $f = @($script:teardownFailures); $script:teardownFailures = @(); $f }
+
+# A fresh challenge each time, and the line the pane's shell prints to answer it: the nonce, its own
+# pid, and its own start time (UTC ticks - the kernel's creation time of THAT process, which a reused
+# pid does not inherit). The echo of the typed command carries `$PID` unexpanded and never matches
+# the answer's shape (digits right after `=`); an answer to another nonce is not this call's.
+function New-ShellNonce { -join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
+function Shell-Challenge([string]$nonce) {
+    "[Console]::Out.WriteLine('AGWSHELL-$nonce=' + `$PID + '|' + (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)`n"
+}
+function Find-ShellAnswer([string]$text, [string]$nonce) {
+    $m = [regex]::Matches($text, "(?m)^AGWSHELL-$nonce=(\d+)\|(\d+)\s*$")
+    if ($m.Count) { @{ Pid = [int]$m[$m.Count - 1].Groups[1].Value; BornUtcTicks = [long]$m[$m.Count - 1].Groups[2].Value } } else { $null }
 }
 
-# Track a shell by the pid it answered in a pane of ours. The row must be alive now: a pid the pane
-# printed a moment ago and that is gone already is not a shell anything can be typed into.
-function Register-OwnedShell([int]$ShellPid) {
+# Ask a pane for its shell's identity: $Type types one string into the pane, $Text reads the pane's
+# screen back (both over the sandbox's own control pipe - that is what makes the answer the
+# suite's). Returns @{ Pid; BornUtcTicks } - the answer to THIS call's nonce, nothing older - or
+# throws, naming the screen, when none shows within $ms. Registers nothing: the identity is a fact
+# about the pane; vouching for it is Register-OwnedShell.
+function Ask-PaneShell([scriptblock]$Type, [scriptblock]$Text, [int]$ms = 8000) {
+    $nonce = New-ShellNonce
+    & $Type (Shell-Challenge $nonce)
+    $seen = ''
+    for ($k = 0; $k -lt ($ms / 200); $k++) {
+        $seen = [string](& $Text)
+        $a = Find-ShellAnswer $seen $nonce
+        if ($a) { return $a }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "the pane never answered AGWSHELL-$nonce=<pid>|<born> within $ms ms; its screen: $seen"
+}
+
+# Track a shell by the identity its pane answered: the pid must be running NOW, and the process
+# running under it must have been born when the answer said (to the 100 ms the two clocks agree
+# to, as Open-Owned) - otherwise the pid has been reused and the answer was another process's.
+# Returns the ledger key.
+function Register-OwnedShell([int]$ShellPid, [long]$BornUtcTicks) {
     $row = Get-ProcRow $ShellPid
     if (-not $row) { throw "the pane answered shell pid $ShellPid, which is not running" }
+    $rowBorn = $row.CreationDate.ToUniversalTime().Ticks
+    if ([math]::Abs($rowBorn - $BornUtcTicks) -gt 1000000) {
+        throw "the pane answered shell pid $ShellPid born at $BornUtcTicks, but the process running under pid $ShellPid now was born at ${rowBorn}: a reused pid, not the shell that answered"
+    }
     $k = Ledger-Key $row
     if (-not $script:ledgerShells.ContainsKey($k)) { $script:ledgerShells[$k] = New-Tracked $row }
     if (-not (Tracked-Alive $script:ledgerShells[$k])) { throw "shell pid $ShellPid could not be pinned; nothing typed into it can be proven" }
     $k
 }
 
-# Ask a pane for its shell's pid and register it: $Type types one string into the pane, $Text reads
-# the pane's screen back (both over the sandbox's own control pipe - that is what makes the answer
-# the suite's). Throws, naming the screen, when no answer shows within $ms.
+# Ask and vouch in one step: the identity the pane answers this call's challenge with, registered.
 function Register-PaneShell([scriptblock]$Type, [scriptblock]$Text, [int]$ms = 8000) {
-    & $Type $script:shellPidProbe
-    $seen = ''
-    for ($k = 0; $k -lt ($ms / 200); $k++) {
-        $seen = [string](& $Text)
-        $shellPid = Find-ShellPid $seen
-        if ($shellPid) { return (Register-OwnedShell $shellPid) }
-        Start-Sleep -Milliseconds 200
-    }
-    throw "the pane never answered AGWSHELL=<pid> within $ms ms; its screen: $seen"
+    $a = Ask-PaneShell $Type $Text $ms
+    Register-OwnedShell $a.Pid $a.BornUtcTicks
 }
 
 # One walk shell -> ping over a single process snapshot; every ping not yet on the ledger is tracked
-# now, while it can still be pinned. Cheap enough to call from a 200 ms poll.
+# now, while it can still be pinned. Cheap enough to call from a 200 ms poll. Throws when the
+# snapshot cannot be taken; the stop helpers catch that and record it.
 function Update-OwnedLedger {
     $all = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'")
     foreach ($sh in @($script:ledgerShells.Values)) {
@@ -167,22 +210,35 @@ function Describe-ForeignPings([string]$n) {
         ForEach-Object { "ping pid $($_.ProcessId) (parent pid $($_.ParentProcessId), born $($_.CreationDate.ToString('HH:mm:ss.fff'))) carries -n $n but is not under a shell this run can prove its own" })
 }
 
-# Stop the ledger's pings with a marker, each through the handle that was checked when it was
-# tracked; wait for each to go. Then say what carried the marker and was left alone.
+# Stop one tracked ping through the handle that was checked when it was tracked, and wait for it to
+# go. Anything short of "gone" is a recorded failure: a Kill that threw on a live process, a wait
+# that ran out, a process still there afterwards.
+function Stop-TrackedPing($t) {
+    "        (stopping owned ping pid $($t.Pid): $($t.CommandLine))"
+    try { $t.Proc.Kill() } catch { if (-not $t.Proc.HasExited) { Teardown-Failed "ping pid $($t.Pid): Kill threw: $($_.Exception.Message)"; return } }
+    $waited = $false
+    try { $waited = [bool]$t.Proc.WaitForExit(3000) } catch { Teardown-Failed "ping pid $($t.Pid): WaitForExit threw: $($_.Exception.Message)"; return }
+    if (-not $waited -or -not $t.Proc.HasExited) { Teardown-Failed "ping pid $($t.Pid) is still alive after the stop" }
+}
+
+# Walk the ledger without throwing: a snapshot that cannot be taken is recorded, and what the ledger
+# already holds is still stopped.
+function Update-OwnedLedgerOrRecord {
+    try { Update-OwnedLedger } catch { Teardown-Failed "could not walk the ledger's shells for their pings: $($_.Exception.Message)" }
+}
+
+# Stop the ledger's pings with a marker, each through its own handle. Then say what carried the
+# marker and was left alone. Never throws; failures are on the record.
 function Stop-OwnedPings([string]$n) {
-    foreach ($t in Get-OwnedPings $n) {
-        "        (stopping owned ping pid $($t.Pid): $($t.CommandLine))"
-        try { $t.Proc.Kill(); [void]$t.Proc.WaitForExit(3000) } catch { "        (could not stop pid $($t.Pid): $($_.Exception.Message))" }
-    }
-    foreach ($line in Describe-ForeignPings $n) { "        (NOT stopping $line)" }
+    Update-OwnedLedgerOrRecord
+    foreach ($t in @($script:ledgerPings.Values | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" -and (Tracked-Alive $_) })) { Stop-TrackedPing $t }
+    try { foreach ($line in Describe-ForeignPings $n) { "        (NOT stopping $line)" } } catch { "        (could not list foreign pings: $($_.Exception.Message))" }
 }
 
 # Every ping the ledger holds, whatever its marker: a teardown that runs after a throw does not know
 # which markers the block got as far as typing. Only the ledger's, only through their handles.
+# Never throws; failures are on the record.
 function Stop-AllOwnedPings {
-    Update-OwnedLedger
-    foreach ($t in @($script:ledgerPings.Values | Where-Object { Tracked-Alive $_ })) {
-        "        (stopping owned ping pid $($t.Pid): $($t.CommandLine))"
-        try { $t.Proc.Kill(); [void]$t.Proc.WaitForExit(3000) } catch { "        (could not stop pid $($t.Pid): $($_.Exception.Message))" }
-    }
+    Update-OwnedLedgerOrRecord
+    foreach ($t in @($script:ledgerPings.Values | Where-Object { Tracked-Alive $_ })) { Stop-TrackedPing $t }
 }

@@ -1501,8 +1501,9 @@ try {
         $stateFile = Join-Path $s.AppDir "agliteterm\sessions-$($s.Pipe).tsv"
         function KLines { @((Get-Content $stateFile -Raw) -split "`n" | Where-Object { $_ -like "K`t*" } | ForEach-Object { $_.TrimEnd("`r") }) }
         # The pings: `-n 3xx 127.0.0.1` is the marker that tells them apart; the ledger in
-        # test/owned-procs.ps1 is what proves one the sandbox's own (the pane's shell answers its own
-        # $PID on the sandbox's screen - Own-Shell - then shell -> ping, walked while alive; the
+        # test/owned-procs.ps1 is what proves one the sandbox's own (the pane's shell answers a fresh
+        # challenge with its pid and start time on the sandbox's screen - Own-Shell - then shell ->
+        # ping, walked while alive; the
         # pty-host is one per machine and shared, so descent from it proves nothing), and the only
         # thing a stop goes through. A marker ping it cannot
         # vouch for - a peer's sandbox, a leftover of an aborted run - is reported and left alone, and
@@ -2952,16 +2953,21 @@ finally {
     # The capture block's pings first, while their shells are alive to vouch for them (a check that
     # threw leaves them running for minutes): only the ledger's, only through the handles it holds -
     # a marker sweep would take a peer's sandbox's ping, or the user's, with them (Codex's read of #49).
+    # Each stage on its own: one that dies is recorded and the next still runs - the registry is
+    # restored whether or not the sandbox went quietly.
     Stop-AllOwnedPings
-    if ($s) { Stop-Sandbox $s }
+    try { if ($s) { Stop-Sandbox $s } } catch { Teardown-Failed "the sandbox could not be stopped: $($_.Exception.Message)" }
     # The second sandbox's geometry values are its own; they were seeded here, so they go.
     foreach ($n in 'WinX', 'WinY', 'WinW', 'WinH', 'WinMax') {
         if (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name "$n-ctlhonesty23" -ErrorAction SilentlyContinue }
     }
     # After the sandbox exits: its own shutdown save (if any) must not land after the restore.
-    Restore-Reg
+    try { Restore-Reg } catch { Teardown-Failed "the registry could not be restored: $($_.Exception.Message)" }
 }
 
+# A teardown the suite could not complete is a failure of the suite, above every check that passed.
+$tf = @(Take-TeardownFailures)
+if ($tf.Count) { "control-honesty: TEARDOWN INCOMPLETE: $($tf -join '; ')"; exit 1 }
 if ($fail) { "control-honesty: $fail failed"; exit 1 }
 if ($skipped -and $Strict) { "control-honesty: $skipped skipped under -Strict"; exit 1 }
 "control-honesty: all passed$(if ($skipped) { " ($skipped skipped)" })"
