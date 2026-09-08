@@ -1,4 +1,6 @@
 #include "../src/configuration.h"
+#include "../src/profiles.h"
+#include "../src/shell_configuration.h"
 #include <cstdio>
 #include <set>
 static int checks = 0, failed = 0;
@@ -19,7 +21,7 @@ int main() {
         check(!parse(key, "no-such-value", out), "unknown value refuses");
         check(!parse(key, std::string("1\0x", 3), out), "embedded NUL refuses");
     }
-    check(names.size() == 14 && registry.size() == 14, "all fourteen supported keys covered");
+    check(names.size() == 15 && registry.size() == 15, "all fifteen supported keys covered");
     check(find("font-size") == nullptr && find("") == nullptr, "unsupported keys stay unsupported");
     check(normalized(" \tCoPy-On-SeLeCt\r\n") == "copy-on-select", "key normalization");
     auto probe = [](const char* key, const char* text, bool good, uint32_t expected) {
@@ -40,6 +42,54 @@ int main() {
     for (auto word : {"1", "5", "25", "-6", "+6", "6.0", "6x"}) probe("sidebar-font-size", word, false, 0);
     probe("scrollback-lines", "0", true, 0); probe("scrollback-lines", "1000000", true, 1000000);
     for (auto word : {"1000001", "4294967296", "99999999999999999999999999", "-1", "1e3"}) probe("scrollback-lines", word, false, 0);
+    profiles::Catalog catalog; std::string error;
+    const std::string validProfile = R"({"default":"test","profiles":[{"name":"Test","command":"pwsh.exe","args":["","a b","x\\y","\"quoted\"","\ud83d\ude80"],"cwd":"C:\\work"}]})";
+    check(profiles::parse(validProfile, catalog, error) && error.empty(), "valid profile catalog");
+    check(catalog.find("TEST") && !catalog.find("Tes"), "profile names exact, ASCII case insensitive");
+    check(catalog.entries[0].args == std::vector<std::string>({"", "a b", "x\\y", "\"quoted\"", "\xf0\x9f\x9a\x80"}), "profile argv preserves empty, whitespace, slash, quote, astral");
+    check(profiles::parse("\xef\xbb\xbf\r\n" + validProfile, catalog, error), "UTF-8 BOM and JSON whitespace");
+    auto badCatalog = [&](const std::string& s) {
+        const auto previous = catalog.entries[0].args;
+        check(!profiles::parse(s, catalog, error) && !error.empty() && catalog.entries[0].args == previous, "bad catalog preserves output");
+    };
+    for (const auto& bad : {"", "{}", "[]", "null", "{", "{\"default\":1}", "{\"default\":\"x\",\"profiles\":[]}",
+            "{\"default\":\"x\",\"default\":\"x\",\"profiles\":[]}", "{\"default\":\"x\",\"profiles\":[],}",
+            "{\"default\":\"x\",\"profiles\":[null]}"}) badCatalog(bad);
+    auto envelope = [](const std::string& entry) { return "{\"default\":\"x\",\"profiles\":[" + entry + "]}"; };
+    for (const std::string& field : {"\"env\":{\"K\":\"V\"}", "\"elevate\":true", "\"icon\":\"glyph\"", "\"unknown\":null",
+            "\"args\":false", "\"args\":[1]", "\"args\":[\"\\u0000\"]", "\"cwd\":\"\\u0000\"", "\"cwd\":true",
+            "\"args\":[\"\\uD800\"]", "\"args\":[\"\\uDC00\"]", "\"args\":[\"\\uD800\\u0000\"]",
+            "\"args\":[\"\\uXXXX\"]", "\"args\":[\"\\q\"]", "\"args\":[\"x\",]", "\"args\":[\"a\\tb\"]", "\"args\":[\"a\\nb\"]"})
+        badCatalog(envelope("{\"name\":\"x\",\"command\":\"pwsh.exe\"," + field + "}"));
+    for (const auto& entry : {"{}", "{\"name\":\"x\"}", "{\"name\":\"x\",\"command\":\" \"}",
+            "{\"name\":\"x\",\"command\":\"cmd\",\"name\":\"x\"}", "{\"name\":\"y\",\"command\":\"cmd\"}"}) badCatalog(envelope(entry));
+    badCatalog(envelope("{\"name\":\"x\",\"command\":\"cmd\"},{\"name\":\"X\",\"command\":\"cmd\"}"));
+    badCatalog(validProfile + "false");
+    badCatalog(std::string(1024 * 1024 + 1, ' '));
+    for (const auto& bytes : {std::string("\xc0\xaf"), std::string("\xed\xa0\x80"), std::string("\xf4\x90\x80\x80"), std::string("\xe2\x82")})
+        badCatalog(envelope("{\"name\":\"x\",\"command\":\"" + bytes + "\"}"));
+    check(profiles::parse(envelope("{\"name\":\"x\",\"command\":\"cmd.exe\",\"args\":null,\"cwd\":null,\"env\":{},\"icon\":null,\"elevate\":false}"), catalog, error), "optional inert canonical fields accepted");
+    for (int count : {16, 17}) {
+        std::string args; for (int n = 0; n < count; ++n) args += (n ? "," : "") + std::string("\"\"");
+        check(profiles::parse(envelope("{\"name\":\"x\",\"command\":\"cmd\",\"args\":[" + args + "]}"), catalog, error) == (count == 16), "wire argument count boundary");
+    }
+    for (const auto& limit : {std::make_pair("name",128), std::make_pair("command",259), std::make_pair("cwd",259)}) {
+        for (int length : {limit.second, limit.second + 1}) {
+            const std::string value(length, 'x');
+            const std::string entry = "{\"name\":\"" + (std::string(limit.first) == "name" ? value : "x") + "\",\"command\":\"" +
+                (std::string(limit.first) == "command" ? value : "cmd") + "\",\"cwd\":\"" + (std::string(limit.first) == "cwd" ? value : "") + "\"}";
+            const std::string input = std::string(limit.first) == "name" ? "{\"default\":\"" + value + "\",\"profiles\":[" + entry + "]}" : envelope(entry);
+            check(profiles::parse(input, catalog, error) == (length == limit.second), "profile wire field boundary");
+        }
+    }
+    for (const auto& app : {"powershell.exe", "C:\\Windows\\PowerShell.EXE", "pwsh", "C:/bin/pwsh.exe"}) check(shell_configuration::powershell(app), "exact PowerShell executable accepted");
+    for (const auto& app : {"notpowershell.exe", "pwsh-helper.exe", "C:/pwsh/cmd.exe", "cmd.exe", ""}) check(!shell_configuration::powershell(app), "substring/non-PowerShell executable refused");
+    check(shell_configuration::literal("C:\\theme's $x;name.omp.json") == "'C:\\theme''s $x;name.omp.json'", "PowerShell literal quotes metacharacters");
+    for (int flags = 0; flags < 16; ++flags) {
+        std::string b = flags & 1 ? "B" : "", r = flags & 2 ? "R" : "", k = flags & 4 ? "K" : "";
+        const auto expected = !b.empty() ? b : !r.empty() ? r : (flags & 8) ? k : "";
+        check(shell_configuration::replay(b, r, k, (flags & 8) != 0) == expected, "complete binding/pin/captured/opt-in precedence space");
+    }
     std::printf("configuration-unit: %d checks, %d failed\n", checks, failed);
     return failed ? 1 : 0;
 }
