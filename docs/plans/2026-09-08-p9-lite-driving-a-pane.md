@@ -113,7 +113,7 @@ One invariant, stated once, quoted by name everywhere:
    `Program.ControlHost.cs:808`), matches highlighted in `paintPane`, the current match scrolled into
    view on the main screen (THE PIN of P7: never on the alt screen), reply = `N of M` / `no matches` /
    `""` / `closed` (`SearchStatus`, `Program.Input.cs:1060-1062`). THE MATCH RULE: a row is searched
-   as CODE POINTS (each cell's `wchar_t`/surrogate pair decoded, `towlower` per code point — never
+   as CODE POINTS (`FfiCell.rune` is already a Unicode scalar; Windows invariant casing — never
    over UTF-8 bytes, where a Cyrillic or wide glyph is 2-4 bytes and a byte offset is not a column),
    with a code-point → cell map kept beside the row so a match is stored in CELLS
    (`{absRow, colStart, colEnd}`; a wide glyph occupies two cells, a match ending on it ends after
@@ -317,7 +317,7 @@ check names the rule it pins ("THE GATE: …"). Checks, in order:
   `session search yy` (cells 8..9), not by byte arithmetic; a row `漢字 needle` (wide glyphs, two
   cells each) → `session search needle` → the band starts at cell 5, not 3; a match ENDING on a wide
   glyph (`search 字`) → the band covers both of its cells; a row with `iglA` → `search IGLa` → found
-  (`towlower` on both sides).
+  (Windows invariant scalar casing on both sides).
 - **NOT list / unknown**: `session background set x.png` → still `unknown command 'session.background'
   (lite subset)`; the skill text lists it with the reason.
 - `test/run-all.ps1 -Strict` green under the token; `tools/check-contract.ps1` green (no contract
@@ -358,8 +358,9 @@ Task 1's status update hang off the same place. Record the findings under Techni
 - Verb `session.readonly` in the surface list of THE RULE :8603-8604. Arm: `op = args.op` default
   `toggle`; `on|off|toggle|state|get` else `ctlErr("session readonly: op '<op>' is not one of on, off,
   toggle, state or get; nothing changed")`; target resolved by the standard pattern (missing →
-  `session not found`); `LockG`; `Session* s = surfaceOf(target)` (P5) — for `--target <overlay id>`
-  the overlay itself; flip/read; `InvalidateRect` + `updateStatus()` posted; reply `ctlOkStr(s->readOnly
+  `session not found`); `LockG`; `Session* s = target` — standard resolution already selected the
+  surface, and an explicit shell target must not be redirected to its overlay; flip/read;
+  `InvalidateRect` + `updateStatus()` posted; reply `ctlOkStr(s->readOnly
   ? "on" : "off")`.
 - `updateStatus` :4875 part 2 gains `READ-ONLY` when the focused SURFACE is read-only (after `MARK`,
   before `FIND`). The sidebar row gets no marker (the flag is per surface, the row is per session).
@@ -452,10 +453,10 @@ Task 1's status update hang off the same place. Record the findings under Techni
 - `struct Search { bool open; std::string query; std::vector<Match> matches; int cur; std::string
   sess; }` — one, for the active surface (v1). `Match = { int absRow, colStart, colEnd }` in CELLS.
   Per THE MATCH RULE: walk the same rows `session text --all` reads (history rows + grid rows) as
-  CELLS, decoding each cell to a code point (`wchar_t`, surrogate pairs joined; a wide glyph's
-  spacer cell adds no code point) into a `std::u32string` (or `std::wstring` of the decoded points)
+  CELLS, reading each `FfiCell.rune` as a Unicode scalar (a wide glyph's spacer adds no code point)
+  into a `std::u32string`; decode surrogate pairs only in the UTF-16 query,
   plus a parallel `std::vector<int>` code-point → cell column; lower-case the query and the row with
-  `towlower` per code point; match by `find` over the code-point string, no wrap across rows
+  Windows invariant scalar casing; match by `find` over the code-point string, no wrap across rows
   (agwinterm `RecomputeSearch` :1005-1039 is row-local too); map the match's first and one-past-last
   code point through the column map to `colStart`/`colEnd` (a wide glyph at the end → `colEnd`
   after its spacer). NEVER search UTF-8 bytes: a byte offset is not a column once a row holds

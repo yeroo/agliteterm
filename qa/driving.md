@@ -54,5 +54,5 @@ view; alt-screen searches never scroll into history. There is no find bar or Ctr
 
 Use PrintWindow to prove cell bounds, wide endpoints, stale-row suppression and removal on close;
 also check FIND in status part 2. API assertions are in driving-cases.ps1 (control-honesty);
-16 in-process Unicode/cell/field-codec checks are in driving.unit.ps1. These are not substitutes
+30 in-process Unicode/cell/field-codec checks are in driving.unit.ps1. These are not substitutes
 for the mouse/popup/clipboard/pixel/restart acceptance cases above.

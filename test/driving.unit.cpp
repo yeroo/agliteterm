@@ -41,11 +41,18 @@ int main() {
     check(hits.size() == 2 && hits[1].first == 2, "row-local nonoverlapping matches");
     const std::string commands[] = {"Claude --Resume C:\\Work\\A", "echo \"quoted\"\tvalue\nnext\r", std::string("a\0b",3), ""};
     for (const auto& command : commands) {
-        std::string encoded = jsonEscape(command), decoded, quoted = "\"" + encoded + "\"";
-        size_t pos = 0;
-        check(encoded.find_first_of("\t\n\r") == std::string::npos && jsonParseString(quoted, pos, decoded) && pos == quoted.size() && decoded == command,
+        std::string encoded = jsonEscape(command), decoded;
+        check(encoded.find_first_of("\t\n\r") == std::string::npos && driving::decodeCommandField(encoded, decoded) && decoded == command,
               "R/B JSON-content field round-trip");
     }
+    const std::string malformed[] = {"C:\\Work", "\\", "\\x41", "\\u123", "\\u12xz", "\\uD800", "\\uDC00", "\\uD800\\u0041", "unescaped\"quote", "raw\nline", std::string("\xC0\xAF",2), std::string("\xED\xA0\x80",3)};
+    for (const auto& field : malformed) {
+        std::string decoded = "unchanged";
+        check(!driving::decodeCommandField(field, decoded) && decoded == "unchanged", "malformed replay field rejected without partial output");
+    }
+    std::string decoded;
+    check(driving::decodeCommandField("\\uD83D\\uDE00", decoded) && decoded == "\xF0\x9F\x98\x80", "escaped surrogate pair produces UTF-8 scalar");
+    check(driving::decodeCommandField("игла", decoded) && decoded == "игла", "literal valid UTF-8 is preserved");
     std::printf("%d driving unit checks passed\n", checks);
     return 0;
 }

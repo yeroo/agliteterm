@@ -387,7 +387,8 @@ To build against a core you are changing:
 ./test/run-all.ps1
 ```
 
-There is no C++ unit-test harness — the checks drive the **built exe** and assert on observable
+`driving.unit.ps1` compiles an in-process C++ harness for search cells, casing and command-field
+decoding (MSVC required). Integration checks drive the **built exe** and assert on observable
 behaviour: the diagnostics log, the state file, the control pipe, and the windows themselves.
 Rules the suite obeys, each learned from a real incident:
 

@@ -66,6 +66,9 @@ try {
         Check "bad ratio '$bad' refuses without moving" (-not (P9 'session.resize' '' @{ratio=$bad}).ok -and [Math]::Abs([double](P9Node $a).splitRatios[0] - 0.4) -lt 0.001)
     }
     Check 'wrong-axis growth refuses' (-not (P9 'session.resize' '' @{'grow-top'=1}).ok)
+    Check 'zero wrong-axis growth is a no-op' ((P9 'session.resize' '' @{'grow-top'=0}).ok -and [Math]::Abs([double](P9Node $a).splitRatios[0] - 0.4) -lt 0.001)
+    Check 'explicit ratio overrides valid growth' ((P9 'session.resize' '' @{ratio=0.4;'grow-right'=10}).ok -and [Math]::Abs([double](P9Node $a).splitRatios[0] - 0.4) -lt 0.001)
+    Check 'ratio does not bypass growth validation' (-not (P9 'session.resize' '' @{ratio=0.4;'grow-right'='bad'}).ok)
     Check 'fractional cell growth refuses' (-not (P9 'session.resize' '' @{'grow-right'='1.5'}).ok)
     P9 'session.resize' '' @{ratio=-99} | Out-Null
     Check 'ratio clamps to lower limit' ([Math]::Abs([double](P9Node $a).splitRatios[0] - 0.05) -lt 0.001)
@@ -75,6 +78,9 @@ try {
     P9 'session.split' $a @{op='off'} | Out-Null
 
     foreach ($id in $a,$c,$b) { P9 'session.select' $id | Out-Null }
+    foreach ($step in @(@('begin','P9-B'),@('advance','P9-C'),@('advance','P9-A'),@('cancel','P9-B'),@('begin','P9-B'),@('advance','P9-C'),@('cancel','P9-B'))) {
+        Check "cancel preserves MRU: $($step[0]) -> $($step[1])" ((P9 'session.switch' '' @{op=$step[0]}).result -eq $step[1])
+    }
     foreach ($step in @(@('begin','P9-B'),@('advance','P9-C'),@('advance','P9-A'),@('advance-back','P9-C'),@('cancel','P9-B'),@('begin','P9-B'),@('advance','P9-C'),@('commit','P9-C'),@('begin','P9-C'),@('advance','P9-B'))) {
         Check "switch $($step[0]) -> $($step[1])" ((P9 'session.switch' '' @{op=$step[0]}).result -eq $step[1])
     }
@@ -94,6 +100,16 @@ try {
     Check 'search closes' ((P9 'session.search' $a @{action='close'}).result -eq 'closed')
     Check 'closing search leaves text unchanged' ([string](P9 'session.text' $a).result -ceq $beforeClose)
     Check 'search missing target refuses' (-not (P9 'session.search' 'p9-no-such-pane' @{query='needle'}).ok)
+    # Put the main-screen marker in actual history, not merely on a grid that alt-screen replaces.
+    P9 'session.write' $a @{text="$esc[3J$esc[2J$esc[H" + "P9-HISTORY-NEEDLE`r`n" + ("filler`r`n" * 300)} | Out-Null
+    Check 'main history search fixture is non-vacuous' ((P9 'session.search' $a @{query='P9-HISTORY-NEEDLE'}).result -eq '1 of 1')
+    P9 'session.write' $a @{text="$esc[?1049h$esc[2J$esc[H"} | Out-Null
+    Check 'alternate search excludes main history' ((P9 'session.search' $a @{query='P9-HISTORY-NEEDLE'}).result -eq 'no matches')
+    P9 'session.write' $a @{text='P9-HISTORY-NEEDLE'} | Out-Null
+    Check 'alternate search counts only alternate grid' ((P9 'session.search' $a @{query='P9-HISTORY-NEEDLE'}).result -eq '1 of 1')
+    P9 'session.write' $a @{text="$esc[?1049l"} | Out-Null
+    Check 'returning to main searches history again' ((P9 'session.search' $a @{query='P9-HISTORY-NEEDLE'}).result -eq '1 of 1')
+    P9 'session.search' $a @{action='close'} | Out-Null
     Check 'background remains refused' (-not (P9 'session.background' $a @{action='set';path='x.png'}).ok)
 }
 finally {

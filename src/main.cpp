@@ -414,8 +414,8 @@ struct Session {
     // last `restore capture`, persisted as a `K` line and read back through `tree --json` as
     // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
     // capture replaces an older checkpoint). Pane 0 is the session itself; a split shell is its
-    // own Session and carries its own slot. NEVER replayed in lite (session.restore is P9): this
-    // is the durable slot and nothing more, so `replayOnRestore` answers false.
+    // own Session and carries its own slot. K is only a checkpoint, never replayed: P9 replays
+    // explicit R pins/B bindings separately, so capture's `replayOnRestore` remains false.
     std::string capturedCmd;
     std::string restoreCmd;        // explicitly pinned command; distinct from capturedCmd
     std::string agentResume;       // binding takes precedence over restoreCmd on fresh restore
@@ -2168,6 +2168,7 @@ struct MruWalkState {
 static MruWalkState g_walk;
 // Caller holds g_lock. Covers/split shells are not independent sidebar sessions.
 static void touchMruLocked(Session* s) {
+    if (g_walk.active) return; // previews must not reorder the stack, including focus notifications
     if (!s || s->hidden || s->exited) return;
     g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), s->id), g_mru.end());
     g_mru.insert(g_mru.begin(), s->id);
@@ -2526,6 +2527,7 @@ static void closeSessionAt(int idx) {
     const Session* splitShell = (g_pane[1] >= 0 && g_pane[1] < (int)g_sessions.size() && g_pane[1] != idx)
                                 ? g_sessions[g_pane[1]] : nullptr;
     emitEvent("session", g_sessions[idx]->id, "closed");
+    g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), g_sessions[idx]->id), g_mru.end());
     g_sessions.erase(g_sessions.begin() + idx);
     emitEvent("tree");
     for (int p = 0; p < 2; p++) {
@@ -2662,6 +2664,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
             survivor->horizontal = owner->horizontal;  // kept for the next `split on`
+            survivor->splitRatio = owner->splitRatio;
             survivor->hidden = false;
             std::swap(g_sessions[oi], g_sessions[si]); // the survivor takes the owner's row; the victim sits where the split shell did
             victim->id = victim->paneId;               // no two entries under one id, even for the instant it is still listed
@@ -3047,8 +3050,8 @@ static DWORD livePid(const Session* s) { return s->exited ? 0 : s->childPid; }
 // the shells themselves and the prompt helpers they spawn between commands. This is agwinterm's
 // DEFAULT list (Program.Services.cs LoadDenylist), frozen: agwinterm lets the user extend it
 // through %LOCALAPPDATA%\agwinterm\restore-denylist.conf, lite has no config file and ships the
-// same list as a constant. The list is consulted at capture only — lite never replays a slot
-// (session.restore is P9), so there is no replay-time check to keep in step with it.
+// same list as a constant. This list applies to capture only; captured K slots never replay.
+// Explicit R pins/B bindings have their own validation and replay policy.
 static const wchar_t* const kRestoreDenylist[] = {
     L"powershell", L"pwsh", L"cmd", L"conhost", L"wsl", L"ssh", L"bash", L"oh-my-posh", L"git", L"windowsterminal",
 };
@@ -3337,7 +3340,7 @@ static bool saveSessionState() {
     if (!idLine.empty()) out += "D" + idLine + "\n";
     out += ctxLines;                         // C lines: session contexts, with F and D, before P
     out += splitLines;                       // P lines: each session's own split shell
-    out += layoutLines;                      // L lines: a split's axis and order, only when not the default
+    out += layoutLines;                      // L/G lines: non-default axis/order and ratio, grouped by owner
     out += capLines;                         // K lines: the captured-command slots, after the P they name
     out += replayLines;
     out += "A\t" + std::to_string(activeWs) + "\n";
@@ -3971,7 +3974,7 @@ static bool recomputeSearch(Session* s, FfiEmuInfo* info) {
     if (query.empty()) { g_search.current = 0; return true; }
     std::vector<FfiCell> grid((size_t)info->cols * info->rows), cells(info->cols);
     if (!emu_copy_grid(s->emu, grid.data(), (uint32_t)grid.size())) return false;
-    for (int r = 0; r < (int)info->historyCount + (int)info->rows; ++r) {
+    for (int r = g_search.alt ? (int)info->historyCount : 0; r < (int)info->historyCount + (int)info->rows; ++r) {
         const FfiCell* data;
         if (r < (int)info->historyCount) {
             if (!emu_copy_history_row(s->emu, (uint32_t)r, cells.data(), info->cols)) continue;
@@ -5252,11 +5255,11 @@ static bool handleKeyDown(WPARAM vk) {
         case VK_F10: tilde = 21; break;
         case VK_F11: tilde = 23; break;
         case VK_F12: tilde = 24; break;
-        case VK_TAB: if (shiftDown()) { sendBytes("\x1b[Z", 3); if (Session* s = focusedSession()) s->scrollOff = 0; return true; } return false; // Shift+Tab = back-tab; plain Tab -> WM_CHAR
+        case VK_TAB: if (shiftDown()) { sendBytes("\x1b[Z", 3); Session* s = focusedSession(); if (s && !s->readOnly) s->scrollOff = 0; return true; } return false; // Shift+Tab = back-tab; plain Tab -> WM_CHAR
         // Backspace: the raw WM_CHAR bytes are INVERTED vs the xterm/Windows Terminal convention
         // (plain -> 0x08 which apps read as Ctrl+Backspace "kill word", Ctrl+ -> 0x7F). Encode at
         // keydown instead: plain DEL 0x7F, Ctrl+Backspace 0x08 (word delete stays available).
-        case VK_BACK: sendBytes(ctrlDown() ? "\x08" : "\x7f", 1); if (Session* s = focusedSession()) s->scrollOff = 0; return true;
+        case VK_BACK: { sendBytes(ctrlDown() ? "\x08" : "\x7f", 1); Session* s = focusedSession(); if (s && !s->readOnly) s->scrollOff = 0; return true; }
         default: return false;
     }
     char buf[32];
@@ -9159,10 +9162,14 @@ static std::string ctlDispatch(const std::string& line) {
         std::string reply;
         {
             LockG hold;
-            auto liveIndex = [](const std::string& id) {
+            auto visibleIndex = [](const std::string& id) {
                 for (int i = 0; i < (int)g_sessions.size(); ++i)
-                    if (g_sessions[i]->id == id && !g_sessions[i]->hidden && !g_sessions[i]->exited) return i;
+                    if (g_sessions[i]->id == id && !g_sessions[i]->hidden) return i;
                 return -1;
+            };
+            auto liveIndex = [&](const std::string& id) {
+                int i = visibleIndex(id);
+                return i >= 0 && !g_sessions[i]->exited ? i : -1;
             };
             g_mru.erase(std::remove_if(g_mru.begin(), g_mru.end(), [&](const std::string& id) { return liveIndex(id) < 0; }), g_mru.end());
             for (Session* s : g_sessions)
@@ -9173,6 +9180,8 @@ static std::string ctlDispatch(const std::string& line) {
                 g_walk.order = g_mru;
                 g_walk.active = !g_walk.order.empty();
                 if (Session* s = displayedOwner()) g_walk.startId = s->id;
+                auto start = std::find(g_walk.order.begin(), g_walk.order.end(), g_walk.startId);
+                g_walk.cursor = start == g_walk.order.end() ? -1 : (int)(start - g_walk.order.begin());
             };
             std::string pick;
             if (op == "begin") begin();
@@ -9180,25 +9189,25 @@ static std::string ctlDispatch(const std::string& line) {
                 if (!g_walk.active) begin();
                 int n = (int)g_walk.order.size();
                 for (int tries = 0; tries < n; ++tries) {
-                    g_walk.cursor = (g_walk.cursor + (back ? -1 : 1) + n) % n;
+                    g_walk.cursor = g_walk.cursor < 0 ? (back ? n - 1 : 0) : (g_walk.cursor + (back ? -1 : 1) + n) % n;
                     if (liveIndex(g_walk.order[g_walk.cursor]) >= 0) { pick = g_walk.order[g_walk.cursor]; break; }
                 }
             } else if (op == "cancel") {
                 if (g_walk.active) pick = g_walk.startId;
                 g_walk = {};
             } else { g_walk = {}; touchMruLocked(displayedOwner()); }
-            int idx = liveIndex(pick);
+            int idx = op == "cancel" ? visibleIndex(pick) : liveIndex(pick);
             if (idx >= 0) {
                 g_pane[0] = idx; g_focus = 0;
                 g_activeWs = g_sessions[idx]->ws;
-                touchMruLocked(g_sessions[idx]);
+                if (op != "cancel") touchMruLocked(g_sessions[idx]);
                 selected = true;
             }
             Session* active = displayedOwner();
             reply = "(none)";
-            if (active && !active->hidden && !active->exited) {
+            if (active && !active->hidden) {
                 int vis = 0;
-                for (Session* s : g_sessions) { if (!s->hidden) ++vis; if (s == active) break; }
+                for (Session* s : g_sessions) { if (!s->hidden && s->ws == active->ws) ++vis; if (s == active) break; }
                 reply = active->name.empty() ? "session " + std::to_string(vis) : narrow(active->name);
             }
         }
@@ -9222,19 +9231,25 @@ static std::string ctlDispatch(const std::string& line) {
                 if (present[i] && !parseCellCount(f->second, &cells[i]))
                     return ctlErr(std::string("session resize: --") + names[i] + " needs a whole number of cells; the divider was not moved");
             }
-            if (owner->horizontal && (present[0] || present[1]))
+            if (owner->horizontal && (cells[0] || cells[1]))
                 return ctlErr("--grow-left/--grow-right mean nothing on a horizontal split (top/bottom panes); use --grow-top/--grow-bottom; the divider was not moved");
-            if (!owner->horizontal && (present[2] || present[3]))
+            if (!owner->horizontal && (cells[2] || cells[3]))
                 return ctlErr("--grow-top/--grow-bottom mean nothing on a vertical split (left/right panes); use --grow-left/--grow-right; the divider was not moved");
             double ratio = owner->splitRatio;
             auto f = req.fields.find("args.ratio");
             if (f != req.fields.end() && !parseFiniteNumber(f->second, &ratio))
                 return ctlErr("session resize: --split-ratio needs a number between 0.05 and 0.95; the divider was not moved");
             ratio = max(0.05, min(0.95, ratio));
-            RECT rc; GetClientRect(g_hwnd, &rc);
-            int span = owner->horizontal ? rc.bottom - toolbarTop() - (g_showStatus ? g_statusH : 0) - 2 : rc.right - sidebarSpan() - 2;
             double shift = owner->horizontal ? (double)cells[3] - cells[2] : (double)cells[1] - cells[0];
-            if (span > 0) ratio += shift * (owner->horizontal ? g_ch : g_cw) / span;
+            if (f == req.fields.end() && shift != 0) {
+                RECT rc{};
+                const bool validClient = GetClientRect(g_hwnd, &rc) && !IsIconic(g_hwnd);
+                int span = owner->horizontal ? rc.bottom - toolbarTop() - (g_showStatus ? g_statusH : 0) - 2 : rc.right - sidebarSpan() - 2;
+                int cell = owner->horizontal ? g_ch : g_cw;
+                if (!validClient || span <= 0 || cell <= 0)
+                    return ctlErr("session resize: pane geometry is unavailable; the divider was not moved");
+                ratio += shift * cell / span;
+            }
             owner->splitRatio = (float)max(0.05, min(0.95, ratio));
         }
         syncPaneSizes();
@@ -9954,10 +9969,8 @@ static std::string ctlDispatch(const std::string& line) {
         // The reply is agwinterm's RestoreCaptureReply, an object (ctlOk): `captured` = the panes
         // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
         // (the owner's id) and `captured` (string | null). `replayOnRestore` is a constant FALSE in
-        // lite: the field says whether the slot will be typed back at the next start, and lite never
-        // types anything back — it restores launch specs, and session.restore is P9. Answering the
-        // truth rather than a toggle with nothing behind it; when P9 lands the replay, the field
-        // starts reporting it and the shape does not change.
+        // lite: this captured K slot is never typed back. Explicit R pins and B bindings are
+        // separate fields; their P9 replay does not change this capture reply.
         struct CapPane { Session* s; std::string id, owner; DWORD pid; };
         std::vector<CapPane> snap;
         // The target is read from the field map, not from get(): absent is the documented "every
@@ -10008,7 +10021,7 @@ static std::string ctlDispatch(const std::string& line) {
         if (!captureForeground(pids, &found)) return ctlErr(kCaptureQueryFailed);
         // The write. Null is written too (an empty slot): a fresh capture replaces the previous
         // checkpoint, including with nothing — "the shell had no non-denylisted child" is an answer,
-        // and keeping a stale command under it would replay (in P9) something that is not running. A
+        // and keeping a stale command would misreport something that is no longer running. A
         // pane closed between the snapshot and here is dropped from the reply rather than written to;
         // the id is re-checked as well as the pointer, since a freed Session's address can be reused.
         // The id compared is the PANE id the snapshot recorded: paneId is written once and never
@@ -10854,13 +10867,8 @@ static ParsedState parseStateFile(const std::wstring& path) {
             auto& lines = ff[0] == "R" ? ps.pins : ps.bindings;
             // New line types use JSON string contents inside each TSV field: tabs/newlines,
             // backslashes and quotes round-trip, so replay never silently changes a command.
-            auto decode = [](const std::string& field, std::string& out) {
-                std::string quoted = "\"" + field + "\"";
-                size_t pos = 0;
-                return jsonParseString(quoted, pos, out) && pos == quoted.size();
-            };
             std::string a, b;
-            if (decode(ff[2], a) && decode(ff.size() >= 4 ? ff[3] : std::string(), b))
+            if (driving::decodeCommandField(ff[2], a) && driving::decodeCommandField(ff.size() >= 4 ? ff[3] : std::string(), b))
                 lines.push_back({ owner, a, b });
             else logWarn("state: malformed %s command field - line dropped", ff[0].c_str());
         } else if (ff[0] == "F") {   // flagged indices, in S-line order
