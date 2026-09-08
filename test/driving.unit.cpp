@@ -1,0 +1,51 @@
+#include "../src/driving.h"
+#include "../src/control.h"
+#include <cstdio>
+#include <cstdlib>
+
+struct Cell { int32_t rune; uint32_t width; };
+static int checks;
+static void check(bool ok, const char* name) {
+    if (!ok) { std::fprintf(stderr, "FAIL %s\n", name); std::exit(1); }
+    ++checks; std::printf("PASS %s\n", name);
+}
+int main() {
+    Cell ascii[] = {{'x',1},{' ',1},{'I',1},{'g',1},{'l',1},{'A',1},{' ',1}};
+    auto a = driving::rowCells(ascii, 7);
+    auto hits = driving::matches(a, driving::queryPoints(L"igLA"));
+    check(hits.size() == 1 && hits[0].first == 2 && hits[0].end == 6, "ASCII case and cell endpoints");
+    check(driving::matches(a, U"").empty(), "empty query");
+    check(driving::matches(a, U"absent").empty(), "no match");
+    Cell cyrillic[] = {{'x',1},{'x',1},{' ',1},{0x438,1},{0x433,1},{0x43B,1},{0x430,1},{' ',1}};
+    auto c = driving::rowCells(cyrillic, 8);
+    hits = driving::matches(c, driving::queryPoints(L"\x418\x413\x41B\x410"));
+    check(hits.size() == 1 && hits[0].first == 3 && hits[0].end == 7, "Cyrillic invariant casing, not UTF-8 offsets");
+    Cell wide[] = {{0x6F22,2},{0,0},{0x5B57,2},{0,0},{' ',1},{'n',1},{'e',1},{'e',1},{'d',1},{'l',1},{'e',1}};
+    auto w = driving::rowCells(wide, 11);
+    hits = driving::matches(w, U"needle");
+    check(hits.size() == 1 && hits[0].first == 5 && hits[0].end == 11, "needle after two wide glyphs");
+    hits = driving::matches(w, driving::queryPoints(L"\x5B57"));
+    check(hits.size() == 1 && hits[0].first == 2 && hits[0].end == 4, "wide match includes spacer");
+    Cell astral[] = {{'x',1},{0x1F600,2},{0,0},{'y',1}};
+    auto e = driving::rowCells(astral, 4);
+    hits = driving::matches(e, driving::queryPoints(L"\xD83D\xDE00"));
+    check(hits.size() == 1 && hits[0].first == 1 && hits[0].end == 3, "astral query decoded to one scalar");
+    check(driving::lower(0x10400) == 0x10428, "astral Deseret case mapping");
+    check(w.sameCells(driving::rowCells(wide, 11)), "unchanged row proof");
+    wide[0].rune = 'z';
+    check(!w.sameCells(driving::rowCells(wide, 11)), "changed row invalidates proof");
+    wide[0].rune = 0x6F22; wide[0].width = 1;
+    check(!w.sameCells(driving::rowCells(wide, 11)), "changed widths invalidate proof");
+    Cell repeat[] = {{'a',1},{'a',1},{'a',1},{'a',1},{'a',1}};
+    hits = driving::matches(driving::rowCells(repeat, 5), U"aa");
+    check(hits.size() == 2 && hits[1].first == 2, "row-local nonoverlapping matches");
+    const std::string commands[] = {"Claude --Resume C:\\Work\\A", "echo \"quoted\"\tvalue\nnext\r", std::string("a\0b",3), ""};
+    for (const auto& command : commands) {
+        std::string encoded = jsonEscape(command), decoded, quoted = "\"" + encoded + "\"";
+        size_t pos = 0;
+        check(encoded.find_first_of("\t\n\r") == std::string::npos && jsonParseString(quoted, pos, decoded) && pos == quoted.size() && decoded == command,
+              "R/B JSON-content field round-trip");
+    }
+    std::printf("%d driving unit checks passed\n", checks);
+    return 0;
+}

@@ -83,7 +83,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   blank Finalize keeps the highlight. Copy and Finalize can refuse a failed UI enqueue with
   `the clipboard write could not be queued; selection unchanged`.
 - **Scriptable**: the same newline-JSON control pipe, speaking the `agwintermctl` dialect —
-  52 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
+  58 verbs covering sessions, workspaces, windows, the sidebar and the tree (`agwintermctl --pipe
   agliteterm tree`). Shells get `AGWINTERM_*` env, so hooks and the agent skill work. Three
   read-only probes answer what an agent otherwise has to guess: `agwintermctl surface cursor`
   reports a pane's caret **column** as a bare integer, so an agent can tell an empty composer from
@@ -124,7 +124,7 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   shell running, and null is written too, so a fresh capture replaces an older checkpoint. The
   slots read back as `capturedCommands` from `tree --json`, keyed by pane id, and persist as a
   `K` line. Its `replayOnRestore` is **always `false`** in lite: it restores launch specs and never
-  types a slot back (`session restore` is a later batch), so a captured command is a checkpoint to
+  types a captured slot back (explicit pins are separate), so a captured command is a checkpoint to
   read, not a command that will run. An unknown, empty or cover-pane target, or a process query
   that did not run, is refused with nothing written for anyone; a save that did not land is
   refused too, but AFTER the slots were replaced in memory (the reply says so, `tree --json` shows
@@ -221,6 +221,28 @@ Every release carries a [Sigstore build-provenance attestation](https://github.c
 ```
 gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
 ```
+
+## Driving a pane
+
+- `session readonly on|off|toggle|state|get [--target ID]` blocks human keys, paste and reporting
+  mouse events. API typing/writing and terminal replies still work; API paste explicitly refuses.
+  The flag is per surface and resets on restart. Status shows READ-ONLY; the Edit/palette toggle
+  has an unbound `Key_ReadOnly` binding.
+- `session restore <command>|none --target PANE` pins a command for a fresh restored shell.
+  `session bind <agent-command>|none --target PANE` supplies a binding instead (default `claude`).
+  Both save before success. Replay waits 2500 ms, uses current values, and skips adopted shells.
+  This delay does not prove shell readiness. Captured commands are separate and never replayed.
+- `session resize --split-ratio R` or `--grow-left/right/top/bottom N` moves the active split's
+  divider. Wrong-axis/malformed growth refuses; ratios clamp to 0.05..0.95 and persist.
+- `session switch begin|advance|advance-back|commit|cancel` walks a snapshot of session recency.
+  Ordinary next/previous keys retain tree order.
+- `session search QUERY [--next|--prev|--close]` searches the active surface, even when a valid
+  target is supplied. Unicode matches map to cells, including wide glyphs. Cyan frames mark the
+  current match, amber frames the others, with FIND in the status bar. Counts are as of the last
+  search call; changed rows suppress stale highlights until another call. No find bar/Ctrl+F.
+  History is never scrolled into on the alt screen.
+
+`session background` remains unavailable: lite draws no images. See [driving checks](qa/driving.md).
 
 ## Session restore & the state file
 

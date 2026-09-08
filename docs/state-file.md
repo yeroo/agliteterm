@@ -8,8 +8,10 @@ README's *Session restore & the state file* section is the user-facing half (whe
 Path: `%LOCALAPPDATA%\agliteterm\sessions.tsv` for the default instance, `sessions-<instance>.tsv`
 for a `--pipe <instance>` window. One file per window process. Tab-separated UTF-8 text, `\n`
 line ends (`\r` is tolerated on read), no BOM. A field never contains a tab, a newline or a carriage
-return: the writer replaces each with a space (`tsvField`), and there is no escaping — which is why
-an "empty field" is a real value and an absent line is the only way to say "none" (see `C`).
+return. Existing line types replace each with a space (`tsvField`). P9's `R`/`B` command fields
+instead use JSON string-content escapes, without the surrounding quotes: `\\`, `\"`, `\t`,
+`\r`, `\n`, and `\u00XX` preserve the command exactly. An empty command field means none.
+Malformed escaped command fields are dropped with a warning. `C` still uses line absence for none.
 
 ## Line types, in the order they are written
 
@@ -25,6 +27,9 @@ an "empty field" is a real value and an absent line is the only way to say "none
 | `L` | `owner` `axis` `order` | The **layout** of the split of the session at `S` index `owner` (parity batch P4): `axis` is `vertical` (left/right panes) or `horizontal` (top/bottom panes) — the arrangement of the panes, never the divider, case-sensitive; `order` is `0` when the session's own shell sits in slot 0 (left/top) or `1` after a `session swap` put it in slot 1. Written **only when the layout is not the default** (horizontal, or swapped, or both), so a vertical unswapped split writes the exact bytes 0.17.14 wrote, and only for a session whose `P` line exists — the layout describes the pair. Written after the `P` lines, before `K`, by the same convention as `K`. **Downgrade**: an older build ignores `L` (unknown line types are ignored) and restores the split in the default layout — the `P` line is untouched, so a downgrade loses the layout, not the split — and drops the line on its next save. On load each field is validated on its own: an `axis` other than the two words restores `vertical`, an `order` other than `0` / `1` restores `0`, each named in the log; an `L` for an owner with no `P` line is dropped and named. |
 | `K` | `i` `pane0` `pane1` | The **captured commands** of the session at `S` index `i` (parity batch P3, `restore capture`): `pane0` is the slot of the session's own shell, `pane1` the slot of its split shell (empty when there is no split, or nothing was captured there). An empty field is "none"; a slot is a plain string with no rules of its own, so unlike `C` one line carries both panes. One line per session with at least one slot. **The fields are by ROLE, not by position on screen**: `pane0` is always the session's own shell and `pane1` always the split shell, whatever slot each sits in — the `L` line carries the order, `K` does not repeat it. After a promotion (the session's own shell closed, the split shell became the session) the survivor's slot is `pane0`, because it is the session's own shell now. Written after the `P` lines by convention — `K` sits with the `P` lines it describes — not by requirement: the reader collects every line type in file order and applies them in its own fixed order, so a `K` above a `P` restores identically. A slot is a checkpoint a caller reads back (`tree --json`, `capturedCommands`); lite never types it into the shell. |
 | `A` | `ws` | The active workspace. Clamped on load to the workspaces the file has. |
+| `G` | `owner` `ratio` | P9 split slot 0's share, written with three decimals only when not 0.5, with the layout lines. Valid range 0.05..0.95; a bad value restores 0.5 with a warning. Requires a valid split. A swap preserves slot shares. |
+| `R` | `i` `pane0` `pane1` | Explicit restore pins, by ROLE like K, using escaped command fields. Written after K when either shell has a pin. Tree reads them as `restoreCommands`, keyed by pane id. |
+| `B` | `i` `agent0` `agent1` | Replay bindings, by ROLE like R; binding wins over pin. Escaped command fields preserve case and command bytes; not exposed in the tree. |
 | `O` | `ws` | The focused workspace. Read when present; this build does not write it. |
 
 A file written by the current build, one workspace, two sessions, the first with a context, a split
@@ -49,6 +54,16 @@ The same file with the split left/right and unswapped has no `L` line at all —
 the build before P4 wrote.
 
 ## The rules the reader applies
+
+P9 `R`/`B` fields follow K's positional guards: a malformed S set drops them; a missing rebuilt
+split drops its pane-1 field, not the owner's field. `G` follows L's split/owner guards.
+Older builds ignore R/B/G and restore without pins, bindings or custom ratios; their next save
+drops those lines. No migration changes older line types. Read-only and search state are not saved.
+
+Only a fresh restored shell receives replay: one 2500 ms timer resolves each queued pane id to its
+current binding, otherwise its current pin, then writes outside the state lock. It is a delay, not
+a readiness guarantee. Adopted/exited/gone panes are skipped. Changes before the timer fires are
+honored. Captured K commands are still never replayed.
 
 - **Unknown line types are ignored**, and the lines it knows are honoured. That is what lets an
   older build read a newer file (it restores the sessions and drops what it cannot carry — and

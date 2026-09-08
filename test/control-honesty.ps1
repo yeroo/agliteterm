@@ -2879,6 +2879,8 @@ try {
         Set-Clipboard -Value $(if ($null -eq $selectionClipboard) { '' } else { $selectionClipboard })
     }
 
+    . "$PSScriptRoot/driving-cases.ps1"
+
     # ---- #23: two persisted values that cannot coexist ------------------------------------------
     # SidebarW (one value for every instance) and WinW-<instance> are each valid on their own; a
     # sidebar saved at 900 from a wide monitor and a window rect saved at 700 on the laptop meet at

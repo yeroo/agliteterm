@@ -28,6 +28,9 @@
 #define AGWL_VERSION_STR "dev"
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
+#include <cmath>
+#include <cerrno>
+#include <climits>
 #include <ctime>        // time(): the statusChangedAt stamp is epoch seconds
 #include <string>
 #include <vector>
@@ -66,6 +69,7 @@ CAppModule _Module;
 #include "proto/pb_encode.h"
 #include "proto/pb_decode.h"
 #include "control.h"
+#include "driving.h"
 
 // ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
@@ -339,6 +343,7 @@ static long long epochNow() { return (long long)time(nullptr); }
 
 struct Session {
     std::string id;
+    bool readOnly = false;         // human input gate, per surface; never persisted
     std::string status = "idle";   // control-API agent status (sidebar dot)
     // When `status` was last WRITTEN (epoch seconds), reported on every `tree` node as
     // statusChangedAt. Seeded at construction, so a session whose status was never set reports its
@@ -373,6 +378,7 @@ struct Session {
     // words are the wire spelling and case-sensitive: `Horizontal` or `h` is refused naming both.
     // Consulted in ONE place for geometry (slotRect) and one for paint (the divider).
     bool horizontal = false;
+    float splitRatio = 0.5f;       // slot 0's share; swapping shells leaves the divider in place
     // P4: the slot order. Slot 0 is the left/top box and slot 1 the right/bottom box; false = the
     // owner's shell (pane 0) sits in slot 0 and the split shell (pane 1) in slot 1; true = exchanged
     // by `session swap`. A swap exchanges the slots and nothing else: ids stay on their shells,
@@ -411,6 +417,9 @@ struct Session {
     // own Session and carries its own slot. NEVER replayed in lite (session.restore is P9): this
     // is the durable slot and nothing more, so `replayOnRestore` answers false.
     std::string capturedCmd;
+    std::string restoreCmd;        // explicitly pinned command; distinct from capturedCmd
+    std::string agentResume;       // binding takes precedence over restoreCmd on fresh restore
+    bool adopted = false;          // a live shell must never receive restore replay
     void* emu = nullptr;
     HANDLE data = INVALID_HANDLE_VALUE;
     HANDLE reader = nullptr;
@@ -572,6 +581,8 @@ static const UINT_PTR kCaretTimer = 1;
 static const UINT_PTR kRelayoutTimer = 2;
 static const UINT_PTR kSelAutoTimer = 3;
 static const UINT kSelAutoMs = 50;
+static const UINT_PTR kReplayTimer = 4;
+static std::vector<std::string> g_replayQueue;   // UI-owned pane ids, never captured commands
 static const UINT kRelayoutRetryMs = 60;
 // How many times in a row a REFUSED resize re-arms the timer before it gives up (60, 120, 240 ms).
 // The lock-contention retry is bounded by the lock freeing; a refusing host is not bounded by
@@ -979,7 +990,7 @@ static void applyTheme() {
 // HIBYTE = HOTKEYF_* (SHIFT 1 / CONTROL 2 / ALT 4). 0 = unbound.
 enum { KB_NEW, KB_NEWWS, KB_CLOSE, KB_SPLIT, KB_NEXT, KB_PREV, KB_COPY, KB_PASTE,
        KB_PALETTE, KB_FOCUSL, KB_FOCUSR, KB_SCROLLUP, KB_SCROLLDN, KB_QUICK, KB_SCRATCH, KB_REOPEN,
-       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_COUNT };
+       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_READONLY, KB_COUNT };
 struct KbInfo { const wchar_t* label; const wchar_t* reg; };
 static const KbInfo kKbInfo[KB_COUNT] = {
     { L"New Session",      L"Key_New" },     { L"New Workspace",    L"Key_NewWs" },
@@ -994,6 +1005,7 @@ static const KbInfo kKbInfo[KB_COUNT] = {
     { L"Flagged View",     L"Key_FlagView" },  { L"Next Blocked",    L"Key_Attention" },
     { L"Focus Workspace",  L"Key_FocusWs" },
     { L"Mark Mode (keyboard select)", L"Key_MarkMode" }, { L"Select All", L"Key_SelectAll" },
+    { L"Toggle Read-Only Pane", L"Key_ReadOnly" },
 };
 static WORD g_keys[KB_COUNT] = { 0 };
 static bool g_swallowChar = false;   // set when a keydown was consumed by a binding, to drop its WM_CHAR
@@ -1013,7 +1025,7 @@ enum { IDM_NEW = 1, IDM_CLOSE = 2, IDM_SPLIT = 3, IDM_NEXT = 4, IDM_COPY = 5, ID
        IDM_QUICK = 120, IDM_SCRATCH = 121, IDM_REOPEN = 122,
        IDM_TG_SIDEBAR = 123, IDM_TG_TOOLBAR = 124, IDM_TG_STATUS = 125,
        IDM_FLAG = 126, IDM_FLAGVIEW = 127, IDM_ATTENTION = 128, IDM_FOCUSWS = 129, IDM_PALETTE = 130,
-       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132 };
+       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132, IDM_READONLY = 135 };
 #define IDM_MOVE_BASE 300   // "Move to workspace <w>" = IDM_MOVE_BASE + w
 enum { ID_TREE = 200, ID_TRAY = 201, ID_TOOLBAR = 202, ID_STATUS = 203 };
 
@@ -1184,6 +1196,7 @@ static const PalAction kPalActions[] = {
     { L"Flagged View",             IDM_FLAGVIEW,   KB_FLAGVIEW,  -1 },
     { L"Next Blocked Session",     IDM_ATTENTION,  KB_ATTENTION, -1 },
     { L"Focus Workspace",          IDM_FOCUSWS,    KB_FOCUSWS,   -1 },
+    { L"Toggle Read-Only Pane",     IDM_READONLY,   KB_READONLY,  -1 },
     { L"Delete Workspace",         IDM_DELWS,      -1,           -1 },
     { L"Focus Left / Top Pane",    0,              KB_FOCUSL,    -1 },   // slot 0 (P4)
     { L"Focus Right / Bottom Pane", 0,             KB_FOCUSR,    -1 },   // slot 1
@@ -1561,9 +1574,7 @@ static void displayedLayout(bool* horizontal, bool* swapped) {
 static int slotOf(int pane) { bool h, sw; displayedLayout(&h, &sw); return sw ? 1 - pane : pane; }
 static int paneOfSlot(int slot) { return slotOf(slot); }   // the map is its own inverse
 
-// The rect of a SLOT on the displayed owner's axis. Half the content, less the divider, the way it
-// always was — only now the halving is of the width (vertical, left/right) or of the height
-// (horizontal, top/bottom). This and the divider in paint are the only two readers of the axis.
+// The rect of a SLOT on the displayed owner's axis, excluding the two-pixel divider.
 static void slotRect(int slot, RECT client, RECT* out) {
     int contentX = sidebarSpan();               // right of the sidebar + splitter (0 if hidden)
     int top = toolbarTop();                     // below the toolbar (0 if hidden)
@@ -1571,14 +1582,19 @@ static void slotRect(int slot, RECT client, RECT* out) {
     if (g_pane[1] < 0) { *out = { contentX, top, client.right, bottom }; return; }
     bool horizontal, swapped;
     displayedLayout(&horizontal, &swapped);
+    float ratio = 0.5f;
+    { LockG hold; if (Session* owner = displayedOwner()) ratio = owner->splitRatio; }
+    int span = max(0, (horizontal ? bottom - top : client.right - contentX) - 2);
+    int cell = horizontal ? g_ch : g_cw;
+    int first = (int)std::lround(span * max(0.05f, min(0.95f, ratio)));
+    if (span >= 2 * cell) first = max(cell, min(span - cell, first));
+    else first = span / 2;   // impossible geometry: paneGridSize declines the resize
     if (horizontal) {
-        int half = (bottom - top) / 2;
-        if (slot == 0) *out = { contentX, top, client.right, top + half - 1 };
-        else *out = { contentX, top + half + 1, client.right, bottom };
+        if (slot == 0) *out = { contentX, top, client.right, top + first };
+        else *out = { contentX, top + first + 2, client.right, bottom };
     } else {
-        int half = (client.right - contentX) / 2;
-        if (slot == 0) *out = { contentX, top, contentX + half - 1, bottom };
-        else *out = { contentX + half + 1, top, client.right, bottom };
+        if (slot == 0) *out = { contentX, top, contentX + first, bottom };
+        else *out = { contentX + first + 2, top, client.right, bottom };
     }
 }
 // The rect of a PANE (owner = 0, split = 1): the rect of the slot it sits in.
@@ -2142,11 +2158,30 @@ static void syncSplitToPrimary() {
 /// and a cover that lands in it is drawn twice and left stale in g_pane when its own close unlists
 /// it (revmux r1 of P5-lite: `session select --target active` under a covered pane did that).
 /// session.select refuses or redirects before it gets here; this is the belt to that brace.
+static std::vector<std::string> g_mru;
+struct MruWalkState {
+    bool active = false;
+    std::string startId;
+    std::vector<std::string> order;
+    int cursor = 0;
+};
+static MruWalkState g_walk;
+// Caller holds g_lock. Covers/split shells are not independent sidebar sessions.
+static void touchMruLocked(Session* s) {
+    if (!s || s->hidden || s->exited) return;
+    g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), s->id), g_mru.end());
+    g_mru.insert(g_mru.begin(), s->id);
+}
 static void selectPrimary(int idx) {
-    if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
-    g_pane[0] = idx;
-    g_focus = 0;
+    {
+        LockG hold;
+        if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
+        g_pane[0] = idx;
+        g_focus = 0;
+        touchMruLocked(g_sessions[idx]);
+    }
     syncSplitToPrimary();
+    PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
@@ -2368,6 +2403,37 @@ static std::vector<HostSession> hostSessions() {
 // probe, so asking twice was a wasted round trip). Filled by scanHostSessions().
 static std::vector<HostSession> g_hostLive;
 static std::vector<std::string> g_adoptedIds;   // ids this launch picked back up (never reaped)
+
+static void replayRestoredPanes() {
+    // UI timer: take the CURRENT binding/pin under g_lock, then release before any PTY write.
+    // Listed Session objects and their data handles are retained even after unlisting; the reader
+    // can still hold them. A removed/replaced shell cannot be found by its unique pane id here.
+    std::vector<std::string> pending;
+    pending.swap(g_replayQueue);
+    for (const auto& id : pending) {
+        HANDLE data = INVALID_HANDLE_VALUE;
+        std::string command, kind, why;
+        {
+            LockG hold;
+            Session* s = nullptr;
+            for (Session* p : g_sessions) if (p->paneId == id) { s = p; break; }
+            if (!s) why = "pane gone";
+            else if (s->adopted) why = "live shell adopted";
+            else if (s->exited || s->data == INVALID_HANDLE_VALUE) why = "pane is not live";
+            else if (s->agentResume.empty() && s->restoreCmd.empty()) why = "pin and binding cleared";
+            else {
+                kind = s->agentResume.empty() ? "pin" : "binding";
+                command = s->agentResume.empty() ? s->restoreCmd : s->agentResume;
+                data = s->data;
+            }
+        }
+        if (!why.empty()) { logInfo("replay skipped for %s: %s", id.c_str(), why.c_str()); continue; }
+        command += '\r';
+        DWORD sent = ovIo(data, true, command.data(), nullptr, (DWORD)command.size());
+        if (sent == command.size()) logInfo("replayed %s into %s", kind.c_str(), id.c_str());
+        else logWarn("replay failed for %s: wrote %lu of %zu bytes", id.c_str(), sent, command.size());
+    }
+}
 
 /// Read the host's sessions and make sure this window can never mint an id the host already has.
 /// Must run for EVERY launch, not just a restoring one: with --no-restore (or a state file that
@@ -3213,6 +3279,7 @@ static bool saveSessionState() {
     // the sessions without their slots — and drops them on its next save (the same write-back loss
     // as C). Never replayed by lite: the slot is a checkpoint a caller reads back, nothing more.
     std::string capLines;
+    std::string replayLines;   // R/B use K's role-based, positional shape
     // "L\t<idx>\t<axis>\t<0|1>" — a split's LAYOUT (P4): the axis word (Session::horizontal's
     // vocabulary, `vertical` / `horizontal`) and the slot order (0 = the session's own shell sits
     // in slot 0, 1 = swapped), indexed by S-line position like P. Written ONLY when the layout
@@ -3240,10 +3307,21 @@ static bool saveSessionState() {
             splitLines += "\n";
             if (owner->horizontal || owner->swapped)
                 layoutLines += "L" + tab + std::to_string(oi) + tab + axisWord(owner) + tab + (owner->swapped ? "1" : "0") + "\n";
+            if (owner->splitRatio != 0.5f) {
+                char ratio[32]; sprintf_s(ratio, "%.3f", (double)owner->splitRatio);
+                layoutLines += "G" + tab + std::to_string(oi) + tab + ratio + "\n";
+            }
         }
         const std::string& p1 = sh ? sh->capturedCmd : std::string();
         if (!owner->capturedCmd.empty() || !p1.empty())
             capLines += "K" + tab + std::to_string(oi) + tab + tsvField(owner->capturedCmd) + tab + tsvField(p1) + "\n";
+        auto replayLine = [&](const char* tag, std::string Session::*field) {
+            const std::string a = owner->*field, b = sh ? sh->*field : std::string();
+            if (!a.empty() || !b.empty())
+                replayLines += tag + tab + std::to_string(oi) + tab + jsonEscape(a) + tab + jsonEscape(b) + "\n";
+        };
+        replayLine("R", &Session::restoreCmd);
+        replayLine("B", &Session::agentResume);
     }
     // Read under the lock, with the session list it describes: the flag is written from the
     // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
@@ -3261,6 +3339,7 @@ static bool saveSessionState() {
     out += splitLines;                       // P lines: each session's own split shell
     out += layoutLines;                      // L lines: a split's axis and order, only when not the default
     out += capLines;                         // K lines: the captured-command slots, after the P they name
+    out += replayLines;
     out += "A\t" + std::to_string(activeWs) + "\n";
 
     // From here on the file is touched: the zero-session read below, the .tmp write and the
@@ -3868,11 +3947,50 @@ static int agbfBench() {
 static int viewOff(Session* s, const FfiEmuInfo& info) {
     return info.isAltScreen ? 0 : max(0, min(s->scrollOff, (int)info.historyCount));
 }
+struct SearchMatch {
+    int absRow, colStart, colEnd;
+    std::shared_ptr<const driving::Row> proof;
+};
+struct SearchState {
+    bool open = false, alt = false;
+    std::string query, paneId;
+    std::vector<SearchMatch> matches;
+    int current = 0;
+};
+static SearchState g_search;   // guarded by g_lock, one active-surface search
+static std::string searchStatus() {
+    return g_search.matches.empty() ? (g_search.query.empty() ? "" : "no matches")
+         : std::to_string(g_search.current + 1) + " of " + std::to_string(g_search.matches.size());
+}
+// Caller holds g_lock. Rows are code points with a parallel cell map, never UTF-8 offsets.
+static bool recomputeSearch(Session* s, FfiEmuInfo* info) {
+    g_search.matches.clear();
+    if (!s->emu || !emu_info(s->emu, info)) return false;
+    g_search.alt = info->isAltScreen != 0;
+    auto query = driving::queryPoints(widen(g_search.query));
+    if (query.empty()) { g_search.current = 0; return true; }
+    std::vector<FfiCell> grid((size_t)info->cols * info->rows), cells(info->cols);
+    if (!emu_copy_grid(s->emu, grid.data(), (uint32_t)grid.size())) return false;
+    for (int r = 0; r < (int)info->historyCount + (int)info->rows; ++r) {
+        const FfiCell* data;
+        if (r < (int)info->historyCount) {
+            if (!emu_copy_history_row(s->emu, (uint32_t)r, cells.data(), info->cols)) continue;
+            data = cells.data();
+        } else data = &grid[(size_t)(r - info->historyCount) * info->cols];
+        auto proof = std::make_shared<driving::Row>(driving::rowCells(data, (int)info->cols));
+        for (const auto& span : driving::matches(*proof, query))
+            g_search.matches.push_back({ r, span.first, span.end, proof });
+    }
+    if (g_search.current >= (int)g_search.matches.size()) g_search.current = 0;
+    return true;
+}
 static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
     if (!s) return;
     FfiEmuInfo info{};
+    SearchState search;
     EnterCriticalSection(&g_lock);
     emu_info(s->emu, &info);
+    if (g_search.open && g_search.paneId == s->paneId && g_search.alt == (info.isAltScreen != 0)) search = g_search;
     size_t need = (size_t)info.cols * info.rows;
     if (s->grid.size() < need) s->grid.resize(need);
     if (s->hrow.size() < info.cols) s->hrow.resize(info.cols);
@@ -3999,6 +4117,28 @@ afterGridPaint:;
                      min((LONG)(pr.left + to * g_cw), pr.right), pr.top + (int)(r + 1) * g_ch };
             InvertRect(mem, &sr);
         }
+    }
+
+    // Search marks are frames, not a second inversion: selection remains visible under a match.
+    // Revalidate each visible row against the snapshot actually drawn, including wide-cell maps.
+    if (search.open) {
+        int base = (int)info.historyCount - off;
+        std::map<int, bool> valid;
+        HBRUSH normal = CreateSolidBrush(RGB(220, 160, 30));
+        HBRUSH current = CreateSolidBrush(RGB(80, 200, 255));
+        for (int i = 0; i < (int)search.matches.size(); ++i) {
+            const auto& match = search.matches[i];
+            int row = match.absRow - base;
+            if (row < 0 || row >= (int)info.rows || (row + 1) * g_ch > pr.bottom - pr.top) continue;
+            auto found = valid.find(row);
+            if (found == valid.end())
+                found = valid.emplace(row, match.proof->sameCells(driving::rowCells(&view[(size_t)row * info.cols], (int)info.cols))).first;
+            if (!found->second) continue;
+            RECT band{ pr.left + match.colStart * g_cw, pr.top + row * g_ch,
+                       min(pr.right, pr.left + match.colEnd * g_cw), pr.top + (row + 1) * g_ch };
+            if (band.right > band.left) FrameRect(mem, &band, i == search.current ? current : normal);
+        }
+        DeleteObject(normal); DeleteObject(current);
     }
 
     // Cursor (only at live view, only in the focused pane, not while selecting). Solid and blinking
@@ -4363,8 +4503,23 @@ static const char* selectAllOf(Session* target) {
 
 // ---- input ----
 static void sendBytes(const char* bytes, int len) {
-    Session* s = focusedSession();
-    if (s && s->data != INVALID_HANDLE_VALUE) ovIo(s->data, true, bytes, nullptr, (DWORD)len);
+    // THE GATE: human keys only. API type/write and emulator protocol replies bypass this.
+    HANDLE data;
+    {
+        LockG hold;
+        Session* s = focusedSession();
+        if (!s || s->readOnly || s->exited || s->data == INVALID_HANDLE_VALUE) return;
+        data = s->data;
+    }
+    ovIo(data, true, bytes, nullptr, (DWORD)len);
+}
+
+static void toggleReadOnly() {
+    {
+        LockG hold;
+        if (Session* s = focusedSession()) s->readOnly = !s->readOnly;
+    }
+    PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
 
 // Clipboard text on Windows is CRLF-delimited, but a terminal wants a bare CR per line: send the
@@ -4384,8 +4539,16 @@ static std::string pasteNormalize(std::string t) {
 }
 
 static void pasteClipboard() {
-    Session* s = focusedSession();
-    if (!s || s->data == INVALID_HANDLE_VALUE || !OpenClipboard(g_hwnd)) return;
+    HANDLE data;
+    FfiEmuInfo info{};
+    {
+        LockG hold;
+        Session* s = focusedSession();
+        if (!s || s->readOnly || s->exited || s->data == INVALID_HANDLE_VALUE) return;
+        data = s->data;
+        emu_info(s->emu, &info);
+    }
+    if (!OpenClipboard(g_hwnd)) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) {
         wchar_t* w = (wchar_t*)GlobalLock(h);
@@ -4395,13 +4558,9 @@ static void pasteClipboard() {
             if (!u8.empty()) WideCharToMultiByte(CP_UTF8, 0, w, -1, &u8[0], n, nullptr, nullptr);
             u8 = pasteNormalize(std::move(u8));
             // Bracketed paste when the app enabled it (safer multiline paste), else raw.
-            FfiEmuInfo info{};
-            EnterCriticalSection(&g_lock);
-            emu_info(s->emu, &info);
-            LeaveCriticalSection(&g_lock);
-            if (info.bracketedPaste) { ovIo(s->data, true, "\x1b[200~", nullptr, 6); }
-            ovIo(s->data, true, u8.data(), nullptr, (DWORD)u8.size());
-            if (info.bracketedPaste) { ovIo(s->data, true, "\x1b[201~", nullptr, 6); }
+            if (info.bracketedPaste) { ovIo(data, true, "\x1b[200~", nullptr, 6); }
+            ovIo(data, true, u8.data(), nullptr, (DWORD)u8.size());
+            if (info.bracketedPaste) { ovIo(data, true, "\x1b[201~", nullptr, 6); }
             GlobalUnlock(h);
         }
     }
@@ -4410,6 +4569,11 @@ static void pasteClipboard() {
 
 
 static void sendUtf8(wchar_t wc) {
+    {
+        LockG hold;
+        Session* s = focusedSession();
+        if (!s || s->readOnly) return;   // a blocked interrupt did not stop the agent
+    }
     // User interrupt: Esc / Ctrl+C typed into the terminal clears a "working" agent status — an
     // interrupted agent turn never fires its Stop hook, so the status would stick forever (agterm
     // #185 / main-app parity: scoped to working-class; blocked stays until the agent or user acts).
@@ -4436,7 +4600,9 @@ static bool mouseReportSurface(Session* s, RECT pr, int x, int y, int cb, bool p
         {
         LockG lk;
         if (!s || indexOfSession(s) < 0 || !s->emu || !emu_info(s->emu, &info)) return false;
+        const bool readOnly = s->readOnly;
         if (!info.mouseClick && !info.mouseDrag && !info.mouseMotion) return false;  // no reporting -> selection path
+        if (readOnly) return true;                                                 // reporting event swallowed, not selection
         if (motion && !info.mouseDrag && !info.mouseMotion) return true;             // click-only app: swallow motion
         if (s->data == INVALID_HANDLE_VALUE) return true;
         // Unlisting keeps the Session and data handle alive for its reader (unlistOverlayLocked).
@@ -5000,6 +5166,7 @@ static void runKbAction(int a) {
         case KB_FLAGVIEW: toggleFlagView(); break;
         case KB_ATTENTION: nextBlocked(); break;
         case KB_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;
+        case KB_READONLY: toggleReadOnly(); break;
     }
 }
 static bool handleKeyDown(WPARAM vk) {
@@ -5133,7 +5300,11 @@ static void updateStatus() {
     SendMessageW(g_status, SB_SETTEXTW, 1, (LPARAM)buf);
     if (Session* s = focusedSession()) {
         FfiEmuInfo info{}; EnterCriticalSection(&g_lock); emu_info(s->emu, &info); LeaveCriticalSection(&g_lock);
-        wsprintfW(buf, L"%u \x00D7 %u%s", info.cols, info.rows, g_markMode ? L"  \x00B7 MARK" : L""); SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)buf);
+        wsprintfW(buf, L"%u \x00D7 %u%s", info.cols, info.rows, g_markMode ? L"  \x00B7 MARK" : L"");
+        std::wstring sizeText = buf;
+        if (s->readOnly) sizeText += L" \x00B7 READ-ONLY";
+        if (g_search.open && g_search.paneId == s->paneId) sizeText += L" \x00B7 FIND " + widen(searchStatus());
+        SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)sizeText.c_str());
     }
     if (!g_catalog.empty() && g_faceIdx >= 0 && g_faceIdx < (int)g_catalog.size()) {
         const FontEntry& e = g_catalog[g_faceIdx];
@@ -5356,6 +5527,7 @@ static HMENU buildMenuBar() {
     AppendMenuW(edit, MF_STRING, IDM_MARK, L"&Mark Mode");
     AppendMenuW(edit, MF_STRING, IDM_SELECTALL, L"Select &All");
     AppendMenuW(edit, MF_STRING, IDM_PASTE, L"&Paste");
+    AppendMenuW(edit, MF_STRING, IDM_READONLY, L"Toggle &Read-Only Pane");
     HMENU view = CreatePopupMenu();
     AppendMenuW(view, MF_STRING, IDM_SPLIT, L"&Split / Unsplit");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
@@ -6199,8 +6371,21 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                : (h == g_scratchHwnd) ? g_scratchSession
                : (h == g_overlayHwnd) ? g_overlaySession : nullptr;
     switch (m) {
-        case WM_SETFOCUS:  { LockG lk; g_focusOverride = s; endMarkModeIfMoved(); return 0; }
-        case WM_KILLFOCUS: { LockG lk; if (g_focusOverride == s) g_focusOverride = nullptr; endMarkModeIfMoved(); return 0; }
+        case WM_SETFOCUS: {
+            LockG hold;
+            g_focusOverride = s;
+            endMarkModeIfMoved();
+            touchMruLocked(displayedOwner());
+            PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+            return 0;
+        }
+        case WM_KILLFOCUS: {
+            LockG hold;
+            if (g_focusOverride == s) g_focusOverride = nullptr;
+            endMarkModeIfMoved();
+            PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+            return 0;
+        }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paintPopup(h, s); return 0;
         case WM_SIZE:
@@ -7013,6 +7198,11 @@ public:
     }
     void OnTimer(UINT_PTR id) {
         if (id == kSelAutoTimer) { selAutoTick(m_hWnd); return; }
+        if (id == kReplayTimer) {
+            KillTimer(kReplayTimer);
+            replayRestoredPanes();
+            return;
+        }
         if (id == kRelayoutTimer) {
             // A resize that did not happen: the UI thread skipped it because a control-pipe thread
             // held g_resizeLock, or the pty-host refused one and the rollback armed this. Kill the
@@ -7475,6 +7665,7 @@ public:
             case IDM_PROPERTIES: showPropertiesDialog(); break;
             case IDM_KEYBOARD: showKeyboardDialog(); break;
             case IDM_PALETTE: togglePalette(); break;
+            case IDM_READONLY: toggleReadOnly(); break;
             case IDM_QUICK: togglePopupTerminal(false); break;
             case IDM_SCRATCH: togglePopupTerminal(true); break;
             case IDM_REOPEN: reopenClosed(); break;
@@ -7521,6 +7712,7 @@ public:
     void OnDestroy() {
         cancelDrag(m_hWnd);
         KillTimer(kCaretTimer);
+        KillTimer(kReplayTimer);
         saveWindowRect();                        // remember window size + position for next launch
         saveSessionState();                      // final save with LIVE cwds — while the shells are
                                                  // still alive to answer the PEB query; the periodic
@@ -7627,6 +7819,27 @@ static std::string splitCoverPane(const std::string& paneId) {
            "`session overlay close` or `quick off` dismiss those. Nothing was split.";
 }
 static const char* const kSplitNotSplit = "session is not split (one pane); nothing to focus";
+static const char* const kSplitNoDivider = "session is not split (one pane); there is no divider to move";
+static bool parseFiniteNumber(const std::string& raw, double* result) {
+    if (raw.empty() || raw.find('\0') != std::string::npos) return false;
+    char* end = nullptr;
+    errno = 0;
+    double n = strtod(raw.c_str(), &end);
+    if (end == raw.c_str() || *end || errno == ERANGE || !std::isfinite(n)) return false;
+    *result = n;
+    return true;
+}
+static bool parseCellCount(const std::string& raw, int* result) {
+    size_t i = !raw.empty() && (raw[0] == '+' || raw[0] == '-') ? 1 : 0;
+    if (i == raw.size()) return false;
+    for (; i < raw.size(); ++i) if (raw[i] < '0' || raw[i] > '9') return false;
+    errno = 0;
+    char* end = nullptr;
+    long n = strtol(raw.c_str(), &end, 10);
+    if (*end || errno == ERANGE || n < INT_MIN || n > INT_MAX) return false;
+    *result = (int)n;
+    return true;
+}
 // `session split close` (SplitCloseReply.cs): each closes nothing.
 static const char* const kSplitCloseNoActive = "split close: there is no active session to close a pane of. Nothing closed.";
 static std::string splitCloseUnknown(const std::string& target) {
@@ -7881,8 +8094,9 @@ static std::string splitBlockFields(const Session* owner, const Session* split, 
     const Session* slot0 = owner->swapped ? split : owner;
     const Session* slot1 = owner->swapped ? owner : split;
     int focusedSlot = g_pane[0] == ownerIdx ? (owner->swapped ? 1 - g_focus : g_focus) : (owner->swapped ? 1 : 0);
+    char ratios[64]; sprintf_s(ratios, ",\"splitRatios\":[%.3f,%.3f]", (double)owner->splitRatio, 1.0 - owner->splitRatio);
     return "\"paneIds\":[\"" + jsonEscape(slot0->paneId) + "\",\"" + jsonEscape(slot1->paneId) +
-           "\"],\"focusedPane\":" + std::to_string(focusedSlot) + ",\"axis\":\"" + axisWord(owner) + "\"";
+           "\"],\"focusedPane\":" + std::to_string(focusedSlot) + ",\"axis\":\"" + axisWord(owner) + "\"" + ratios;
 }
 // The process query did not run. Refused rather than reported as "nothing running" everywhere: an
 // empty answer from a dead query would write null into every slot and look exactly like a quiet desk.
@@ -8507,7 +8721,7 @@ splits section) are not the session id - and persist as a `K` line. `--target` n
 disk when you read it.
 
 **`replayOnRestore` is always `false` here.** lite restores a session's LAUNCH spec at the next
-start and never types a slot back (`session restore` is not in lite), so a captured command is a
+start and never types a captured slot back (explicit restore pins are separate), so a captured command is a
 checkpoint you read - from the reply, `tree` or the file - not a command that will run again.
 The field exists so one script reads one shape against both products; it starts reporting a
 toggle the day lite has a replay.
@@ -8617,12 +8831,34 @@ the button flashes) when it is not. Both are `ok` - the window exists and the re
 which is the shape the contract pins and what the full app answers - so test the result, not
 `ok`: `ok:false` means the window was not found.
 
+## Driving a pane
+
+Stop human keys reaching your shell with `session readonly on`; your own `session type` and
+`session write` still work. Human paste and mouse reports are blocked too; `session paste` refuses
+explicitly. `on|off|toggle|state|get` operate on the targeted surface (active includes its overlay;
+an explicit shell id reaches underneath). READ-ONLY appears in the status bar. The flag is not saved.
+
+`session restore <command>|none --target PANE` pins a command typed after a fresh restart;
+`session bind <agent-command>|none --target PANE` replays that binding instead (default `claude`).
+Both need an explicit shell id and save before success. Replay waits 2500 ms, then re-reads the
+current value; it never replays into an adopted live shell. A delay is not a readiness check.
+Captured commands remain separate and never replay.
+
+`session resize --split-ratio R` changes slot 0's share (0.05..0.95); whole-cell grow arguments
+move its divider along the split axis. `session switch begin|advance|advance-back|commit|cancel`
+walks a snapshot of recency; next/previous keys still use tree order.
+
+`session search QUERY --next|--prev|--close` searches the active surface (a valid target is accepted
+but does not redirect v1 search). Unicode matches are highlighted in cells, the current one cyan
+and others amber, with FIND in the status bar. Counts are as of the last call; changed rows do not
+paint stale highlights. The alt screen never scrolls into history. No find bar or Ctrl+F binding.
+
 ## What this terminal does NOT have
 
 Do not reach for these - they exist in the full agwinterm and will be refused here with
 "unknown command '<verb>' (lite subset)":
 
-`session search`, `session readonly`, `session bind`, `session restore`, `session background`,
+`session background` (lite draws no images),
 `command run`, `command list`, `command leader`, `notify`, `broadcast`, `dashboard`,
 `config get|set|list`, `profiles list|reload`, `theme list|set`, `omp list|set`, `image show|sixel`,
 `font`, `keymap reload`, `restore clear`, `install hooks|shell|cli`, `claude *`.
@@ -8735,6 +8971,14 @@ static std::string ctlDispatch(const std::string& line) {
                     }
                     if (sh && !sh->capturedCmd.empty())
                         sess += std::string(any ? "," : "") + "\"" + jsonEscape(sh->paneId) + "\":\"" + jsonEscape(sh->capturedCmd) + "\"";
+                    sess += "}";
+                }
+                if (!s->restoreCmd.empty() || (sh && !sh->restoreCmd.empty())) {
+                    sess += ",\"restoreCommands\":{";
+                    if (!s->restoreCmd.empty())
+                        sess += "\"" + jsonEscape(s->paneId) + "\":\"" + jsonEscape(s->restoreCmd) + "\"";
+                    if (sh && !sh->restoreCmd.empty())
+                        sess += std::string(s->restoreCmd.empty() ? "" : ",") + "\"" + jsonEscape(sh->paneId) + "\":\"" + jsonEscape(sh->restoreCmd) + "\"";
                     sess += "}";
                 }
                 // "paneOverlays" (P5): the open PANE slots as agwinterm's words, in SLOT order (slot 0 =
@@ -8904,9 +9148,139 @@ static std::string ctlDispatch(const std::string& line) {
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr(s->id);
     }
+    if (cmd == "session.switch") {
+        std::string op = req.get("args.op");
+        if (op.empty()) op = "advance";
+        const bool forward = op == "advance" || op == "next";
+        const bool back = op == "advance-back" || op == "back" || op == "prev" || op == "previous";
+        if (op != "begin" && !forward && !back && op != "commit" && op != "cancel")
+            return ctlErr("session switch: op '" + op + "' is not one of begin, advance, advance-back, commit or cancel; nothing changed");
+        bool selected = false;
+        std::string reply;
+        {
+            LockG hold;
+            auto liveIndex = [](const std::string& id) {
+                for (int i = 0; i < (int)g_sessions.size(); ++i)
+                    if (g_sessions[i]->id == id && !g_sessions[i]->hidden && !g_sessions[i]->exited) return i;
+                return -1;
+            };
+            g_mru.erase(std::remove_if(g_mru.begin(), g_mru.end(), [&](const std::string& id) { return liveIndex(id) < 0; }), g_mru.end());
+            for (Session* s : g_sessions)
+                if (!s->hidden && !s->exited && std::find(g_mru.begin(), g_mru.end(), s->id) == g_mru.end()) g_mru.push_back(s->id);
+            auto begin = [&]() {
+                touchMruLocked(displayedOwner());
+                g_walk = {};
+                g_walk.order = g_mru;
+                g_walk.active = !g_walk.order.empty();
+                if (Session* s = displayedOwner()) g_walk.startId = s->id;
+            };
+            std::string pick;
+            if (op == "begin") begin();
+            else if (forward || back) {
+                if (!g_walk.active) begin();
+                int n = (int)g_walk.order.size();
+                for (int tries = 0; tries < n; ++tries) {
+                    g_walk.cursor = (g_walk.cursor + (back ? -1 : 1) + n) % n;
+                    if (liveIndex(g_walk.order[g_walk.cursor]) >= 0) { pick = g_walk.order[g_walk.cursor]; break; }
+                }
+            } else if (op == "cancel") {
+                if (g_walk.active) pick = g_walk.startId;
+                g_walk = {};
+            } else { g_walk = {}; touchMruLocked(displayedOwner()); }
+            int idx = liveIndex(pick);
+            if (idx >= 0) {
+                g_pane[0] = idx; g_focus = 0;
+                g_activeWs = g_sessions[idx]->ws;
+                touchMruLocked(g_sessions[idx]);
+                selected = true;
+            }
+            Session* active = displayedOwner();
+            reply = "(none)";
+            if (active && !active->hidden && !active->exited) {
+                int vis = 0;
+                for (Session* s : g_sessions) { if (!s->hidden) ++vis; if (s == active) break; }
+                reply = active->name.empty() ? "session " + std::to_string(vis) : narrow(active->name);
+            }
+        }
+        if (selected) syncSplitToPrimary();
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return ctlOkStr(reply);
+    }
+    if (cmd == "session.resize") {
+        {
+            LockG hold;
+            Session* owner = displayedOwner();
+            if (!owner || g_pane[1] < 0) return ctlErr(kSplitNoDivider);
+            const char* names[] = { "grow-left", "grow-right", "grow-top", "grow-bottom" };
+            int cells[4]{};
+            bool present[4]{};
+            for (int i = 0; i < 4; ++i) {
+                auto f = req.fields.find(std::string("args.") + names[i]);
+                present[i] = f != req.fields.end();
+                if (present[i] && !parseCellCount(f->second, &cells[i]))
+                    return ctlErr(std::string("session resize: --") + names[i] + " needs a whole number of cells; the divider was not moved");
+            }
+            if (owner->horizontal && (present[0] || present[1]))
+                return ctlErr("--grow-left/--grow-right mean nothing on a horizontal split (top/bottom panes); use --grow-top/--grow-bottom; the divider was not moved");
+            if (!owner->horizontal && (present[2] || present[3]))
+                return ctlErr("--grow-top/--grow-bottom mean nothing on a vertical split (left/right panes); use --grow-left/--grow-right; the divider was not moved");
+            double ratio = owner->splitRatio;
+            auto f = req.fields.find("args.ratio");
+            if (f != req.fields.end() && !parseFiniteNumber(f->second, &ratio))
+                return ctlErr("session resize: --split-ratio needs a number between 0.05 and 0.95; the divider was not moved");
+            ratio = max(0.05, min(0.95, ratio));
+            RECT rc; GetClientRect(g_hwnd, &rc);
+            int span = owner->horizontal ? rc.bottom - toolbarTop() - (g_showStatus ? g_statusH : 0) - 2 : rc.right - sidebarSpan() - 2;
+            double shift = owner->horizontal ? (double)cells[3] - cells[2] : (double)cells[1] - cells[0];
+            if (span > 0) ratio += shift * (owner->horizontal ? g_ch : g_cw) / span;
+            owner->splitRatio = (float)max(0.05, min(0.95, ratio));
+        }
+        syncPaneSizes();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        if (!saveSessionState()) return ctlErr("session resize: divider changed in memory but this save could not write the state file; see the log");
+        return ctlOkStr("resized");
+    }
     std::string targetWhy;
     const std::string targetWord = req.get("target");
+    if (cmd == "session.restore" && (targetWord.empty() || targetWord == "active"))
+        return ctlErr("session.restore needs a pane: pass --target <pane-id>. A pin outlives the pane that is active now, so there is no active-pane default (inside a session, AGWINTERM_SESSION_ID is that pane's id). Nothing pinned.");
+    if (cmd == "session.bind" && (targetWord.empty() || targetWord == "active"))
+        return ctlErr("session not found");
     Session* target = resolveTarget(targetWord, &targetWhy);
+    if (cmd == "session.restore" || cmd == "session.bind") {
+        const bool pin = cmd == "session.restore";
+        const std::string missing = pin ? "no pane or session matches '" + targetWord + "'. Nothing pinned." : "session not found";
+        if (!target) return ctlErr(missing);
+        const char* field = pin ? "args.command" : "args.agent";
+        auto f = req.fields.find(field);
+        std::string command = f == req.fields.end() ? (pin ? "" : "claude") : f->second;
+        std::wstring trimmed = widen(command);
+        size_t begin = trimmed.find_first_not_of(L" \t\r\n\v\f"), end = trimmed.find_last_not_of(L" \t\r\n\v\f");
+        trimmed = begin == std::wstring::npos ? L"" : trimmed.substr(begin, end - begin + 1);
+        if (trimmed.empty() || _wcsicmp(trimmed.c_str(), L"none") == 0) command.clear();
+        std::string pane, session;
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr(missing);
+            if (isCoverLocked(target)) {
+                if (!pin) return ctlErr(sessionIdentityCover("bind", target->paneId, "bound"));
+                return ctlErr("'" + target->paneId + "' is a scratch/overlay/quick pane, which is never restored; a pin there would be lost at the next restart. Nothing pinned.");
+            }
+            pane = target->paneId;
+            Session* owner = splitOwnerOf(target);
+            session = owner ? owner->id : target->id;
+            if (pin) target->restoreCmd = command;
+            else target->agentResume = command;
+        }
+        if (!saveSessionState())
+            return ctlErr(std::string(pin ? "session restore" : "session bind") + ": value changed in memory but this save could not write the state file; see the log");
+        if (!pin) return ctlOkStr("bound");
+        std::string reply = "{\"action\":\"" + std::string(command.empty() ? "cleared" : "pinned") + "\",\"pane\":\"" + jsonEscape(pane) + "\",\"session\":\"" + jsonEscape(session) + "\"";
+        if (!command.empty()) reply += ",\"command\":\"" + jsonEscape(command) + "\"";
+        return ctlOk(reply + "}");
+    }
     // THE `active` RULE, by verb kind (P5; revmux r1 of P5-lite). An empty target / `active` resolves
     // through focusedSession(): the focused pane's SURFACE — its pane overlay while one covers it,
     // the popup while that is focused. That is right for the verbs that read or write a surface
@@ -8933,7 +9307,8 @@ static std::string ctlDispatch(const std::string& line) {
     if (target && (targetWord.empty() || targetWord == "active") &&
         cmd != "session.type" && cmd != "session.write" && cmd != "session.output" && cmd != "session.text" &&
         cmd != "surface.cursor" && cmd != "session.copy" && cmd != "session.paste" && cmd != "session.overlay" &&
-        cmd != "selection.all" && cmd != "selection.copy" && cmd != "selection.clear" && cmd != "selection.finalize") {
+        cmd != "selection.all" && cmd != "selection.copy" && cmd != "selection.clear" && cmd != "selection.finalize" &&
+        cmd != "session.readonly" && cmd != "session.search") {
         LockG hold;
         if (Session* shell = focusedShell()) {
             target = shell;
@@ -8941,6 +9316,66 @@ static std::string ctlDispatch(const std::string& line) {
                                    cmd == "session.swap" || cmd == "restore.capture";
             if (!paneClass) if (Session* owner = splitOwnerOf(shell)) target = owner;
         }
+    }
+    if (cmd == "session.readonly") {
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        std::string op = req.get("args.op");
+        if (op.empty()) op = "toggle";
+        if (op != "on" && op != "off" && op != "toggle" && op != "state" && op != "get")
+            return ctlErr("session readonly: op '" + op + "' is not one of on, off, toggle, state or get; nothing changed");
+        bool on;
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");
+            // Already resolved: active means the surface; an explicit shell id stays underneath.
+            if (op == "on") target->readOnly = true;
+            else if (op == "off") target->readOnly = false;
+            else if (op == "toggle") target->readOnly = !target->readOnly;
+            on = target->readOnly;
+        }
+        PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return ctlOkStr(on ? "on" : "off");
+    }
+    if (cmd == "session.search") {
+        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        std::string reply, action = req.get("args.action");
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");
+            Session* s = focusedSession();   // v1 accepts target for shape; searches the active surface
+            if (!s || indexOfSession(s) < 0) return ctlErr("session not found");
+            if (action == "close") {
+                g_search.open = false; g_search.matches.clear();
+                reply = "closed";
+            } else {
+                if (g_search.paneId != s->paneId) g_search.current = 0;
+                g_search.paneId = s->paneId;
+                g_search.open = true;
+                if (!req.get("args.query").empty()) {
+                    g_search.query = req.get("args.query");
+                    g_search.current = 0;
+                }
+                FfiEmuInfo info{};
+                if (!recomputeSearch(s, &info)) return ctlErr("session search: surface could not be read");
+                int count = (int)g_search.matches.size();
+                if (count && req.get("args.query").empty() && (action == "next" || action == "prev"))
+                    g_search.current = (g_search.current + (action == "next" ? 1 : -1) + count) % count;
+                if (!info.isAltScreen && count) {
+                    int row = g_search.matches[g_search.current].absRow;
+                    int base = (int)info.historyCount - min(s->scrollOff, (int)info.historyCount);
+                    if (row < base || row >= base + (int)info.rows)
+                        s->scrollOff = max(0, min((int)info.historyCount, (int)info.historyCount - row));
+                }
+                reply = searchStatus();
+            }
+        }
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        if (g_overlayHwnd) InvalidateRect(g_overlayHwnd, nullptr, FALSE);
+        if (g_scratchHwnd) InvalidateRect(g_scratchHwnd, nullptr, FALSE);
+        if (g_quickHwnd) InvalidateRect(g_quickHwnd, nullptr, FALSE);
+        PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+        return ctlOkStr(reply);
     }
     if (cmd == "session.select") {
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
@@ -9907,6 +10342,11 @@ static std::string ctlDispatch(const std::string& line) {
     }
     if (cmd == "session.paste") {   // paste text (or the clipboard) into the target
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");
+            if (target->readOnly) return ctlErr("session paste: '" + target->paneId + "' is read-only; nothing pasted");
+        }
         std::string text = req.get("args.text");
         if (text.empty() && OpenClipboard(nullptr)) {   // no text -> clipboard contents
             if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
@@ -10317,6 +10757,7 @@ struct ParsedState {
     std::vector<RestoreSpec> specs;
     std::vector<SplitSpec> splits;       // from P lines; empty for any file written before 0.17.13
     std::vector<LayoutSpec> layouts;     // from L lines (P4); empty for a default layout, or a file written before it
+    std::vector<std::pair<int, float>> ratios;
     // From C lines (P3): (S-line index, raw text) per session that had a context. Raw here — the
     // loader runs each one through contextRefusal, the verb's own rules, before it is set.
     std::vector<std::pair<int, std::string>> contexts;
@@ -10325,6 +10766,7 @@ struct ParsedState {
     // index, and the split guard below (a pane-1 slot lands only on a split the P line rebuilt).
     struct CaptureLine { int idx; std::string pane0, pane1; };
     std::vector<CaptureLine> captures;
+    std::vector<CaptureLine> pins, bindings;
     int sLines = 0;                      // RAW S lines seen, valid or not - see the P-line guard
     std::vector<std::string> savedIds;   // from the D line; empty for a pre-0.17.3 file
     int activeWs = 0, focusWs = -1;
@@ -10388,6 +10830,15 @@ static ParsedState parseStateFile(const std::wstring& path) {
                 ls.swapped = false;
             }
             ps.layouts.push_back(ls);
+        } else if (ff[0] == "G" && ff.size() >= 3) {
+            int owner;
+            if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed G owner - line dropped"); continue; }
+            double ratio;
+            if (!parseFiniteNumber(ff[2], &ratio) || ratio < 0.05 || ratio > 0.95) {
+                logWarn("state: invalid split ratio '%s' - restoring 0.5", ff[2].c_str());
+                ratio = 0.5;
+            }
+            ps.ratios.push_back({ owner, (float)ratio });
         } else if (ff[0] == "C" && ff.size() >= 3) {   // a session's context: S-line index, text
             // Kept as (index, text) rather than applied here: the index is checked against the
             // spec list only after the whole file is read, under the same count guard as P below.
@@ -10397,6 +10848,21 @@ static ParsedState parseStateFile(const std::wstring& path) {
             // file is read, under the count guard below. The pane-1 field is optional on read (a
             // hand-shortened line) and empty means none.
             ps.captures.push_back({ atoi(ff[1].c_str()), ff[2], ff.size() >= 4 ? ff[3] : std::string() });
+        } else if ((ff[0] == "R" || ff[0] == "B") && ff.size() >= 3) {
+            int owner;
+            if (!parseCellCount(ff[1], &owner)) { logWarn("state: malformed %s owner - line dropped", ff[0].c_str()); continue; }
+            auto& lines = ff[0] == "R" ? ps.pins : ps.bindings;
+            // New line types use JSON string contents inside each TSV field: tabs/newlines,
+            // backslashes and quotes round-trip, so replay never silently changes a command.
+            auto decode = [](const std::string& field, std::string& out) {
+                std::string quoted = "\"" + field + "\"";
+                size_t pos = 0;
+                return jsonParseString(quoted, pos, out) && pos == quoted.size();
+            };
+            std::string a, b;
+            if (decode(ff[2], a) && decode(ff.size() >= 4 ? ff[3] : std::string(), b))
+                lines.push_back({ owner, a, b });
+            else logWarn("state: malformed %s command field - line dropped", ff[0].c_str());
         } else if (ff[0] == "F") {   // flagged indices, in S-line order
             for (size_t k = 1; k < ff.size(); k++) {
                 int fi = atoi(ff[k].c_str());
@@ -10480,6 +10946,34 @@ static ParsedState parseStateFile(const std::wstring& path) {
             logWarn("state: layout line for session index %d has no split (P) line to describe - dropped", li);
             ps.layouts.erase(ps.layouts.begin() + k);
         } else k++;
+    }
+    auto guardReplayLines = [&](std::vector<ParsedState::CaptureLine>& lines, const char* tag) {
+        if (ps.sLines != (int)ps.specs.size()) {
+            if (!lines.empty()) logWarn("state: refusing %s lines because session positions are inconsistent", tag);
+            lines.clear();
+        }
+        for (size_t k = 0; k < lines.size();) {
+            int idx = lines[k].idx;
+            if (idx < 0 || idx >= (int)ps.specs.size()) {
+                logWarn("state: %s line names invalid session index %d - dropped", tag, idx);
+                lines.erase(lines.begin() + k);
+            } else ++k;
+        }
+    };
+    guardReplayLines(ps.pins, "R");
+    guardReplayLines(ps.bindings, "B");
+    if (ps.sLines != (int)ps.specs.size()) {
+        if (!ps.ratios.empty()) logWarn("state: refusing G lines because session positions are inconsistent");
+        ps.ratios.clear();
+    }
+    for (size_t k = 0; k < ps.ratios.size();) {
+        int idx = ps.ratios[k].first;
+        bool split = false;
+        for (const auto& p : ps.splits) if (p.owner == idx) { split = true; break; }
+        if (idx < 0 || idx >= (int)ps.specs.size() || !split) {
+            logWarn("state: G line for session index %d has no valid split - dropped", idx);
+            ps.ratios.erase(ps.ratios.begin() + k);
+        } else ++k;
     }
     if (!ps.savedIds.empty() && ps.savedIds.size() != ps.specs.size()) {
         logWarn("state: %zu saved id(s) for %zu session line(s) — the file is inconsistent, so live "
@@ -10626,7 +11120,7 @@ static bool restoreSessions() {
             s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? nullptr : sp.app.c_str(),
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
                               true);   // repaint: the shell already has a screen, ask it to redraw
-            if (s) { adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
+            if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
             // The shell itself is untouched by a failed adopt (attach may well have succeeded and
             // only the data pipe refused), so it keeps running under an id nothing points at any
             // more — a duplicate for the same spec is created beside it. Name the id: that orphan is
@@ -10725,6 +11219,12 @@ static bool restoreSessions() {
     }
     if (!ps.layouts.empty())
         logInfo("restore: %d of %zu split layout(s) restored", layoutsSet, ps.layouts.size());
+    for (const auto& ratio : ps.ratios) {
+        if (ratio.first >= 0 && ratio.first < (int)bySpec.size() && bySpec[ratio.first] && splitOf[ratio.first]) {
+            LockG hold;
+            bySpec[ratio.first]->splitRatio = ratio.second;
+        }
+    }
     // Pane 1's slot goes onto the split the P line just rebuilt (a fresh Session, so the value has
     // to be re-attached here). No split — the split failed to start, the OWNER failed to start (a
     // dead entry has no split: the P loop above skips a null bySpec owner, so its shell was never
@@ -10748,6 +11248,31 @@ static bool restoreSessions() {
     if (!ps.captures.empty())
         logInfo("restore: %d captured command slot(s) restored from %zu K line(s), %d dropped",
                 capSet, ps.captures.size(), capDropped);
+    auto restoreReplayLines = [&](const std::vector<ParsedState::CaptureLine>& lines,
+                                  std::string Session::*field, const char* tag) {
+        LockG hold;
+        for (const auto& line : lines) {
+            if (line.idx < 0 || line.idx >= (int)byPos.size() || !byPos[line.idx]) continue;
+            byPos[line.idx]->*field = line.pane0;
+            if (Session* sh = splitOf[line.idx]) sh->*field = line.pane1;
+            else if (!line.pane1.empty())
+                logWarn("restore: %s split slot for session index %d dropped - split was not restored", tag, line.idx);
+        }
+    };
+    restoreReplayLines(ps.pins, &Session::restoreCmd, "R");
+    restoreReplayLines(ps.bindings, &Session::agentResume, "B");
+    {
+        LockG hold;
+        for (Session* s : g_sessions) {
+            if (s->restoreCmd.empty() && s->agentResume.empty()) continue;
+            if (s->adopted) { logInfo("replay skipped for %s: live shell adopted", s->paneId.c_str()); continue; }
+            if (!s->exited && s->data != INVALID_HANDLE_VALUE) g_replayQueue.push_back(s->paneId);
+        }
+    }
+    if (!g_replayQueue.empty() && !SetTimer(g_hwnd, kReplayTimer, 2500, nullptr)) {
+        logWarn("restore: replay timer could not be armed (err %lu); no commands replayed", GetLastError());
+        g_replayQueue.clear();
+    }
     g_restoring = false;
     logInfo("restore: %d of %zu session(s) built (%d adopted live from the pty-host, %d kept as dead)",
             built, specs.size(), adopted, dead);
@@ -10760,6 +11285,7 @@ static bool restoreSessions() {
         return false;
     }
     g_pane[0] = firstIdx; g_focus = 0;
+    { LockG hold; touchMruLocked(displayedOwner()); }
     resolveSplitForPrimary();   // ...and the restored session shows its own split, if it had one
     g_activeWs = (activeWs >= 0 && activeWs < (int)g_workspaces.size()) ? activeWs : 0;
     g_focusWs = (focusWs >= 0 && focusWs < (int)g_workspaces.size()) ? focusWs : -1;
