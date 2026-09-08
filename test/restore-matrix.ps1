@@ -94,6 +94,7 @@ function LastSessionId($inst) { @(SessionsOf $inst | ForEach-Object { $_.id })[-
 
 function Start-Lite($inst) {
     $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru
+    Register-OwnedWindow $p                   # the root of the proof for anything typed into its panes
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         $r = (& $ctl tree --json --pipe $inst 2>&1) -join ''
@@ -187,7 +188,7 @@ function Cell {
     $inst = "rm-$Name"
     Reset-Cell $inst
     $before = ''; $after = ''; $err = ''; $ok = $false
-    $p = $null; $p2 = $null
+    $p = $null; $p2 = $null; $script:cellNotes = @()
     try {
         $p = Start-Lite $inst
         & $Setup $inst
@@ -204,7 +205,13 @@ function Cell {
         # whole suite (skipping every cell after it, and the exit code with them).
         $ok = [bool](& $Assert $before $after $inst)
     } catch { $err = $_.Exception.Message; $ok = $false }
-    finally { Stop-Leftover $p; Stop-Leftover $p2 }
+    # The ledger's pings first, whatever the Setup or the Assert got as far as: a throw between a
+    # `session type` and its Stop-Ping would leave one running for minutes under a shell about to go.
+    finally { $script:cellNotes += @(Stop-AllOwnedPings); Stop-Leftover $p; Stop-Leftover $p2 }
+    # A stop the ledger could not complete fails the cell: a PASS over a ping still running under a
+    # dead shell would be the old sweep's lie with better manners.
+    $tf = @(Take-TeardownFailures)
+    if ($tf.Count) { $ok = $false; $err = (@($err, "TEARDOWN INCOMPLETE: $($tf -join '; ')") | Where-Object { $_ }) -join ' | ' }
 
     if ($ok) {
         "  PASS  {0,-22} [{1}]" -f $Name, $after
@@ -216,6 +223,7 @@ function Cell {
         "        after:  [$after]"
         "        log:    $(Restore-Verdict $inst)"
     }
+    $script:cellNotes | Select-Object -Unique  # what the cell stopped on the way out, or left alone
 }
 
 "== restore matrix =="
@@ -576,6 +584,7 @@ function Restart-Cell {
         $p = $null   # already exited: that is what this cell just asserted
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2; Stop-Owned-Relaunch $relays $inst $known }
+    $script:teardownIncomplete += @(Take-TeardownFailures)
     if ($script:teardownIncomplete.Count -and -not $err) { $err = "TEARDOWN INCOMPLETE: $($script:teardownIncomplete -join ', ')" }
 
     if (-not $err -and $after -eq $before -and (SessionCount $before) -ge 2) {
@@ -1022,14 +1031,34 @@ if ($cliHasP3) {
 # The captured-command slots, written as `K\t<S-index>\t<pane0>\t<pane1>` after the P lines and read
 # back onto the session (pane 0) and onto the split the P line rebuilds (pane 1). The Signature
 # carries them as `name^cmd0;cmd1`, so the assertion is on the tree after the restart. The foreground
-# child is a `ping` typed into the pane, found and stopped by its marker argument (`-n 31x`): a
-# graceful close kills the shell and can orphan the ping, so every cell stops its own on the way out.
-function Ping-Procs([string]$n) { @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match "-n $n 127\.0\.0\.1" }) }
+# child is a `ping` typed into the pane, told apart by its marker argument (`-n 31x`) and PROVEN the
+# cell's own by the ledger in test/owned-procs.ps1: the pane's shell first answers a fresh challenge
+# with its own pid and start time on the cell's screen (Own-Shell, over the cell's pipe - the
+# pty-host is one per machine and shared, so nothing under it is ours by descent), then shell ->
+# ping is walked while the chain is alive.
+# A graceful close kills the shell and orphans the ping, so every cell stops its
+# own on the way out - through the handle the ledger pinned, never by the marker, which any other
+# run of this suite on the machine would match too. A marker ping the ledger cannot vouch for is
+# reported and left alone; Wait-Ping does not count it, so it cannot stand in for the cell's own.
 function Wait-Ping([string]$n, [int]$ms = 8000) {
-    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Ping-Procs $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
+    for ($k = 0; $k -lt ($ms / 200); $k++) { if (@(Get-OwnedPings $n).Count -gt 0) { return $true }; Start-Sleep -Milliseconds 200 }
     return $false
 }
-function Stop-Ping([string]$n) { Ping-Procs $n | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+# The stop's report is kept for the verdict line, not returned: a Setup's or an Assert's output is
+# the cell's, and a string among an Assert's output would cast to $true - a FAIL read as PASS.
+function Stop-Ping([string]$n) { $script:cellNotes += @(Stop-OwnedPings $n) }
+# Register a pane's shell by what it answers on its own screen, both legs over the cell's pipe.
+# Returns the ledger key (`pid|birth`); throws when the pane never answers.
+function Own-Shell([string]$id, [string]$i) {
+    Register-PaneShell { param($t) & $ctl session type $t --target $id --pipe $i 2>&1 | Out-Null } `
+                       { (& $ctl session text --target $id --pipe $i 2>&1) -join "`n" }
+}
+# The Setup's throw when a ping never showed up under a shell of ours: names the foreign one if the
+# marker IS running somewhere, which is the case the old marker sweep used to hide.
+function Describe-NoPing([string]$what, [string[]]$ns) {
+    $foreign = @($ns | ForEach-Object { Describe-ForeignPings $_ })
+    if ($foreign.Count) { "$what; $($foreign -join '; ')" } else { $what }
+}
 if ($cliHasP3) {
     # Captured over the API, saved by the verb itself, back after a graceful close — and re-written
     # by the build that loaded it (the file inspected AFTER the second run).
@@ -1038,8 +1067,9 @@ if ($cliHasP3) {
         Stop-Ping '311'
         $id = LastSessionId $i
         & $ctl session rename cap-keeper --target $id --pipe $i 2>&1 | Out-Null
+        Own-Shell $id $i | Out-Null
         & $ctl session type "ping -n 311 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '311')) { throw 'the ping never started under the pane shell' }
+        if (-not (Wait-Ping '311')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('311')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1056,8 +1086,9 @@ if ($cliHasP3) {
         Stop-Ping '312'
         $id = LastSessionId $i
         & $ctl session rename cap-survivor --target $id --pipe $i 2>&1 | Out-Null
+        Own-Shell $id $i | Out-Null
         & $ctl session type "ping -n 312 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '312')) { throw 'the ping never started under the pane shell' }
+        if (-not (Wait-Ping '312')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('312')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1078,9 +1109,10 @@ if ($cliHasP3) {
         $split = [string](ConvertFrom-Json $sraw).result
         if (-not $split) { throw "session split answered no id: $sraw" }
         Start-Sleep -Seconds 2
+        Own-Shell $id $i | Out-Null; Own-Shell $split $i | Out-Null
         & $ctl session type "ping -n 313 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 314 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw 'a ping never started under its pane shell' }
+        if (-not (Wait-Ping '313') -or -not (Wait-Ping '314')) { throw (Describe-NoPing 'a ping never started under its pane shell' @('313', '314')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 2
@@ -1145,9 +1177,10 @@ if ($cliHasP4) {
         $split = [string](ConvertFrom-Json $sraw).result
         if (-not $split) { throw "session split answered no id: $sraw" }
         Start-Sleep -Seconds 2
+        Own-Shell $id $i | Out-Null; Own-Shell $split $i | Out-Null
         & $ctl session type "ping -n 315 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
         & $ctl session type "ping -n 316 127.0.0.1`n" --target $split --pipe $i 2>&1 | Out-Null
-        if (-not (Wait-Ping '315') -or -not (Wait-Ping '316')) { throw 'a ping never started under its pane shell' }
+        if (-not (Wait-Ping '315') -or -not (Wait-Ping '316')) { throw (Describe-NoPing 'a ping never started under its pane shell' @('315', '316')) }
         Start-Sleep -Milliseconds 500
         & $ctl restore capture --pipe $i 2>&1 | Out-Null
         Start-Sleep -Seconds 1
@@ -1161,6 +1194,60 @@ if ($cliHasP4) {
         $tsv = Get-Content (State $i) -Raw
         ($a -eq $b) -and ($tsv -match "(?m)^L`t0`tvertical`t1`r?$") -and
             ($tsv -match "(?m)^K`t0`t[^`t]*-n 315 127\.0\.0\.1`t[^`t]*-n 316 127\.0\.0\.1`r?$")
+    }
+    # The negative case of the proof: a second window on its own pipe - under the same pty-host, since
+    # there is one per machine - types the same marker into a shell the ledger was never told about.
+    # The ledger claims only the ping under the shell that answered on OUR pane; the other is named as
+    # foreign and left alone. The other pane's identity is asked through the same challenge as ours
+    # BEFORE its ping (a shell running a ping answers nothing until the ping ends) but not registered
+    # until the checks are done: registering is the act of vouching, and the identity came off a pane
+    # of a window this run started, so vouching for it afterwards is honest - and its ping is then
+    # stopped as ours. Whatever the checks did, the finally admits that identity too: a throw between
+    # its ping and the vouching must not leave that ping outside the ledger's stop. No restart: this
+    # checks the ledger, not the state file, so it is not a Cell.
+    if (-not $Only -or $Only -eq 'foreign-shell') {
+        $inst = 'rm-foreign-shell'; $inst2 = 'rm-foreign-shell-2'
+        Reset-Cell $inst; Reset-Cell $inst2
+        $p = $null; $p2 = $null; $err = ''; $ok = $false; $detail = ''; $script:cellNotes = @()
+        $other = $null; $otherVouched = $false
+        try {
+            $p = Start-Lite $inst
+            $p2 = Start-Lite $inst2
+            Start-Sleep -Seconds 2
+            $id = LastSessionId $inst; $id2 = LastSessionId $inst2
+            $ours = Own-Shell $id $inst
+            $shellPid = [int]($ours -split '\|')[0]
+            $other = Ask-PaneShell { param($t) & $ctl session type $t --target $id2 --pipe $inst2 2>&1 | Out-Null } `
+                                   { (& $ctl session text --target $id2 --pipe $inst2 2>&1) -join "`n" }
+            $otherPid = $other.Pid
+            # The other window's ping first: a walk that claimed by descent would find it first too.
+            & $ctl session type "ping -n 317 127.0.0.1`n" --target $id2 --pipe $inst2 2>&1 | Out-Null
+            & $ctl session type "ping -n 317 127.0.0.1`n" --target $id --pipe $inst 2>&1 | Out-Null
+            if (-not (Wait-Ping '317')) { throw (Describe-NoPing 'our ping never started under the registered shell' @('317')) }
+            Start-Sleep -Seconds 2   # the other window's ping is up by now too
+            $owned = @(Get-OwnedPings '317'); $foreign = @(Describe-ForeignPings '317')
+            $detail = "owned: $(@($owned | ForEach-Object { "pid $($_.Pid) under shell $($_.ParentPid)" }) -join ', '); foreign: $($foreign -join '; ')"
+            $ok = ($owned.Count -eq 1) -and ($owned[0].ParentPid -eq $shellPid) -and ($foreign.Count -eq 1) -and
+                  ($foreign[0] -match "parent pid $otherPid\b")
+            # Now the other shell is vouched for by the identity its own pane answered, and its ping is ours to stop.
+            Register-OwnedShell $other.Pid $other.BornUtcTicks | Out-Null; $otherVouched = $true
+            if (@(Get-OwnedPings '317').Count -ne 2) { $ok = $false; $detail += "; after registering the other shell: $(@(Get-OwnedPings '317').Count) owned" }
+            $script:cellNotes += @(Stop-AllOwnedPings)   # before the graceful closes: they kill the shells and orphan the pings
+            Stop-Lite $p; $p = $null
+            Stop-Lite $p2; $p2 = $null
+        } catch { $err = $_.Exception.Message; $ok = $false }
+        finally {
+            if ($other -and -not $otherVouched) {
+                try { Register-OwnedShell $other.Pid $other.BornUtcTicks | Out-Null }
+                catch { $script:cellNotes += @(Teardown-Failed "the other window's shell could not be admitted for its ping's stop: $($_.Exception.Message)") }
+            }
+            $script:cellNotes += @(Stop-AllOwnedPings); Stop-Leftover $p; Stop-Leftover $p2
+        }
+        $tf = @(Take-TeardownFailures)
+        if ($tf.Count) { $ok = $false; $err = (@($err, "TEARDOWN INCOMPLETE: $($tf -join '; ')") | Where-Object { $_ }) -join ' | ' }
+        if ($ok) { "  PASS  {0,-22} [{1}]" -f 'foreign-shell', $detail }
+        else { $script:failed += 'foreign-shell'; "  FAIL  {0,-22}" -f 'foreign-shell'; if ($err) { "        error:  $err" }; "        detail: $detail" }
+        $script:cellNotes | Select-Object -Unique
     }
     # A split re-oriented LIVE (`--axis` on an already split session), killed: the re-orient arm
     # has to schedule the save the other split mutations schedule, or the L line keeps the old
