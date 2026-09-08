@@ -4512,6 +4512,7 @@ static void sendBytes(const char* bytes, int len) {
         LockG hold;
         Session* s = focusedSession();
         if (!s || s->readOnly || s->exited || s->data == INVALID_HANDLE_VALUE) return;
+        s->scrollOff = 0;   // only input that passes the gate snaps back to the live grid
         data = s->data;
     }
     ovIo(data, true, bytes, nullptr, (DWORD)len);
@@ -5255,11 +5256,11 @@ static bool handleKeyDown(WPARAM vk) {
         case VK_F10: tilde = 21; break;
         case VK_F11: tilde = 23; break;
         case VK_F12: tilde = 24; break;
-        case VK_TAB: if (shiftDown()) { sendBytes("\x1b[Z", 3); Session* s = focusedSession(); if (s && !s->readOnly) s->scrollOff = 0; return true; } return false; // Shift+Tab = back-tab; plain Tab -> WM_CHAR
+        case VK_TAB: if (shiftDown()) { sendBytes("\x1b[Z", 3); return true; } return false; // Shift+Tab = back-tab; plain Tab -> WM_CHAR
         // Backspace: the raw WM_CHAR bytes are INVERTED vs the xterm/Windows Terminal convention
         // (plain -> 0x08 which apps read as Ctrl+Backspace "kill word", Ctrl+ -> 0x7F). Encode at
         // keydown instead: plain DEL 0x7F, Ctrl+Backspace 0x08 (word delete stays available).
-        case VK_BACK: { sendBytes(ctrlDown() ? "\x08" : "\x7f", 1); Session* s = focusedSession(); if (s && !s->readOnly) s->scrollOff = 0; return true; }
+        case VK_BACK: sendBytes(ctrlDown() ? "\x08" : "\x7f", 1); return true;
         default: return false;
     }
     char buf[32];
@@ -5273,7 +5274,6 @@ static bool handleKeyDown(WPARAM vk) {
         if (mod > 1) wsprintfA(buf, "\x1b[%d;%d~", tilde, mod);
         else wsprintfA(buf, "\x1b[%d~", tilde);
     }
-    if (Session* s = focusedSession()) s->scrollOff = 0;   // typing snaps back to live
     sendBytes(buf, (int)strlen(buf));
     return true;
 }
@@ -6410,7 +6410,6 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)w); return 0; }
             if (g_swallowChar) { g_swallowChar = false; return 0; }
             wchar_t wc = (wchar_t)w;
-            if (s) s->scrollOff = 0;
             if (wc == L'\r') sendBytes("\r", 1); else sendUtf8(wc);
             return 0;
         }
@@ -7052,7 +7051,6 @@ public:
     void OnChar(TCHAR chr, UINT, UINT) {
         if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)chr); return; }
         if (g_swallowChar) { g_swallowChar = false; return; }   // belongs to a keydown a binding consumed
-        if (Session* s = focusedSession()) s->scrollOff = 0;
         if (chr == L'\r') { sendBytes("\r", 1); return; }
         sendUtf8((wchar_t)chr);
     }

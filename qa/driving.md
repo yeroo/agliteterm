@@ -56,3 +56,10 @@ Use PrintWindow to prove cell bounds, wide endpoints, stale-row suppression and 
 also check FIND in status part 2. API assertions are in driving-cases.ps1 (control-honesty);
 30 in-process Unicode/cell/field-codec checks are in driving.unit.ps1. These are not substitutes
 for the mouse/popup/clipboard/pixel/restart acceptance cases above.
+
+Automated guarded acceptance is `test/selection-ui.ps1 -Strict -DrivingOnly -TokenOwner <owner>`
+on the shared desktop (or the same fixture under the inherited suite receipt). The normal
+`run-all.ps1 -Strict` includes it after P7 selection checks. `driving-ui-cases.ps1` covers API
+refusals, MRU cancel/commit, alternate history exclusion, minimized growth, promotion, static
+search pixels, read-only scroll/status, all shell/cover input gates and inert fresh/adopted replay.
+Replay markers are per command so simultaneous split shells cannot collide on a test output file.

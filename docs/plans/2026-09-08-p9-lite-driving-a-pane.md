@@ -599,3 +599,29 @@ new `qa/driving.md` with the human-readable statement of THE GATE and the replay
 - P10-lite carries: `restore-commands` (then `replayOnRestore` may become true), a find bar/Ctrl+F,
   divider drag, `session background` if wanted.
 - Release: lite 0.17.x after merge (Boris tags).
+
+## Codex takeover execution — 2026-09-08
+
+- P9 rebased onto P7 candidate `04a31d0` (PR #50): `304a860` implementation, `bb5dbb4` fix batch.
+  The rebase preserves both timers, mark/select/read-only bindings, status segments and the
+  lock-free mouse I/O correction. Build, canonical contract check and 30 pure driving checks pass.
+- Prior Claude findings and Codex recovery review (4/4 healthy, one Major/nine Minors) are batched:
+  previews no longer reorder MRU; cancel preserves recency; exited origins start before the first
+  live entry and can be restored by cancel; closed IDs are removed; default names count within
+  workspaces. Alt search excludes main history. Ratios override valid grow arguments, zero wrong-axis
+  growth is a no-op, unavailable geometry refuses before mutation, and promotion preserves ratio.
+  Read-only Backspace/Shift-Tab preserve scrollback. Saved R/B commands use strict escape/Unicode
+  decoding; malformed fields are rejected instead of silently changing a command that may replay.
+  Runtime comments/state-file ordering and stale plan pseudocode are corrected in the same batch.
+- Added guarded live acceptance through the P7 fixture, not through the legacy text-only clipboard
+  helpers. Initial complete run: 83 checks (token 46). Expanded acceptance: 117/117 passed
+  (`selection-ui-20260908T131511-e953dc`, token 50). Both tokens were released on verified cleanup.
+  The raw-key sink enables VT input and reads raw bytes: ReadKey alone cannot prove delivery of
+  reporting mouse input. Static pixels wait for an idle sink, and each replay command owns a
+  separate marker file. Popup dismissal is observed before closing its owner. All earlier fixture
+  failures are retained, not relabelled as passes. A final input-gate consolidation now also keeps
+  readonly arrows/plain characters from resetting scrollback; combined P7/P9 rerun and narrow
+  confirmation are pending for that final candidate.
+- Full Strict suite remains a merge gate on the disposable GitHub Windows runner. Some legacy
+  fixtures still have unsafe shared-desktop clipboard/registry handling; they are not run locally.
+  The owned P7/P9 guarded fixture remains mandatory for local acceptance and token release proof.

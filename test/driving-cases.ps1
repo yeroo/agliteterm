@@ -34,11 +34,11 @@ try {
     P9 'session.type' $a @{text="[Console]::WriteLine('P9-'+'API-ALLOWED')`r"} | Out-Null
     Check 'API type still reaches readonly shell' (P9WaitText $a 'P9-API-ALLOWED')
     $human = "[Console]::WriteLine('P9-'+'HUMAN')`r"
-    foreach ($ch in $human.ToCharArray()) { [LiteHonesty]::PostMessageW($s.Hwnd, 0x102, [IntPtr][int]$ch, [IntPtr]::Zero) | Out-Null }
+    foreach ($ch in $human.ToCharArray()) { [LiteUi]::PostMessageW($s.Hwnd, 0x102, [IntPtr][int]$ch, [IntPtr]::Zero) | Out-Null }
     Start-Sleep -Milliseconds 250
     Check 'posted human chars do not reach readonly shell' ([string](P9 'session.text' $a).result -notlike '*P9-HUMAN*')
     Check 'readonly off' ((P9 'session.readonly' $a @{op='off'}).result -eq 'off')
-    foreach ($ch in $human.ToCharArray()) { [LiteHonesty]::PostMessageW($s.Hwnd, 0x102, [IntPtr][int]$ch, [IntPtr]::Zero) | Out-Null }
+    foreach ($ch in $human.ToCharArray()) { [LiteUi]::PostMessageW($s.Hwnd, 0x102, [IntPtr][int]$ch, [IntPtr]::Zero) | Out-Null }
     Check 'same posted human chars reach writable shell (non-vacuous gate)' (P9WaitText $a 'P9-HUMAN')
 
     foreach ($t in '', 'active') {

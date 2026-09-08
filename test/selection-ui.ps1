@@ -1,6 +1,6 @@
 # Keyboard/mouse selection parity. Run locally under the shared hub token; CI is an isolated host.
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
-      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER)
+      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly)
 $ErrorActionPreference='Stop'
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
@@ -82,6 +82,7 @@ try {
         Write-Screen ($esc+'[6;3H') # known caret; surface.cursor exposes only a column
     }
     function Shot([string]$name){Selection-Capture $h $name $g.Left $g.Top ([math]::Min(350,$g.Right-$g.Left)) ([math]::Min(200,$g.Bottom-$g.Top))}
+    if(-not $DrivingOnly){
     Seed-Main
     $before=Shot 'wheel-before';[SelectionUi]::Wheel($h,($g.Left+100),($g.Top+60),3);$after=Shot 'wheel-after'
     Check 'wheel: posted main-screen wheel changes the viewport' ((Selection-PixelDiff $before $after)-gt 100)
@@ -301,6 +302,8 @@ try {
     Check 'bindings: rebound mark chord also toggles it off' ([SelectionUi]::Status($h,2)-notmatch 'MARK')
     Write-Screen ($esc+'[2J'+$esc+'[HSELECT-ALL-REBOUND');Set-Marker;[LiteUi]::Chord($h,[int][char]'L',$true)
     Check 'bindings: rebound Select All highlights without copying' ((Selected)-match 'SELECT-ALL-REBOUND' -and (Clip)-eq $script:selectionMarker)
+    }
+    if(Test-Path "$PSScriptRoot/driving-ui-cases.ps1"){. "$PSScriptRoot/driving-ui-cases.ps1"}
 }catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
     $cleanupOk=Invoke-SelectionCleanup { Stop-SelectionSandbox } {

@@ -70,14 +70,14 @@ function Selection-Rpc([string]$cmd,[hashtable]$args_=@{},[string]$target='activ
     try {
         $client.Connect(2000);$writer=[IO.StreamWriter]::new($client);$writer.AutoFlush=$true;$reader=[IO.StreamReader]::new($client)
         $writer.WriteLine((@{cmd=$cmd;target=$target;args=$args_}|ConvertTo-Json -Compress -Depth 10))
-        $read=$reader.ReadLineAsync();if(-not $read.Wait(5000)){throw 'selection UI control request timed out'}
+        $read=$reader.ReadLineAsync();if(-not $read.Wait(5000)){throw "selection UI control request timed out: $cmd"}
         $reply=$read.Result|ConvertFrom-Json
         if(-not $reply.ok -and -not $AllowError){throw "${cmd}: $($reply.error)"}
         if($AllowError){return $reply};return $reply.result
     } finally {$client.Dispose()}
 }
 function Start-SelectionSandbox {
-    param([string]$Exe,[string]$Profile)
+    param([string]$Exe,[string]$Profile,[switch]$Restore,[int]$SettleMilliseconds=3000)
     # loadKeys deletes these obsolete values. Make that an explicitly guarded fixture write
     # before launching, rather than adopting whatever is missing after the app has run.
     foreach($name in 'Key_ZoomIn','Key_ZoomOut','Key_ZoomReset'){
@@ -90,10 +90,13 @@ function Start-SelectionSandbox {
         Set-SelectionRegistry $keyName $script:selectionRegistry[$keyName].Expected
     }
     # Caller records the launch immediately; even startup failure is cleaned by its finally.
-    $script:selectionProc=Start-Process $Exe -ArgumentList @('--pipe',$script:selectionPipe,'--no-restore') -Environment @{LOCALAPPDATA=$Profile} -WindowStyle Hidden -PassThru
+    $launchArgs=@('--pipe',$script:selectionPipe)
+    if(-not $Restore){$launchArgs+='--no-restore'}
+    $script:selectionProc=Start-Process $Exe -ArgumentList $launchArgs -Environment @{LOCALAPPDATA=$Profile} -WindowStyle Hidden -PassThru
     $script:selectionLaunched=$true
     [void]$script:selectionProc.SafeHandle
-    $script:selectionHosts=@()
+    # A killed-window adoption check deliberately retains its already-proven owned host.
+    $script:selectionHosts=@($script:selectionHosts | Where-Object {-not $_.HasExited})
     for($i=0;$i -lt 60;$i++) {
         try {$null=Selection-Rpc 'ping';break} catch {if($script:selectionProc.HasExited){throw 'selection sandbox exited during launch'};Start-Sleep -Milliseconds 250}
     }
@@ -111,7 +114,7 @@ function Start-SelectionSandbox {
     [void][LiteUi]::ShowWindow($script:selectionHwnd,4) # show without activating
     [void][LiteUi]::SetWindowPos($script:selectionHwnd,[IntPtr]::Zero,150,100,1100,700,0x14)
     Save-SelectionRegistryPlacement
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds $SettleMilliseconds
 }
 function Stop-SelectionSandbox {
     $registryFault=$null
