@@ -158,6 +158,16 @@ function ReplayText {
     # Separate sinks avoid sharing violations between simultaneously replayed split shells.
     (@('A','B','C','D','E','F','G','H','I') | ForEach-Object {if(Test-Path -LiteralPath "$replayMarker.$_"){[IO.File]::ReadAllText("$replayMarker.$_")}})-join ''
 }
+function Wait-ReplayText([string[]]$Expected) {
+    # The 2500 ms replay timer is not proof that the shell has completed its file write.
+    # Wait only for positive results; exact bytes still reject duplicate or superseded commands.
+    for($attempt=0;$attempt-lt 50;$attempt++) {
+        $actual=ReplayText
+        if($Expected -ccontains $actual){return $actual}
+        Start-Sleep -Milliseconds 100
+    }
+    return (ReplayText)
+}
 function Restart-P9([switch]$Adopt,[int]$SettleMilliseconds=3000){
     if($Adopt){
         if(-not $script:selectionHosts.Count){throw 'Adoption requires a previously pinned owned host'}
@@ -173,12 +183,14 @@ Selection-Rpc 'session.restore' @{command=(ReplayCommand 'A')} $id | Out-Null
 Selection-Rpc 'session.readonly' @{op='on'} $id | Out-Null
 Restart-P9
 $id=[string](@(Nodes | Where-Object name -eq 'P9-replay')[0].id)
-Check 'fresh restore replays pin once' ((ReplayText)-ceq 'A')
+$observed=Wait-ReplayText @('A')
+Check 'fresh restore replays pin once' ($observed-ceq 'A') "markers=<$observed>"
 Check 'readonly resets on fresh restore' ((Selection-Rpc 'session.readonly' @{op='get'} $id)-eq 'off')
 Selection-Rpc 'session.bind' @{agent=(ReplayCommand 'B')} $id | Out-Null
 Restart-P9
 $id=[string](@(Nodes | Where-Object name -eq 'P9-replay')[0].id)
-Check 'binding wins over pin on fresh restore' ((ReplayText)-ceq 'AB')
+$observed=Wait-ReplayText @('AB')
+Check 'binding wins over pin on fresh restore' ($observed-ceq 'AB') "markers=<$observed>"
 Restart-P9 -Adopt
 $id=[string](@(Nodes | Where-Object name -eq 'P9-replay')[0].id)
 Check 'adopted live shell receives neither binding nor pin' ((ReplayText)-ceq 'AB')
@@ -193,8 +205,8 @@ Selection-Rpc 'session.restore' @{command=(ReplayCommand 'D')} $id | Out-Null
 Restart-P9 -SettleMilliseconds 0
 $id=[string](@(Nodes | Where-Object name -eq 'P9-replay')[0].id)
 Selection-Rpc 'session.restore' @{command=(ReplayCommand 'E')} $id | Out-Null
-Start-Sleep -Seconds 3
-Check 'changing a pending pin replays the new command only' ((ReplayText)-ceq 'ABE')
+$observed=Wait-ReplayText @('ABE')
+Check 'changing a pending pin replays the new command only' ($observed-ceq 'ABE') "markers=<$observed>"
 Selection-Rpc 'session.restore' @{command=(ReplayCommand 'F')} $id | Out-Null
 Restart-P9 -SettleMilliseconds 0
 $id=[string](@(Nodes | Where-Object name -eq 'P9-replay')[0].id)
@@ -214,5 +226,5 @@ $node=@(Nodes | Where-Object name -eq 'P9-roles')[0]
 $id=[string]$node.id;$split=[string]$node.paneIds[1]
 Check 'role pins survive restart with exact quote/backslash/tab bytes' ([string]$node.restoreCommands.$id-ceq $exactPin -and [string]$node.restoreCommands.$split-ceq (ReplayCommand 'H'))
 Check 'split ratio survives fresh restart' ([math]::Abs([double]$node.splitRatios[0]-0.37)-lt 0.001)
-$tail=(ReplayText).Substring(3)
-Check 'binding and split pin replay once each, never the overridden owner pin' ($tail-eq 'IH' -or $tail-eq 'HI')
+$observed=Wait-ReplayText @('ABEIH','ABEHI')
+Check 'binding and split pin replay once each, never the overridden owner pin' ($observed-ceq 'ABEIH' -or $observed-ceq 'ABEHI') "markers=<$observed>"
