@@ -3,12 +3,7 @@
 #include <fstream>
 #include <string>
 #include <cstdio>
-static HANDLE stopped;
 static bool ignore = false;
-static BOOL WINAPI interrupt(DWORD event) {
-    if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT) { if (!ignore) SetEvent(stopped); return TRUE; }
-    return FALSE;
-}
 int main(int argc, char** argv) {
     char self[MAX_PATH]{}; GetModuleFileNameA(nullptr,self,MAX_PATH);
     std::string dir(self); dir.resize(dir.find_last_of("/\\")+1);
@@ -34,6 +29,9 @@ int main(int argc, char** argv) {
     for (int i=1; i+1<argc; ++i) if (std::string(argv[i])=="--session-id" || std::string(argv[i])=="--resume") sid=argv[i+1];
     const bool immediate = std::ifstream(dir+"immediate.txt").good();
     ignore = !sid.empty() && std::ifstream(dir+"ignore-"+sid).good();
+    HANDLE input=GetStdHandle(STD_INPUT_HANDLE); DWORD inputMode=0;
+    if(!immediate && (!GetConsoleMode(input,&inputMode) ||
+        !SetConsoleMode(input,inputMode & ~(ENABLE_PROCESSED_INPUT|ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT)))) return 12;
     // Two panes can resume together. CRT append seeks are not an inter-process logging lock.
     std::string mutexName="Local\\p11-fake-log-"+dir;
     for(size_t i=6;i<mutexName.size();++i) if(mutexName[i]=='\\' || mutexName[i]=='/' || mutexName[i]==':') mutexName[i]='_';
@@ -49,11 +47,15 @@ int main(int argc, char** argv) {
     if(!logged) return 11;
     std::printf("P11-AGENT-READY\n"); std::fflush(stdout);
     if (immediate) return 0;
-    stopped = CreateEventW(nullptr,TRUE,FALSE,nullptr);
-    DWORD mode; HANDLE input=GetStdHandle(STD_INPUT_HANDLE);
-    if (GetConsoleMode(input,&mode)) SetConsoleMode(input,mode|ENABLE_PROCESSED_INPUT);
-    SetConsoleCtrlHandler(interrupt,TRUE);
-    WaitForSingleObject(stopped,INFINITE); CloseHandle(stopped);
+    // Interactive Claude uses raw input: Ctrl+C cancels; the documented Ctrl+D requests exit.
+    bool exiting=false; char bytes[128]; DWORD count=0;
+    while(!exiting && ReadFile(input,bytes,sizeof bytes,&count,nullptr) && count){
+        for(DWORD i=0;i<count;++i){
+            if(bytes[i]=='\x03'){std::printf("P11-AGENT-CANCELLED\n");std::fflush(stdout);}
+            if(bytes[i]=='\x04' && !ignore) exiting=true;
+        }
+    }
+    SetConsoleMode(input,inputMode);
     if (!sid.empty() && std::ifstream(dir+"late-"+sid).good()) {
         STARTUPINFOA startup{}; startup.cb=sizeof startup; PROCESS_INFORMATION child{};
         std::string command="\""+std::string(self)+"\" --fixture-console-child";

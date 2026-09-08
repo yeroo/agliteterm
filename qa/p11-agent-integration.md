@@ -89,3 +89,14 @@ the console consumed a second Ctrl+C. Three successive native restarts now prece
 test; failure records both pane screens and events. The fake's shared append log is serialized so
 simultaneous launches cannot overwrite evidence. Unit coverage proves reader preservation, no execution
 inside the boundary function, and no claim during prompt rendering (29 script checks pass).
+
+At 37d3aa8 focused 64/64 and combined 403/403 passed; tokens 80/81 were released after restoration
+and respectively 37/39 retained descendant exits. Review 05 nevertheless caught the fake's wrong
+CLI semantics: Ctrl+C cancels rather than exits normal Claude. The runtime's one-byte exit request
+is corrected to documented Ctrl+D; the fake now uses raw input, proves Ctrl+C cancellation without
+exit, and waits for Ctrl+D (or deliberately ignores exit for timeout coverage). This small correction
+is directly checked against the official interactive controls and the existing ownership/deadline
+gates, not another broad review. Revmux 05 had 2/2 healthy sources, no zero sources, open questions,
+pre-existing or immaterial entries. Its second retained finding, delegated-reader `$?` status, is
+explicitly documented and accepted as nonblocking follow-up #61; actual exit codes are unchanged.
+Full schema coverage remains follow-up #60. Exact-candidate integration/CI still gate delivery.

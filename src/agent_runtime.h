@@ -127,7 +127,8 @@ static DWORD WINAPI agentInterruptWorker(void* opaque) {
     bool interrupted = false;
     while (GetTickCount64() - op->started < 30000) {
         bool interrupt = false;
-        // Never queue a second Ctrl+C: pipe completion is not proof the console consumed it.
+        // Claude's documented exit key is Ctrl+D. Ctrl+C only cancels current input/work.
+        // One exit byte avoids a delayed second interrupt crossing into a replacement process.
         {
             std::lock_guard<std::mutex> guard(g_agentMutex);
             if (op->claimed) return 0;
@@ -137,7 +138,7 @@ static DWORD WINAPI agentInterruptWorker(void* opaque) {
         }
         if (interrupt) {
             bounded_pipe_write::Pending* pending = nullptr;
-            auto written = ovIo(op->evidence.pane->data, true, "\x03", nullptr, 1, true, false, nullptr, op->lease, 1000, &pending);
+            auto written = ovIo(op->evidence.pane->data, true, "\x04", nullptr, 1, true, false, nullptr, op->lease, 1000, &pending);
             bool expired = false;
             while (pending) {
                 if (!expired && GetTickCount64()-op->started >= 30000) {

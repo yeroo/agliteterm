@@ -154,6 +154,9 @@ function P11-Agent([string]$Name,[string]$Id,[string]$Extra='') {
 $sidA=[guid]::NewGuid().ToString();$sidB=[guid]::NewGuid().ToString()
 $agentA=P11-Agent 'P11-agent-A' $sidA
 $agentB=P11-Agent 'P11-agent-B' $sidB
+$cancelCount=@(P11-Launches).Count
+$null=Selection-Rpc 'session.type' @{text=[string][char]3} $agentA
+Check 'Claude-like Ctrl+C cancels input without exiting the agent' ((P11-Wait {([string](Selection-Rpc 'session.text' @{} $agentA)).Contains('P11-AGENT-CANCELLED')}) -and @(P11-Launches).Count-eq$cancelCount)
 Check 'two same-folder agents adopt their exact process UUIDs' ((Selection-Rpc 'claude.adopt' @{} $agentA)-match$sidA -and (Selection-Rpc 'claude.adopt' @{} $agentB)-match$sidB)
 $null=Selection-Rpc 'session.readonly' @{op='on'} $agentA
 $r=Selection-Rpc 'claude.yolo' @{} $agentA -AllowError
