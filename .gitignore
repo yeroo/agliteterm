@@ -1,4 +1,6 @@
 /bin
+/.revmux/
+/.ralphex/
 /.native
 /installer/Output
 /installer/stage

@@ -7,9 +7,10 @@ always what is visibly highlighted. A selection follows its text through scrollb
 dies with its own lines; it never survives a change of screen, because the alt screen is a different
 buffer and an index into one names unrelated text in the other.
 
-Lite has Select All through `selection all` (no chord). The agwinterm sibling carries more cases —
-mark mode, drag-autoscroll, a `scrollback-lines = 0` case — because lite has none of those features. See `qa/product.md` for the
-differences that are deliberate.
+Lite supports keyboard mark mode, Select All, double/triple-click word/line selection and
+drag-autoscroll in panes and popups. `test/selection-ui.ps1 -Strict` drives these with posted input
+and PrintWindow, under a shared suite token locally. Scrollback size remains non-configurable;
+see `qa/product.md` for deliberate differences.
 
 Setup for every case: sandbox instance per `qa/product.md`. Fixtures print **distinct** text per
 line — with identical lines a selection that slid onto other rows compares equal to the original and
@@ -175,31 +176,31 @@ decides "copied something" by string length.
 
 ---
 
-## Scrolling back inside a full-screen app copies what it shows — MANUAL
+## Wheel, drag and mark mode stay on the alt screen
 
-**Guards:** a deliberate DIFFERENCE from agwinterm, recorded so nobody "fixes" it by copying the
-other product. `paintPane` composes the history tail above the live grid through `scrollOff`, and
-`hitTest` maps clicks through the same offset — on *either* screen. So if the view is scrolled, the
-highlight and the copy move together. agwinterm instead pins the offset to 0 on the alt screen, and
-had a bug where only its renderer did: the highlight and the clipboard disagreed, and Ctrl+C copied
-rows the user could not see.
+Seed distinct `MARKER-n` main-screen history, then enter the alt screen with distinct `ALT-n`
+rows and mouse reporting disabled. Posted wheel-up must leave a PrintWindow cell-region capture
+unchanged. Select All, dragging above the top edge and mark-mode Up must stop at `ALT-0` and
+never include `MARKER-`. Returning to main drops the selection and ends mark mode; the next
+key goes to the shell. This is automated in `test/selection-ui.ps1`.
 
-**Why manual:** the harness cannot scroll a full-screen app's view. A posted `WM_MOUSEWHEEL` does not
-reach lite's handler, and Shift+PageUp does not scroll while the alt screen is up (verified on
-0.17.11 — worth its own question, but it is not this case's subject). So drive it with a real wheel.
+The main-screen control proves the wheel delivery: three upward notches change the captured
+viewport; three downward restore it. `session text` reads the whole buffer, not the viewport,
+and is not a scroll oracle. Mouse-reporting apps may consume wheel messages themselves.
 
-**Steps:** run `qa/fixtures/marker.ps1`, then `qa/fixtures/tui.ps1`. Wheel up until `MARKER-` rows
-are visible, then drag across them and read `session copy`.
+## Mouse and keyboard selection agree with the clipboard
 
-**Expect:** what the copy returns is what is highlighted on screen. Both showing history is fine;
-one showing history while the other shows the TUI is not.
+On `MARKER-7 word two`, double-click selects `MARKER-7`, then a nearby third click selects the
+whole line. The clipboard changes only when the button is released; blank double-click leaves
+it untouched. Hold a drag above/below the pane edge to auto-scroll; release must copy exactly
+`session copy`. Repeat in a popup and confirm its painted highlight with PrintWindow.
 
-**Fails when:** `hitTest` and `paintPane` stop deriving their row from the same `scrollOff`, in
-either direction.
-
-**Automated part:** with the view NOT scrolled, the agreement invariant still holds and is covered by
-the TUI case above. If you cannot scroll, report this case SKIP — never PASS on the un-scrolled path,
-which checks nothing this case is about.
+Ctrl+Shift+M anchors mark mode at a deliberately seeded caret (the cursor API reports a column,
+not a row). Arrows and Home/End extend; Enter/Ctrl+C copy and keep the highlight; Esc and the
+configured mark chord clear and exit. Other keys are swallowed only while the mode remains on.
+Ctrl+Shift+A selects all without copying. Explicit zero disables a seeded binding, and a rebound
+mark chord must both enter and leave the mode. The harness saves/restores the clipboard formats
+and touched registry values before releasing its token.
 
 ---
 

@@ -9,12 +9,9 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $failed = @()
-# NOTE: the SELECTION checks moved to qa/selection.md — markdown cases an agent executes through the
-# ui-qa skill, because they need a real window, real mouse buttons and a modifier a program can
-# actually see, and because the interesting ones are about intent that reads badly as code.
-# clipboard.ps1 stays: CI runs this runner, and its OSC 52 / host-action drain coverage would have
-# no home until the markdown cases have a CI story of their own.
-foreach ($t in 'owned-procs-checks', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty') {
+# Selection UI checks use window-scoped messages and PrintWindow; qa/selection.md also records manual cases.
+# Local token-owning callers pass AGLITETERM_TEST_RECEIPT so selection-ui borrows that live lease.
+foreach ($t in 'owned-procs-checks', 'registry-guard.unit', 'clipboard-guard.tests', 'clipboard-receipt.unit', 'selection-clipboard.unit', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
     $script = Join-Path $PSScriptRoot "$t.ps1"
     if (-not (Test-Path $script)) { continue }
     # Each child sets $ErrorActionPreference = 'Stop', so it can die before reaching its own exit

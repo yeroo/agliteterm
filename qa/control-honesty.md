@@ -110,6 +110,15 @@ posted message (the rect comes out at the previous size for one call).
 
 ---
 
+## Popup selection is visible and copy reads it
+
+Open a session-wide overlay popup (omit `--pane`), seed a distinct marker, then select with a
+drag or `selection all --target <popup id>`. `session overlay copy` must return its selected text,
+without writing the clipboard; `no selection` applies only before selecting or after clearing.
+PrintWindow must show the highlighted band and then its removal after `selection clear`.
+Quick and scratch share the same selection behavior. `test/selection-ui.ps1` covers the UI;
+`test/control-honesty.ps1` covers raw JSON and client target resolution.
+
 ## The divider moved
 
 **Guards:** `sidebar width 300` used to **toggle the sidebar** and answer `ok` — the op table was

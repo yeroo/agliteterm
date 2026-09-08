@@ -109,8 +109,8 @@ public static class LiteUi {
     /// <summary>Ctrl (+Shift) + key. A posted WM_KEYDOWN cannot make GetKeyState see the modifier,
     /// so this attaches to the target's input queue and sets the shared state for the duration —
     /// scoped to this instance, nothing injected globally.</summary>
-    /// <summary>Any modifier combination. A posted WM_MOUSEWHEEL does not reach lite's handler, so
-    /// scrollback is driven from the keyboard (Shift+PageUp/PageDown) instead.</summary>
+    /// <summary>Any modifier combination. Posted Wheel reaches the main-screen scroll handler;
+    /// mouse-reporting apps may consume it. Shift+PageUp/PageDown are app keys, not scrollback.</summary>
     public static void KeyMods(IntPtr h, int vk, bool ctrl, bool shift, int times) {
         uint me = GetCurrentThreadId(), it = GetWindowThreadProcessId(h, IntPtr.Zero);
         AttachThreadInput(me, it, true);

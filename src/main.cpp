@@ -559,7 +559,7 @@ static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices 
 // Caret state. A terminal cursor has to say two things: "input lands here" (blink) and "this window
 // has focus" (solid vs hollow). lite drew a static invert regardless, so switching sessions or
 // windows gave no cue at all that typing had moved. kCaretBlinkMs matches the main app's default
-// cursor-blink-ms. lite runs two timers: this one, always, and kRelayoutTimer, armed on demand.
+// cursor-blink-ms. Caret runs always; relayout and selection-autoscroll timers run on demand.
 static bool g_winFocused = true;      // frame has keyboard focus (solid caret) vs not (hollow)
 static bool g_caretOn = true;         // blink phase
 static const UINT_PTR kCaretTimer = 1;
@@ -570,6 +570,8 @@ static const UINT_PTR kCaretTimer = 1;
 // strictly worse than the dropped resize it was fixing, and unbounded when the host is wedged
 // (#27). WM_TIMER is delivered only when the queue is empty, so the loop idles between attempts.
 static const UINT_PTR kRelayoutTimer = 2;
+static const UINT_PTR kSelAutoTimer = 3;
+static const UINT kSelAutoMs = 50;
 static const UINT kRelayoutRetryMs = 60;
 // How many times in a row a REFUSED resize re-arms the timer before it gives up (60, 120, 240 ms).
 // The lock-contention retry is bounded by the lock freeing; a refusing host is not bounded by
@@ -972,12 +974,12 @@ static void applyTheme() {
         RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
     }
 }
-// Configurable key bindings for every lite action. ALL UNBOUND BY DEFAULT so no combo is stolen from
-// the shell/TUI until the user assigns one in File -> Keyboard. Stored HOTKEY-format: LOBYTE = vk,
+// Configurable key bindings for every lite action. Palette, mark and Select All have seeded defaults;
+// others start unbound until assigned in File -> Keyboard. Stored HOTKEY-format: LOBYTE = vk,
 // HIBYTE = HOTKEYF_* (SHIFT 1 / CONTROL 2 / ALT 4). 0 = unbound.
 enum { KB_NEW, KB_NEWWS, KB_CLOSE, KB_SPLIT, KB_NEXT, KB_PREV, KB_COPY, KB_PASTE,
        KB_PALETTE, KB_FOCUSL, KB_FOCUSR, KB_SCROLLUP, KB_SCROLLDN, KB_QUICK, KB_SCRATCH, KB_REOPEN,
-       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_COUNT };
+       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_COUNT };
 struct KbInfo { const wchar_t* label; const wchar_t* reg; };
 static const KbInfo kKbInfo[KB_COUNT] = {
     { L"New Session",      L"Key_New" },     { L"New Workspace",    L"Key_NewWs" },
@@ -991,6 +993,7 @@ static const KbInfo kKbInfo[KB_COUNT] = {
     { L"Flag / Unflag",    L"Key_Flag" },
     { L"Flagged View",     L"Key_FlagView" },  { L"Next Blocked",    L"Key_Attention" },
     { L"Focus Workspace",  L"Key_FocusWs" },
+    { L"Mark Mode (keyboard select)", L"Key_MarkMode" }, { L"Select All", L"Key_SelectAll" },
 };
 static WORD g_keys[KB_COUNT] = { 0 };
 static bool g_swallowChar = false;   // set when a keydown was consumed by a binding, to drop its WM_CHAR
@@ -1004,6 +1007,7 @@ static const uint32_t kEgaPalette[16] = {
 
 // Menu command ids (the command palette posts these too — one implementation per action).
 enum { IDM_NEW = 1, IDM_CLOSE = 2, IDM_SPLIT = 3, IDM_NEXT = 4, IDM_COPY = 5, IDM_PASTE = 6, IDM_PREV = 7,
+       IDM_MARK = 8, IDM_SELECTALL = 9,
        IDM_EXIT = 100, IDM_ABOUT = 101, IDM_NEWWS = 102, IDM_RESTART = 103, IDM_SHOW = 104,
        IDM_DUP = 105, IDM_RENAME = 106, IDM_DELWS = 107, IDM_PROPERTIES = 108, IDM_KEYBOARD = 109,
        IDM_QUICK = 120, IDM_SCRATCH = 121, IDM_REOPEN = 122,
@@ -1102,6 +1106,8 @@ static const wchar_t* kAppId = L"agliteterm";
 static const wchar_t* kLegacyAppId = L"agwinterm-lite";   // control-pipe alias, see ctlServerThread
 
 // ---- selection (buffer-absolute rows; the same viewport composition as paint) ----
+static bool g_markMode = false;   // protected by g_lock, like the selection it owns
+static constexpr int kPopupPane = 2;
 struct Sel {
     int pane = -1;                  // which pane the selection lives in (-1 = none)
     // The SESSION the selection belongs to. A pane index alone is not identity: switching sessions
@@ -1121,7 +1127,11 @@ struct Sel {
     // extended end is written in the new one, and the next reconcile then shifts that fresh end too.
     bool bound() const { return pane >= 0 && sess; }
     bool isFor(const void* s) const { return has() && sess == s; }
-    void clear() { *this = Sel{}; }
+    // Caller holds g_lock; dropping the selection also ends mark mode and posts a status refresh.
+    void clear() {
+        *this = Sel{};
+        if (g_markMode) { g_markMode = false; PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0); }
+    }
     void norm(int& r0, int& c0, int& r1, int& c1) const {
         if (aRow < bRow || (aRow == bRow && aCol <= bCol)) { r0 = aRow; c0 = aCol; r1 = bRow; c1 = bCol; }
         else { r0 = bRow; c0 = bCol; r1 = aRow; c1 = aCol; }
@@ -1129,6 +1139,13 @@ struct Sel {
 };
 static Sel g_sel;
 static void syncSelection();   // fwd: the paint path uses it above the definition
+static HWND g_selWindow = nullptr;   // UI-thread drag owner; never inferred from focus
+static bool g_selFixedSpan = false;  // word/line spans wait for release without following pointer jitter
+static int g_selAutoDir = 0, g_selMouseX = 0;
+static DWORD g_lastDoubleClick = 0;
+static Session* g_doubleSession = nullptr;
+static POINT g_doublePoint{};
+static void updateStatus();
 // Main-app parity (TerminalConfig.RightClickPaste / .CopyOnCtrlC, both on by default). No UI:
 // they are the behaviour nearly everyone wants, and the registry is the escape hatch for the
 // rest - HKCU\Software\agliteterm, DWORD 0 to turn either off.
@@ -1158,6 +1175,8 @@ static const PalAction kPalActions[] = {
     { L"Next Session",             IDM_NEXT,       KB_NEXT,      -1 },
     { L"Previous Session",         IDM_PREV,       KB_PREV,      -1 },
     { L"Copy",                     IDM_COPY,       KB_COPY,      -1 },
+    { L"Mark Mode (keyboard select)", IDM_MARK,     KB_MARK,      -1 },
+    { L"Select All",               IDM_SELECTALL,  KB_SELECTALL, -1 },
     { L"Paste",                    IDM_PASTE,      KB_PASTE,     -1 },
     { L"Quick Terminal",           IDM_QUICK,      KB_QUICK,     -1 },
     { L"Scratch Terminal",         IDM_SCRATCH,    KB_SCRATCH,   -1 },
@@ -2810,9 +2829,11 @@ static void loadColors() {   // Properties->Colors overrides (default fg/bg + on
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"CopyOnCtrlC", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_copyOnCtrlC = v != 0;
 }
 static void loadKeys() {   // configurable key bindings; absent = unbound (0)
-    // One seeded default: Ctrl+Shift+P opens the command palette (parity with the full app).
+    // Seeded defaults: palette and keyboard selection. Explicit registry zero still means unbound.
     // Any saved Keyboard settings override it — the dialog writes every action, including 0s.
     g_keys[KB_PALETTE] = MAKEWORD('P', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+    g_keys[KB_MARK] = MAKEWORD('M', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+    g_keys[KB_SELECTALL] = MAKEWORD('A', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
     for (int a = 0; a < KB_COUNT; a++) {
         DWORD v = 0, sz = sizeof(v);
         if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, kKbInfo[a].reg, RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_keys[a] = (WORD)v;
@@ -3487,8 +3508,8 @@ static HFONT styleFont(uint32_t attrs) {
     return g_fonts[((attrs & kAttrBold) ? 1 : 0) | ((attrs & kAttrItalic) ? 2 : 0)];
 }
 
-// Render one session's viewport into rect pr. `pane` selects the selection-highlight span (-1 = none,
-// e.g. popup windows); `showCursor` draws the cursor (the focused main pane, or a popup terminal).
+// Render one session's viewport into rect pr. Frame slots are 0/1, popups use kPopupPane,
+// and -1 suppresses selection. `showCursor` draws the focused pane or popup caret.
 // ---- AGWin Bitmap (.agbf) — pre-rasterized font packs, no vector fonts at runtime -------------
 // Format v1 (fonts/generate.py): 172-byte header, sorted glyph records, 8-bit alpha atlas.
 // Record flags: 1 = synthesized, 2 = 1-bit glyph (rows bit-packed MSB-first, byte-padded —
@@ -3841,6 +3862,12 @@ static int agbfBench() {
     return 0;
 }
 
+// THE PIN: an alternate screen has no main-screen history in its viewport. All coordinate
+// readers use this offset; scroll writers leave it at zero rather than accumulating hidden debt.
+// Caller holds g_lock.
+static int viewOff(Session* s, const FfiEmuInfo& info) {
+    return info.isAltScreen ? 0 : max(0, min(s->scrollOff, (int)info.historyCount));
+}
 static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
     if (!s) return;
     FfiEmuInfo info{};
@@ -3850,7 +3877,7 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
     if (s->grid.size() < need) s->grid.resize(need);
     if (s->hrow.size() < info.cols) s->hrow.resize(info.cols);
     emu_copy_grid(s->emu, s->grid.data(), (uint32_t)s->grid.size());
-    int off = min(s->scrollOff, (int)info.historyCount);
+    int off = viewOff(s, info);
     s->scrollOff = off;
     // Compose the viewport: history tail above, live grid below (main-app semantics).
     std::vector<FfiCell> view((size_t)info.cols * info.rows);
@@ -3955,7 +3982,7 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
 afterGridPaint:;
 
     // Selection highlight (invert the selected span, buffer-absolute rows mapped into the view).
-    const bool selected = pane >= 0 && selection.isFor(s);   // -1 is the popup's no-selection sentinel
+    const bool selected = pane >= 0 && selection.isFor(s);   // frame slots 0/1 and popup slot 2
     if (selected) {   // follow the surface through a swap or a later display in another slot
         int r0, c0, r1, c1;
         selection.norm(r0, c0, r1, c1);
@@ -4165,7 +4192,17 @@ static void paint(HDC dc, RECT rc) {
 }
 
 // ---- selection: pixel → (pane, buffer-absolute row, col) ----
-static bool hitTest(int x, int y, int* pane, int* absRow, int* col) {
+// The same clamped mapping for the frame, popup and out-of-bounds drag (THE PIN).
+static bool cellAt(Session* s, RECT pr, int x, int y, int* absRow, int* col) {
+    FfiEmuInfo info{};
+    if (!s || !s->emu || !emu_info(s->emu, &info) || !info.cols || !info.rows) return false;
+    int row = max(0, min((y - pr.top) / g_ch, (int)info.rows - 1));
+    *absRow = (int)info.historyCount - viewOff(s, info) + row;
+    *col = max(0, min((x - pr.left) / g_cw, (int)info.cols));
+    return true;
+}
+static bool hitTest(int x, int y, int* pane) {
+    LockG lk;
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     for (int p = 0; p < 2; p++) {
@@ -4174,16 +4211,9 @@ static bool hitTest(int x, int y, int* pane, int* absRow, int* col) {
         paneRect(p, rc, &pr);
         if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
         Session* s = surfaceOf(g_sessions[g_pane[p]]);   // the pane's surface: its overlay while one is open (P5)
-        FfiEmuInfo info{};
-        EnterCriticalSection(&g_lock);
-        emu_info(s->emu, &info);
-        LeaveCriticalSection(&g_lock);
-        int r = (y - pr.top) / g_ch;
-        int c = (x - pr.left) / g_cw;
         *pane = p;
-        *absRow = (int)info.historyCount - min(s->scrollOff, (int)info.historyCount) + r;
-        *col = max(0, min(c, (int)info.cols));
-        return true;
+        int absRow, col;
+        return cellAt(s, pr, x, y, &absRow, &col);
     }
     return false;
 }
@@ -4303,6 +4333,7 @@ static bool copySelection() {
 
 // Caller holds g_lock. pane remains a drag boundary; paint keys only on the surface identity.
 static int paneOf(Session* target) {
+    if (target && (target == g_quickSession || target == g_scratchSession || target == g_overlaySession)) return kPopupPane;
     for (int p = 0; p < 2; ++p) {
         int i = g_pane[p];
         if (i >= 0 && i < (int)g_sessions.size()) {
@@ -4313,18 +4344,20 @@ static int paneOf(Session* target) {
     return 0;   // not displayed yet; isFor prevents painting over a different surface
 }
 
-// Caller holds g_lock and has rejected the popup. As agwinterm's ClampSel: main starts at 0,
+// Caller holds g_lock. As agwinterm's ClampSel: main starts at 0,
 // alt starts at historyCount, because the history belongs to the other screen. The clipboard
-// must read the same cells as the highlight. Wheel/drag hitTest and scrollOff are P7's work.
+// must read the same cells as the highlight (THE PIN).
 static const char* selectAllOf(Session* target) {
     FfiEmuInfo info{};
     if (!target->emu || !emu_info(target->emu, &info)) return "empty";
     int total = (int)info.historyCount + (int)info.rows;
     int first = info.isAltScreen ? (int)info.historyCount : 0;
     if (total <= first || info.cols == 0) return "empty";
+    if (g_sel.bound()) InvalidateRect(windowForSession((Session*)g_sel.sess), nullptr, FALSE);
+    g_sel.clear();
     g_sel = { paneOf(target), target, false, first, 0, total - 1, (int)info.cols,
               target->evicted, info.isAltScreen != 0 };
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    InvalidateRect(windowForSession(target), nullptr, FALSE);
     return "selected all";
 }
 
@@ -4396,24 +4429,20 @@ static bool ctrlDown() { return (GetKeyState(VK_CONTROL) & 0x8000) != 0; }
 static bool shiftDown() { return (GetKeyState(VK_SHIFT) & 0x8000) != 0; }
 static bool altDown() { return (GetKeyState(VK_MENU) & 0x8000) != 0; }
 
-// Forward a mouse event to the app when the pane under (x,y) has mouse reporting on (so full-screen
-// apps like Far Manager get clicks/drags/wheel). Returns true if it was forwarded OR deliberately
-// swallowed (a reporting pane), so the caller skips selection/paste; false = do the normal UI action.
-// cb: 0 left, 1 middle, 2 right, 64 wheel-up, 65 wheel-down.
-static bool mouseReport(int x, int y, int cb, bool press, bool motion) {
-    RECT rc; GetClientRect(g_hwnd, &rc);
-    for (int p = 0; p < 2; p++) {
-        if (g_pane[p] < 0) continue;
-        RECT pr; paneRect(p, rc, &pr);
-        if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
-        Session* s = surfaceOf(g_sessions[g_pane[p]]);   // the mouse in the box reaches the overlay (P5)
+// Report for a caller-supplied surface and client rect, frame pane or popup alike.
+static bool mouseReportSurface(Session* s, RECT pr, int x, int y, int cb, bool press, bool motion) {
         FfiEmuInfo info{};
-        EnterCriticalSection(&g_lock);
-        emu_info(s->emu, &info);
-        LeaveCriticalSection(&g_lock);
+        HANDLE data = INVALID_HANDLE_VALUE;
+        {
+        LockG lk;
+        if (!s || indexOfSession(s) < 0 || !s->emu || !emu_info(s->emu, &info)) return false;
         if (!info.mouseClick && !info.mouseDrag && !info.mouseMotion) return false;  // no reporting -> selection path
         if (motion && !info.mouseDrag && !info.mouseMotion) return true;             // click-only app: swallow motion
         if (s->data == INVALID_HANDLE_VALUE) return true;
+        // Unlisting keeps the Session and data handle alive for its reader (unlistOverlayLocked).
+        // Snapshot under the lock, but never hold it over I/O: readers must drain host output.
+        data = s->data;
+        }
         int col = (x - pr.left) / g_cw + 1;
         int row = (y - pr.top) / g_ch + 1;
         int mods = (shiftDown() ? 4 : 0) + (altDown() ? 8 : 0) + (ctrlDown() ? 16 : 0);
@@ -4427,22 +4456,228 @@ static bool mouseReport(int x, int y, int cb, bool press, bool motion) {
             int cc = col > 223 ? 0 : col, rr = row > 223 ? 0 : row;
             len = wsprintfA(buf, "\x1b[M%c%c%c", 32 + b, 32 + cc, 32 + rr);
         }
-        ovIo(s->data, true, buf, nullptr, (DWORD)len);
+        ovIo(data, true, buf, nullptr, (DWORD)len);
         return true;
+}
+// Forward a mouse event to the app under (x,y). True means forwarded or deliberately swallowed
+// by a reporting surface; false means use the normal UI action. cb: 0/1/2 buttons, 64/65 wheel.
+static bool mouseReport(int x, int y, int cb, bool press, bool motion) {
+    RECT rc; GetClientRect(g_hwnd, &rc);
+    RECT hit{}; Session* s = nullptr;
+    {
+    LockG lk;
+    for (int p = 0; p < 2; p++) {
+        if (g_pane[p] < 0) continue;
+        RECT pr; paneRect(p, rc, &pr);
+        if (x < pr.left || x >= pr.right || y < pr.top || y >= pr.bottom) continue;
+        hit = pr; s = surfaceOf(g_sessions[g_pane[p]]); break;
     }
-    return false;
+    }
+    return mouseReportSurface(s, hit, x, y, cb, press, motion);
 }
 
-static void scrollFocused(int deltaRows) {
-    Session* s = focusedSession();
+static void scrollSurface(Session* s, int deltaRows) {
+    LockG lk;
     if (!s) return;
     FfiEmuInfo info{};
-    EnterCriticalSection(&g_lock);
-    emu_info(s->emu, &info);
-    LeaveCriticalSection(&g_lock);
-    int off = s->scrollOff + deltaRows;
+    if (!s->emu || !emu_info(s->emu, &info)) return;
+    if (info.isAltScreen) { s->scrollOff = 0; return; }   // THE PIN
+    int off = viewOff(s, info) + deltaRows;
     s->scrollOff = max(0, min(off, (int)info.historyCount));
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    InvalidateRect(windowForSession(s), nullptr, FALSE);
+}
+static void scrollFocused(int deltaRows) { LockG lk; scrollSurface(focusedSession(), deltaRows); }
+
+// UI-thread drag plumbing, shared by frame and popup. The selected surface, never focus, owns
+// coordinates, timers and release-copy. All selection/emulator access stays under g_lock.
+static void stopSelAuto() {
+    if (g_selWindow) KillTimer(g_selWindow, kSelAutoTimer);
+    g_selAutoDir = 0;
+}
+static bool selectionRect(RECT* pr) {
+    if (!g_sel.bound() || !g_selWindow || !IsWindowVisible(g_selWindow)) return false;
+    Session* s = (Session*)g_sel.sess;
+    RECT rc; GetClientRect(g_selWindow, &rc);
+    if (g_sel.pane == kPopupPane) {
+        if (windowForSession(s) != g_selWindow || g_selWindow == g_hwnd) return false;
+        *pr = rc; return true;
+    }
+    int p = g_sel.pane;
+    if (p < 0 || p > 1 || g_pane[p] < 0 || surfaceOf(g_sessions[g_pane[p]]) != s) return false;
+    paneRect(p, rc, pr); return true;
+}
+static void endMarkMode(bool clear = true) {
+    LockG lk;
+    if (!g_markMode) return;
+    g_markMode = false;
+    HWND h = windowForSession((Session*)g_sel.sess);
+    if (clear) g_sel.clear();
+    PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+    InvalidateRect(h, nullptr, FALSE);
+}
+// Focus writes have no single entry point. Input and the UI status/timer path reconcile here,
+// before routing a key. syncSelection can end mark mode wherever it runs, paint included.
+static void endMarkModeIfMoved() {
+    LockG lk;
+    if (g_markMode && (!g_sel.bound() || g_sel.sess != focusedSession())) endMarkMode();
+    syncSelection();
+}
+static void cancelDrag(HWND h) {
+    LockG lk;
+    if (g_selWindow != h) return;
+    stopSelAuto(); g_sel.active = false; g_selWindow = nullptr; g_selFixedSpan = false;
+    // A screen switch/eviction can drop the selection mid-drag. Capture must not survive it,
+    // even though the later button-up no longer finds a live drag owner. Clear ownership first
+    // because ReleaseCapture synchronously calls WM_CAPTURECHANGED back into this handler.
+    if (::GetCapture() == h) ::ReleaseCapture();
+}
+// Caller holds g_lock across the info snapshot and row read.
+static bool selectionCells(Session* s, const FfiEmuInfo& info, int row, std::vector<FfiCell>& cells) {
+    if (row < 0 || row >= (int)info.historyCount + (int)info.rows) return false;
+    cells.resize(info.cols);
+    if (row < (int)info.historyCount) return emu_copy_history_row(s->emu, row, cells.data(), info.cols);
+    std::vector<FfiCell> grid((size_t)info.cols * info.rows);
+    if (!emu_copy_grid(s->emu, grid.data(), (uint32_t)grid.size())) return false;
+    memcpy(cells.data(), &grid[(row - info.historyCount) * info.cols], info.cols * sizeof(FfiCell));
+    return true;
+}
+static int selectionLead(const std::vector<FfiCell>& cells, int col) {
+    return col > 0 && col < (int)cells.size() && cells[col].width == 0 && cells[col - 1].width == 2 ? col - 1 : col;
+}
+static void beginSelection(HWND h, Session* s, int pane, RECT pr, int x, int y, bool word = false) {
+    LockG lk;
+    int row, col;
+    if (!cellAt(s, pr, x, y, &row, &col)) return;
+    if (g_sel.bound()) InvalidateRect(windowForSession((Session*)g_sel.sess), nullptr, FALSE);
+    stopSelAuto(); endMarkMode();
+    FfiEmuInfo info{}; emu_info(s->emu, &info);
+    bool line = !word && g_doubleSession == s && GetTickCount() - g_lastDoubleClick <= GetDoubleClickTime()
+        && abs(x - g_doublePoint.x) <= GetSystemMetrics(SM_CXDOUBLECLK)
+        && abs(y - g_doublePoint.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
+    // A blank double-click still counts toward a third click selecting its whole line.
+    g_doubleSession = word ? s : nullptr;
+    if (word) { g_lastDoubleClick = GetTickCount(); g_doublePoint = { x, y }; }
+    int a = col, b = col;
+    if (line) { a = 0; b = (int)info.cols; }
+    else if (word) {
+        std::vector<FfiCell> cells;
+        if (!selectionCells(s, info, row, cells)) { g_sel.clear(); return; }
+        auto isWord = [&](int c) {
+            if (c < 0 || c >= (int)info.cols) return false;
+            c = selectionLead(cells, c);
+            return cells[c].rune != 0 && cells[c].rune != ' ';
+        };
+        if (!isWord(col)) { g_sel.clear(); InvalidateRect(h, nullptr, FALSE); return; }
+        a = col = selectionLead(cells, col);
+        while (a > 0 && isWord(a - 1)) --a;
+        b = col + 1; while (b < (int)info.cols && isWord(b)) ++b;
+    }
+    g_sel = { pane, s, true, row, a, row, b, s->evicted, info.isAltScreen != 0 };
+    g_selFixedSpan = word || line;
+    g_selWindow = h; g_selMouseX = x;
+    ::SetCapture(h);
+    InvalidateRect(h, nullptr, FALSE);
+}
+static void extendSelection(HWND h, int x, int y) {
+    LockG lk;
+    if (g_selWindow != h) return;
+    syncSelection();
+    RECT pr;
+    if (!g_sel.active || !selectionRect(&pr)) { cancelDrag(h); return; }
+    if (g_selFixedSpan) return;   // preserve the entire word/line until the actual release
+    int row, col;
+    if (!cellAt((Session*)g_sel.sess, pr, x, y, &row, &col)) { cancelDrag(h); return; }
+    g_sel.bRow = row; g_sel.bCol = col; g_selMouseX = x;
+    int dir = y < pr.top ? -1 : y >= pr.bottom ? 1 : 0;
+    if (dir != g_selAutoDir) {
+        stopSelAuto(); g_selAutoDir = dir;
+        if (dir) SetTimer(h, kSelAutoTimer, kSelAutoMs, nullptr);
+    }
+    InvalidateRect(h, nullptr, FALSE);
+}
+static void selAutoTick(HWND h) {
+    LockG lk;
+    if (g_selWindow != h) { KillTimer(h, kSelAutoTimer); return; }
+    syncSelection(); RECT pr;
+    if (!g_sel.active || !g_selAutoDir || !selectionRect(&pr)) { cancelDrag(h); return; }
+    Session* s = (Session*)g_sel.sess;
+    scrollSurface(s, -g_selAutoDir);   // one row per tick, THE PIN applies here too
+    int row, col;
+    if (cellAt(s, pr, g_selMouseX, g_selAutoDir < 0 ? pr.top : pr.bottom - 1, &row, &col)) {
+        g_sel.bRow = row; g_sel.bCol = col;
+        InvalidateRect(h, nullptr, FALSE);
+    }
+}
+static void finishSelection(HWND h) {
+    std::string text;
+    {
+        LockG lk;
+        if (g_selWindow == h) {
+            stopSelAuto();
+            if (g_sel.active) text = selectionText();
+            g_sel.active = false; g_selWindow = nullptr; g_selFixedSpan = false;
+        }
+    }
+    if (::GetCapture() == h) ::ReleaseCapture();
+    if (text.find_first_not_of("\r\n ") != std::string::npos) setClipboardUtf8(text);
+}
+static void toggleMarkMode() {
+    LockG lk;
+    endMarkModeIfMoved();
+    if (g_markMode) { endMarkMode(); return; }
+    Session* s = focusedSession(); FfiEmuInfo info{};
+    if (!s || !s->emu || !emu_info(s->emu, &info) || !info.cols || !info.rows) return;
+    if (g_sel.bound()) InvalidateRect(windowForSession((Session*)g_sel.sess), nullptr, FALSE);
+    stopSelAuto();
+    if (g_selWindow && ::GetCapture() == g_selWindow) ::ReleaseCapture();
+    g_selWindow = nullptr;
+    int row = (int)info.historyCount + min((int)info.cursorRow, (int)info.rows - 1);
+    int col = min((int)info.cursorCol, (int)info.cols - 1);
+    std::vector<FfiCell> cells;
+    if (!selectionCells(s, info, row, cells)) return;
+    col = selectionLead(cells, col);
+    g_sel = { paneOf(s), s, false, row, col, row, col, s->evicted, info.isAltScreen != 0 };
+    g_markMode = true;
+    s->scrollOff = 0;   // the live caret is the anchor, not its stale scrolled pixel position
+    PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+    InvalidateRect(windowForSession(s), nullptr, FALSE);
+}
+static bool markModeKey(WPARAM vk) {
+    LockG lk;
+    endMarkModeIfMoved();
+    if (!g_markMode) return false;
+    Session* s = (Session*)g_sel.sess; FfiEmuInfo info{};
+    if (!s->emu || !emu_info(s->emu, &info) || !info.rows || !info.cols) { endMarkMode(); return false; }
+    BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
+    if (vk == VK_ESCAPE || (g_keys[KB_MARK] && g_keys[KB_MARK] == MAKEWORD((BYTE)vk, mods))) { endMarkMode(); return true; }
+    if (vk == VK_SPACE && altDown()) return false;   // preserve the native system menu (unless rebound above)
+    if (vk == VK_RETURN || (vk == 'C' && ctrlDown() && !altDown())) { copySelection(); endMarkMode(false); return true; }
+    int first = info.isAltScreen ? (int)info.historyCount : 0;
+    int last = (int)info.historyCount + (int)info.rows - 1;
+    switch (vk) {
+        case VK_LEFT: g_sel.bCol = max(0, g_sel.bCol - 1); break;
+        case VK_RIGHT: g_sel.bCol = min((int)info.cols, g_sel.bCol + 1); break;
+        case VK_UP: g_sel.bRow = max(first, g_sel.bRow - 1); break;
+        case VK_DOWN: g_sel.bRow = min(last, g_sel.bRow + 1); break;
+        case VK_HOME: g_sel.bCol = 0; break;
+        case VK_END: g_sel.bCol = (int)info.cols; break;
+        default: return true;
+    }
+    g_sel.bRow = max(first, min(g_sel.bRow, last));
+    g_sel.bCol = max(0, min(g_sel.bCol, (int)info.cols));
+    std::vector<FfiCell> cells;
+    if (!selectionCells(s, info, g_sel.bRow, cells)) { endMarkMode(); return true; }
+    int lead = selectionLead(cells, g_sel.bCol);
+    // An exclusive edge moves across a whole glyph: Right advances past its spacer; all other
+    // moves snap to its lead. Never leave an anchor/focus edge inside the two-cell glyph.
+    if (lead != g_sel.bCol) g_sel.bCol = vk == VK_RIGHT ? min((int)info.cols, lead + 2) : lead;
+    if (!info.isAltScreen) {   // THE PIN; only main-screen mark motion follows into history
+        int top = (int)info.historyCount - viewOff(s, info);
+        if (g_sel.bRow < top) s->scrollOff = (int)info.historyCount - g_sel.bRow;
+        else if (g_sel.bRow >= top + (int)info.rows) s->scrollOff = max(0, last - g_sel.bRow);
+    }
+    InvalidateRect(windowForSession(s), nullptr, FALSE);
+    return true;
 }
 
 // ---- self-update (parity with the full app's app-update): GitHub releases/latest -> pick the
@@ -4746,6 +4981,8 @@ static void runKbAction(int a) {
         case KB_NEXT: cycleSession(1); break;
         case KB_PREV: cycleSession(-1); break;
         case KB_COPY: copySelection(); break;
+        case KB_MARK: toggleMarkMode(); break;
+        case KB_SELECTALL: { LockG lk; if (Session* s = focusedSession()) selectAllOf(s); break; }
         case KB_PASTE: pasteClipboard(); break;
         case KB_PALETTE: togglePalette(); break;
         // Slot-based (P4): "left / top" is SLOT 0 and "right / bottom" SLOT 1, whichever shell sits
@@ -4766,6 +5003,7 @@ static void runKbAction(int a) {
     }
 }
 static bool handleKeyDown(WPARAM vk) {
+    endMarkModeIfMoved();
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
         auto move = [&](int d) {
@@ -4792,7 +5030,8 @@ static bool handleKeyDown(WPARAM vk) {
         if (mods && g_keys[KB_PALETTE] == MAKEWORD((BYTE)vk, mods)) { togglePalette(); return true; }
         return false;   // anything else: let WM_CHAR through for the query (OnChar routes it)
     }
-    // Configurable key bindings (all unbound by default, so every combo otherwise reaches the shell).
+    if (markModeKey(vk)) return true;
+    // Configurable key bindings; unmatched combos otherwise reach the shell.
     // Match the pressed vk + modifiers against the user's bindings; the same actions are always on the
     // menu + toolbar. Checked before the xterm-key encoding so a bound combo wins over the default key.
     {
@@ -4873,6 +5112,7 @@ static void newSessionDialog(const char* cwd = nullptr);   // fwd (defined below
 
 // Fill the status bar's four parts: workspace · session count · terminal size · font.
 static void updateStatus() {
+    endMarkModeIfMoved();
     if (!g_status) return;
     wchar_t buf[160];
     // Its own hold: this reads g_workspaces (a reference INTO the vector) and walks g_sessions,
@@ -4893,7 +5133,7 @@ static void updateStatus() {
     SendMessageW(g_status, SB_SETTEXTW, 1, (LPARAM)buf);
     if (Session* s = focusedSession()) {
         FfiEmuInfo info{}; EnterCriticalSection(&g_lock); emu_info(s->emu, &info); LeaveCriticalSection(&g_lock);
-        wsprintfW(buf, L"%u \x00D7 %u", info.cols, info.rows); SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)buf);
+        wsprintfW(buf, L"%u \x00D7 %u%s", info.cols, info.rows, g_markMode ? L"  \x00B7 MARK" : L""); SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)buf);
     }
     if (!g_catalog.empty() && g_faceIdx >= 0 && g_faceIdx < (int)g_catalog.size()) {
         const FontEntry& e = g_catalog[g_faceIdx];
@@ -5113,6 +5353,8 @@ static HMENU buildMenuBar() {
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"E&xit");
     HMENU edit = CreatePopupMenu();
     AppendMenuW(edit, MF_STRING, IDM_COPY, L"&Copy");
+    AppendMenuW(edit, MF_STRING, IDM_MARK, L"&Mark Mode");
+    AppendMenuW(edit, MF_STRING, IDM_SELECTALL, L"Select &All");
     AppendMenuW(edit, MF_STRING, IDM_PASTE, L"&Paste");
     HMENU view = CreatePopupMenu();
     AppendMenuW(view, MF_STRING, IDM_SPLIT, L"&Split / Unsplit");
@@ -5580,7 +5822,7 @@ static void showPropertiesDialog() {
     SetFocus(g_hwnd);
 }
 
-// ---- Keyboard bindings dialog (native hotkey controls; all unbound by default) ----
+// ---- Keyboard bindings dialog (native hotkey controls; every binding can be cleared) ----
 static HWND g_kbHwnd, g_kbCtl[KB_COUNT];
 enum { KBID_CLEAR = 4001, KBID_BASE = 4100 };   // KBID_BASE + action = that action's hotkey control
 static LRESULT CALLBACK kbDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -5942,7 +6184,7 @@ static void paintPopup(HWND h, Session* s) {
     HGDIOBJ ob = SelectObject(mem, bmp);
     HBRUSH bg = CreateSolidBrush(g_customColors ? toColorRef(g_defBg, false) : RGB(0, 0, 0));
     FillRect(mem, &rc, bg); DeleteObject(bg);
-    if (s) paintPane(mem, rc, s, -1, true);   // -1 pane = no selection span; cursor always shown
+    if (s) paintPane(mem, rc, s, kPopupPane, true);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
     EndPaint(h, &ps);
@@ -5957,8 +6199,8 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                : (h == g_scratchHwnd) ? g_scratchSession
                : (h == g_overlayHwnd) ? g_overlaySession : nullptr;
     switch (m) {
-        case WM_SETFOCUS:  g_focusOverride = s; return 0;
-        case WM_KILLFOCUS: if (g_focusOverride == s) g_focusOverride = nullptr; return 0;
+        case WM_SETFOCUS:  { LockG lk; g_focusOverride = s; endMarkModeIfMoved(); return 0; }
+        case WM_KILLFOCUS: { LockG lk; if (g_focusOverride == s) g_focusOverride = nullptr; endMarkModeIfMoved(); return 0; }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paintPopup(h, s); return 0;
         case WM_SIZE:
@@ -5985,8 +6227,43 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_MOUSEWHEEL:
-            if (s) { s->scrollOff = max(0, s->scrollOff + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 3 : -3)); InvalidateRect(h, nullptr, FALSE); }
+            if (s) {
+                POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) }; ScreenToClient(h, &pt);
+                RECT rc; GetClientRect(h, &rc);
+                bool up = GET_WHEEL_DELTA_WPARAM(w) > 0;
+                if (!mouseReportSurface(s, rc, pt.x, pt.y, up ? 64 : 65, true, false)) scrollSurface(s, up ? 3 : -3);
+            }
             return 0;
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK: {
+            if (!s || g_palette) return 0;
+            RECT rc; GetClientRect(h, &rc);
+            { LockG lk; g_focusOverride = s; endMarkModeIfMoved(); }
+            if (!mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, false)) {
+                LockG lk;
+                if (indexOfSession(s) >= 0)
+                beginSelection(h, s, kPopupPane, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), m == WM_LBUTTONDBLCLK);
+            }
+            SetFocus(h); return 0;
+        }
+        case WM_MOUSEMOVE: {
+            RECT rc; GetClientRect(h, &rc);
+            if ((w & MK_LBUTTON) && g_selWindow == h) { extendSelection(h, GET_X_LPARAM(l), GET_Y_LPARAM(l)); return 0; }
+            if ((w & MK_LBUTTON) && !mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, true))
+                extendSelection(h, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            RECT rc; GetClientRect(h, &rc);
+            if (g_selWindow == h) finishSelection(h);
+            else mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, false, false);
+            return 0;
+        }
+        case WM_CAPTURECHANGED: if ((HWND)l != h) cancelDrag(h); return 0;
+        case WM_TIMER: if (w == kSelAutoTimer) selAutoTick(h); return 0;
+        case WM_SHOWWINDOW:
+            if (!w) { cancelDrag(h); LockG lk; if (g_markMode && g_sel.sess == s) endMarkMode(); }
+            break;
         case WM_SYSCOMMAND:
             if ((w & 0xFFF0) == SC_MINIMIZE) { ShowWindow(g_hwnd, SW_MINIMIZE); return 0; }   // minimize -> all windows
             break;
@@ -6001,6 +6278,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (h == g_overlayHwnd || h == g_scratchHwnd) { DestroyWindow(h); return 0; }
             ShowWindow(h, SW_HIDE); return 0;
         case WM_DESTROY: {
+            cancelDrag(h);
             Session** slot = (h == g_overlayHwnd) ? &g_overlaySession
                            : (h == g_scratchHwnd) ? &g_scratchSession : nullptr;
             if (slot) {   // kill the transient window's session + clear its state
@@ -6027,6 +6305,7 @@ static void ensurePopupClass() {
     static bool reg = false;
     if (reg) return;
     WNDCLASSW wc{};
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = popupProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"AgwintermLitePopup";
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_IBEAM); wc.hIcon = g_appIcon;
     RegisterClassW(&wc); reg = true;
@@ -6492,6 +6771,7 @@ public:
         MSG_WM_CHAR(OnChar)
         MSG_WM_MOUSEWHEEL(OnMouseWheel)
         MSG_WM_LBUTTONDOWN(OnLButtonDown)
+        MSG_WM_LBUTTONDBLCLK(OnLButtonDblClk)
         MSG_WM_MOUSEMOVE(OnMouseMove)
         MSG_WM_LBUTTONUP(OnLButtonUp)
         MSG_WM_RBUTTONDOWN(OnRButtonDown)
@@ -6505,6 +6785,7 @@ public:
         MSG_WM_KILLFOCUS(OnKillFocusFrame)
         MSG_WM_DESTROY(OnDestroy)
         MESSAGE_HANDLER(WM_KEYDOWN, OnKey)
+        MESSAGE_HANDLER(WM_CAPTURECHANGED, OnCaptureChanged)
         MESSAGE_HANDLER(WM_SYSKEYDOWN, OnKey)
         MESSAGE_HANDLER(WM_SETCURSOR, OnSetCursor)
         MESSAGE_HANDLER(WM_APP_REFRESHTREE, OnRefreshTree)
@@ -6610,7 +6891,9 @@ public:
         ScreenToClient(&pt);                                                        // wheel coords are screen-relative
         bool up = zDelta > 0;
         if (mouseReport(pt.x, pt.y, up ? 64 : 65, true, false)) return TRUE;        // to the app if it reports mouse
-        scrollFocused(up ? 3 : -3);
+        LockG lk;
+        int pane;
+        if (hitTest(pt.x, pt.y, &pane)) scrollSurface(surfaceOf(g_sessions[g_pane[pane]]), up ? 3 : -3);
         return TRUE;
     }
     void OnLButtonDown(UINT, CPoint pt) {
@@ -6624,26 +6907,39 @@ public:
             return;
         }
         // The sidebar is the native tree child, so clicks here are always in the terminal area.
-        int pane, absRow, col;
-        // One hold for the hit-test, the alt-screen flag and the eviction count: absRow is derived
-        // from historyCount, and if the reader evicts between reading the row and reading the count
-        // the two describe different buffers — permanently, since nothing later can detect it.
+        int pane;
+        // Reporting I/O runs unlocked; beginSelection re-reads cell and eviction count together.
+        { LockG lk; if (hitTest(pt.x, pt.y, &pane)) g_focus = pane; }
+        if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
         LockG lk;
-        if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) {
+        if (hitTest(pt.x, pt.y, &pane)) {
             g_focus = pane;
-            if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
             int si = g_pane[pane];                              // begin drag-select, bound to THIS session —
             Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? surfaceOf(g_sessions[si]) : nullptr;   // the pane's surface (P5): a drag inside a covered box selects in the overlay
-            FfiEmuInfo ai{};
-            bool alt = false;
-            if (ss && ss->emu && emu_info(ss->emu, &ai)) alt = ai.isAltScreen != 0;
-            g_sel = { pane, (void*)ss, true, absRow, col, absRow, col,
-                      ss ? ss->evicted : 0,                     // rows are relative to THIS eviction count
-                      alt };                                    // ...and to THIS buffer
-            SetCapture();
-            Invalidate(FALSE);
+            RECT rc, pr; GetClientRect(&rc); paneRect(pane, rc, &pr);
+            g_focusOverride = nullptr;
+            beginSelection(m_hWnd, ss, pane, pr, pt.x, pt.y);
         }
         SetFocus();
+    }
+    void OnLButtonDblClk(UINT, CPoint pt) {
+        if (g_palette || inSplitter(pt.x, pt.y)) return;
+        int pane;
+        { LockG lk;
+        if (!hitTest(pt.x, pt.y, &pane)) return;
+        g_focus = pane; g_focusOverride = nullptr;
+        }
+        if (!mouseReport(pt.x, pt.y, 0, true, false)) {
+            LockG lk;
+            if (!hitTest(pt.x, pt.y, &pane)) return;
+            RECT rc, pr; GetClientRect(&rc); paneRect(pane, rc, &pr);
+            beginSelection(m_hWnd, surfaceOf(g_sessions[g_pane[pane]]), pane, pr, pt.x, pt.y, true);
+        }
+        SetFocus();
+    }
+    LRESULT OnCaptureChanged(UINT, WPARAM, LPARAM lp, BOOL&) {
+        if ((HWND)lp != m_hWnd) cancelDrag(m_hWnd);
+        return 0;
     }
     void OnMouseMove(UINT nFlags, CPoint pt) {
         if (g_splitDrag) {   // the splitter resizes the LEFT pane (the sidebar); terminal takes the rest
@@ -6654,46 +6950,17 @@ public:
             relayout();
             return;
         }
+        if (g_selWindow == m_hWnd && (nFlags & MK_LBUTTON)) { extendSelection(m_hWnd, pt.x, pt.y); return; }
         if (nFlags & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) {   // report drags to a mouse-aware app
             int held = (nFlags & MK_LBUTTON) ? 0 : (nFlags & MK_RBUTTON) ? 2 : 1;
             if (mouseReport(pt.x, pt.y, held, true, true)) return;
         }
-        if (nFlags & MK_LBUTTON) {
-            int pane, absRow, col;
-            // Held across hit-test, reconcile and store, for the same reason as mouse-down: an
-            // eviction landing between any two of them puts the ends in different numberings.
-            LockG lk;
-            if (!g_sel.active) return;
-            if (hitTest(pt.x, pt.y, &pane, &absRow, &col) && pane == g_sel.pane) {
-                // Reconcile BEFORE writing: absRow is in today's numbering while the anchor may
-                // still be in the numbering from when the drag started, and storing the two
-                // together would leave the next reconcile shifting this fresh end as well.
-                syncSelection();
-                if (!g_sel.bound()) return;   // it was dropped under us
-                g_sel.bRow = absRow; g_sel.bCol = col;
-                Invalidate(FALSE);
-            }
-        }
+        if (nFlags & MK_LBUTTON) extendSelection(m_hWnd, pt.x, pt.y);
     }
     void OnLButtonUp(UINT, CPoint pt) {
         if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveColors(); return; }   // persist the new width
-        if (mouseReport(pt.x, pt.y, 0, false, false)) return;
-        {
-            // ReleaseCapture unconditionally: syncSelection can DROP the selection mid-drag (its
-            // rows evicted, or the app switched to the alt screen), which clears `active` — and the
-            // mouse then stayed captured with no drag in progress.
-            std::string releasedText;
-            {
-                LockG lk;
-                // Capture this drag before releasing the hold: selection.all on another surface
-                // must not make an unrelated mouse-up copy that surface's new whole buffer.
-                if (g_sel.active) releasedText = selectionText();
-                g_sel.active = false;
-            }
-            if (GetCapture() == m_hWnd) ReleaseCapture();
-            if (releasedText.find_first_not_of("\r\n ") != std::string::npos)
-                setClipboardUtf8(releasedText);   // auto-copy on release (convention)
-        }
+        if (g_selWindow == m_hWnd) finishSelection(m_hWnd);
+        else mouseReport(pt.x, pt.y, 0, false, false);
     }
     void OnRButtonDown(UINT, CPoint pt) {
         if (pt.x < sidebarSpan()) return;                        // sidebar/splitter: no paste
@@ -6706,8 +6973,8 @@ public:
         //     it — the next keystroke drove the TreeView's type-ahead instead of the shell, which
         //     selects a different row and so silently SWITCHES SESSION. Pasting a command and typing
         //     Enter then landed in a terminal the user was not looking at.
-        int pane, absRow, col;
-        if (hitTest(pt.x, pt.y, &pane, &absRow, &col)) g_focus = pane;
+        int pane;
+        if (hitTest(pt.x, pt.y, &pane)) g_focus = pane;
         SetFocus();                                              // before the early return below
         // Paste WINS over the app's mouse reporting (main-app parity, Program.WndProc.cs). It used
         // to lose, and that made right-click paste dead exactly where it is wanted most: a TUI like
@@ -6745,6 +7012,7 @@ public:
         }
     }
     void OnTimer(UINT_PTR id) {
+        if (id == kSelAutoTimer) { selAutoTick(m_hWnd); return; }
         if (id == kRelayoutTimer) {
             // A resize that did not happen: the UI thread skipped it because a control-pipe thread
             // held g_resizeLock, or the pty-host refused one and the rollback armed this. Kill the
@@ -6761,6 +7029,7 @@ public:
             return;
         }
         if (id != kCaretTimer) return;
+        endMarkModeIfMoved();
         if (!g_winFocused) return;            // hollow caret doesn't blink
         g_caretOn = !g_caretOn;
         InvalidateCaret();
@@ -7194,6 +7463,8 @@ public:
         if (lp != 0 && (HWND)lp != g_toolbar) return 0;
         if (HIWORD(wp) > 1) return 0;   // BN_CLICKED/menu/accel only, never EN_*/CBN_*
         switch (id) {
+            case IDM_MARK: runKbAction(KB_MARK); break;
+            case IDM_SELECTALL: runKbAction(KB_SELECTALL); break;
             case IDM_NEW: newSessionDialog(); break;                                     // profile picker
             case IDM_NEWWS: {                                                            // new workspace ("folder")
                 wchar_t nm[32]; wsprintfW(nm, L"workspace %d", (int)g_workspaces.size() + 1);
@@ -7248,6 +7519,7 @@ public:
     }
 
     void OnDestroy() {
+        cancelDrag(m_hWnd);
         KillTimer(kCaretTimer);
         saveWindowRect();                        // remember window size + position for next launch
         saveSessionState();                      // final save with LIVE cwds — while the shells are
@@ -8166,9 +8438,8 @@ difference: the full app refuses a pane id of a split without `--pane`) - except
 own id, which names ITS slot (the rule). Bare `result` is the WINDOW-WIDE last popup exit: `exit
 N` once the last popup's command completed and the popup closed, `no overlay` (ok) before any and
 again after every popup `open`. Bare `text` reads the popup's buffer, `no overlay` when none. Bare
-`copy` ALWAYS answers `no selection`: the popup paints no selection and takes no drag - a recorded
-gap of lite's, not something this verb hides. `selection all` on it is refused:
-`the popup paints no selection`.
+`copy` reads the popup's selected text without changing the clipboard, or answers `no selection`
+when it has none. The popup supports mouse/keyboard selection and `selection all`.
 
 **`text` on either slot and `session text` on any pane take the same two flags.** The bare form
 and `--all` read the whole buffer, scrollback plus screen - `--all` is the explicit spelling of
@@ -8323,9 +8594,14 @@ agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width
 Every window is its own process with its own pipe, so `--pipe <name>` picks the window and
 `window list` enumerates them.
 
-`selection all` selects the whole buffer, or only the app's screen on the alt screen. Popup
-terminals (overlay, quick and scratch) refuse it: `the popup paints no selection`. `selection
-copy` posts the selected text to the Windows clipboard and clears the highlight; `copied N chars`
+`selection all` selects the whole buffer, or only the app's screen on the alt screen, including
+popup terminals (overlay, quick and scratch). It highlights without copying. Ctrl+Shift+A is its
+seeded chord; Ctrl+Shift+M toggles mark mode at the caret (both rebindable/clearable in File → Keyboard).
+In mark mode arrows and Home/End extend; Enter or Ctrl+C copies, exits and keeps the highlight;
+Esc or the configured mark chord clears and exits. A surface/screen change also ends the mode.
+Double/triple-click selects a word/line and copies on button release; dragging beyond the edge
+auto-scrolls. Wheel, drag and mark mode never expose main-screen history on the alt screen.
+`selection copy` posts the selected text to the Windows clipboard and clears the highlight; `copied N chars`
 counts UTF-8 bytes, unlike the full app's UTF-16 count. Allow the next UI message before reading
 the clipboard. Blank Copy answers `nothing to copy` and still clears the highlight without
 changing the clipboard; Finalize alone keeps it. Copy and Finalize refuse a failed UI enqueue:
@@ -9052,10 +9328,8 @@ static std::string ctlDispatch(const std::string& line) {
             // checks it is still listed (its WM_DESTROY unlists it under g_lock), so the slot the
             // reply describes is the one that existed when the read ran. An empty slot is the bare
             // `no overlay` (the pane arm names its slot after the colon). `copy` is `no selection`
-            // whenever nothing is selected in the popup — which in lite is always: paintPopup draws
-            // no selection and hitTest never enters the popup, so no drag can make one (said in the
-            // skill; the "selection" gap in lite-parity.md, not this batch's). The clipboard is not
-            // touched.
+            // whenever nothing is selected in the popup. Popup mouse/keyboard selection and the
+            // selection API share the painted range. This read never touches the clipboard.
             LockG hold;
             Session* ov = g_overlaySession;
             if (!ov || !g_overlayHwnd || indexOfSession(ov) < 0) return ctlErr(kOverlayNone);
@@ -9613,12 +9887,10 @@ static std::string ctlDispatch(const std::string& line) {
         LockG hold;   // target liveness, reconciliation, extraction and mutation are one operation
         if (indexOfSession(target) < 0) return ctlErr("session not found");
         if (cmd == "selection.all") {
-            if (target == g_overlaySession || target == g_quickSession || target == g_scratchSession)
-                return ctlErr("the popup paints no selection");
             return ctlOkStr(selectAllOf(target));
         }
         if (cmd == "selection.clear") {
-            if (g_sel.isFor(target)) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+            if (g_sel.sess == target) { g_sel.clear(); InvalidateRect(windowForSession(target), nullptr, FALSE); }
             return ctlOkStr("cleared");
         }
         syncSelection();
@@ -9626,11 +9898,11 @@ static std::string ctlDispatch(const std::string& line) {
         if (!g_sel.isFor(target)) return ctlOkStr(finalize ? "finalized (empty)" : "no selection");
         std::string text = selectionText();
         if (text.find_first_not_of("\r\n ") == std::string::npos) {
-            if (!finalize) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+            if (!finalize) { g_sel.clear(); InvalidateRect(windowForSession(target), nullptr, FALSE); }
             return ctlOkStr(finalize ? "finalized (empty)" : "nothing to copy");
         }
         if (!postClipboardUtf8(text)) return ctlErr("the clipboard write could not be queued; selection unchanged");
-        if (!finalize) { g_sel.clear(); InvalidateRect(g_hwnd, nullptr, FALSE); }
+        if (!finalize) { g_sel.clear(); InvalidateRect(windowForSession(target), nullptr, FALSE); }
         return ctlOkStr(finalize ? "finalized (copied)" : "copied " + std::to_string(text.size()) + " chars");
     }
     if (cmd == "session.paste") {   // paste text (or the clipboard) into the target
@@ -10599,7 +10871,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_haveAgbfC = GetFileAttributesW((dir + L"\\agwin-bitmap-complete-16.agbf").c_str()) != INVALID_FILE_ATTRIBUTES;
     buildFontCatalog();
     loadColors();      // Properties->Colors overrides, remembered across restarts
-    loadKeys();        // configurable key bindings (unbound by default)
+    loadKeys();        // palette, mark and Select All seeded; other bindings start unbound
     loadFontSel();     // resolve the remembered face+size (first run -> AGWin Bitmap Complete 16)
     applyFont();       // creates g_fonts + sets g_cw/g_ch (g_hwnd still null, so no relayout yet)
     if (g_faceIdx >= 0 && g_faceIdx < (int)g_catalog.size())

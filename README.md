@@ -53,14 +53,20 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   while the other pane stays interactive (`session overlay open <cmd> --pane left|right`), font catalog (incl. bundled Cozette, Tamzen, Terminus, Spleen, UNSCII &
   GNU Unifont bitmap fonts) — face and size are chosen once in Properties; there is deliberately
   **no zoom**, because a raster face only exists at the strike sizes its pack ships,
-  MS-DOS/EGA palette, cmd.exe-style Properties dialog, fully rebindable keys (all unbound by
-  default — keystrokes belong to your shell; the two pane-focus rows are by **slot** — *Focus Left /
+  MS-DOS/EGA palette, cmd.exe-style Properties dialog, fully rebindable keys (Ctrl+Shift+P opens
+  the palette, Ctrl+Shift+M toggles mark mode, Ctrl+Shift+A selects all; other actions start unbound).
+  The two pane-focus rows are by **slot** — *Focus Left /
   Top Pane* is slot 0 and *Focus Right / Bottom Pane* slot 1, whichever shell a `session swap` put
-  there, and the same two rows serve both axes). The **sidebar text size** is set separately
+  there, and the same two rows serve both axes. The **sidebar text size** is set separately
   (*Properties → Sidebar text*), because wanting a bigger session list is not wanting a
   bigger terminal.
-- **Clipboard**: select with the mouse and it is copied on release; **Ctrl+C copies a selection**
-  and otherwise still interrupts the shell (Ctrl+Shift+C always copies); **right-click pastes**
+- **Clipboard**: select with the mouse and it is copied on release
+  (double/triple-click selects a word/line; dragging past an edge auto-scrolls). Mark mode starts
+  at the caret: arrows and Home/End extend, Enter or Ctrl+C copies and exits while keeping the
+  highlight, Esc or the configured mark chord clears and exits. Select All only highlights.
+  These work in panes and overlay/quick/scratch popups. The alt screen stays pinned to its own
+  rows: wheel, drag and mark mode cannot reach main-screen history. **Ctrl+C copies a selection**
+  and otherwise interrupts the shell (Ctrl+Shift+C always copies); **right-click pastes**
   even while a full-screen app is grabbing the mouse — a TUI like Claude Code holds mouse mode on
   for its whole run, which is exactly when pasting matters. A program can drive the clipboard
   itself with **OSC 52**, and terminal queries get answered. Both bindings are on by default; the
@@ -71,8 +77,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   clears it. `copied N chars` counts UTF-8 bytes of the text `session copy` returns, with CRLF
   between rows and trailing spaces trimmed. The clipboard write is posted to the UI thread;
   allow its next message before reading it. `selection finalize` is the release-copy testing
-  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Select All
-  is refused on popup terminals (overlay, quick and scratch): `the popup paints no selection`.
+  hook: it copies and keeps the highlight, with no copy-on-select off mode in lite. Popup terminals
+  (overlay, quick and scratch) support selection too.
   Blank Copy answers `nothing to copy`, clears the highlight, and leaves the clipboard alone;
   blank Finalize keeps the highlight. Copy and Finalize can refuse a failed UI enqueue with
   `the clipboard write could not be queued; selection unchanged`.
@@ -162,8 +168,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   `overlay still running` while it is up and `no overlay result` before anything completed there;
   the bare `result` is the window-wide last popup exit. `copy` and `text [--all | --lines N]`
   answer `{text}` on either slot — the selection made inside the overlay (the clipboard
-  untouched) and its buffer — refused `no overlay` / `no selection`; the popup's `copy` is always
-  `no selection`, and `selection all` on it is refused: `the popup paints no selection`.
+  untouched) and its buffer — refused `no overlay` / `no selection` when absent. The popup supports
+  drag selection and `selection all`; `copy` reads its selected text without changing the clipboard.
   `session text` gains the same `--lines N` (the last N
   lines; `0` the screen; a non-number refused instead of dropped) and `--all` (lite's bare form —
   the full app's bare form is the screen only, a recorded difference); the pair is refused. The
