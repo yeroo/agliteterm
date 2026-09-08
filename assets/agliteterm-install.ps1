@@ -119,6 +119,26 @@ try {
                     if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw 'Claude hook matcher is not text; unchanged'}
                     foreach($hook in $entry.hooks){
                         if($hook -isnot [pscustomobject] -or $hook.type -isnot [string]){throw 'Claude hook/type has invalid shape; unchanged'}
+                        # Documented handler union: https://code.claude.com/docs/en/hooks#hook-handler-fields
+                        $required=switch -CaseSensitive ($hook.type){
+                            'command' {@('command')};'http' {@('url')};'mcp_tool' {@('server','tool')}
+                            'prompt' {@('prompt')};'agent' {@('prompt')}
+                            default {throw 'Unknown Claude hook handler type; unchanged'}
+                        }
+                        foreach($field in $required){if($hook.$field -isnot [string] -or -not$hook.$field.Trim()){throw "Claude hook requires text field $field; unchanged"}}
+                        foreach($field in 'command','url','server','tool','prompt','model','if','statusMessage','shell'){
+                            if($hook.PSObject.Properties[$field] -and $hook.$field -isnot [string]){throw "Claude hook $field is not text; unchanged"}
+                        }
+                        foreach($field in 'once','async','asyncRewake'){
+                            if($hook.PSObject.Properties[$field] -and $hook.$field -isnot [bool]){throw "Claude hook $field is not boolean; unchanged"}
+                        }
+                        foreach($field in 'args','allowedEnvVars'){
+                            if($hook.PSObject.Properties[$field] -and ($hook.$field -isnot [Array] -or @($hook.$field|Where-Object {$_ -isnot [string]}).Count)){throw "Claude hook $field is not a text array; unchanged"}
+                        }
+                        if($hook.PSObject.Properties['timeout'] -and ($hook.timeout -isnot [ValueType] -or $hook.timeout -is [bool] -or $hook.timeout -lt 0)){throw 'Claude hook timeout is not a nonnegative number; unchanged'}
+                        if($hook.PSObject.Properties['headers'] -and ($hook.headers -isnot [pscustomobject] -or @($hook.headers.PSObject.Properties|Where-Object {$_.Value -isnot [string]}).Count)){throw 'Claude hook headers is not a text map; unchanged'}
+                        if($hook.PSObject.Properties['input'] -and $hook.input -isnot [pscustomobject]){throw 'Claude MCP hook input is not an object; unchanged'}
+                        if($hook.PSObject.Properties['shell'] -and $hook.shell -cnotin @('bash','powershell')){throw 'Claude hook shell is unsupported; unchanged'}
                         if($hook.PSObject.Properties['command'] -and $hook.command -isnot [string]){throw 'Claude hook command is not text; unchanged'}
                         if($hook.type-eq'command' -and $hook.command -isnot [string]){throw 'Claude command hook has no command text; unchanged'}
                     }

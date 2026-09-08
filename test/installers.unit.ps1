@@ -37,11 +37,19 @@ $r=Install hooks
 Check 'hooks install idempotent' ($r.ok -and [IO.File]::ReadAllText($settings)-ceq$saved -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
 foreach($bad in @('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"not-array"}}','{"unrelated":1,"unrelated":2}','{"unrelated":{"X":1,"x":2}}','{"key":1,"\u006bey":2}',
     '{"hooks":{"Stop":[{"hooks":"not-an-array"}]}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}',
-    '{"hooks":{"Stop":[{"hooks":["command"]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","command":false}]}]}}')){
+    '{"hooks":{"Stop":[{"hooks":["command"]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","command":false}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"bogus"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"http"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"prompt"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"agent","prompt":false}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"mcp_tool","server":"s"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"x","args":[1]}]}]}}')){
     [IO.File]::WriteAllText($settings,$bad)
     $r=Install hooks
     Check 'malformed settings refuse without profile/settings change' (-not$r.ok -and $installExit-ne 0 -and [IO.File]::ReadAllText($settings)-ceq$bad -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
 }
+[IO.File]::WriteAllText($settings,$saved)
+$variants='{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"https://example.invalid/hook","headers":{"X":"v"}},{"type":"mcp_tool","server":"local","tool":"check","input":{"x":1}},{"type":"prompt","prompt":"check","model":"unchanged"},{"type":"agent","prompt":"check","timeout":15}]}]}}'
+[IO.File]::WriteAllText($settings,$variants);$r=Install hooks
+$kept=Get-Content -Raw $settings|ConvertFrom-Json
+Check 'all documented non-command hook variants survive unchanged' ($r.ok -and $kept.hooks.Stop[0].hooks.Count-eq 4 -and $kept.hooks.Stop[0].hooks[1].input.x-eq 1 -and $kept.hooks.Stop[0].hooks[2].model-eq'unchanged')
 [IO.File]::WriteAllText($settings,$saved)
 $scoped=$saved|ConvertFrom-Json
 $scoped.hooks.Notification[0].matcher='idle_prompt'

@@ -24,6 +24,10 @@ int main() {
         Identity id; check(!identify("claude.exe",args,id), "unknown/headless/ambiguous invocation refused");
     }
     Identity node;
+    std::string binding="original";
+    check(publishBinding(binding,"original","resume") && binding=="resume","acknowledged binding publishes against original value");
+    binding="later custom binding";
+    check(!publishBinding(binding,"original","resume") && binding=="later custom binding","late receipt cannot overwrite newer user binding");
     for (const auto& args : std::vector<std::vector<std::string>>{
         {"claude.exe","--resume",sid,"--fork-session"},
         {"claude.exe","--append-system-prompt","--session-id",sid},
@@ -74,9 +78,12 @@ int main() {
     HANDLE client=CreateFileA(pipeName.c_str(),GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr);
     check(server!=INVALID_HANDLE_VALUE && client!=INVALID_HANDLE_VALUE,"private bounded-write pipe opens");
     if (server!=INVALID_HANDLE_VALUE && client!=INVALID_HANDLE_VALUE) {
-        check(bounded_pipe_write::write(server,"abc",3,100)==3,"bounded write reports full delivered bytes");
+        bounded_pipe_write::Pending* pending=nullptr;
+        check(bounded_pipe_write::write(server,"abc",3,100,pending)==3 && !pending,"bounded write reports full delivered bytes");
         std::string blocked(1024*1024,'x'); const auto started=GetTickCount64();
-        check(bounded_pipe_write::write(server,blocked.data(),static_cast<DWORD>(blocked.size()),50)==0 && GetTickCount64()-started<2000,
+        DWORD result=bounded_pipe_write::write(server,blocked.data(),static_cast<DWORD>(blocked.size()),50,pending);
+        while(pending) { if(!bounded_pipe_write::complete(pending,result)) Sleep(10); }
+        check(result==0 && GetTickCount64()-started<2000,
               "non-draining pipe cancels within deadline, no false write success");
     }
     if(client!=INVALID_HANDLE_VALUE) CloseHandle(client);

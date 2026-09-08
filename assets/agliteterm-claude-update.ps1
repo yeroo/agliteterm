@@ -1,5 +1,6 @@
 param([Parameter(Mandatory)][string]$Executable,[Parameter(Mandatory)][string]$Receipt,[Parameter(Mandatory)][string]$Nonce,[string]$NodeScript)
 $ErrorActionPreference='Stop'
+[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
 function Read-AgentVersion {
     $prefix=if($NodeScript){@($NodeScript)}else{@()}
     $versionOutput=@(& $Executable @prefix --version 2>&1)

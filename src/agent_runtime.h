@@ -103,9 +103,10 @@ static std::string agentResume(const AgentEvidence& evidence, bool yolo) {
 struct AgentOperation {
     AgentEvidence evidence;
     std::string command;
+    std::string authorization;
     unsigned long long lease = 0;
     std::atomic<bool> claimed{false};
-    bool interrupting = false, offered = false, acknowledged = false; // under g_agentMutex
+    bool interrupting = false, offered = false, acknowledged = false, cancelled = false; // under g_agentMutex
     ULONGLONG started = GetTickCount64();
     ~AgentOperation() { if (lease) evidence.pane->inputGate.release(lease); }
 };
@@ -132,10 +133,19 @@ static DWORD WINAPI agentInterruptWorker(void* opaque) {
                 op->interrupting = interrupt = true;
         }
         if (interrupt) {
-            const auto written = ovIo(op->evidence.pane->data, true, "\x03", nullptr, 1, true, false, nullptr, op->lease, 1000);
+            bounded_pipe_write::Pending* pending = nullptr;
+            auto written = ovIo(op->evidence.pane->data, true, "\x03", nullptr, 1, true, false, nullptr, op->lease, 1000, &pending);
+            bool expired = false;
+            while (pending) {
+                if (!expired && GetTickCount64()-op->started >= 30000) {
+                    expired = true;
+                    emitEvent("agent.restart",op->evidence.paneId,"restart deadline expired; interrupt cancellation unresolved, input remains reserved until completion");
+                }
+                if (!bounded_pipe_write::complete(pending,written)) Sleep(50);
+            }
             std::lock_guard<std::mutex> guard(g_agentMutex);
             op->interrupting = false;
-            if (written != 1) { result = "interrupt write failed or timed out; no resume dispatched"; break; }
+            if (expired || written != 1) { op->cancelled = true; result = "interrupt completed/cancelled after failure or deadline; no resume dispatched"; break; }
             if (first) second = true; else first = true;
         }
         Sleep(50);
@@ -153,6 +163,9 @@ static DWORD WINAPI agentInterruptWorker(void* opaque) {
 }
 static std::string agentQueueRestart(AgentEvidence evidence, bool yolo) {
     auto op = std::make_shared<AgentOperation>(); op->evidence = std::move(evidence); op->command = agentResume(op->evidence, yolo);
+    GUID id{}; wchar_t idText[40]{};
+    if (CoCreateGuid(&id) != S_OK || !StringFromGUID2(id,idText,40)) return ctlErr("restart authorization identity unavailable; nothing interrupted");
+    op->authorization = narrow(idText);
     const auto simple = "claude --resume " + op->evidence.identity.conversation +
         (op->evidence.identity.dangerous ? " --dangerously-skip-permissions" : "");
     if (!op->evidence.binding.empty() && op->evidence.binding != simple && op->evidence.binding != agentResume(op->evidence, false))
@@ -192,16 +205,16 @@ static std::string agentBridge(const JsonReq& req) {
         const auto found = g_agentOperations.find(pane->paneId);
         if (found == g_agentOperations.end()) return ctlOkStr("");
         op = found->second;
-        if (action != "claim" && req.get("args.lease") != std::to_string(op->lease)) return ctlErr("stale bridge offer");
+        if (action != "claim" && req.get("args.lease") != op->authorization) return ctlErr("stale bridge offer");
         if (action == "received") {
             if (!op->acknowledged) return ctlErr("bridge offer was not acknowledged");
             op->claimed = true; g_agentOperations.erase(found);
-            { LockG hold; pane->agentResume = op->command; }
+            { LockG hold; agent_integration::publishBinding(pane->agentResume,op->evidence.binding,op->command); }
         } else {
         if (req.get("args.console-pids") != std::to_string(op->evidence.shell->pid))
             return ctlErr("prompt has not proved sole console ownership; no resume dispatched");
         if (!agentStillEligible(*op) || GetTickCount64() - op->started >= 30000) return ctlErr("restart no longer eligible");
-        if (op->interrupting) return ctlErr("interrupt still in flight; retry claim");
+        if (op->interrupting || op->cancelled) return ctlErr("interrupt in flight or cancelled; no resume authorized");
         for (const auto& child : op->evidence.descendants) if (WaitForSingleObject(child->handle, 0) != WAIT_OBJECT_0)
             return ctlErr("agent descendants have not all exited; no resume dispatched");
         // Catch descendants started after the original snapshot. At a prompt there must be no
@@ -226,7 +239,7 @@ static std::string agentBridge(const JsonReq& req) {
         const auto wall = (static_cast<ULONGLONG>(now.dwHighDateTime)<<32)|now.dwLowDateTime;
         const auto elapsed = GetTickCount64() - op->started;
         const auto deadline = wall + (elapsed < 30000 ? 30000-elapsed : 0)*10000;
-        return ctlOkStr("{\"lease\":\"" + std::to_string(op->lease) + "\",\"deadline\":\"" + std::to_string(deadline) +
+        return ctlOkStr("{\"lease\":\"" + op->authorization + "\",\"deadline\":\"" + std::to_string(deadline) +
                         "\",\"command\":\"" + jsonEscape(op->command) + "\"}");
         }
     }
@@ -240,13 +253,19 @@ struct AgentUpdateOperation {
     Session* overlay = nullptr;
     std::wstring receipt;
     std::string nonce;
+    HANDLE job = nullptr, helper = nullptr, helperThread = nullptr;
+    ~AgentUpdateOperation() { if (helperThread) CloseHandle(helperThread); if (helper) CloseHandle(helper); if (job) CloseHandle(job); }
+    bool ended() const {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
+        return job && QueryInformationJobObject(job,JobObjectBasicAccountingInformation,&info,sizeof info,nullptr) && info.ActiveProcesses == 0;
+    }
 };
 static std::atomic<bool> g_agentUpdateBusy{false};
 static std::string agentUpdateOnUi(const JsonReq& req) {
     if (req.get("args.close") == "true") {
         Session* owner = nullptr;
         { LockG hold;
-          for (auto* pane : g_sessions) if (pane->overlay && pane->overlay->paneId == req.get("target") && overlayExitOf(pane->overlay) == "exit 0") { owner = pane; break; } }
+          for (auto* pane : g_sessions) if (pane->overlay && pane->overlay->paneId == req.get("target")) { owner = pane; break; } }
         return owner && closePaneOverlay(owner) ? ctlOkStr("closed completed owned update overlay") : ctlErr("update overlay changed; no restart authorized");
     }
     Session* shell;
@@ -259,18 +278,21 @@ static std::string agentUpdateOnUi(const JsonReq& req) {
 }
 static DWORD WINAPI agentUpdateWorker(void* opaque) {
     std::unique_ptr<AgentUpdateOperation> op(static_cast<AgentUpdateOperation*>(opaque));
+    const bool resumed = ResumeThread(op->helperThread) != static_cast<DWORD>(-1);
+    CloseHandle(op->helperThread); op->helperThread = nullptr;
+    if (!resumed) TerminateJobObject(op->job,1); // root never executed, no updater ran
     std::string result = "update timed out; no agents restarted; overlay retained for inspection";
     bool expired = true;
     const auto start = GetTickCount64();
     while (GetTickCount64() - start < 300000) {
-        std::string exit;
         { LockG hold;
           if (indexOfSession(op->overlay) < 0 || op->overlay->exited) { expired = false; result = "update overlay closed; no agents restarted"; break; }
-          exit = overlayExitOf(op->overlay); }
-        if (!exit.empty()) {
+        }
+        if (op->ended()) {
             expired = false;
             result = "update failed or did not install a newer version; no agents restarted";
-            if (exit != "exit 0") break;
+            DWORD code=1;
+            if (!resumed || !GetExitCodeProcess(op->helper,&code) || code != 0) break;
             HANDLE file = CreateFileW(op->receipt.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
             if (file == INVALID_HANDLE_VALUE) break;
             LARGE_INTEGER size{}; std::string bytes; DWORD read = 0;
@@ -293,14 +315,9 @@ static DWORD WINAPI agentUpdateWorker(void* opaque) {
         Sleep(100);
     }
     emitEvent("agent.update", op->overlay->paneId, result); logInfo("agent update: %s", result.c_str());
-    // Expiration stops restart supervision, not the updater itself. Keep exclusion until the
-    // owned overlay command has actually ended; this passive tail never schedules a restart.
-    for (;;) {
-        bool ended;
-        { LockG hold; ended = indexOfSession(op->overlay) < 0 || op->overlay->exited || !overlayExitOf(op->overlay).empty(); }
-        if (ended) break;
-        Sleep(250);
-    }
+    // The overlay is only a log viewer. Shell unlisting is never process-tree exit evidence.
+    // The job contains the suspended-before-assignment helper and all updater descendants.
+    while (!op->ended()) Sleep(250); // passive exclusion; never authorizes late restarts
     // The uniquely created receipt is retained as diagnostic evidence, not mistaken for a release asset.
     g_agentUpdateBusy = false;
     if (expired) emitEvent("agent.update",op->overlay->paneId,"expired updater ended; exclusion released; no late restarts");
@@ -348,16 +365,41 @@ static std::string agentUpdate(const JsonReq& req) {
         " -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + shell_configuration::literal(narrow(helper)) +
         " -Executable " + shell_configuration::literal(image) + " -Receipt " + shell_configuration::literal(narrow(op->receipt)) +
         " -Nonce " + shell_configuration::literal(op->nonce) + (nodeScript.empty() ? "" : " -NodeScript " + shell_configuration::literal(nodeScript));
-    JsonReq open; open.fields = {{"cmd","agent.update.open"},{"target",target},{"args.script",script}};
+    // Launch the actual updater under native ownership, not as an unowned PTY grandchild.
+    const auto logPath=op->receipt+L".log";
+    SECURITY_ATTRIBUTES security{sizeof security,nullptr,TRUE};
+    HANDLE output=CreateFileW(logPath.c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    HANDLE input=CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,OPEN_EXISTING,0,nullptr);
+    op->job=CreateJobObjectW(nullptr,nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{}; limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (output==INVALID_HANDLE_VALUE || input==INVALID_HANDLE_VALUE || !op->job ||
+        !SetInformationJobObject(op->job,JobObjectExtendedLimitInformation,&limits,sizeof limits)) {
+        if(output!=INVALID_HANDLE_VALUE) CloseHandle(output); if(input!=INVALID_HANDLE_VALUE) CloseHandle(input);
+        return ctlErr("update log/input/ownership job unavailable; no updater started");
+    }
+    const auto shell=std::wstring(system)+L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    auto command=L"\""+shell+L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "+widen(base64(widen(script)));
+    STARTUPINFOW startup{};startup.cb=sizeof startup;startup.dwFlags=STARTF_USESTDHANDLES;
+    startup.hStdInput=input;startup.hStdOutput=output;startup.hStdError=output;
+    PROCESS_INFORMATION process{};
+    const bool created=command.size()<32767 && CreateProcessW(shell.c_str(),&command[0],nullptr,nullptr,TRUE,
+        CREATE_NO_WINDOW|CREATE_SUSPENDED,nullptr,exeDir().c_str(),&startup,&process);
+    CloseHandle(output);CloseHandle(input);
+    if(!created) return ctlErr("owned updater helper could not be created; no updater started");
+    op->helper=process.hProcess;op->helperThread=process.hThread;
+    if(!AssignProcessToJobObject(op->job,op->helper)) {
+        TerminateProcess(op->helper,1);WaitForSingleObject(op->helper,5000);
+        return ctlErr("updater job assignment failed; helper was never resumed");
+    }
+    const auto viewer="Get-Content -LiteralPath "+shell_configuration::literal(narrow(logPath))+" -Encoding UTF8 -Wait";
+    JsonReq open; open.fields = {{"cmd","agent.update.open"},{"target",target},{"args.script",viewer}};
     const auto reply = dispatchConfig(open); JsonReq answer; size_t pos = 0;
     if (!jsonParseObject(reply, pos, "", answer) || answer.get("ok") != "true") return reply;
-    // From here a real updater may be running. A supervisor failure must fail closed rather
-    // than admit a concurrent updater. In that rare case restart this app after closing it.
-    reset.armed = false;
+    // The owned helper remains suspended until the supervisor starts. Failure closes its job.
     { LockG hold; op->overlay = resolveTarget(answer.get("result"), nullptr); }
     if (!op->overlay) return ctlErr("update overlay disappeared; no restart worker started");
     HANDLE worker = CreateThread(nullptr, 0, agentUpdateWorker, op.get(), 0, nullptr);
-    if (!worker) return ctlErr("update overlay opened but supervisor failed; no agents will be restarted");
+    if (!worker) return ctlErr("update log overlay opened but supervisor failed; owned updater never resumed");
     op.release(); CloseHandle(worker); reset.armed = false;
     return ctlOkStr("Claude update opened in owned overlay " + answer.get("result") + "; completion is reported by agent.update and agent.restart events");
 }

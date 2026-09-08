@@ -28,6 +28,10 @@ struct Identity {
 inline bool optionIn(const std::string& arg, const std::string& choices) {
     return choices.find("|" + arg + "|") != std::string::npos;
 }
+inline bool publishBinding(std::string& current, const std::string& expected, const std::string& next) {
+    if (current != expected) return false;
+    current = next; return true;
+}
 // Identity comes from a live, owned process's real image and argv, not its title or cwd.
 // Bare/continue/headless invocations deliberately cannot be adopted by guessing a transcript.
 inline bool identify(const std::string& image, const std::vector<std::string>& argv, Identity& out) {

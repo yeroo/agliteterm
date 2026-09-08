@@ -53,3 +53,14 @@ also exercises the actual five-minute update-supervision expiry; those pending r
 Record the exact candidate, Codex-only revmux completeness/dispositions, combined local counts,
 full Windows CI run and implementation/companion-doc PRs in the final PR delivery note. This document
 does not claim those pending gates have passed. No release/tag is authorized or produced by P11.
+
+Confirmation `02-after-fix` at cde398d had 2/2 healthy Codex sources, retaining 3 major lifecycle
+defects: updater grandchildren surviving viewer close, unknown canceled-write completion, and numeric
+authorization reuse after UI adoption. A hook-handler union validation gap was classified pre-existing
+to that fix range but is still part of P11, so it is included rather than deferred. The next batch
+owns updater descendants in a suspended-before-assignment native job (the overlay only views its log),
+retains the input lease and duplicated I/O handle through actual cancellation completion, and uses a
+GUID authorization independent of the numeric gate token. It also compare-publishes bindings so a late
+receipt cannot overwrite a newer user value. Pure checks pass 61 agent/I/O, 37 installer and 28 script
+cases. The preceding cde398d combined run passed 396/396, with 33 retained descendants exited and token
+77 released after restoration; a new exact-candidate run and blocker-only confirmation remain required.

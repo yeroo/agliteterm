@@ -89,25 +89,33 @@ custom conflicting binding, readonly, covered or ambiguous panes refuse without 
 
 While pending, a per-pane lease refuses editing input (including API type/paste); terminal protocol
 replies remain available. The app sends up to two Ctrl+C bytes only while the verified original agent
-is alive, and waits at most 30 seconds. The shell claims a generated, quoted argv only from its prompt,
+is alive, and authorizes resume only within 30 seconds. If Windows has not completed a canceled
+interrupt I/O, the pane's lease remains reserved until completion is known; an event reports that
+exception and no late resume is authorized. No global agent lock is held during that wait.
+The shell claims a generated, quoted argv only from its prompt,
 after all retained descendants exited, a new snapshot shows no surviving shell children, and the
 shell reports itself as the sole attached console client (including late orphan checks). Resume
 executes inside the prompt, never by appending executable text to PSReadLine's draft. State changes,
 unknown ownership, timeout or missing claim mean no resume dispatch. No fixed-delay fallback or
 name/PID-only process kill is used. Interrupt I/O has a bounded cancellable wait. Offers and acknowledgements
-are retryable for the same lease; the prompt checks expiry and executes each lease at most once. Receipt
+are retryable for the same globally unique authorization; the prompt checks expiry and executes it at most once,
+including after a surviving shell is adopted by a new UI. A late receipt cannot replace a newer binding. Receipt
 notification and binding persistence do not block authorization replies. An unconfirmed acknowledgement
 is reported as such, never as completed startup. `agent.bridge` is the capability-checked shell integration protocol,
 not a command API for callers to supply executable text.
 
-`claude.update` opens an owned pane overlay and probes versions around `claude update`. Failed, unknown,
+`claude.update` owns its helper and descendants in a native kill-on-close job, assigned before the
+helper starts. An owned pane overlay displays the update log; closing that viewer does not stop the
+updater or release its exclusion. Closing the app terminates its owned update job and may leave a
+partial update. The helper probes versions around `claude update`. Failed, unknown,
 unchanged or older versions restart nothing and leave the overlay for inspection. A proven newer
 version closes that completed overlay and requests safe restarts only for the window's originally
 verified eligible panes using that executable/script. Each keeps its conversation and explicit startup
 permission arguments; interactive permission-mode changes inside Claude cannot be inferred from argv.
 Closed, changed, custom-bound or newly ineligible panes are skipped; new agents are not discovered
 and interrupted after the update. The supervisor expires after five minutes without killing the updater.
-It continues to exclude another update until that owned updater ends; late completion never restarts agents.
+It continues to exclude another update until the owned job has no active processes, even if the viewer
+was closed; late completion never restarts agents. The log and version receipt are retained for inspection.
 
 Replies say queued/opened, not completed. Read `agent.update` and `agent.restart` events for outcomes;
 resume dispatch and binding persistence are distinct from successful agent startup. Receipt files in

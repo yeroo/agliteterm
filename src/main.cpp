@@ -1443,7 +1443,10 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
 #include "bounded_pipe_write.h"
 static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
                   bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr,
-                  unsigned long long reservation = 0, DWORD timeout = INFINITE) {
+                  unsigned long long reservation = 0, DWORD timeout = INFINITE,
+                  bounded_pipe_write::Pending** pendingWrite = nullptr) {
+    if (pendingWrite) *pendingWrite = nullptr;
+    if (timeout != INFINITE && !pendingWrite) return 0; // ownership receiver is mandatory
     Session* inputPane = nullptr;
     if (write) {
         LockG hold;
@@ -1460,7 +1463,7 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     }
     DWORD n = 0;
     auto transfer = [&] {
-        if (write && timeout != INFINITE) { n = bounded_pipe_write::write(h,wbuf,len,timeout); return; }
+        if (write && timeout != INFINITE) { n = bounded_pipe_write::write(h,wbuf,len,timeout,*pendingWrite); return; }
         OVERLAPPED ov{};
         ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
@@ -9342,8 +9345,11 @@ explicitly requests permission-bypassing resume through the bundled PowerShell p
 Old/adopted/explicit-argv shells need that bridge loaded explicitly. Readonly/covered/ambiguous
 panes, custom conflicting bindings and unknown readiness refuse. Pending restarts reserve input;
 Ctrl+C targets the still-live verified process, and only a prompt claim after proven descendant
-exit can dispatch resume. Timeout/state changes cancel; no executable text is appended to a draft.
-`claude update` uses a visible owned overlay; only a proven newer version triggers safe restarts
+exit can dispatch resume. Authorization expires after 30 seconds; unresolved Windows I/O cancellation
+retains the pane's input gate until completion, with an event. No executable text is appended to a draft.
+`claude update` owns the updater tree in a job and shows output in an overlay log viewer. Closing the
+viewer does not release updater exclusion; closing this app terminates its update job (possibly partial).
+Only a proven newer version triggers safe restarts
 of the originally verified eligible panes, preserving each conversation and explicit startup
 permission arguments (not later interactive mode changes). Initial prompt text is not replayed;
 fork-session, unknown option arities and relative npm script paths refuse adoption.

@@ -93,6 +93,8 @@ function global:Invoke-AgLiteBridgeRequest([string]$Op,[string]$Lease='', [switc
 }
 if((Get-AgLiteResume)-cne'p11-command' -or $global:p11Claims-ne 2 -or $global:p11Acks-ne 2 -or $global:p11Receipts-ne 1){throw 'Lost reply retry/receipt failed'}
 if((Get-AgLiteResume) -or $global:p11Receipts-ne 1){throw 'Duplicate lease executed twice'}
+$global:p11Offer=@{lease=[guid]::NewGuid().ToString();deadline=[string][DateTime]::UtcNow.AddSeconds(20).ToFileTimeUtc();command='new-ui-command'}|ConvertTo-Json -Compress
+if((Get-AgLiteResume)-cne'new-ui-command' -or $global:p11Receipts-ne 2){throw 'Fresh UI authorization mistaken for old numeric reservation'}
 $global:p11Offer=@{lease='78';deadline=[string][DateTime]::UtcNow.AddSeconds(-1).ToFileTimeUtc();command='expired'}|ConvertTo-Json -Compress
 if(Get-AgLiteResume){throw 'Expired authorization executed'}
 '@

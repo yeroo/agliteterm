@@ -218,6 +218,7 @@ foreach($mode in 'fail','noop','new'){
         Check 'update preserves each prior permission mode' ($lastA-match'--dangerously-skip-permissions' -and $lastB-notmatch'--dangerously-skip-permissions')
     }else{
         Check "$mode update does not interrupt agents" (@(P11-Launches).Count-eq$count)
+        Check "$mode owned log viewer displays updater output" (P11-Wait {([string](Selection-Rpc 'session.text' @{} $updateCover)).Contains('Claude update: installed version')})
         $null=Selection-Rpc 'session.overlay' @{action='close'} $updateCover
     }
 }
@@ -230,8 +231,10 @@ Check 'running updater refuses another update' (-not(Selection-Rpc 'claude.updat
 Check 'slow updater reaches real supervision timeout' (P11-Wait {@((Selection-Rpc 'events' @{since=$cursor}).events|Where-Object {$_.type-eq'agent.update' -and $_.info-match'update timed out'}).Count-gt 0} 310)
 $r=Selection-Rpc 'claude.update' @{} $agentA -AllowError
 Check 'expired supervisor still excludes a concurrent updater' (-not$r.ok -and $r.error-match'already running')
+$null=Selection-Rpc 'session.overlay' @{action='close'} $slowCover
+$r=Selection-Rpc 'claude.update' @{} $agentA -AllowError
+Check 'closing expired viewer does not release updater process-tree exclusion' (-not$r.ok -and $r.error-match'already running')
 [IO.File]::WriteAllText((Join-Path $fakeDir 'update-release.txt'),'allow owned fake updater to finish')
 Check 'updater exit releases exclusion without late restarts' ((P11-Wait {@((Selection-Rpc 'events' @{since=$cursor}).events|Where-Object {$_.type-eq'agent.update' -and $_.info-match'exclusion released'}).Count-gt 0}) -and @(P11-Launches).Count-eq$count)
-$null=Selection-Rpc 'session.overlay' @{action='close'} $slowCover
 Capture-P11Children
 'P11 fixtures used only the locally compiled fake claude.exe; no real Claude, profile installer or release updater invoked.'
