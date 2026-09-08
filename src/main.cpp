@@ -417,7 +417,7 @@ struct Session {
     std::string overlayResult;
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
-    bool inputWritten = false;    // g_lock; sticky: terminal marks cannot prove a draft was cleared
+    shell_configuration::InputGate inputGate; // sticky PTY input history + per-pane write serialization
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     // restore.capture (P3): the command line of the shell's foreground child as captured by the
     // last `restore capture`, persisted as K (ordinary) or K2 (escaped), read through `tree --json` as
@@ -1426,19 +1426,36 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
     return INVALID_HANDLE_VALUE;
 }
 
-static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len, bool paneInput = true) {
-    if (write && len && paneInput) {
+static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
+                  bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr) {
+    Session* inputPane = nullptr;
+    if (write) {
         LockG hold;
-        for (auto* pane : g_sessions) if (pane->data == h) { pane->inputWritten = true; break; }
+        for (auto* pane : g_sessions) if (pane->data == h) { inputPane = pane; break; }
     }
-    OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
+    // Session objects outlive unlisting and their reader; the pointer and mutex remain valid.
+    // Resolve under g_lock, release it, then serialize the entire write. Never reacquire g_lock
+    // inside the gate. The pristine check and its initialization bytes are one operation
+    // relative to human input, API type/paste and restore replay. Non-editing protocol replies
+    // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
+    if (requireUntouched && !inputPane) {
+        if (guardRefused) *guardRefused = true;
+        return 0;
+    }
     DWORD n = 0;
-    if (issued || GetLastError() == ERROR_IO_PENDING) {
-        if (!GetOverlappedResult(h, &ov, &n, TRUE)) n = 0;
-    }
-    CloseHandle(ov.hEvent);
+    auto transfer = [&] {
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL issued = write ? WriteFile(h, wbuf, len, nullptr, &ov) : ReadFile(h, rbuf, len, nullptr, &ov);
+        if (issued || GetLastError() == ERROR_IO_PENDING) {
+            if (!GetOverlappedResult(h, &ov, &n, TRUE)) n = 0;
+        }
+        CloseHandle(ov.hEvent);
+    };
+    if (inputPane) {
+        if (!inputPane->inputGate.write(paneInput && len != 0, requireUntouched, transfer) && guardRefused)
+            *guardRefused = true;
+    } else transfer();
     return n;
 }
 
@@ -5629,6 +5646,8 @@ static void showTreeContextMenu() {
     bool isSession = g_ctxParam >= 0;
     int si = isSession ? (int)g_ctxParam : -1;
     int cws = isSession ? (si < (int)g_sessions.size() ? g_sessions[si]->ws : 0) : (int)(-g_ctxParam - 1);
+    Session* duplicateSource = nullptr;
+    { LockG hold; if (isSession && si >= 0 && si < (int)g_sessions.size()) duplicateSource = g_sessions[si]; }
     if (!isSession && (cws < 0 || cws >= (int)g_workspaces.size())) return;   // hint row etc.
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
@@ -5667,10 +5686,21 @@ static void showTreeContextMenu() {
             break;
         }
         case IDM_DUP:
-            if (isSession) {
-                g_activeWs = cws;
+            if (duplicateSource) {
+                std::string app, cwd;
+                std::vector<std::string> args;
+                {
+                    LockG hold;
+                    // The popup pumps messages: an index may now name a different session.
+                    if (indexOfSession(duplicateSource) < 0 ||
+                        (duplicateSource->hidden && !splitOwnerOf(duplicateSource))) break;
+                    g_activeWs = duplicateSource->ws;
+                    app = duplicateSource->app; args = duplicateSource->args; cwd = duplicateSource->cwd;
+                }
                 int c, r; newSessionGrid(g_focus, &c, &r);
-                Session* s = newSession(c, r);
+                // Duplicate the resolved launch, not whichever profile is the new default.
+                Session* s = newSession(c, r, app.empty() ? "powershell.exe" : app.c_str(),
+                                        &args, cwd.empty() ? nullptr : cwd.c_str());
                 if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
             }
             break;
@@ -7194,7 +7224,7 @@ static std::string configOnUi(const JsonReq& req) {
             // Marks locate a prompt line, not the PSReadLine buffer. Never append executable text
             // to a draft. Without shell-side buffer acknowledgement, only a fresh untouched pane
             // is eligible; output/Enter/Escape cannot reset this conservative lifetime guard.
-            if (pane->adopted || pane->inputWritten)
+            if (pane->adopted)
                 return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
             FfiEmuInfo info{}; FfiMark last{};
             if (!pane->emu || !emu_info(pane->emu, &info) || info.isAltScreen || !info.markCount)
@@ -7209,7 +7239,10 @@ static std::string configOnUi(const JsonReq& req) {
             data = pane->data;
         }
         const auto command = narrow(ompInitialization(req.get("args.resolved-theme"))) + "\r";
-        const DWORD written = ovIo(data, true, command.data(), nullptr, static_cast<DWORD>(command.size()));
+        bool guardRefused = false;
+        const DWORD written = ovIo(data, true, command.data(), nullptr, static_cast<DWORD>(command.size()), true, true, &guardRefused);
+        if (guardRefused)
+            return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
         if (written != command.size()) return ctlErr("omp: initialization write failed or was partial; nothing saved; shell outcome unknown");
         if (req.get("args.persist") == "true" && !saveOmpTheme(req.get("args.resolved-theme")))
             return ctlErr("omp: initialization written, but theme could not be saved");

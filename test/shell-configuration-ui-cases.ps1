@@ -122,7 +122,9 @@ $draft="[IO.File]::WriteAllText('$($draftSink.Replace("'","''"))','EXECUTED'); "
 $null=Selection-Rpc 'session.type' @{text=$draft} $draftPane
 Start-Sleep -Milliseconds 150
 $answer=Selection-Rpc 'omp.set' @{name=$themeFile} $draftPane -AllowError
-Check 'OMP refuses a single-line draft without submitting it' (-not $answer.ok -and $answer.error-match 'emptiness is unproven' -and -not (Test-Path $draftSink))
+# A wrapped draft may invalidate the observed-prompt gate before the atomic input gate.
+# Both refusals must leave the draft unsubmitted; never accept a generic RPC failure here.
+Check 'OMP refuses a single-line draft without submitting it' (-not $answer.ok -and $answer.error-match 'emptiness is unproven|not at an observed prompt' -and -not (Test-Path $draftSink)) ($answer|ConvertTo-Json -Compress)
 $answer=Selection-Rpc 'omp.set' @{name=$themeFile} $ompPane -AllowError
 Check 'OMP conservatively refuses after prior initialization input' (-not $answer.ok -and $answer.error-match 'emptiness is unproven')
 foreach($setter in @(@{key='omp-theme'},@{key='omp-theme';value=''})){

@@ -3,6 +3,9 @@
 #include "../src/shell_configuration.h"
 #include <cstdio>
 #include <set>
+#include <future>
+#include <thread>
+#include <cstdlib>
 static int checks = 0, failed = 0;
 static void check(bool yes, const char* label) {
     ++checks; if (!yes) ++failed;
@@ -89,6 +92,58 @@ int main() {
         std::string b = flags & 1 ? "B" : "", r = flags & 2 ? "R" : "", k = flags & 4 ? "K" : "";
         const auto expected = !b.empty() ? b : !r.empty() ? r : (flags & 8) ? k : "";
         check(shell_configuration::replay(b, r, k, (flags & 8) != 0) == expected, "complete binding/pin/captured/opt-in precedence space");
+    }
+    {
+        shell_configuration::InputGate gate;
+        std::string bytes;
+        check(gate.write(false, false, [&] { bytes += "REPLY"; }), "protocol response transfer succeeds");
+        check(gate.write(true, true, [&] { bytes += "INIT"; }), "protocol response does not taint pristine input");
+        check(!gate.write(true, true, [&] { bytes += "BAD"; }) && bytes == "REPLYINIT", "second pristine write refuses without bytes");
+        check(gate.write(true, false, [&] { bytes += "DRAFT"; }) && bytes == "REPLYINITDRAFT", "normal input remains allowed after initialization");
+        shell_configuration::InputGate other;
+        check(other.write(true, true, [] {}), "input gates are per pane");
+        shell_configuration::InputGate failedWrite;
+        try { failedWrite.write(true, false, [] { throw 1; }); } catch (int) {}
+        check(!failedWrite.write(true, true, [] {}), "failed transfer conservatively retains input history");
+    }
+    for (bool initializationFirst : {false, true}) {
+        shell_configuration::InputGate gate;
+        std::promise<void> firstEntered, secondStarted, releaseFirst, firstDone, secondDone;
+        auto entered = firstEntered.get_future(), started = secondStarted.get_future();
+        auto done1 = firstDone.get_future(), done2 = secondDone.get_future();
+        auto await = [&](std::future<void>& signal) {
+            if (signal.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+                check(false, "input serialization test timed out"); std::exit(1);
+            }
+        };
+        auto release = releaseFirst.get_future().share();
+        std::string bytes; bool firstOk = false, secondOk = false;
+        std::thread first([&] {
+            firstOk = gate.write(true, initializationFirst, [&] {
+                firstEntered.set_value(); release.wait();
+                bytes += initializationFirst ? "INIT\r" : "DRAFT; ";
+            });
+            firstDone.set_value();
+        });
+        await(entered); // first writer holds the gate through the controlled transfer
+        std::promise<void> replyDone; auto replied = replyDone.get_future();
+        bool replyOk = false;
+        std::thread reply([&] {
+            replyOk = gate.write(false, false, [] {});
+            replyDone.set_value();
+        });
+        await(replied); reply.join();
+        check(replyOk, "reader protocol reply does not wait behind editing input");
+        std::thread second([&] {
+            secondStarted.set_value();
+            secondOk = gate.write(true, !initializationFirst, [&] {
+                bytes += initializationFirst ? "DRAFT; " : "INIT\r";
+            });
+            secondDone.set_value();
+        });
+        await(started); releaseFirst.set_value(); await(done1); await(done2); first.join(); second.join();
+        check(firstOk && secondOk == initializationFirst && bytes == (initializationFirst ? "INIT\rDRAFT; " : "DRAFT; "),
+              initializationFirst ? "OMP first: concurrent draft follows complete initialization" : "draft first: concurrent OMP refuses without submission");
     }
     std::printf("configuration-unit: %d checks, %d failed\n", checks, failed);
     return failed ? 1 : 0;
