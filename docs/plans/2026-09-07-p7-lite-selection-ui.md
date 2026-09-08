@@ -576,6 +576,26 @@ say what it was.
   blockers; no cosmetic-round loop. Full acceptance still waits for the safe cleanup dependency
   and main integration. Task 8 remains unchecked until those tests actually pass.
 
+## Shared-state guard port (2026-09-08, in progress)
+
+- Claude explicitly assigned the clipboard/registry port to Codex in hub mail
+  `20260908T055530Z-claude-agwinterm-8266`; he owns #48/#49 process cleanup separately.
+- **Do not run the current selection-ui fixture yet.** Its old automatic clipboard/registry
+  restoration is unconditional. Historical restoration evidence above does not prove it preserves
+  a newer user change. The old recovery commands are not authorization to overwrite today's clipboard.
+- Added `registry-guard.ps1`: original/expected values retain kinds, absence and exact array data;
+  observed conflicts stop writes, preserve the newer value and fail teardown. All 14 in-memory
+  checks pass. Registry value checks are not atomic compare/exchange against arbitrary outside writers.
+- Ported #256's native whole-format/DPAPI clipboard guard and fake tests. The base fake suite passes.
+  Added per-app-copy receipts (expected selection text plus owned-window check under OpenClipboard)
+  and exact-generation restoration: a newer identical-text copy is preserved, never adopted by content.
+  All 10 additional fake checks pass. Unexpected/unreadable owned copies remain unverified and must
+  retain recovery evidence; they are not called foreign changes.
+- **Not yet integrated or accepted:** native owner adapter, receipt bracketing of every fixture copy,
+  guarded marker writes, registry fixture wiring (including app-written geometry/obsolete-key cleanup),
+  recovery-file/token lifecycle, peer review, and live Strict acceptance. The helper tests touched no
+  real clipboard, HKCU, windows or processes. No token acquired for this work.
+
 ## Post-Completion
 
 - agwinterm docs PR: `docs/lite-parity.md`, the batch index P6+P7 shipped, differences (a)–(i).
