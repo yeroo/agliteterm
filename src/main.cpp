@@ -38,7 +38,9 @@
 #include <memory>     // unique_ptr: the heap payload a posted WM_APP_OVERLAY carries
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <map>        // captureForeground: shell pid -> the newest non-denylisted child's command line
+#include "remainder.h"
 #include <tlhelp32.h> // CreateToolhelp32Snapshot: the parent-pid walk behind restore.capture (P3)
 
 // ---- WTL (third_party/wtl, MS-PL) — the UI layer is built on ATL/WTL -------------------------
@@ -234,6 +236,12 @@ static void migrateFromLegacy() {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((cur + L"\\sessions*.tsv").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) { haveNew = true; FindClose(h); }
+    // Explicit clearing still means this profile was initialized. Otherwise removing its last
+    // state file would silently re-import old sessions AND overwrite preferences from legacy HKCU.
+    if (!haveNew) {
+        h = FindFirstFileW((cur + L"\\sessions*.tsv.cleared").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) { haveNew = true; FindClose(h); }
+    }
     if (haveNew) { logInfo("migrate: agliteterm state already present - legacy state left untouched"); return; }
 
     int files = 0;
@@ -397,6 +405,7 @@ struct Session {
     bool flagged = false;          // user-flagged (working set); amber pennant in the tree, persisted
     int seenDone = 0;              // completed-command (FTCS) count when the session was last visible
     int unread = 0;                // commands finished while NOT visible — red count pill in the tree
+    int notifications = 0;         // explicit notices, independent of command-completion bookkeeping
     bool hidden = false;          // split-pane shell: a real shell, but NOT a sidebar/tree session
     // P5: THIS SHELL's pane overlay — one more hidden Session (minted by newSession, name `overlay`,
     // never in g_pane, never a tree node, never persisted), drawn in this shell's box instead of the
@@ -1003,7 +1012,7 @@ static void applyTheme() {
 // HIBYTE = HOTKEYF_* (SHIFT 1 / CONTROL 2 / ALT 4). 0 = unbound.
 enum { KB_NEW, KB_NEWWS, KB_CLOSE, KB_SPLIT, KB_NEXT, KB_PREV, KB_COPY, KB_PASTE,
        KB_PALETTE, KB_FOCUSL, KB_FOCUSR, KB_SCROLLUP, KB_SCROLLDN, KB_QUICK, KB_SCRATCH, KB_REOPEN,
-       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_READONLY, KB_COUNT };
+       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_READONLY, KB_BROADCAST, KB_DASHBOARD, KB_COUNT };
 struct KbInfo { const wchar_t* label; const wchar_t* reg; };
 static const KbInfo kKbInfo[KB_COUNT] = {
     { L"New Session",      L"Key_New" },     { L"New Workspace",    L"Key_NewWs" },
@@ -1019,6 +1028,7 @@ static const KbInfo kKbInfo[KB_COUNT] = {
     { L"Focus Workspace",  L"Key_FocusWs" },
     { L"Mark Mode (keyboard select)", L"Key_MarkMode" }, { L"Select All", L"Key_SelectAll" },
     { L"Toggle Read-Only Pane", L"Key_ReadOnly" },
+    { L"Toggle Broadcast Input", L"Key_Broadcast" }, { L"Dashboard", L"Key_Dashboard" },
 };
 static WORD g_keys[KB_COUNT] = { 0 };
 static commands::Catalog g_commands; // UI-thread owned; pipe access uses dispatchConfig
@@ -1133,6 +1143,23 @@ struct LockG {
 static HANDLE g_control = INVALID_HANDLE_VALUE;
 static std::vector<Session*> g_sessions;
 static std::vector<std::wstring> g_workspaces = { L"workspace 1" };  // session "folders" (groups)
+static bool g_broadcast = false; // UI-thread state, never persisted
+static bool g_dashboard = false;
+static std::vector<std::string> g_dashIds;
+static std::vector<RECT> g_dashCells;
+static int g_dashSelected = 0;
+static std::string g_noticeId;
+static std::wstring g_noticeText;
+static ULONGLONG g_noticeUntil = 0;
+static RECT g_noticeRect{};
+static bool g_attentionLeftUp = false;
+static ULONGLONG g_attentionDoubleUntil = 0;
+static void paintDashboard(HDC dc, RECT rc);
+static void paintAttention(HDC dc, RECT rc);
+static bool dashboardKey(WPARAM key);
+static void dashboardClick(POINT pt);
+static bool noticeClick(POINT pt);
+static std::string remainderOnUi(const JsonReq& req);
 static int g_activeWs = 0;           // workspace new sessions are created into
 static int g_pane[2] = { 0, -1 };   // session index per pane; pane[1] = -1 → no split
 static int g_focus = 0;             // focused pane (0/1)
@@ -1224,6 +1251,8 @@ static const PalAction kPalActions[] = {
     { L"Next Blocked Session",     IDM_ATTENTION,  KB_ATTENTION, -1 },
     { L"Focus Workspace",          IDM_FOCUSWS,    KB_FOCUSWS,   -1 },
     { L"Toggle Read-Only Pane",     IDM_READONLY,   KB_READONLY,  -1 },
+    { L"Toggle Broadcast Input",    0,              KB_BROADCAST, -1 },
+    { L"Dashboard",                 0,              KB_DASHBOARD, -1 },
     { L"Delete Workspace",         IDM_DELWS,      -1,           -1 },
     { L"Focus Left / Top Pane",    0,              KB_FOCUSL,    -1 },   // slot 0 (P4)
     { L"Focus Right / Bottom Pane", 0,             KB_FOCUSR,    -1 },   // slot 1
@@ -2338,6 +2367,7 @@ static void selectPrimary(int idx) {
         if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
         g_pane[0] = idx;
         g_focus = 0;
+        g_sessions[idx]->notifications = 0;
         touchMruLocked(g_sessions[idx]);
     }
     syncSplitToPrimary();
@@ -2697,12 +2727,15 @@ static void closeSessionAt(int idx) {
     // ...and the other direction: a split shell that dies on its own (the user typed exit in it)
     // must not leave its owner pointing at nothing.
     for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
-    if (!cs->hidden) {   // remember the launch spec so it can be reopened (skip transient split/popup shells)
+    killSession(cs);
+    EnterCriticalSection(&g_lock);
+    idx = indexOfSession(cs); // host I/O above allowed another client to unlist/shift sessions
+    if (idx < 0) { LeaveCriticalSection(&g_lock); return; }
+    if (!cs->hidden) {   // snapshot + append ordered atomically against workspace.move
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
         g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args, cs->context });
     }
-    killSession(g_sessions[idx]);
-    EnterCriticalSection(&g_lock);
+    const Session* previousPrimary = displayedOwner();
     // Taken BEFORE the erase: the split pane's shell is hidden (never persisted, never in the tree)
     // but it is on screen in this window, so it still counts against "the window is empty". After the
     // erase the pane fixup below can repoint a pane at ANY surviving session — including a quick
@@ -2719,6 +2752,8 @@ static void closeSessionAt(int idx) {
     }
     if (g_sessions.empty()) g_pane[1] = -1;   // unsplit when the last pane dies
     resolveSplitForPrimary();                // pane 1 follows whichever session pane 0 now shows
+    auto* primary = displayedOwner();
+    if (primary && primary != previousPrimary) primary->notifications = 0;
     // "Emptied" means NOTHING IS LEFT ON SCREEN IN THIS WINDOW, which is neither the raw session
     // count nor the save's count. The save writes only non-hidden sessions, so a quick/scratch popup
     // (its own window) keeps g_sessions non-empty while the save sees zero — judged by the raw vector
@@ -2752,9 +2787,11 @@ static void closeSessionAt(int idx) {
 
 // Reopen the most recently closed session, relaunched with its remembered profile + cwd.
 static void reopenClosed() {
-    if (g_closedStack.empty()) return;
-    ClosedSpec sp = g_closedStack.back(); g_closedStack.pop_back();
-    if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws;
+    ClosedSpec sp;
+    { LockG hold;
+      if (g_closedStack.empty()) return;
+      sp = g_closedStack.back(); g_closedStack.pop_back();
+      if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws; }
     int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
@@ -2846,6 +2883,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->context = owner->context;
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
+            survivor->notifications = owner->notifications;
             survivor->horizontal = owner->horizontal;  // kept for the next `split on`
             survivor->splitRatio = owner->splitRatio;
             survivor->hidden = false;
@@ -4215,19 +4253,19 @@ static bool recomputeSearch(Session* s, FfiEmuInfo* info) {
     if (g_search.current >= (int)g_search.matches.size()) g_search.current = 0;
     return true;
 }
-static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
+static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor, bool preview = false) {
     if (!s) return;
     FfiEmuInfo info{};
     SearchState search;
     EnterCriticalSection(&g_lock);
     emu_info(s->emu, &info);
-    if (g_search.open && g_search.paneId == s->paneId && g_search.alt == (info.isAltScreen != 0)) search = g_search;
+    if (!preview && g_search.open && g_search.paneId == s->paneId && g_search.alt == (info.isAltScreen != 0)) search = g_search;
     size_t need = (size_t)info.cols * info.rows;
     if (s->grid.size() < need) s->grid.resize(need);
     if (s->hrow.size() < info.cols) s->hrow.resize(info.cols);
     emu_copy_grid(s->emu, s->grid.data(), (uint32_t)s->grid.size());
     int off = viewOff(s, info);
-    s->scrollOff = off;
+    if (!preview) s->scrollOff = off;
     // Compose the viewport: history tail above, live grid below (main-app semantics).
     std::vector<FfiCell> view((size_t)info.cols * info.rows);
     for (uint32_t r = 0; r < info.rows; r++) {
@@ -4243,7 +4281,7 @@ static void paintPane(HDC mem, RECT pr, Session* s, int pane, bool showCursor) {
     }
     // Snapshot selection in the same hold as the viewport: pipe verbs can replace it while GDI
     // draws. Geometry, owner, highlight and cursor must all describe this frame's buffer.
-    syncSelection();
+    if (!preview) syncSelection();
     Sel selection = g_sel;
     LeaveCriticalSection(&g_lock);
 
@@ -4412,7 +4450,7 @@ afterGridPaint:;
             DeleteObject(b);
         }
     }
-    if (!s->hidden) {   // painting = visible: mark as seen, clear the badge the moment you land here
+    if (!preview && !s->hidden) {   // previewing is not marking a notification/command as seen
         s->seenDone = doneMarks;
         if (s->unread) { s->unread = 0; PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0); }
     }
@@ -4436,7 +4474,7 @@ static void paint(HDC dc, RECT rc) {
 
     // The sidebar is now the native SysTreeView32 child (0..kSidebarW); WS_CLIPCHILDREN keeps this
     // paint out of it. Only the terminal content area (>= kSidebarW) is drawn here.
-    for (int p = 0; p < 2; p++) {
+    for (int p = 0; !g_dashboard && p < 2; p++) {
         if (g_pane[p] < 0 || g_pane[p] >= (int)g_sessions.size()) continue;
         RECT pr;
         paneRect(p, rc, &pr);
@@ -4484,6 +4522,7 @@ static void paint(HDC dc, RECT rc) {
                FillRect(mem, &ln, lb); ln.left = sp.right - 1; ln.right = sp.right; FillRect(mem, &ln, lb); DeleteObject(lb); }
     }
 
+    if (g_dashboard) paintDashboard(mem, rc);
     if (g_palette) {   // command palette overlay: query row + filtered, scrollable action list
         int n = (int)g_palHits.size();
         int rowH = g_ch + 8, rows = min(n, kPalMaxRows);
@@ -4557,6 +4596,7 @@ static void paint(HDC dc, RECT rc) {
         }
     }
 
+    paintAttention(mem, rc);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -4734,17 +4774,55 @@ static const char* selectAllOf(Session* target) {
 }
 
 // ---- input ----
+static bool sendHumanBytes(Session* s, const char* bytes, DWORD len) {
+    HANDLE data = INVALID_HANDLE_VALUE;
+    { LockG hold;
+      if (!s || std::find(g_sessions.begin(),g_sessions.end(),s) == g_sessions.end() || s->readOnly || s->exited ||
+          s->data == INVALID_HANDLE_VALUE || !DuplicateHandle(GetCurrentProcess(),s->data,GetCurrentProcess(),&data,0,FALSE,DUPLICATE_SAME_ACCESS)) return false;
+    }
+    // Fail closed on a busy/reserved recipient; never queue these bytes for later delivery.
+    const auto lease = s->inputGate.reserve(0);
+    if (!lease) { CloseHandle(data); return false; }
+    DWORD written = 0; bounded_pipe_write::Pending* pending = nullptr;
+    s->inputGate.write(true,false,[&] { written = bounded_pipe_write::write(data,bytes,len,250,pending); },lease);
+    CloseHandle(data);
+    if (pending) {
+        emitEvent("input",s->paneId,"write cancellation pending; input remains reserved until completion");
+        try { std::thread([s,lease,pending]() mutable {
+            WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
+            if (bounded_pipe_write::complete(pending,ignored)) s->inputGate.release(lease);
+            // A wait failure cannot authorize new input or free possibly active I/O.
+        }).detach(); } catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
+    } else s->inputGate.release(lease);
+    return written == len && !pending;
+}
 static void sendBytes(const char* bytes, int len) {
     // THE GATE: human keys only. API type/write and emulator protocol replies bypass this.
-    HANDLE data;
+    if (g_dashboard) return;
+    std::vector<Session*> recipients;
     {
         LockG hold;
         Session* s = focusedSession();
         if (!s || s->readOnly || s->exited || s->data == INVALID_HANDLE_VALUE) return;
-        s->scrollOff = 0;   // only input that passes the gate snaps back to the live grid
-        data = s->data;
+        Session* owner = s->hidden ? splitOwnerOf(s) : s;
+        if (g_broadcast && owner && surfaceOf(s) == s && !g_focusOverride) {
+            recipients.push_back(s); // a reserved source must prevent fanout to every peer
+            for (auto* candidate : g_sessions) {
+                if (candidate == s) continue;
+                auto* root = candidate->hidden ? splitOwnerOf(candidate) : candidate;
+                if (root && root->ws == owner->ws && !candidate->overlay && !candidate->readOnly &&
+                    !candidate->exited && candidate->data != INVALID_HANDLE_VALUE) recipients.push_back(candidate);
+            }
+        } else recipients.push_back(s);
     }
-    ovIo(data, true, bytes, nullptr, (DWORD)len);
+    for (auto* s : recipients) {
+        if (sendHumanBytes(s,bytes,static_cast<DWORD>(len))) {
+            LockG hold; if (indexOfSession(s) >= 0) s->scrollOff = 0;
+            if (len == 1 && (bytes[0] == '\x1b' || bytes[0] == '\x03') && clearWorkingStatus(s)) {
+                emitEvent("status", s->id, "idle"); PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+            }
+        } else if (s == recipients.front()) return;
+    }
 }
 
 static void toggleReadOnly() {
@@ -4772,6 +4850,7 @@ static std::string pasteNormalize(std::string t) {
 }
 
 static void pasteClipboard() {
+    if (g_dashboard) return;
     HANDLE data;
     FfiEmuInfo info{};
     {
@@ -4806,16 +4885,7 @@ static void sendUtf8(wchar_t wc) {
         Session* s = focusedSession();
         if (!s || s->readOnly) return;   // a blocked interrupt did not stop the agent
     }
-    // User interrupt: Esc / Ctrl+C typed into the terminal clears a "working" agent status — an
-    // interrupted agent turn never fires its Stop hook, so the status would stick forever (agterm
-    // #185 / main-app parity: scoped to working-class; blocked stays until the agent or user acts).
-    if (wc == 0x1B || wc == 0x03) {
-        Session* s = focusedSession();
-        if (s && clearWorkingStatus(s)) {
-            emitEvent("status", s->id, "idle");
-            PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
-        }
-    }
+    // Working-status interruption is recorded only after sendBytes actually delivers the byte.
     char utf8[8];
     int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, utf8, sizeof utf8, nullptr, nullptr);
     if (n > 0) sendBytes(utf8, n);
@@ -5406,9 +5476,12 @@ static void runKbAction(int a) {
         case KB_ATTENTION: nextBlocked(); break;
         case KB_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;
         case KB_READONLY: toggleReadOnly(); break;
+        case KB_BROADCAST: { JsonReq r; r.fields["cmd"] = "broadcast"; remainderOnUi(r); break; }
+        case KB_DASHBOARD: { JsonReq r; r.fields["cmd"] = "dashboard"; if (g_dashboard) r.fields["args.close"] = "true"; remainderOnUi(r); break; }
     }
 }
 static bool handleKeyDown(WPARAM vk) {
+    if (g_dashboard) return dashboardKey(vk);
     endMarkModeIfMoved();
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
@@ -5553,7 +5626,7 @@ static void updateStatus() {
 }
 // Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
 // UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
-static void refreshTree() {
+static void refreshTree(bool persist = true) {
     if (!g_tree) return;
     // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
     // here inline on a control-pipe thread, driving the UI thread's TreeView by cross-thread
@@ -5639,7 +5712,7 @@ static void refreshTree() {
     g_treeSyncing = false;
     }   // g_lock released
     updateStatus();
-    if (!g_restoring) saveSessionState();   // persist the workspace/session structure on every change
+    if (persist && !g_restoring) saveSessionState();   // callers may explicitly save once and report its result
 }
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
@@ -6872,6 +6945,7 @@ static bool showPopupRaised(HWND h) {
 // Toggle a quick (scratch=false) or scratch (scratch=true) popup terminal: show/hide, creating its
 // window + dedicated hidden session on first use.
 static void togglePopupTerminal(bool scratch) {
+    g_dashboard = false; g_dashCells.clear(); // popup terminals regain their own keyboard
     HWND& hw = scratch ? g_scratchHwnd : g_quickHwnd;
     Session*& sess = scratch ? g_scratchSession : g_quickSession;
     if (hw && IsWindowVisible(hw)) {
@@ -6925,6 +6999,7 @@ static void togglePopupTerminal(bool scratch) {
 static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct) {
+    g_dashboard = false; g_dashCells.clear();
     // One at a time; WM_DESTROY kills the old session + clears state. Every popup open resets the
     // window-wide `result` (agwinterm's rule) — the VERB already did, when it answered "opened", so
     // a `result` right after the ack reads `no overlay` and not the replaced popup's exit — and the
@@ -7244,6 +7319,7 @@ static std::string configOnUi(const JsonReq& req) {
     // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
     // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
     if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return ctlErr("a modal dialog is open or queued; configuration unchanged");
+    if (cmd == "broadcast" || cmd == "notify" || cmd == "dashboard" || cmd == "restore.clear" || cmd == "workspace.move") return remainderOnUi(req);
     if (cmd == "agent.update.open") return agentUpdateOnUi(req); // internal dispatch only, not a public control verb
     if (cmd.rfind("command.", 0) == 0) return commandOnUi(req);
     if (cmd == "app.update") {
@@ -7472,6 +7548,7 @@ public:
 
     // ---- keyboard ----
     void OnChar(TCHAR chr, UINT, UINT) {
+        if (g_dashboard) return;
         if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)chr); return; }
         if (g_swallowChar) { g_swallowChar = false; return; }   // belongs to a keydown a binding consumed
         if (chr == L'\r') { sendBytes("\r", 1); return; }
@@ -7488,6 +7565,7 @@ public:
 
     // ---- mouse ----
     BOOL OnMouseWheel(UINT nFlags, short zDelta, CPoint pt) {
+        if (g_dashboard) return TRUE;
         if (g_palette) {   // scroll the palette list
             int n = (int)g_palHits.size(), rows = min(n, kPalMaxRows);
             if (n > rows) {
@@ -7506,6 +7584,8 @@ public:
         return TRUE;
     }
     void OnLButtonDown(UINT, CPoint pt) {
+        if (noticeClick(pt)) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); return; }
+        if (g_dashboard) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); dashboardClick(pt); return; }
         if (inSplitter(pt.x, pt.y)) { g_splitDrag = true; SetCapture(); return; }   // grab the sidebar splitter
         if (g_palette) {   // click an item to run it; click anywhere else to dismiss
             if (PtInRect(&g_palList, POINT{ pt.x, pt.y })) {
@@ -7532,6 +7612,8 @@ public:
         SetFocus();
     }
     void OnLButtonDblClk(UINT, CPoint pt) {
+        if (GetTickCount64() < g_attentionDoubleUntil) { g_attentionLeftUp = true; SetCapture(); return; }
+        if (g_dashboard) return;
         if (g_palette || inSplitter(pt.x, pt.y)) return;
         int pane;
         { LockG lk;
@@ -7547,10 +7629,12 @@ public:
         SetFocus();
     }
     LRESULT OnCaptureChanged(UINT, WPARAM, LPARAM lp, BOOL&) {
-        if ((HWND)lp != m_hWnd) cancelDrag(m_hWnd);
+        if ((HWND)lp != m_hWnd) { g_attentionLeftUp = false; cancelDrag(m_hWnd); }
         return 0;
     }
     void OnMouseMove(UINT nFlags, CPoint pt) {
+        if (g_attentionLeftUp) return; // activation click still owns its drag/release sequence
+        if (g_dashboard) return;
         if (g_splitDrag) {   // the splitter resizes the LEFT pane (the sidebar); terminal takes the rest
             RECT c; GetClientRect(&c);
             // 60 % of the client at most, and never past what leaves kMinContentCols for the
@@ -7567,11 +7651,14 @@ public:
         if (nFlags & MK_LBUTTON) extendSelection(m_hWnd, pt.x, pt.y);
     }
     void OnLButtonUp(UINT, CPoint pt) {
+        if (g_attentionLeftUp) { g_attentionLeftUp = false; if (GetCapture() == m_hWnd) ReleaseCapture(); return; }
+        if (g_dashboard) return;
         if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveSidebarWidth(); return; }
         if (g_selWindow == m_hWnd) finishSelection(m_hWnd);
         else mouseReport(pt.x, pt.y, 0, false, false);
     }
     void OnRButtonDown(UINT, CPoint pt) {
+        if (g_dashboard) return;
         if (pt.x < sidebarSpan()) return;                        // sidebar/splitter: no paste
         // Everything a LEFT click does about focus, a right click must do too. It did neither, and
         // both omissions bite:
@@ -7597,6 +7684,7 @@ public:
     // Only report the release if the press was reported: a paste must not leak an orphan button-2
     // release into an app that never saw the press.
     void OnRButtonUp(UINT, CPoint pt) {
+        if (g_dashboard) { g_rbtnForwarded = false; return; }
         if (!g_rbtnForwarded) return;
         g_rbtnForwarded = false;
         mouseReport(pt.x, pt.y, 2, false, false);
@@ -7643,6 +7731,8 @@ public:
             return;
         }
         if (id != kCaretTimer) return;
+        if (g_dashboard) Invalidate(FALSE); // fixed-rate live previews even when no main pane is dirty
+        if (g_noticeUntil && GetTickCount64() >= g_noticeUntil) { g_noticeUntil = 0; Invalidate(FALSE); }
         endMarkModeIfMoved();
         if (!g_winFocused) return;            // hollow caret doesn't blink
         g_caretOn = !g_caretOn;
@@ -7782,8 +7872,8 @@ public:
         } else if (wp == HA_NOTIFY) {              // OSC 9 / OSC 777
             NotifyMsg* n = (NotifyMsg*)lp;
             g_nid.uFlags |= NIF_INFO;
-            wcscpy_s(g_nid.szInfoTitle, n->title.empty() ? L"agliteterm" : n->title.c_str());
-            wcscpy_s(g_nid.szInfo, n->body.c_str());
+            wcsncpy_s(g_nid.szInfoTitle, n->title.empty() ? L"agliteterm" : n->title.c_str(), _TRUNCATE);
+            wcsncpy_s(g_nid.szInfo, n->body.c_str(), _TRUNCATE);
             g_nid.dwInfoFlags = NIIF_INFO;
             Shell_NotifyIconW(NIM_MODIFY, &g_nid);
             g_nid.uFlags &= ~NIF_INFO;
@@ -7880,7 +7970,7 @@ public:
                 if (p >= 0 && p < (LPARAM)g_sessions.size()) {
                     LockG hold;
                     if (p < (LPARAM)g_sessions.size())
-                        postPaint = g_sessions[p]->flagged || g_sessions[p]->unread > 0 || !g_sessions[p]->context.empty();
+                        postPaint = g_sessions[p]->flagged || g_sessions[p]->unread > 0 || g_sessions[p]->notifications > 0 || !g_sessions[p]->context.empty();
                 }
                 if (postPaint) r |= CDRF_NOTIFYPOSTPAINT;
                 return r;
@@ -7895,7 +7985,7 @@ public:
                         LockG hold;
                         if (p < (LPARAM)g_sessions.size()) {
                             flagged = g_sessions[p]->flagged;
-                            unread = g_sessions[p]->unread;
+                            unread = g_sessions[p]->unread + g_sessions[p]->notifications;
                             ctx = g_sessions[p]->context;
                         }
                     }
@@ -9345,7 +9435,7 @@ never a newest-folder guess; existing bindings and permission modes are preserve
 explicitly requests permission-bypassing resume through the bundled PowerShell prompt bridge.
 Old/adopted/explicit-argv shells need that bridge loaded explicitly. Readonly/covered/ambiguous
 panes, custom conflicting bindings and unknown readiness refuse. Pending restarts reserve input;
-Ctrl+C targets the still-live verified process, and only a prompt claim after proven descendant
+Ctrl+D requests exit from the still-live verified process, and only a prompt claim after proven descendant
 exit can dispatch resume. Authorization expires after 30 seconds; unresolved Windows I/O cancellation
 retains the pane's input gate until completion, with an event. No executable text is appended to a draft.
 `claude update` owns the updater tree in a job and shows output in an overlay log viewer. Closing the
@@ -9357,15 +9447,36 @@ fork-session, unknown option arities and relative npm script paths refuse adopti
 Queued/opened is not completed: read agent.update / agent.restart events. Full details and
 compatibility limits: docs/agent-integration.md. Do not invoke these on a peer's pane as a test.
 
+## Workspace input and attention (P12)
+
+`broadcast on|off|toggle|state` fans human keyboard input to writable uncovered panes in the
+displayed session's workspace, including splits. It starts off and shows a red warning while on.
+Readonly/reserved sources block fanout; popup input, paste, API typing and mouse reports stay targeted.
+Use the palette or keymap `toggle_broadcast` action; this is explicit opt-in, never a test on real peers.
+`notify BODY --title TITLE --target ID` adds a badge, event and clickable eight-second banner,
+and requests a bounded desktop balloon without raising the window. Windows may suppress the balloon.
+`session seen` or selecting the session clears its notice badge. Popup/cover targets refuse.
+`dashboard [ID ...] [--close]` shows up to nine live fixed-strike previews, defaulting to recent
+sessions. Arrows/Home/End navigate; Enter/Space/click select, Escape closes. No shell input leaks
+through the grid. It never resizes shells or zooms fonts; nonzero `--font-size` refuses. The palette
+and keymap `dashboard` action open it; existing split shortcuts are unchanged. Pipe `op=state`
+returns open/selected/ids. Hidden/popup selectors, duplicate IDs and unavailable targets refuse.
+`workspace move --to up|down|top|bottom --target ID` preserves membership and active/focused identity;
+numeric workspace IDs remain order indices and change after a move. Names resolve exactly or uniquely.
+Workspace moves and dashboard opening refuse during menus or sidebar drags. Dashboard close cannot
+be combined with selectors, and nonzero font-size refuses even with close.
+`restore clear` removes only this instance's primary/backup/temp restore files, NOT live sessions,
+pins or bindings. A .cleared marker prevents legacy re-import; later ordinary app saves or normal exit
+save live state again. Failures report partial work.
+
 ## What this terminal does NOT have
 
 Do not reach for these - they exist in the full agwinterm and will be refused here with
 "unknown command '<verb>' (lite subset)":
 
 `session background` (lite draws no images),
-`notify`, `broadcast`, `dashboard`,
 `image show|sixel`,
-`font`, `restore clear`.
+`font`.
 
 For anything not listed as available, drive the shell directly with `session type` and read the
 result with `session output` or `session text`.
@@ -9409,6 +9520,7 @@ static std::string installAgentSkill() {
 #include "commands_runtime.h"
 #include "install_runtime.h"
 #include "agent_runtime.h"
+#include "remainder_runtime.h"
 
 static std::string ctlDispatch(const std::string& line) {
     JsonReq req;
@@ -9459,7 +9571,8 @@ static std::string ctlDispatch(const std::string& line) {
         if (!pane) return ctlErr(why.empty() ? "no command target" : why);
         req.fields["target"] = pane->paneId;
     }
-    if (cmd.rfind("command.", 0) == 0 || cmd == "app.update") return dispatchConfig(req);
+    if (cmd.rfind("command.", 0) == 0 || cmd == "app.update" || cmd == "broadcast" || cmd == "notify" ||
+        cmd == "dashboard" || cmd == "restore.clear" || cmd == "workspace.move") return dispatchConfig(req);
     if (cmd == "install.cli" || cmd == "install.hooks" || cmd == "install.shell") return installIntegration(req);
     if (cmd == "claude.adopt" || cmd == "claude.yolo" || cmd == "claude.update" || cmd == "agent.bridge") return agentDispatch(req);
     if (cmd == "config.get" || cmd == "config.list" || cmd == "config.set" ||
@@ -9504,7 +9617,7 @@ static std::string ctlDispatch(const std::string& line) {
                         ",\"exited\":" + (s->exited ? "true" : "false") +
                         // a spec that could not be relaunched on this machine: kept, not dropped
                         ",\"failed\":" + (s->failed ? "true" : "false") +
-                        ",\"unread\":" + std::to_string(s->unread) +
+                        ",\"unread\":" + std::to_string(s->unread + s->notifications) +
                         // Beyond the contract (extra fields are allowed): the grid the session was
                         // last resized to. It is how a caller sees that `sidebar width` moved the
                         // content region, and the oracle #23 needs (a pane that collapsed to 2).
@@ -9762,7 +9875,10 @@ static std::string ctlDispatch(const std::string& line) {
             } else if (op == "cancel") {
                 if (g_walk.active) pick = g_walk.startId;
                 g_walk = {};
-            } else { g_walk = {}; touchMruLocked(displayedOwner()); }
+            } else {
+                g_walk = {}; touchMruLocked(displayedOwner());
+                if (auto* primary = displayedOwner()) primary->notifications = 0;
+            }
             int idx = op == "cancel" ? visibleIndex(pick) : liveIndex(pick);
             if (idx >= 0) {
                 g_pane[0] = idx; g_focus = 0;
@@ -10457,6 +10573,7 @@ static std::string ctlDispatch(const std::string& line) {
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("seen", target->id, "marked"));
             target->seenDone = completedMarks(target);   // under the same hold as the re-check (revmux r4)
             target->unread = 0;
+            target->notifications = 0;
         }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("seen");

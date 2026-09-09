@@ -1,8 +1,8 @@
 # Keyboard/mouse selection parity. Run locally under the shared hub token; CI is an isolated host.
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
-      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly)
+      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly,[switch]$RemainderOnly)
 $ErrorActionPreference='Stop'
-if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
+if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
 New-Item -ItemType Directory $script:selectionArtifact -Force | Out-Null
@@ -36,7 +36,7 @@ try {
     if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){$skipReason='Existing lite/host: refusing isolated selection fixture';throw $skipReason}
     $clipboard=Save-SelectionClipboard "$script:selectionArtifact/clipboard-before.dpapi"
     $reg=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regPath)
-    $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
+    $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset','Key_Broadcast','Key_Dashboard')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
     $configDefaults=@{Theme=0;CustomColors=0;DefFg=0xC0C0C0;DefBg=0;DosPalette=1;SidebarFontPt=0;
         ShowSidebar=1;ShowToolbar=1;ShowStatus=1;FlagView=0;RightClickPaste=1;CopyOnCtrlC=1;
         CopyOnSelect=1;ScrollbackLines=5000;RestoreCommands=0}
@@ -45,7 +45,7 @@ try {
     if($reg){$reg.Dispose()};$geoSaved=$true
     $script:selectionRegistry|ConvertTo-Json -Depth 8|Set-Content "$script:selectionArtifact/registry-before.json"
     # Deterministic defaults, even if the user's dialog previously cleared/rebound these actions.
-    foreach($name in 'Key_MarkMode','Key_SelectAll'){Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}}
+    foreach($name in 'Key_MarkMode','Key_SelectAll','Key_Broadcast','Key_Dashboard'){Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}}
     foreach($name in $configDefaults.Keys){Set-SelectionRegistry $name @{Exists=$true;Kind=4;Value=[int]$configDefaults[$name]}}
     Set-SelectionRegistry 'OmpTheme' @{Exists=$false;Kind=0;Value=$null}
     $profile=Join-Path $script:selectionArtifact profile;New-Item -ItemType Directory $profile|Out-Null
@@ -89,7 +89,7 @@ try {
         Write-Screen ($esc+'[6;3H') # known caret; surface.cursor exposes only a column
     }
     function Shot([string]$name){Selection-Capture $h $name $g.Left $g.Top ([math]::Min(350,$g.Right-$g.Left)) ([math]::Min(200,$g.Bottom-$g.Top))}
-    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly){
+    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly){
     Seed-Main
     $before=Shot 'wheel-before';[SelectionUi]::Wheel($h,($g.Left+100),($g.Top+60),3);$after=Shot 'wheel-after'
     Check 'wheel: posted main-screen wheel changes the viewport' ((Selection-PixelDiff $before $after)-gt 100)
@@ -310,16 +310,19 @@ try {
     Write-Screen ($esc+'[2J'+$esc+'[HSELECT-ALL-REBOUND');Set-Marker;[LiteUi]::Chord($h,[int][char]'L',$true)
     Check 'bindings: rebound Select All highlights without copying' ((Selected)-match 'SELECT-ALL-REBOUND' -and (Clip)-eq $script:selectionMarker)
     }
-    if(-not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and (Test-Path "$PSScriptRoot/driving-ui-cases.ps1")){. "$PSScriptRoot/driving-ui-cases.ps1"}
-    if(-not $DrivingOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and (Test-Path "$PSScriptRoot/configuration-ui-cases.ps1")){. "$PSScriptRoot/configuration-ui-cases.ps1"}
-    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $AgentIntegrationOnly){. "$PSScriptRoot/shell-configuration-ui-cases.ps1"}
-    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly){. "$PSScriptRoot/agent-integration-ui-cases.ps1"}
+    if(-not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly -and (Test-Path "$PSScriptRoot/driving-ui-cases.ps1")){. "$PSScriptRoot/driving-ui-cases.ps1"}
+    if(-not $DrivingOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly -and (Test-Path "$PSScriptRoot/configuration-ui-cases.ps1")){. "$PSScriptRoot/configuration-ui-cases.ps1"}
+    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly){. "$PSScriptRoot/shell-configuration-ui-cases.ps1"}
+    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $RemainderOnly){. "$PSScriptRoot/agent-integration-ui-cases.ps1"}
+    if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly){. "$PSScriptRoot/remainder-ui-cases.ps1"}
 }catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
     $cleanupOk=Invoke-SelectionCleanup {
         if(Get-Command Capture-P11Children -ErrorAction SilentlyContinue){Capture-P11Children}
+        if(Get-Command Capture-P12Children -ErrorAction SilentlyContinue){Capture-P12Children}
         Stop-SelectionSandbox
         if(Get-Command Confirm-P11ChildrenExited -ErrorAction SilentlyContinue){Confirm-P11ChildrenExited}
+        if(Get-Command Confirm-P12ChildrenExited -ErrorAction SilentlyContinue){Confirm-P12ChildrenExited}
     } {
         if($geoSaved){
             $reg=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($regPath)

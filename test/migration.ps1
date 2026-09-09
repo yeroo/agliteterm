@@ -76,7 +76,24 @@ try {
     $tree2 = (& $ctl tree --json --pipe $inst 2>&1) -join ''
     Check 'existing agliteterm state wins' (($tree2 -match 'new-session') -and -not ($tree2 -match 'inherited-session')) $tree2
     Check 'legacy state left alone'        ((Get-Content "$old\sessions-$inst.tsv" -Raw) -match 'inherited-session')
+    $cleared = (& $ctl restore clear --json --pipe $inst 2>&1) -join ''
+    Check 'explicit clear creates migration barrier' (($cleared -match '"ok":true') -and (Test-Path "$new\sessions-$inst.tsv.cleared")) $cleared
     Stop-Lite $p2
+
+    # Normal exit saves live state again. Remove only this private fixture's exact files to model
+    # restart after a clear with no intervening save; the marker must be the ONLY migration guard.
+    foreach ($suffix in @('', '.bak', '.tmp')) {
+        $stateTarget = [IO.Path]::GetFullPath("$new\sessions-$inst.tsv$suffix")
+        if (-not $stateTarget.StartsWith([IO.Path]::GetFullPath($root) + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'migration fixture path escaped' }
+        Remove-Item -LiteralPath $stateTarget -Force -ErrorAction SilentlyContinue
+    }
+    if (@(Get-ChildItem -LiteralPath $new -Filter 'sessions*.tsv').Count) { throw 'clear barrier test would be masked by existing state' }
+    Write-State "$old\sessions-never-reimport.tsv" @('V1', "W${TAB}must-not-return")
+    $adoptionsBefore = @((Get-Content "$new\agliteterm-$inst.log") | Select-String 'migrate: adopted').Count
+    $pClear = Start-Lite $inst $root
+    Check 'clear marker blocks later legacy file adoption' (-not (Test-Path "$new\sessions-never-reimport.tsv"))
+    Check 'clear marker prevents another migration pass' (@((Get-Content "$new\agliteterm-$inst.log") | Select-String 'migrate: adopted').Count -eq $adoptionsBefore)
+    Stop-Lite $pClear
 
     # --- 3. the deprecated pipe name still answers -------------------------------------------
     $p3 = Start-Lite 'agliteterm' $root      # default instance: both listeners run

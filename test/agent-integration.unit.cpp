@@ -61,6 +61,7 @@ int main() {
     }
     shell_configuration::InputGate gate; int calls = 0;
     const auto first = gate.reserve(); check(first != 0 && gate.reserve() == 0, "exclusive input lease");
+    check(gate.reserve(0) == 0, "nonwaiting human input cannot seize restart lease");
     check(!gate.write(true,false,[&]{++calls;}), "human/API editing input refused during restart");
     check(gate.write(false,false,[&]{++calls;}), "terminal protocol replies bypass reservation");
     check(gate.write(true,false,[&]{++calls;},first), "owned interrupt permitted");

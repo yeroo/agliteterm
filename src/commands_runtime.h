@@ -6,7 +6,8 @@ static const std::map<std::string,int> kCommandActions = {
     {"focus_right_pane",KB_FOCUSR},{"focus_bottom_pane",KB_FOCUSR},{"quick_terminal",KB_QUICK},
     {"toggle_scratch",KB_SCRATCH},{"reopen_session",KB_REOPEN},{"toggle_flag",KB_FLAG},
     {"toggle_flagged_view",KB_FLAGVIEW},{"next_attention",KB_ATTENTION},{"focus_workspace",KB_FOCUSWS},
-    {"mark_mode",KB_MARK},{"select_all",KB_SELECTALL},{"toggle_read_only",KB_READONLY}
+    {"mark_mode",KB_MARK},{"select_all",KB_SELECTALL},{"toggle_read_only",KB_READONLY},
+    {"toggle_broadcast",KB_BROADCAST},{"dashboard",KB_DASHBOARD}
 };
 static bool loadCommands(std::string& error) {
     const auto dir = stateDir(); if (dir.empty()) { error = "app-data directory unavailable"; return false; }

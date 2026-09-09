@@ -15,9 +15,9 @@ class InputGate {
     std::atomic<bool> editable{true};
 public:
     void setReadOnly(bool readOnly) { editable = !readOnly; }
-    unsigned long long reserve() {
+    unsigned long long reserve(unsigned waitMs = 1000) {
         std::unique_lock<std::timed_mutex> hold(mutex,std::defer_lock);
-        if (!hold.try_lock_for(std::chrono::milliseconds(1000))) return 0;
+        if (!hold.try_lock_for(std::chrono::milliseconds(waitMs))) return 0;
         if (reservation) return 0;
         return reservation = ++sequence;
     }
