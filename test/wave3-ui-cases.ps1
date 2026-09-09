@@ -17,9 +17,21 @@ public static class WaveUi {
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h,int id,uint mods,uint vk);
+ [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h,int id);
+ [DllImport("user32.dll")] public static extern bool SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,IntPtr l,uint f,uint t,out IntPtr r);
  public static void Text(IntPtr h,string text){IntPtr r;if(SendMessageTimeoutW(h,12,IntPtr.Zero,text,2,5000,out r)==IntPtr.Zero)throw new Exception("Set owned text timed out");}
 }
 '@}
+function Wave-Set([string]$Key,[string]$Value,[string]$Registry,[int]$Stored){
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    $prior=$script:selectionRegistry[$Registry].Expected
+    try{Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
+        {param($n) Read-RegistryGuardValue $regKey $n} `
+        {param($n,$state) $null=Wave-Rpc 'config.set' @{key=$Key;value=$Value}}
+    }catch{if(Test-RegistryGuardValue (Read-RegistryGuardValue $regKey $Registry) $prior){$script:selectionRegistry[$Registry].Expected=$prior};throw
+    }finally{$regKey.Dispose()}
+}
 # Start fresh even in run-all: previous phase restart fixtures must not dictate Wave3's tree.
 Stop-SelectionSandbox
 $waveProfile=Join-Path $script:selectionArtifact 'wave3-profile';New-Item -ItemType Directory $waveProfile|Out-Null
@@ -71,6 +83,19 @@ for($n=0;$n -lt 8;$n++){$recent=Wave-Rpc 'pick.open' @{items=$items};$null=Wave-
 Check 'picker evicts oldest after eight completed answers' (Wave-Rpc 'pick.result' @{} $pick.id -Refusal)
 Check 'picker retains newest exact result' ((Wave-Rpc 'pick.result' @{} $recent.id).pick.result -eq 'cancelled')
 
+# Capture refusal is before state creation; a subsequent picker must still be possible.
+Selection-Button -EventArgs @($h,0x201,($g.Left+10),($g.Top+10))
+try{
+    Check 'picker capture fixture owns capture' ([SelectionUi]::Capture($h) -eq $h)
+    Check 'picker refuses while terminal drag owns capture' (Wave-Rpc 'pick.open' @{items=$items} -Refusal)
+}finally{Selection-Button -EventArgs @($h,0x202,($g.Left+10),($g.Top+10))}
+$isolated=Wave-Rpc 'pick.open' @{items=$items}
+$picker=[SelectionUi]::Window($script:selectionProc.Id,'AgwintermLitePicker')
+$null=Wave-Rpc 'session.write' @{text=([string][char]27+'[2J'+[char]27+'[HOWNER-STAYS')} $owner
+[LiteUi]::Key($h,0x1B,1);Start-Sleep -Milliseconds 200
+Check 'owner keyboard Escape routes to picker cancellation' ((Wave-Rpc 'pick.result' @{} $isolated.id).pick.result -eq 'cancelled')
+Check 'explicit API writes remain independent of picker' ((Wave-Rpc 'session.text' @{} $owner) -match 'OWNER-STAYS')
+
 $ws=Wave-Rpc 'workspace.new' @{name='P17 empty'}
 $null=Wave-Rpc 'session.select' @{} $owner
 $null=Wave-Rpc 'workspace.collapse' @{} $ws
@@ -101,4 +126,25 @@ Check 'cursor defaults readable' ((Wave-Rpc 'config.get' @{key='cursor-style'}) 
 Check 'quick default size and disabled hotkey readable' ((Wave-Rpc 'config.get' @{key='quick-terminal-size'}) -eq '70' -and (Wave-Rpc 'config.get' @{key='quick-terminal-hotkey'}) -eq '')
 foreach($bad in @(@{key='cursor-style';value='circle'},@{key='cursor-blink-ms';value='0'},@{key='quick-terminal-size';value='91'},@{key='quick-terminal-hotkey';value='win+k'})){
     Check 'invalid Wave3 setting refuses unchanged' (Wave-Rpc 'config.set' $bad -Refusal)
+}
+foreach($style in @(@('block',1),@('underline',2),@('bar',0))){
+    Wave-Set 'cursor-style' $style[0] 'CursorStyle' $style[1]
+    Check 'cursor style applies and reads back' ((Wave-Rpc 'config.get' @{key='cursor-style'}) -eq $style[0])
+}
+Wave-Set 'cursor-blink' 'off' 'CursorBlink' 0
+Wave-Set 'cursor-blink-ms' '250' 'CursorBlinkMs' 250
+Check 'cursor blink settings apply live' ((Wave-Rpc 'config.get' @{key='cursor-blink'}) -eq 'false' -and (Wave-Rpc 'config.get' @{key='cursor-blink-ms'}) -eq '250')
+Wave-Set 'cursor-blink' 'on' 'CursorBlink' 1
+Wave-Set 'cursor-blink-ms' '530' 'CursorBlinkMs' 530
+if($env:CI -eq 'true'){
+    # Registration only on a disposable desktop. No real global key injection is used.
+    Wave-Set 'quick-terminal-hotkey' 'ctrl+alt+f10' 'QuickTerminalHotkey' 0x379
+    $reserved=[WaveUi]::RegisterHotKey([IntPtr]::Zero,0x713,0x4003,0x7A)
+    try{
+        Check 'hotkey conflict fixture reserves distinct candidate' $reserved
+        if(-not $reserved){throw 'Cannot reserve disposable hotkey conflict'}
+        Check 'hotkey conflict refuses replacement' (Wave-Rpc 'config.set' @{key='quick-terminal-hotkey';value='ctrl+alt+f11'} -Refusal)
+        Check 'hotkey conflict preserves prior binding' ((Wave-Rpc 'config.get' @{key='quick-terminal-hotkey'}) -eq 'ctrl+alt+f10')
+    }finally{if($reserved){[void][WaveUi]::UnregisterHotKey([IntPtr]::Zero,0x713)}}
+    Wave-Set 'quick-terminal-hotkey' '' 'QuickTerminalHotkey' 0
 }
