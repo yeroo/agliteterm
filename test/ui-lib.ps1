@@ -132,19 +132,28 @@ public static class LiteUi {
 
     public static void Chord(IntPtr h, int vk, bool shift) {
         uint me = GetCurrentThreadId(), it = GetWindowThreadProcessId(h, IntPtr.Zero);
-        AttachThreadInput(me, it, true);
-        var st = new byte[256]; GetKeyboardState(st);
-        st[0x11] = 0x80; st[0xA2] = 0x80;                      // VK_CONTROL, VK_LCONTROL
-        if (shift) { st[0x10] = 0x80; st[0xA0] = 0x80; }       // VK_SHIFT, VK_LSHIFT
-        SetKeyboardState(st);
-        PostMessageW(h, 0x0100, (IntPtr)vk, (IntPtr)1);
-        System.Threading.Thread.Sleep(400);
-        st[0x11] = 0; st[0xA2] = 0; st[0x10] = 0; st[0xA0] = 0;
-        SetKeyboardState(st);
-        PostMessageW(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam);
-        AttachThreadInput(me, it, false);
-        System.Threading.Thread.Sleep(300);
+        if (!AttachThreadInput(me, it, true)) throw new Exception("Cannot attach owned window input queue");
+        var before = new byte[256]; bool captured = false;
+        try {
+            if (!GetKeyboardState(before)) throw new Exception("Cannot capture keyboard state");
+            captured = true;
+            var st = (byte[])before.Clone();
+            st[0x11] = 0x80; st[0xA2] = 0x80;
+            if (shift) { st[0x10] = 0x80; st[0xA0] = 0x80; }
+            if (!SetKeyboardState(st)) throw new Exception("Cannot set owned chord modifiers");
+            IntPtr result;
+            // Keep modifiers until the owned UI actually consumes the chord, not a guessed delay.
+            if (ChordMessage(h, 0x0100, (IntPtr)vk, (IntPtr)1, 2, 10000, out result) == IntPtr.Zero)
+                throw new Exception("Owned chord timed out");
+            if (ChordMessage(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam, 2, 10000, out result) == IntPtr.Zero)
+                throw new Exception("Owned chord release timed out");
+        } finally {
+            if (captured) SetKeyboardState(before);
+            AttachThreadInput(me, it, false);
+        }
     }
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW")]
+    static extern IntPtr ChordMessage(IntPtr h,uint m,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
 }
 '@
 

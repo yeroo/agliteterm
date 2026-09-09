@@ -7,7 +7,8 @@ static const std::map<std::string,int> kCommandActions = {
     {"toggle_scratch",KB_SCRATCH},{"reopen_session",KB_REOPEN},{"toggle_flag",KB_FLAG},
     {"toggle_flagged_view",KB_FLAGVIEW},{"next_attention",KB_ATTENTION},{"focus_workspace",KB_FOCUSWS},
     {"mark_mode",KB_MARK},{"select_all",KB_SELECTALL},{"toggle_read_only",KB_READONLY},
-    {"toggle_broadcast",KB_BROADCAST},{"dashboard",KB_DASHBOARD}
+    {"toggle_broadcast",KB_BROADCAST},{"dashboard",KB_DASHBOARD},
+    {"next_workspace",KB_NEXTWS},{"previous_workspace",KB_PREVWS},{"toggle_workspace_collapse",KB_COLLAPSEWS}
 };
 static bool loadCommands(std::string& error) {
     const auto dir = stateDir(); if (dir.empty()) { error = "app-data directory unavailable"; return false; }
@@ -40,6 +41,7 @@ static std::string commandAction(const std::string& action) {
     }
     const auto found = kCommandActions.find(action);
     if (found == kCommandActions.end()) return ctlErr("unsupported action; nothing executed");
+    if(g_focusOverride==g_quickSession&&g_quickSession&&found->second!=KB_COPY&&found->second!=KB_PASTE&&found->second!=KB_MARK&&found->second!=KB_SELECTALL&&found->second!=KB_READONLY&&found->second!=KB_SCROLLUP&&found->second!=KB_SCROLLDN&&found->second!=KB_CLOSE&&found->second!=KB_QUICK)return ctlErr("quick: library action refused; nothing executed");
     runKbAction(found->second); return ctlOkStr("ran " + action);
 }
 static bool customKey(WORD combo) {
@@ -108,6 +110,7 @@ static std::string commandOnUi(const JsonReq& req) {
     {
         LockG hold; std::string why; pane = resolveTarget(req.get("target"), &why);
         if (!pane || pane->exited) return ctlErr("command target is absent or exited; nothing executed");
+        if(pane==g_quickSession&&mode!="send"&&mode!="detached")return ctlErr("quick supports only send or detached commands; nothing created");
         if (mode == "send" && (pane->readOnly || pane->data == INVALID_HANDLE_VALUE)) return ctlErr("command send requires a live writable pane; nothing written");
         if (mode == "overlay" && (isCoverLocked(pane) || pane->overlay)) return ctlErr("command overlay requires an uncovered shell pane; nothing opened");
         auto* owner = pane->hidden ? splitOwnerOf(pane) : pane;

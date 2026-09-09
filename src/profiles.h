@@ -22,12 +22,12 @@ struct Catalog {
 };
 namespace detail {
 struct Value {
-    enum Kind { Null, String, Boolean, Object, Array } kind = Null;
+    enum Kind { Null, String, Boolean, Object, Array, Number } kind = Null;
     std::string text; bool boolean = false;
     std::map<std::string, Value> object; std::vector<Value> array;
 };
 class Parser {
-    const std::string& s; size_t pos = 0;
+    const std::string& s; size_t pos = 0; bool numbers = false;
     void ws() { while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) ++pos; }
     bool take(char c) { ws(); if (pos == s.size() || s[pos] != c) return false; ++pos; return true; }
     bool hex(uint32_t& code) {
@@ -118,10 +118,31 @@ class Parser {
         if (s.compare(pos, 4, "null") == 0) { pos += 4; return true; }
         if (s.compare(pos, 4, "true") == 0) { pos += 4; out.kind = Value::Boolean; out.boolean = true; return true; }
         if (s.compare(pos, 5, "false") == 0) { pos += 5; out.kind = Value::Boolean; return true; }
-        return false; // No numeric fields are supported by this catalog schema.
+        if (numbers && (s[pos] == '-' || (s[pos] >= '0' && s[pos] <= '9'))) {
+            const auto begin = pos;
+            if (s[pos] == '-' && ++pos == s.size()) return false;
+            if (s[pos] == '0') ++pos;
+            else {
+                if (s[pos] < '1' || s[pos] > '9') return false;
+                while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') ++pos;
+            }
+            if (pos < s.size() && s[pos] == '.') {
+                const auto first = ++pos;
+                while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') ++pos;
+                if (pos == first) return false;
+            }
+            if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
+                ++pos; if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
+                const auto first = pos;
+                while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') ++pos;
+                if (pos == first) return false;
+            }
+            out.kind = Value::Number; out.text = s.substr(begin, pos - begin); return true;
+        }
+        return false; // Catalog parsing keeps numeric fields disabled.
     }
 public:
-    explicit Parser(const std::string& input) : s(input) {}
+    explicit Parser(const std::string& input, bool allowNumbers = false) : s(input), numbers(allowNumbers) {}
     bool parse(Value& out) {
         if (s.size() > 1024 * 1024) return false;
         if (s.compare(0, 3, "\xef\xbb\xbf") == 0) pos = 3;

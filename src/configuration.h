@@ -2,12 +2,13 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include "quick_settings.h"
 
 namespace configuration {
 enum class Id { Theme, CustomColors, Foreground, Background, DosPalette, SidebarFont,
     ShowSidebar, ShowToolbar, ShowStatus, FlagView, RightClickPaste, CopyOnCtrlC,
-    CopyOnSelect, Scrollback, RestoreCommands };
-enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback };
+    CopyOnSelect, Scrollback, RestoreCommands, CursorStyle, CursorBlink, CursorBlinkMs, QuickSize, QuickHotkey };
+enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback, CursorStyle, CursorBlink, PositiveInt, QuickSize, Hotkey };
 struct Key { const char* name; const wchar_t* registry; Id id; Kind kind; uint32_t initial; };
 static const Key keys[] = {
     {"theme", L"Theme", Id::Theme, Kind::Theme, 0},
@@ -25,6 +26,11 @@ static const Key keys[] = {
     {"copy-on-select", L"CopyOnSelect", Id::CopyOnSelect, Kind::Boolean, 1},
     {"scrollback-lines", L"ScrollbackLines", Id::Scrollback, Kind::Scrollback, 5000},
     {"restore-commands", L"RestoreCommands", Id::RestoreCommands, Kind::Boolean, 0},
+    {"cursor-style", L"CursorStyle", Id::CursorStyle, Kind::CursorStyle, 0},
+    {"cursor-blink", L"CursorBlink", Id::CursorBlink, Kind::CursorBlink, 1},
+    {"cursor-blink-ms", L"CursorBlinkMs", Id::CursorBlinkMs, Kind::PositiveInt, 530},
+    {"quick-terminal-size", L"QuickTerminalSize", Id::QuickSize, Kind::QuickSize, 70},
+    {"quick-terminal-hotkey", L"QuickTerminalHotkey", Id::QuickHotkey, Kind::Hotkey, 0},
 };
 inline std::string normalized(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -39,7 +45,11 @@ inline const Key* find(const std::string& name) {
 }
 inline bool valid(const Key& key, uint32_t value) {
     switch (key.kind) {
-    case Kind::Boolean: return value <= 1;
+    case Kind::Boolean: case Kind::CursorBlink: return value <= 1;
+    case Kind::CursorStyle: return value <= 2;
+    case Kind::PositiveInt: return value > 0 && value <= INT32_MAX;
+    case Kind::QuickSize: return value >= 40 && value <= 90;
+    case Kind::Hotkey: return quick_settings::valid(value);
     case Kind::Color: return value <= 0xffffff;
     case Kind::Theme: return value <= 3;
     case Kind::SidebarFont: return value == 0 || (value >= 6 && value <= 24);
@@ -49,7 +59,9 @@ inline bool valid(const Key& key, uint32_t value) {
 }
 inline std::string format(const Key& key, uint32_t value) {
     switch (key.kind) {
-    case Kind::Boolean: return value ? "true" : "false";
+    case Kind::Boolean: case Kind::CursorBlink: return value ? "true" : "false";
+    case Kind::CursorStyle: return value == 0 ? "bar" : value == 1 ? "block" : "underline";
+    case Kind::Hotkey: return quick_settings::format(value);
     case Kind::Theme: {
         static const char* modes[] = {"auto", "dark", "light", "classic"};
         return value <= 3 ? modes[value] : "invalid";
@@ -65,8 +77,15 @@ inline std::string format(const Key& key, uint32_t value) {
 // Failure leaves out untouched, including overflow and partially valid input.
 inline bool parse(const Key& key, const std::string& raw, uint32_t& out) {
     const std::string s = normalized(raw); uint32_t value = 0;
+    if (key.kind == Kind::Hotkey) return quick_settings::parse(s, out);
     if (s.empty()) return false;
-    if (key.kind == Kind::Boolean) {
+    if (key.kind == Kind::CursorStyle) {
+        if (s == "bar" || s == "beam" || s == "line") value = 0;
+        else if (s == "block" || s == "box") value = 1;
+        else if (s == "underline" || s == "underscore") value = 2;
+        else return false;
+    } else if (key.kind == Kind::CursorBlink && (s == "yes" || s == "no")) value = s == "yes";
+    else if (key.kind == Kind::Boolean || key.kind == Kind::CursorBlink) {
         if (s == "true" || s == "on" || s == "1") value = 1;
         else if (s != "false" && s != "off" && s != "0") return false;
     } else if (key.kind == Kind::Theme) {

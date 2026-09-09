@@ -75,11 +75,18 @@ inline bool parse(const std::string& input, const std::map<std::string,int>& act
         } else if (tag.rfind("map ", 0) == 0) {
             head = trim(head.substr(4)); bool second = lower(head).rfind("leader ", 0) == 0;
             if (second) head = trim(head.substr(7));
-            auto key = chord(head); if (!key) return bad("bad chord");
             auto action = lower(value);
             if (action.rfind("command:", 0) == 0) value = "command:" + trim(value.substr(8));
             else { if (!actions.count(action)) return bad("unsupported action"); value = action; }
-            result.bindings.push_back({key, lower(head), value, second, number});
+            size_t start = 0;
+            for (;;) {
+                const auto end = head.find('|', start);
+                const auto spelling = trim(head.substr(start, end == std::string::npos ? end : end - start));
+                const auto key = chord(spelling); if (!key) return bad("bad or empty alternative chord");
+                result.bindings.push_back({key, lower(spelling), value, second, number});
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
         } else return bad("expected map, command or leader");
     }
     for (const auto& b : result.bindings) {
