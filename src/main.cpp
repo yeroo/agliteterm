@@ -8808,7 +8808,7 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
     for (Session* s : g_sessions)
         if (s->paneId == target) return s;
     for (Session* s : g_sessions)
-        if (!s->hidden && target.size() >= 4 && (s->id.compare(0, target.size(), target) == 0 ||
+        if (!isCoverLocked(s) && target.size() >= 4 && (s->id.compare(0, target.size(), target) == 0 ||
                                    s->paneId.compare(0, target.size(), target) == 0)) return s;
 
     std::wstring wanted = widen(target);

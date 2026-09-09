@@ -63,8 +63,7 @@ jobs:
       # rather than passing quietly.
       - name: Check the contract against agwinterm
         shell: pwsh
-        # Bootstrap only until canonical PR #272 merges; restore main URL before shipping.
-        run: ./tools/check-contract.ps1 -Url https://raw.githubusercontent.com/yeroo/agwinterm/7c3357f48026cdf8bca945a1352edaf1bbc740fc/tests/conformance/control-api.json
+        run: ./tools/check-contract.ps1
 
       - name: Wave 3 acceptance (guarded disposable desktop)
         shell: pwsh
