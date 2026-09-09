@@ -37,6 +37,26 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
+      # Fetch/build above may stage a release-era CLI. Stage the P16 source-pinned CLI LAST.
+      - name: Checkout the shared Wave 3 CLI
+        uses: actions/checkout@v4
+        with:
+          repository: yeroo/agwinterm
+          ref: 7af9b0751aa73dc9e79b7e3de593e50bea76b331
+          path: .ci-full-cli
+
+      - name: Setup shared CLI SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: .ci-full-cli/global.json
+
+      - name: Build and stage shared CLI
+        shell: pwsh
+        run: |
+          dotnet build .ci-full-cli/src/Agwinterm.Ctl/Agwinterm.Ctl.csproj -c Release -o .ci-cli-output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item .ci-cli-output/* bin -Force
+
       # The control-API contract is canonical in agwinterm and mirrored here. Two copies of a promise
       # drift silently — both suites keep passing against their own stale idea of it — so the copies
       # are compared on every build. Skips with a warning when the canonical copy is unreachable

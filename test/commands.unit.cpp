@@ -29,6 +29,11 @@ int main() {
     check(!parse(std::string("command X=a\0b",13)),"NUL refuses");
     check(parse("\xef\xbb\xbf# bom\r\ncommand X = hi\r\nmap x=command:X\r\nmap x=select_all"),"BOM CRLF and replacement binding");
     check(catalog.binding(commands::chord("x"),false)->action=="select_all","last binding wins");
+    check(parse("command X=echo a|b\nmap f5 | f7 = command:X\nleader=f10\nmap leader a | b=select_all"),"ordinary and leader alternatives");
+    check(catalog.bindings.size()==4 && catalog.commands[0].text=="echo a|b","only chord heads split on pipes");
+    for(auto bad:{"map f5 | = select_all","map | f5=select_all","map f5 || f7=select_all","map f5 | unknown=select_all","leader=f5|f7"}) {
+        check(!parse(bad)&&catalog.bindings.size()==4,"alternative validation is atomic");
+    }
     std::map<std::string,std::string> values{{"AGW_SESSION","test"},{"AGW_CWD","C:\\a b"}};
     check(commands::expand("{AGW_SESSION}:{AGW_CWD}:{AGW_UNKNOWN}:{AGW_lower}",values)=="test:C:\\a b::{AGW_lower}","tokens known unknown and non-token");
     check(commands::expand("{AGW_SESSION",values)=="{AGW_SESSION","unterminated token literal");

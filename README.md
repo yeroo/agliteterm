@@ -102,7 +102,8 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   leading `--` are sent, none of which survives the argv path (exactly one trailing newline is
   dropped; invalid UTF-8 is refused before anything is sent). The flag lives in the shared
   `agwintermctl`; lite's server side is unchanged. There is no `quick type`: the quick terminal
-  is a hidden session, typed into as `session type --target <its id>` (the id arrives as a
+  is a hidden session, typed into as `session type --window quick` while visible or
+  `session type --target <its id>` (the id arrives as a
   `session`/`created` event after `quick on`). And a call that answers `ok` did what was asked
   (parity batch P2): `session overlay open <cmd> --size-percent N` is validated as 1..100 and
   refused otherwise with nothing opened, and the reply carries the percentage **in effect** (a popup

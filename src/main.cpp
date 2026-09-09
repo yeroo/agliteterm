@@ -78,6 +78,9 @@ CAppModule _Module;
 #include "profiles.h"
 #include "shell_configuration.h"
 #include "commands.h"
+#include "wave3.h"
+#include "native_picker.h"
+#pragma comment(lib, "normaliz.lib")
 
 // ---- agwinterm-core C ABI (ABI v18) ----
 struct FfiCell {
@@ -375,6 +378,7 @@ struct Session {
     // persisted as a `C` line. Empty = none. Separate from `name`: a rename leaves it alone and a
     // context never enters the label. The rules are contextRefusal's (agwinterm's SessionContexts).
     std::wstring context;
+    std::shared_ptr<const wave3::Hud> hud; // transient session-wide presentation; never restored
     int ws = 0;                    // workspace this session belongs to (index into g_workspaces)
     // The id of THIS session's split shell (slot 0 or 1 by its layout, see paneRect), empty when it has none. A split belongs to the
     // session, not to the window: switching sessions shows that session's split (or no split), the
@@ -532,6 +536,21 @@ static HFONT g_treeItalic;      // italic variant of the sidebar font (agent "wo
 // popup's session while it's active.
 static HWND g_quickHwnd, g_scratchHwnd, g_overlayHwnd;
 static Session* g_quickSession, *g_scratchSession, *g_overlaySession, *g_focusOverride;
+static std::unique_ptr<NativePicker> g_picker;
+static std::string g_pendingPick;
+static bool g_pickPublished = false;
+static std::deque<std::pair<std::string,std::string>> g_pickAnswers; // UI-owned, eight completed answers
+static std::string g_overlayOwnerId;
+static bool g_quickPinned = false;
+static void abortPicker(const std::string& id);
+static std::string waveOnUi(const JsonReq& req);
+static bool waveCommand(const std::string& cmd);
+static void paintHud(HDC dc, RECT area);
+static void repositionQuick();
+static void quickVisibility(const std::string& op, bool human);
+static std::string navigateWorkspace(const std::string& direction);
+static void collapseCurrentWorkspace();
+static bool setQuickHotkey(uint32_t value,bool persist,std::string& error);
 static HWND g_toolbar;          // native toolbar (New Session / New Workspace / Split)
 static int g_toolbarH = 0;      // its height; the tree + terminal start below it
 static HWND g_status;           // native status bar (msctls_statusbar32)
@@ -611,6 +630,10 @@ static const UINT kRelayoutRetryMs = 60;
 // anything, so it needs a count of its own (revmux r5).
 static const int kResizeRetryAttempts = 3;
 static const UINT kCaretBlinkMs = 530;
+static uint32_t g_cursorStyle=0, g_cursorBlink=1, g_cursorBlinkMs=kCaretBlinkMs;
+static uint32_t g_quickSize=70, g_quickHotkey=0;
+static int g_quickHotkeyId=0;
+static const UINT_PTR kHudTimer=5;
 
 // ---- UI theme (Properties -> Appearance) -----------------------------------------------------
 // Four modes. CLASSIC means "hands off": every control keeps whatever the OS draws, which is the
@@ -1012,7 +1035,8 @@ static void applyTheme() {
 // HIBYTE = HOTKEYF_* (SHIFT 1 / CONTROL 2 / ALT 4). 0 = unbound.
 enum { KB_NEW, KB_NEWWS, KB_CLOSE, KB_SPLIT, KB_NEXT, KB_PREV, KB_COPY, KB_PASTE,
        KB_PALETTE, KB_FOCUSL, KB_FOCUSR, KB_SCROLLUP, KB_SCROLLDN, KB_QUICK, KB_SCRATCH, KB_REOPEN,
-       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_READONLY, KB_BROADCAST, KB_DASHBOARD, KB_COUNT };
+       KB_FLAG, KB_FLAGVIEW, KB_ATTENTION, KB_FOCUSWS, KB_MARK, KB_SELECTALL, KB_READONLY, KB_BROADCAST, KB_DASHBOARD,
+       KB_NEXTWS, KB_PREVWS, KB_COLLAPSEWS, KB_COUNT };
 struct KbInfo { const wchar_t* label; const wchar_t* reg; };
 static const KbInfo kKbInfo[KB_COUNT] = {
     { L"New Session",      L"Key_New" },     { L"New Workspace",    L"Key_NewWs" },
@@ -1029,6 +1053,8 @@ static const KbInfo kKbInfo[KB_COUNT] = {
     { L"Mark Mode (keyboard select)", L"Key_MarkMode" }, { L"Select All", L"Key_SelectAll" },
     { L"Toggle Read-Only Pane", L"Key_ReadOnly" },
     { L"Toggle Broadcast Input", L"Key_Broadcast" }, { L"Dashboard", L"Key_Dashboard" },
+    { L"Next Workspace", L"Key_NextWorkspace" }, { L"Previous Workspace", L"Key_PreviousWorkspace" },
+    { L"Toggle Workspace Collapse", L"Key_WorkspaceCollapse" },
 };
 static WORD g_keys[KB_COUNT] = { 0 };
 static commands::Catalog g_commands; // UI-thread owned; pipe access uses dispatchConfig
@@ -1098,7 +1124,7 @@ struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
 // already carries a NotifyMsg. Two globals used to hold this, so a queued open picked up the size
 // a LATER resize had stored and ran at a number nobody was told (revmux r1 of P2-lite).
-struct OverlayReq { std::string cmd; int sizePct; };
+struct OverlayReq { std::string cmd; int sizePct; std::string ownerId; };
 static HICON g_appIcon;         // big (taskbar / alt-tab)
 static HICON g_appIconSm;       // small (title bar / tray)
 static NOTIFYICONDATAW g_nid{};
@@ -1143,6 +1169,7 @@ struct LockG {
 static HANDLE g_control = INVALID_HANDLE_VALUE;
 static std::vector<Session*> g_sessions;
 static std::vector<std::wstring> g_workspaces = { L"workspace 1" };  // session "folders" (groups)
+static std::set<int> g_collapsedWorkspaces; // transient, under g_lock; remapped with workspace indices
 static bool g_broadcast = false; // UI-thread state, never persisted
 static bool g_dashboard = false;
 static std::vector<std::string> g_dashIds;
@@ -1253,6 +1280,9 @@ static const PalAction kPalActions[] = {
     { L"Toggle Read-Only Pane",     IDM_READONLY,   KB_READONLY,  -1 },
     { L"Toggle Broadcast Input",    0,              KB_BROADCAST, -1 },
     { L"Dashboard",                 0,              KB_DASHBOARD, -1 },
+    { L"Next Workspace",           0,              KB_NEXTWS,    -1 },
+    { L"Previous Workspace",       0,              KB_PREVWS,    -1 },
+    { L"Toggle Workspace Collapse",0,              KB_COLLAPSEWS,-1 },
     { L"Delete Workspace",         IDM_DELWS,      -1,           -1 },
     { L"Focus Left / Top Pane",    0,              KB_FOCUSL,    -1 },   // slot 0 (P4)
     { L"Focus Right / Bottom Pane", 0,             KB_FOCUSR,    -1 },   // slot 1
@@ -2289,7 +2319,7 @@ static std::vector<Profile> listedProfiles() {
 // catalog default; remembered legacy empty-app specs explicitly select powershell.exe at callers.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint = false);   // fwd
+                              bool repaint = false, bool hidden = false);   // fwd
 
 // The protocol's string fields are FIXED-SIZE arrays, and MSVC's strcpy_s does not truncate on an
 // oversize source — it invokes the CRT invalid-parameter handler, whose default terminates the
@@ -2366,6 +2396,7 @@ static void selectPrimary(int idx) {
         LockG hold;
         if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
         g_pane[0] = idx;
+        g_activeWs = g_sessions[idx]->ws;
         g_focus = 0;
         g_sessions[idx]->notifications = 0;
         touchMruLocked(g_sessions[idx]);
@@ -2375,7 +2406,7 @@ static void selectPrimary(int idx) {
 }
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
-                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr) {
+                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false) {
     profiles::Entry defaultProfile;
     if (!app) {
         const auto catalog = profileSnapshot();
@@ -2387,7 +2418,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     char idbuf[64];
     // _snprintf_s, not wsprintfA: wsprintfA does not bound its output to the destination, and the
     // prefix comes from --pipe (see parseLaunchArgs, which caps it — this is the second lock).
-    _snprintf_s(idbuf, _TRUNCATE, "%s-%d", g_idPrefix.c_str(), g_seq++);
+    _snprintf_s(idbuf, _TRUNCATE, "%s%s-%d", quick?"quick:":"", g_idPrefix.c_str(), g_seq++);
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_create_tag;
@@ -2452,7 +2483,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         strcpy_s(req.cmd.create.env[i].key, k);
         strcpy_s(req.cmd.create.env[i].value, v);
     };
-    req.cmd.create.env_count = 6;
+    req.cmd.create.env_count = 7;
     setEnv(0, "AGWINTERM", "1");
     setEnv(1, "AGWINTERM_ENABLED", "1");
     std::string pipeNarrow = g_argPipe.empty() ? narrow(kAppId) : narrow(g_argPipe);
@@ -2462,6 +2493,8 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     // TERM_PROGRAM names the TERMINAL, so it takes the new name. The AGWINTERM_* vars above
     // deliberately do NOT: the agent skill, the status hooks and agwintermctl all read them.
     setEnv(5, "TERM_PROGRAM", "agliteterm");
+    const auto windowIdentity=quick?std::string("quick"):narrow(g_instance);
+    setEnv(6, "AGWINTERM_WINDOW_ID", windowIdentity.c_str());
     // An id the host already holds is REFUSED, and that single rejection is what used to sink every
     // spec of a restore at once. scanHostSessions() reserves the ids it can see, but it only sees
     // what `list` returns: a reply this build cannot decode (more sessions than its field storage
@@ -2471,14 +2504,14 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     ReqOutcome oc = ReqOutcome::NoReply;
     for (int tries = 0; !request(req, &rep, &oc); tries++) {
         if (oc != ReqOutcome::Refused || !strstr(rep.error, "already exists") || tries >= 64) return nullptr;
-        _snprintf_s(idbuf, _TRUNCATE, "%s-%d", g_idPrefix.c_str(), g_seq++);
+        _snprintf_s(idbuf, _TRUNCATE, "%s%s-%d", quick?"quick:":"", g_idPrefix.c_str(), g_seq++);
         strcpy_s(req.cmd.create.id, idbuf);
         strcpy_s(req.cmd.create.env[3].value, idbuf);   // AGWINTERM_SESSION_ID
         strcpy_s(req.cmd.create.env[4].value, idbuf);   // AGWINTERM_PANE_ID
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
@@ -2499,7 +2532,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
 /// running and can simply be picked back up, scrollback and all.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint) {
+                              bool repaint, bool hidden) {
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_attach_tag;
@@ -2572,6 +2605,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // seeding the scrollback is a separate improvement.
     s->reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr);
     EnterCriticalSection(&g_lock);
+    s->hidden=hidden;
     g_sessions.push_back(s);
     emitEvent("session", s->id, "created");
     emitEvent("tree");
@@ -2819,6 +2853,7 @@ static void closeFocused() {
                    : (g_focusOverride == g_quickSession && g_quickHwnd) ? g_quickHwnd : nullptr;
         if (popup) { PostMessageW(popup, WM_CLOSE, 0, 0); return; }
     }
+    { LockG hold; auto* owner=displayedOwner(); if(owner&&owner->hud){owner->hud.reset();InvalidateRect(g_hwnd,nullptr,FALSE);return;} }
     {
         Session* shell = nullptr;
         {
@@ -2881,6 +2916,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->id = owner->id;                  // the session id moves; paneId stays (the shell's)
             survivor->name = owner->name;
             survivor->context = owner->context;
+            survivor->hud = std::move(owner->hud);
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
             survivor->notifications = owner->notifications;
@@ -3114,6 +3150,11 @@ static uint32_t configValue(const configuration::Key& key) {
     case Id::CopyOnSelect: return g_copyOnSelect.load();
     case Id::Scrollback: return g_scrollbackLines.load();
     case Id::RestoreCommands: return g_restoreCommands.load();
+    case Id::CursorStyle: return g_cursorStyle;
+    case Id::CursorBlink: return g_cursorBlink;
+    case Id::CursorBlinkMs: return g_cursorBlinkMs;
+    case Id::QuickSize: return g_quickSize;
+    case Id::QuickHotkey: return g_quickHotkey;
     }
     return 0;
 }
@@ -3136,6 +3177,11 @@ static void assignConfig(const configuration::Key& key, uint32_t value) {
     case Id::CopyOnSelect: g_copyOnSelect = value != 0; break;
     case Id::Scrollback: g_scrollbackLines = value; break;
     case Id::RestoreCommands: g_restoreCommands = value != 0; break;
+    case Id::CursorStyle: g_cursorStyle = value; break;
+    case Id::CursorBlink: g_cursorBlink = value; break;
+    case Id::CursorBlinkMs: g_cursorBlinkMs = value; break;
+    case Id::QuickSize: g_quickSize = value; break;
+    case Id::QuickHotkey: g_quickHotkey = value; break;
     }
 }
 static void loadColors() {   // config API and startup share key names, types, validation and defaults
@@ -3164,6 +3210,7 @@ static void loadKeys(bool cleanupObsolete = true) {   // absent = seeded default
     g_keys[KB_PALETTE] = MAKEWORD('P', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
     g_keys[KB_MARK] = MAKEWORD('M', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
     g_keys[KB_SELECTALL] = MAKEWORD('A', HOTKEYF_CONTROL | HOTKEYF_SHIFT);
+    g_keys[KB_QUICK] = MAKEWORD(VK_OEM_3, HOTKEYF_CONTROL);
     for (int a = 0; a < KB_COUNT; a++) {
         DWORD v = 0, sz = sizeof(v);
         if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, kKbInfo[a].reg, RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) g_keys[a] = (WORD)v;
@@ -4418,11 +4465,14 @@ afterGridPaint:;
         RECT cur{ pr.left + (LONG)info.cursorCol * g_cw, pr.top + (LONG)info.cursorRow * g_ch,
                   pr.left + (LONG)(info.cursorCol + 1) * g_cw, pr.top + (LONG)(info.cursorRow + 1) * g_ch };
         if (cur.right <= pr.right) {
-            if (!g_winFocused) {
+            const auto cursor = wave3::cursor((int)g_cursorStyle,g_cursorBlink!=0,info.cursorShape);
+            if (GetFocus() != windowForSession(s)) {
                 HBRUSH cb = CreateSolidBrush(toColorRef(g_customColors ? g_defFg : 0xC0C0C0, false));
                 FrameRect(mem, &cur, cb);
                 DeleteObject(cb);
-            } else if (g_caretOn) {
+            } else if (!cursor.blink || g_caretOn) {
+                if (cursor.shape == 0) cur.right = cur.left + (std::max)(1,g_cw/6);
+                else if (cursor.shape == 2) cur.top = cur.bottom - (std::max)(1,g_ch/8);
                 InvertRect(mem, &cur);
             }
         }
@@ -4522,6 +4572,7 @@ static void paint(HDC dc, RECT rc) {
                FillRect(mem, &ln, lb); ln.left = sp.right - 1; ln.right = sp.right; FillRect(mem, &ln, lb); DeleteObject(lb); }
     }
 
+    paintHud(mem, rc);
     if (g_dashboard) paintDashboard(mem, rc);
     if (g_palette) {   // command palette overlay: query row + filtered, scrollable action list
         int n = (int)g_palHits.size();
@@ -5448,7 +5499,11 @@ static void palChar(wchar_t wc) {   // printable input -> query (both frame + po
 }
 
 static void runKbAction(int a) {
+    if(g_focusOverride==g_quickSession&&g_quickSession&&a!=KB_COPY&&a!=KB_PASTE&&a!=KB_MARK&&a!=KB_SELECTALL&&a!=KB_READONLY&&a!=KB_SCROLLUP&&a!=KB_SCROLLDN&&a!=KB_CLOSE&&a!=KB_QUICK){logWarn("quick: library action refused");return;}
     switch (a) {
+        case KB_NEXTWS: navigateWorkspace("next"); break;
+        case KB_PREVWS: navigateWorkspace("prev"); break;
+        case KB_COLLAPSEWS: collapseCurrentWorkspace(); break;
         case KB_NEW: { int c, r; newSessionGrid(g_focus, &c, &r); Session* s = newSession(c, r); if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); } break; }
         case KB_NEWWS: SendMessageW(g_hwnd, WM_COMMAND, IDM_NEWWS, 0); break;
         case KB_CLOSE: closeFocused(); break;
@@ -5698,7 +5753,7 @@ static void refreshTree(bool persist = true) {
             HTREEITEM h = TreeView_InsertItem(g_tree, &tis);
             if (i == focusIdx) sel = h;
         }
-        TreeView_Expand(g_tree, wh, TVE_EXPAND);
+        TreeView_Expand(g_tree, wh, g_collapsedWorkspaces.count(w)?TVE_COLLAPSE:TVE_EXPAND);
     }
     if (g_flagView && !anyShown) {   // hint row; lParam sentinel is out of range for every handler
         TVINSERTSTRUCTW ti{};
@@ -5709,6 +5764,10 @@ static void refreshTree(bool persist = true) {
         TreeView_InsertItem(g_tree, &ti);
     }
     if (sel) TreeView_SelectItem(g_tree, sel);
+    for(HTREEITEM item=TreeView_GetRoot(g_tree);item;item=TreeView_GetNextSibling(g_tree,item)){
+        TVITEMW ti{};ti.mask=TVIF_PARAM;ti.hItem=item;TreeView_GetItem(g_tree,&ti);
+        if(ti.lParam<0&&g_collapsedWorkspaces.count((int)(-ti.lParam-1)))TreeView_Expand(g_tree,item,TVE_COLLAPSE);
+    }
     g_treeSyncing = false;
     }   // g_lock released
     updateStatus();
@@ -5729,6 +5788,7 @@ static WsDelete deleteWorkspace(int w) {
         if ((int)g_workspaces.size() <= 1) return WsDelete::LastOne;
         if (w < 0 || w >= (int)g_workspaces.size()) return WsDelete::NoSuchIndex;
         g_workspaces.erase(g_workspaces.begin() + w);
+        {std::set<int> next;for(int old:g_collapsedWorkspaces)if(old!=w)next.insert(old>w?old-1:old);g_collapsedWorkspaces=std::move(next);}
         for (auto* s : g_sessions) {
             if (s->ws == w) s->ws = 0;
             else if (s->ws > w) s->ws--;
@@ -6717,10 +6777,11 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_KILLFOCUS: {
-            LockG hold;
-            if (g_focusOverride == s) g_focusOverride = nullptr;
-            endMarkModeIfMoved();
+            {LockG hold;
+             if (g_focusOverride == s) g_focusOverride = nullptr;
+             endMarkModeIfMoved();}
             PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+            if(h==g_quickHwnd&&!g_quickPinned)ShowWindow(h,SW_HIDE);
             return 0;
         }
         case WM_ERASEBKGND: return 1;
@@ -6797,11 +6858,12 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // window hides or dies. The explicit raise only mattered when the foreground was
             // elsewhere — and then it was a steal from whatever the user was doing.
             if (h == g_overlayHwnd || h == g_scratchHwnd) { DestroyWindow(h); return 0; }
+            if(h==g_quickHwnd)g_quickPinned=false;
             ShowWindow(h, SW_HIDE); return 0;
         case WM_DESTROY: {
             cancelDrag(h);
             Session** slot = (h == g_overlayHwnd) ? &g_overlaySession
-                           : (h == g_scratchHwnd) ? &g_scratchSession : nullptr;
+                           : (h == g_scratchHwnd) ? &g_scratchSession : (h == g_quickHwnd) ? &g_quickSession : nullptr;
             if (slot) {   // kill the transient window's session + clear its state
                 if (g_focusOverride == *slot) g_focusOverride = nullptr;
                 // The popup's exit status, read off its marks BEFORE the session is killed (P5):
@@ -6815,7 +6877,8 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     for (int i = 0; i < (int)g_sessions.size(); i++)
                         if (g_sessions[i] == *slot) { closeSessionAt(i); break; }
                 *slot = nullptr;
-                if (h == g_overlayHwnd) g_overlayHwnd = nullptr; else g_scratchHwnd = nullptr;
+                if (h == g_overlayHwnd) {g_overlayHwnd = nullptr;g_overlayOwnerId.clear();}
+                else if(h==g_quickHwnd){g_quickHwnd=nullptr;g_quickPinned=false;}else g_scratchHwnd = nullptr;
             }
             return 0;
         }
@@ -6945,6 +7008,7 @@ static bool showPopupRaised(HWND h) {
 // Toggle a quick (scratch=false) or scratch (scratch=true) popup terminal: show/hide, creating its
 // window + dedicated hidden session on first use.
 static void togglePopupTerminal(bool scratch) {
+    if(!scratch){try{quickVisibility("toggle",true);}catch(const std::exception& ex){logWarn("quick: %s",ex.what());}return;}
     g_dashboard = false; g_dashCells.clear(); // popup terminals regain their own keyboard
     HWND& hw = scratch ? g_scratchHwnd : g_quickHwnd;
     Session*& sess = scratch ? g_scratchSession : g_quickSession;
@@ -6998,7 +7062,9 @@ static void togglePopupTerminal(bool scratch) {
 // create still fails there is no popup to leave behind either: the window goes, and the log says.
 static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
-static void openOverlay(const std::string& command, int sizePct) {
+static void openOverlay(const std::string& command, int sizePct, const std::string& ownerId) {
+    { LockG hold; bool found=false; for(auto* s:g_sessions)if(!s->hidden&&s->id==ownerId){found=true;break;}
+      if(!found){logWarn("overlay: owner closed before queued open");return;} }
     g_dashboard = false; g_dashCells.clear();
     // One at a time; WM_DESTROY kills the old session + clears state. Every popup open resets the
     // window-wide `result` (agwinterm's rule) — the VERB already did, when it answered "opened", so
@@ -7019,6 +7085,7 @@ static void openOverlay(const std::string& command, int sizePct) {
         return;
     }
     g_overlaySession->hidden = true; g_overlaySession->name = L"overlay";
+    {LockG hold;g_overlayOwnerId=ownerId;for(auto* s:g_sessions)if(!s->hidden&&s->id==ownerId)s->hud.reset();}
     if (showPopupRaised(g_overlayHwnd)) g_focusOverride = g_overlaySession;   // see showPopupRaised
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);
 }
@@ -7133,6 +7200,7 @@ static void applyTreeFont() {
 }
 
 static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR) {
+    if(g_picker&&g_picker->route(m,w,l))return 0;
     if (m == WM_NCDESTROY) RemoveWindowSubclass(h, treeProc, id);
     switch (m) {
         case WM_SETFOCUS:
@@ -7297,6 +7365,7 @@ static Session* resolveTarget(const std::string& target, std::string* why);
 static std::string configOnUi(const JsonReq& req) {
     using configuration::Id;
     const auto& cmd = req.get("cmd");
+    if(waveCommand(cmd))return waveOnUi(req);
     if (cmd == "command.list" || (cmd == "command.leader" && req.get("args.op") == "state")) return commandOnUi(req);
     if (cmd == "theme.list") return ctlOkStr("auto\nlight\ndark\nclassic");
     if (cmd == "config.list") {
@@ -7318,7 +7387,7 @@ static std::string configOnUi(const JsonReq& req) {
     }
     // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
     // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
-    if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd)) return ctlErr("a modal dialog is open or queued; configuration unchanged");
+    if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd) || (g_picker&&g_picker->active())) return ctlErr("a modal dialog or picker is open or queued; configuration unchanged");
     if (cmd == "broadcast" || cmd == "notify" || cmd == "dashboard" || cmd == "restore.clear" || cmd == "workspace.move") return remainderOnUi(req);
     if (cmd == "agent.update.open") return agentUpdateOnUi(req); // internal dispatch only, not a public control verb
     if (cmd.rfind("command.", 0) == 0) return commandOnUi(req);
@@ -7382,6 +7451,7 @@ static std::string configOnUi(const JsonReq& req) {
     uint32_t value = 0;
     if (!configuration::parse(*key, req.get(theme ? "args.name" : "args.value"), value))
         return ctlErr(theme ? "theme not found" : "invalid value for config key '" + name + "'");
+    if(key->id==Id::QuickHotkey){std::string error;if(!setQuickHotkey(value,true,error))return ctlErr(error);return ctlOkStr(name+" = "+configuration::format(*key,value));}
     DWORD stored = value;
     const LSTATUS saved = RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, key->registry,
                                         REG_DWORD, &stored, sizeof(stored));
@@ -7390,6 +7460,9 @@ static std::string configOnUi(const JsonReq& req) {
     { LockG hold; assignConfig(*key, value); }
     // Changing one key must not publish stale unrelated preferences, including through UI actions.
     switch (key->id) {
+    case Id::CursorStyle: case Id::CursorBlink: case Id::CursorBlinkMs:
+        g_caretOn=true;SetTimer(g_hwnd,kCaretTimer,g_cursorBlinkMs,nullptr);break;
+    case Id::QuickSize: repositionQuick(); break;
     case Id::Theme: applyTheme(); break;
     case Id::SidebarFont: applyTreeFont(); relayout(); break;
     case Id::ShowSidebar: case Id::ShowToolbar: case Id::ShowStatus: {
@@ -7418,7 +7491,13 @@ static void drainConfigRequests() {
         if (!call->state.compare_exchange_strong(pending, 1)) continue;
         try { call->result = configOnUi(call->request); }
         catch (...) { call->result = ctlErr("configuration request failed; outcome unknown; read back the setting"); }
-        call->state = 2; SetEvent(call->done);
+        if(call->request.get("cmd")=="pick.open") {
+            int running=1;
+            if(!call->state.compare_exchange_strong(running,2)) {
+                try {auto reply=wave3::parse(call->result);if(wave3::boolean(reply,"ok")){auto* result=wave3::field(reply,"result");if(result)abortPicker(wave3::text(*result,"id",true));}}catch(...){logWarn("withdrawn picker rollback failed");}
+            }
+        } else call->state = 2;
+        SetEvent(call->done);
     }
 }
 static std::string dispatchConfig(const JsonReq& req) {
@@ -7432,12 +7511,19 @@ static std::string dispatchConfig(const JsonReq& req) {
             g_configRequests.pop_back(); return ctlErr("the window is closing; configuration unchanged");
         }
     }
-    if (WaitForSingleObject(call->done, 5000) == WAIT_OBJECT_0) return call->result;
-    int pending = 0; const bool cancelled = call->state.compare_exchange_strong(pending, 3);
+    const bool picker= req.get("cmd")=="pick.open";
+    if (WaitForSingleObject(call->done, picker?10000:5000) == WAIT_OBJECT_0) return call->result;
+    int pending = 0; bool cancelled = call->state.compare_exchange_strong(pending, 3);
+    if(picker&&!cancelled){
+        if(pending==2)return call->result;
+        int running=1;cancelled=call->state.compare_exchange_strong(running,3);
+        if(!cancelled&&running==2)return call->result;
+    }
     {
         std::lock_guard<std::mutex> guard(g_configMutex);
         g_configRequests.erase(std::remove(g_configRequests.begin(), g_configRequests.end(), call), g_configRequests.end());
     }
+    if(picker)return ctlErr("picker open withdrawn; in-flight construction will be discarded");
     return ctlErr(cancelled ? "configuration request timed out before execution; configuration unchanged" :
         "configuration request timed out; outcome unknown; read back the setting");
 }
@@ -7451,6 +7537,7 @@ public:
     CStatusBarCtrl m_status;    // workspace · count · grid · font
 
     BEGIN_MSG_MAP(CMainFrame)
+        MESSAGE_RANGE_HANDLER(0, 0xffff, OnPickerInput)
         MSG_WM_PAINT(OnPaint)
         MSG_WM_ERASEBKGND(OnEraseBkgnd)
         MSG_WM_CHAR(OnChar)
@@ -7483,6 +7570,7 @@ public:
         MESSAGE_HANDLER(WM_APP_SIDEBARW, OnSidebarWidth)
         MESSAGE_HANDLER(WM_APP_PANEEXIT, OnPaneExit)
         MESSAGE_HANDLER(WM_APP_CONFIG, OnConfig)
+        MESSAGE_HANDLER(WM_HOTKEY, OnQuickHotkey)
         MESSAGE_HANDLER(WM_NOTIFY, OnNotify)
         MESSAGE_HANDLER(WM_COMMAND, OnCommand)
         MESSAGE_HANDLER(WM_UAHDRAWMENU, OnUahDrawMenu)
@@ -7493,6 +7581,14 @@ public:
         MESSAGE_HANDLER(WM_MENUSELECT, OnMenuSeamTouch)
         CHAIN_MSG_MAP(CFrameWindowImpl<CMainFrame>)
     END_MSG_MAP()
+
+    LRESULT OnPickerInput(UINT msg,WPARAM w,LPARAM l,BOOL& handled){handled=g_picker&&(g_picker->route(msg,w,l)||(g_picker->active()&&msg==WM_COMMAND));return 0;}
+    LRESULT OnQuickHotkey(UINT,WPARAM w,LPARAM l,BOOL&){
+        if((int)w==g_quickHotkeyId&&HIWORD(l)==(g_quickHotkey&255)&&(LOWORD(l)&7)==(g_quickHotkey>>8)) {
+            try{if(!g_picker||!g_picker->active())quickVisibility("toggle",true);}catch(const std::exception& ex){logWarn("quick hotkey: %s",ex.what());}
+        }
+        return 0;
+    }
 
     // ---- dark menu bar ----
     LRESULT OnUahDrawMenu(UINT, WPARAM, LPARAM lp, BOOL& bHandled) {
@@ -7730,13 +7826,14 @@ public:
             refitPopupSessions(true);
             return;
         }
+        if (id == kHudTimer) { if (!g_dashboard) { LockG hold; auto* s=displayedOwner(); if(s&&s->hud&&s->hud->spinner!="none") Invalidate(FALSE); } return; }
         if (id != kCaretTimer) return;
         if (g_dashboard) Invalidate(FALSE); // fixed-rate live previews even when no main pane is dirty
         if (g_noticeUntil && GetTickCount64() >= g_noticeUntil) { g_noticeUntil = 0; Invalidate(FALSE); }
         endMarkModeIfMoved();
-        if (!g_winFocused) return;            // hollow caret doesn't blink
         g_caretOn = !g_caretOn;
-        InvalidateCaret();
+        if (g_winFocused) InvalidateCaret();
+        for(HWND popup:{g_quickHwnd,g_scratchHwnd,g_overlayHwnd})if(popup&&::GetFocus()==popup)::InvalidateRect(popup,nullptr,FALSE);
     }
     // Coming back to the window (Alt-Tab, taskbar, clicking the title bar) must land in the shell.
     // Windows restores focus to whichever child held it last, which after any sidebar interaction
@@ -7807,6 +7904,7 @@ public:
     /// Restore keyboard focus to the terminal after the sidebar finished handling a click. Skipped
     /// while a tree label is being edited (rename) — that edit box legitimately owns the keyboard.
     LRESULT OnFocusTerm(UINT, WPARAM, LPARAM, BOOL&) {
+        if(g_picker&&g_picker->active()){g_picker->focus();return 0;}
         if (g_tree && TreeView_GetEditControl(g_tree)) { logInfo("focus: restore SKIPPED (rename edit owns the keyboard)"); return 0; }
         SetFocus();
         logInfo("focus: terminal has the keyboard (focus owner now %p)", (void*)::GetFocus());
@@ -7829,7 +7927,7 @@ public:
         std::unique_ptr<OverlayReq> r((OverlayReq*)lp);       // this message owns it
         if (!r) return 0;
         if (wp == OVL_RESIZE) resizeOverlay(r->sizePct);
-        else openOverlay(r->cmd, r->sizePct);
+        else openOverlay(r->cmd, r->sizePct, r->ownerId);
         return 0;
     }
     // `sidebar width N` stored g_sidebarW on a control-pipe thread and posted this. The layout runs
@@ -7845,6 +7943,7 @@ public:
     // A host action the reader thread drained (see runHostActions): the clipboard and the tray
     // icon both belong to this thread, so it does that half of the work.
     LRESULT OnPaneExit(UINT, WPARAM, LPARAM lp, BOOL&) {   // reader thread -> UI thread: a shell hit EOF (P4)
+        if((Session*)lp==g_quickSession&&g_quickHwnd){::DestroyWindow(g_quickHwnd);return 0;}
         // A split side whose shell exits collapses to the survivor (agwinterm OnPaneProcessExited,
         // agterm #121): the session's own shell exiting is a promotion, the split shell's an
         // unsplit — a side that stayed on screen as "(exited)" was a pane nothing could type into
@@ -8113,6 +8212,10 @@ public:
             // next keystroke went nowhere useful. Post it and restore focus once the tree is done.
             ::PostMessageW(m_hWnd, WM_APP_FOCUSTERM, 0, 0);
         }
+        if(nm->idFrom==ID_TREE&&nm->code==TVN_ITEMEXPANDEDW&&!g_treeSyncing){
+            auto* tv=reinterpret_cast<NMTREEVIEWW*>(lp);if(tv->itemNew.lParam<0){LockG hold;int ws=(int)(-tv->itemNew.lParam-1);
+                if(ws>=0&&ws<(int)g_workspaces.size()){if(tv->itemNew.state&TVIS_EXPANDED)g_collapsedWorkspaces.erase(ws);else g_collapsedWorkspaces.insert(ws);}}
+        }
         // A click on the ALREADY-selected row sends no TVN_SELCHANGED at all, so it needs the same
         // treatment or clicking the current session (the obvious "put me back in the terminal"
         // gesture) leaves focus in the tree.
@@ -8231,6 +8334,9 @@ public:
     }
 
     void OnDestroy() {
+        if(g_picker)g_picker->finish("{\"result\":\"cancelled\"}");
+        if(g_quickHotkeyId)UnregisterHotKey(m_hWnd,g_quickHotkeyId);
+        KillTimer(kHudTimer);
         cancelDrag(m_hWnd);
         KillTimer(kCaretTimer);
         KillTimer(kReplayTimer);
@@ -9322,6 +9428,20 @@ agwintermctl surface cursor
 agwintermctl selection all|copy|clear [--target <id>]
 agwintermctl restore capture
 agwintermctl workspace new|rename|select|delete|collapse|expand|focus
+agwintermctl workspace go next|prev
+
+Wave 3 (P17): `session hud open MESSAGE` / `update MESSAGE` / `close` is a passive
+owning-session HUD (tree read-back), not a terminal. `pick --no-block` reads bounded
+UTF-8 lines/JSON from stdin and returns an exact ID; `pick result ID` / `cancel ID`
+must use this originating pipe. Eight completed answers live only for this process.
+Picker no-block/result print payload JSON, even with --json; pending exits 1,
+picked/custom 0, cancelled 2. Data is never executed. Escape/Cancel dismisses it.
+Quick is one per lite process: `quick on` is pinned/nonactivating, human Ctrl+backtick
+is focus-dismissed. `--window quick` routes visible quick content; library mutations
+refuse. Config keys quick-terminal-size (40..90, default 70), quick-terminal-hotkey
+(disabled by default), cursor-style, cursor-blink and cursor-blink-ms apply live.
+Tree foregroundShells are conservative observations, NEVER proof of prompt readiness.
+Details and boundaries: docs/wave3.md. No cross-process UI broker or terminal UIA claim.
 agwintermctl window new|list|select|close|delete|rename|move|resize|state|zoom
 agwintermctl tree --json | ping | version | sidebar show|hide|toggle|state|width | quick on|off|toggle
 ```
@@ -9521,12 +9641,35 @@ static std::string installAgentSkill() {
 #include "install_runtime.h"
 #include "agent_runtime.h"
 #include "remainder_runtime.h"
+#include "wave3_runtime.h"
 
 static std::string ctlDispatch(const std::string& line) {
     JsonReq req;
     size_t i = 0;
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
+
+    if(waveCommand(cmd)) {
+        try {wave3::parse(line);}catch(const std::exception& ex){return ctlErr(ex.what());}
+        req.fields["wave3.raw"]=line;
+        return dispatchConfig(req);
+    }
+
+    // A lite pipe addresses one library window. The quick selector pins its dedicated pane;
+    // structural operations cannot silently fall through to the library underneath it.
+    if(req.fields.count("window")){
+        try{
+            auto root=wave3::parse(line);
+            if(req.get("window")=="quick"){
+                const bool surface=cmd=="session.type"||cmd=="session.write"||cmd=="session.output"||cmd=="session.text"||cmd=="session.copy"||cmd=="session.paste"||cmd=="surface.cursor"||cmd=="session.readonly"||cmd=="session.search"||cmd.rfind("selection.",0)==0;
+                const bool global=cmd=="ping"||cmd.rfind("config.",0)==0;
+                if(!surface&&!global)return ctlErr("quick window does not support this library operation");
+                if(surface){LockG hold;if(!g_quickSession||!g_quickHwnd||!IsWindowVisible(g_quickHwnd))return ctlErr("quick window is not open");
+                    const auto target=req.get("target");if(!target.empty()&&target!="active"&&target!=g_quickSession->id&&target!=g_quickSession->paneId)return ctlErr("target is not in quick window");
+                    req.fields["target"]=g_quickSession->paneId;}
+            }else waveWindow(root);
+        }catch(const std::exception& ex){return ctlErr(ex.what());}
+    }
 
     if (cmd == "omp.list") {
         std::string names;
@@ -9584,6 +9727,7 @@ static std::string ctlDispatch(const std::string& line) {
     // and the self-updater read the same updVersion(), so all three name the same build.
     if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
+        const auto shellHints=waveShellHints();
         // This runs on a control-pipe thread while another pipe thread's session.new can push_back
         // into g_sessions (a realloc frees the buffer this loop indexes) and session.rename can
         // reassign a name this loop reads. Both mutate under g_lock, so the walk holds it too.
@@ -9661,6 +9805,7 @@ static std::string ctlDispatch(const std::string& line) {
                 {
                     const Session* slot0 = (sh && s->swapped) ? sh : s;
                     const Session* slot1 = sh ? (s->swapped ? s : sh) : nullptr;
+                    sess+=",\"foregroundShells\":["+waveShellValue(slot0,shellHints)+(slot1?","+waveShellValue(slot1,shellHints):"")+"]";
                     if (slot0->overlay || (slot1 && slot1->overlay)) {
                         sess += ",\"paneOverlays\":[";
                         if (slot0->overlay) sess += std::string("\"") + paneWord(0) + "\"";
@@ -9689,11 +9834,15 @@ static std::string ctlDispatch(const std::string& line) {
                 // products; `paneIds` is present, in lite, exactly when the session's pane ids are
                 // not simply [id] (revmux r2).
                 else if (s->paneId != s->id) sess += ",\"paneIds\":[\"" + jsonEscape(s->paneId) + "\"]";
+                if(s->hud)sess+=",\"hud\":"+s->hud->json();
+                auto primaryHint=waveShellValue(s,shellHints);if(primaryHint!="null")sess+=",\"foregroundShell\":"+primaryHint;
+                if(sh){auto splitHint=waveShellValue(sh,shellHints);if(splitHint!="null")sess+=",\"splitForegroundShell\":"+splitHint;}
                 sess += "}";
             }
             wss += "{\"id\":\"" + std::to_string(w) + "\",\"name\":\"" + jsonEscape(narrow(g_workspaces[w])) +
                    "\",\"active\":" + (w == g_activeWs ? "true" : "false") +
                    ",\"focused\":" + (w == g_focusWs ? "true" : "false") +
+                   ",\"collapsed\":" + (g_collapsedWorkspaces.count(w) ? "true" : "false") +
                    ",\"sessions\":[" + sess + "]}";
         }
         return ctlOk("{\"workspaces\":[" + wss + "]}");
@@ -10477,6 +10626,10 @@ static std::string ctlDispatch(const std::string& line) {
         // resizeOverlay then does nothing, and the caller's next `resize` is refused truthfully.
         bool open = g_overlayHwnd != nullptr;
         if (action == "close") {
+            bool closedHud=false;
+            {LockG hold;if(target&&indexOfSession(target)>=0){auto* owner=splitOwnerOf(target);if(!owner)owner=target;
+                if(owner->hud){owner->hud.reset();closedHud=true;}}}
+            if(closedHud){InvalidateRect(g_hwnd,nullptr,FALSE);return ctlOkStr("closed");}
             if (!open) return ctlOkStr(kOverlayNone);   // idempotent: "no overlay open" is true afterwards
             {   // The exit the popup has NOW, written before the ack: a `result` right after
                 // "closed" reads it, not the value the posted WM_DESTROY has yet to write (revmux r1
@@ -10505,7 +10658,10 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlOkStr(overlaySizeIsPercent(rawMin) ? "resized " + std::to_string(effectivePct) + "%"
                                                          : "resized to " + overlaySizeReason(rawMin));
         }
-        auto* rq = new OverlayReq{ command, effectivePct };   // the number the reply names (see resize above)
+        std::string overlayOwner;
+        {LockG hold;if(target&&indexOfSession(target)>=0){auto* owner=splitOwnerOf(target);if(!owner)owner=target;if(!owner->hidden)overlayOwner=owner->id;}}
+        if(overlayOwner.empty())return ctlErr("overlay requires a live owning session");
+        auto* rq = new OverlayReq{ command, effectivePct, overlayOwner };   // the number the reply names (see resize above)
         if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was opened"); }
         setLastOverlayExit(kOverlayNone);   // the reset, before the ack (openOverlay's comment); the popup being replaced holds its own
         // A status word carrying the size IN EFFECT, not the overlay's session id: the session does
@@ -12131,8 +12287,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (!g_hwnd) fatal(L"could not create the main window");
     g_frame.SetWindowText(g_isDefaultInstance ? L"agliteterm"
                                               : (L"agliteterm \x2014 " + g_instance).c_str());
-    SetTimer(g_hwnd, kCaretTimer, kCaretBlinkMs, nullptr);   // the caret blink (the other is kRelayoutTimer, armed on demand)
+    SetTimer(g_hwnd, kCaretTimer, g_cursorBlinkMs, nullptr);
+    SetTimer(g_hwnd, kHudTimer, 50, nullptr);
     announceInstance(g_hwnd);   // visible to the other windows' window.* verbs
+    {std::string error;if(!setQuickHotkey(g_quickHotkey,false,error))logWarn("quick hotkey startup: %s",error.c_str());}
     g_frame.SetMenu(buildMenuBar());
     g_frame.SetIcon(g_appIcon, TRUE);    // VGA black+cyan terminal icon (window + taskbar)
     g_frame.SetIcon(g_appIconSm, FALSE);
@@ -12146,6 +12304,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                           TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_EDITLABELS,
                           WS_EX_CLIENTEDGE, (UINT)ID_TREE);
     g_tree = g_frame.m_tree;   // the rest of the file talks to the raw handle
+    if(HWND tip=TreeView_GetToolTips(g_tree))SendMessageW(tip,TTM_SETMAXTIPWIDTH,0,600);
     SetWindowSubclass(g_tree, treeProc, 1, 0);   // session drag & drop (own drag-detect loop)
     applyTreeFont();   // shell UI face at the saved size, not the stock bitmap font
     // g_treeItalic is built by applyTreeFont() alongside g_treeFont, so it tracks the sidebar size.

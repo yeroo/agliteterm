@@ -178,6 +178,7 @@ static std::string remainderOnUi(const JsonReq& req) {
           for (auto* s : g_sessions) s->ws = lite_remainder::remap(s->ws, from, to);
           for (auto& s : g_closedStack) s.ws = lite_remainder::remap(s.ws, from, to);
           g_activeWs = lite_remainder::remap(g_activeWs, from, to); g_focusWs = lite_remainder::remap(g_focusWs, from, to);
+          {std::set<int> next;for(int old:g_collapsedWorkspaces)next.insert(lite_remainder::remap(old,from,to));g_collapsedWorkspaces=std::move(next);}
         }
         emitEvent("tree"); refreshTree(false);
         if (!saveSessionState()) return ctlErr("workspace moved in memory, but state could not be saved");

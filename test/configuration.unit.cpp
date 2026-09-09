@@ -20,11 +20,11 @@ int main() {
         check(valid(key, key.initial), "default is valid");
         uint32_t out = 0x12345678;
         check(parse(key, format(key, key.initial), out) && out == key.initial, "default roundtrip");
-        check(!parse(key, "", out) && out == key.initial, "empty refuses without output mutation");
+        check(parse(key, "", out) == (key.kind == Kind::Hotkey) && out == key.initial, "empty only disables hotkey");
         check(!parse(key, "no-such-value", out), "unknown value refuses");
         check(!parse(key, std::string("1\0x", 3), out), "embedded NUL refuses");
     }
-    check(names.size() == 15 && registry.size() == 15, "all fifteen supported keys covered");
+    check(names.size() == 20 && registry.size() == 20, "all twenty supported keys covered");
     check(find("font-size") == nullptr && find("") == nullptr, "unsupported keys stay unsupported");
     check(normalized(" \tCoPy-On-SeLeCt\r\n") == "copy-on-select", "key normalization");
     auto probe = [](const char* key, const char* text, bool good, uint32_t expected) {
@@ -46,6 +46,18 @@ int main() {
     probe("scrollback-lines", "0", true, 0); probe("scrollback-lines", "1000000", true, 1000000);
     for (auto word : {"1000001", "4294967296", "99999999999999999999999999", "-1", "1e3"}) probe("scrollback-lines", word, false, 0);
     profiles::Catalog catalog; std::string error;
+    for(auto key:{"bar","beam","line"})probe("cursor-style",key,true,0);
+    for(auto key:{"block","box"})probe("cursor-style",key,true,1);
+    for(auto key:{"underline","underscore"})probe("cursor-style",key,true,2);
+    probe("cursor-blink","yes",true,1);probe("cursor-blink","no",true,0);
+    probe("cursor-blink-ms","2147483647",true,2147483647);probe("cursor-blink-ms","0",false,0);
+    probe("cursor-blink-ms","2147483648",false,0);
+    probe("quick-terminal-size","40",true,40);probe("quick-terminal-size","90",true,90);
+    probe("quick-terminal-size","39",false,0);probe("quick-terminal-size","91",false,0);
+    for(auto raw:{"ctrl+alt+backtick","alt+f11","ctrl+shift+a","ctrl+1"}){
+        uint32_t packed=0,again=0;check(parse(*find("quick-terminal-hotkey"),raw,packed)&&parse(*find("quick-terminal-hotkey"),format(*find("quick-terminal-hotkey"),packed),again)&&packed==again,"hotkey canonical roundtrip");
+    }
+    for(auto raw:{"ctrl+ctrl+a","shift+a","f5","win+a","ctrl+f12","ctrl++a","ctrl+a+","ctrl+a+b"})probe("quick-terminal-hotkey",raw,false,0);
     const std::string validProfile = R"({"default":"test","profiles":[{"name":"Test","command":"pwsh.exe","args":["","a b","x\\y","\"quoted\"","\ud83d\ude80"],"cwd":"C:\\work"}]})";
     check(profiles::parse(validProfile, catalog, error) && error.empty(), "valid profile catalog");
     check(catalog.find("TEST") && !catalog.find("Tes"), "profile names exact, ASCII case insensitive");
