@@ -22,13 +22,16 @@ P12 implements five existing agwinterm verbs without adding canonical contract s
   primary shell viewport, not its split/cover, and do not mark notices seen. Closed items are
   pruned. The dashboard refuses while popup terminals are visible; opening a popup closes it.
   Pipe-only `args.op="state"` returns `{open,selected,ids}` for automation.
+  Close cannot be combined with selectors; nonzero font-size refuses even with close.
 - `workspace move --to up|down|top|bottom --target ID`: atomically reorder and remap live/hidden
   sessions, active/focused workspace and reopen history. Numeric workspace IDs are order indices,
   so they change after a move; exact names beat unique substring matches, ambiguity refuses.
   Boundaries do nothing. Saved order follows the move; a failed save reports the in-memory change.
+  Workspace moves and opening the dashboard refuse during a menu or sidebar drag.
 - `restore clear`: remove only this instance's primary, `.bak` fallback and `.tmp` restore files.
   Older snapshots are fenced under the save lock; newer concurrent saves may require a retry.
-  No live session, pin or binding is changed. Later structural changes or normal exit save them
+  A per-instance `.cleared` marker prevents legacy-profile re-import when no state files remain.
+  No live session, pin or binding is changed. Later ordinary app saves, including normal exit, save them
   again: this is not a persistent restore-disable switch. Historical diagnostic files are not
   automatic fallback and are retained. Partial deletion reports the count and Windows errors.
 

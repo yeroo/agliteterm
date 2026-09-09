@@ -1,6 +1,7 @@
 #include "../src/remainder.h"
 #include <iostream>
 #include <set>
+#include <array>
 int main() {
     int checks = 0, failed = 0;
     auto check = [&](bool ok) { ++checks; if (!ok) ++failed; };
@@ -14,9 +15,9 @@ int main() {
         }
     }
     for (int n = 1; n <= 9; ++n) for (int from = 0; from < n; ++from) {
-        for (const auto& op : {"up","down","top","bottom","bad"}) {
+        for (const auto& op : {"up","down","top","bottom","bad",""}) {
             int to = lite_remainder::destination(from,n,op);
-            if (std::string(op)=="bad") { check(to==-1); continue; }
+            if (std::string(op)=="bad" || std::string(op).empty()) { check(to==-1); continue; }
             check(to>=0 && to<n); std::set<int> mapped;
             for (int i=0;i<n;++i) { const int out=lite_remainder::remap(i,from,to); mapped.insert(out);
                 check(out>=0 && out<n); check(lite_remainder::remap(out,to,from)==i); }
@@ -31,6 +32,11 @@ int main() {
     check(lite_remainder::navigate(0,0,40)==0);
     check(lite_remainder::navigate(2,3,39)==2);
     check(lite_remainder::navigate(1,3,40)==1);
+    // Expected successful and boundary transitions for each arrow, including a ragged last row.
+    for (const auto& c : {std::array<int,4>{1,9,37,0}, {0,9,37,0}, {0,9,39,1}, {2,9,39,2},
+                         {4,9,38,1}, {1,9,38,1}, {1,9,40,4}, {7,9,40,7},
+                         {3,5,39,4}, {4,5,39,4}, {2,5,40,2}, {4,5,38,1}})
+        check(lite_remainder::navigate(c[0],c[1],c[2])==c[3]);
     std::cout << "remainder: " << checks << " checks, " << failed << " failed\n";
     return failed ? 1 : 0;
 }

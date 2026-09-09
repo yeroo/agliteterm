@@ -36,7 +36,7 @@ try {
     if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){$skipReason='Existing lite/host: refusing isolated selection fixture';throw $skipReason}
     $clipboard=Save-SelectionClipboard "$script:selectionArtifact/clipboard-before.dpapi"
     $reg=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regPath)
-    $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
+    $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset','Key_Broadcast','Key_Dashboard')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
     $configDefaults=@{Theme=0;CustomColors=0;DefFg=0xC0C0C0;DefBg=0;DosPalette=1;SidebarFontPt=0;
         ShowSidebar=1;ShowToolbar=1;ShowStatus=1;FlagView=0;RightClickPaste=1;CopyOnCtrlC=1;
         CopyOnSelect=1;ScrollbackLines=5000;RestoreCommands=0}
@@ -45,7 +45,7 @@ try {
     if($reg){$reg.Dispose()};$geoSaved=$true
     $script:selectionRegistry|ConvertTo-Json -Depth 8|Set-Content "$script:selectionArtifact/registry-before.json"
     # Deterministic defaults, even if the user's dialog previously cleared/rebound these actions.
-    foreach($name in 'Key_MarkMode','Key_SelectAll'){Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}}
+    foreach($name in 'Key_MarkMode','Key_SelectAll','Key_Broadcast','Key_Dashboard'){Set-SelectionRegistry $name @{Exists=$false;Kind=0;Value=$null}}
     foreach($name in $configDefaults.Keys){Set-SelectionRegistry $name @{Exists=$true;Kind=4;Value=[int]$configDefaults[$name]}}
     Set-SelectionRegistry 'OmpTheme' @{Exists=$false;Kind=0;Value=$null}
     $profile=Join-Path $script:selectionArtifact profile;New-Item -ItemType Directory $profile|Out-Null

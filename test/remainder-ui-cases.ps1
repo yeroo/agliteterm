@@ -1,7 +1,12 @@
 # P12 only runs under selection-ui's token, redirected files and restoration guards.
 if(-not $script:selectionProc -or -not $clipboard){throw 'P12 requires guarded fixture'}
 '-- P12 guarded workspace and attention acceptance --'
-if(-not('P12Native' -as[type])){Add-Type -Name P12Native -Namespace '' -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();'}
+if(-not('P12Native' -as[type])){Add-Type -Name P12Native -Namespace '' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] static extern System.IntPtr SendMessageTimeoutW(System.IntPtr h,uint m,System.IntPtr w,System.IntPtr l,uint f,uint t,out System.IntPtr r);
+[System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool InvalidateRect(System.IntPtr h,System.IntPtr r,bool erase);
+public static void Redraw(System.IntPtr h,bool enabled) {System.IntPtr r;if(SendMessageTimeoutW(h,11,(System.IntPtr)(enabled?1:0),System.IntPtr.Zero,2,5000,out r)==System.IntPtr.Zero)throw new System.Exception("Owned redraw dispatch failed");if(enabled)InvalidateRect(h,System.IntPtr.Zero,false);}
+'@ }
 if(Get-Command Capture-P11Children -ErrorAction SilentlyContinue){Capture-P11Children}
 Stop-SelectionSandbox
 if(Get-Command Confirm-P11ChildrenExited -ErrorAction SilentlyContinue){Confirm-P11ChildrenExited}
@@ -33,12 +38,17 @@ function P12-Wait([scriptblock]$Condition,[int]$Seconds=20){
 function P12-Nodes {@((Selection-Rpc 'tree').workspaces|ForEach-Object{$_.sessions})}
 function P12-Node([string]$Id){P12-Nodes|Where-Object id -eq $Id|Select-Object -First 1}
 function P12-Sink([string]$Id){Join-Path $script:selectionArtifact ("input-$Id.txt")}
-function P12-Input([string]$Id){$file=P12-Sink $Id;if(Test-Path $file){[IO.File]::ReadAllText($file)}else{'NOT-READY'}}
+function P12-Input([string]$Id){
+    $file=P12-Sink $Id;if(-not(Test-Path $file)){return 'NOT-READY'}
+    $stream=[IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    $reader=[IO.StreamReader]::new($stream)
+    try{$reader.ReadToEnd()}finally{$reader.Dispose()}
+}
 function P12-Char([char]$Char){[void][LiteUi]::PostMessageW($h,0x102,[IntPtr][int]$Char,[IntPtr]::Zero);Start-Sleep -Milliseconds 150}
 function P12-Ready([string]$Id){if(-not(P12-Wait {(P12-Input $Id)-ne'NOT-READY'})){throw "P12 sink not ready: $Id"};Capture-P12Children}
 $catalogPath=Join-Path $profile 'agliteterm/profiles.json'
 $sinkRoot=$script:selectionArtifact.Replace("'","''")
-$setup="`$f=Join-Path '$sinkRoot' ('input-'+`$env:AGWINTERM_SESSION_ID+'.txt'); [IO.File]::WriteAllText(`$f,''); [Console]::Write('P12-SINK-READY'); while (`$true) { `$k=[Console]::ReadKey(`$true); [IO.File]::AppendAllText(`$f,([int]`$k.KeyChar).ToString()+',') }"
+$setup="Add-Type 'using System; using System.Runtime.InteropServices; public static class RawInput { [DllImport(`"kernel32.dll`")] static extern IntPtr GetStdHandle(int n); [DllImport(`"kernel32.dll`")] static extern bool GetConsoleMode(IntPtr h,out uint m); [DllImport(`"kernel32.dll`")] static extern bool SetConsoleMode(IntPtr h,uint m); public static void Enable() { uint m; var h=GetStdHandle(-10); if(!GetConsoleMode(h,out m)||!SetConsoleMode(h,(m & ~7u)|0x200u))throw new Exception(`"raw console input unavailable`"); } }'; [RawInput]::Enable(); `$f=Join-Path '$sinkRoot' ('input-'+`$env:AGWINTERM_SESSION_ID+'.txt'); [IO.File]::WriteAllText(`$f,''); [Console]::Write('P12-SINK-READY'); `$inputBytes=[Console]::OpenStandardInput(); while (`$true) { `$k=`$inputBytes.ReadByte(); if(`$k-lt0){break}; [IO.File]::AppendAllText(`$f,`$k.ToString()+',') }"
 @{default='P12';profiles=@(@{name='P12';command='powershell.exe';args=@('-NoLogo','-NoProfile','-Command',$setup);cwd=$script:selectionArtifact})}|ConvertTo-Json -Depth 8|Set-Content $catalogPath -Encoding utf8
 Start-SelectionSandbox $Exe $profile;$h=$script:selectionHwnd;$g=Selection-Geometry
 $a=[string](P12-Nodes|Select-Object -First 1).id;P12-Ready $a
@@ -101,7 +111,7 @@ $inputBefore=P12-Input $a
 P12-Char 'X';[LiteUi]::Chord($h,[int][char]'V',$false);[SelectionUi]::Wheel($h,($g.Left+40),($g.Top+40),1)
 [SelectionUi]::Button($h,0x204,($g.Left+40),($g.Top+40));[SelectionUi]::Button($h,0x205,($g.Left+40),($g.Top+40))
 Check 'dashboard captures characters paste wheel and right mouse' ((P12-Input $a)-ceq$inputBefore)
-foreach($args_ in @(@{ids="$a,missing"},@{ids="$a,$a"},@{ids="$a,"},@{'font-size'=12},@{close='yes'},@{op='typo'})){
+foreach($args_ in @(@{ids="$a,missing"},@{ids="$a,$a"},@{ids="$a,"},@{'font-size'=12},@{close='yes'},@{op='typo'},@{close=$true;ids='missing'},@{close=$true;'font-size'=12})){
     $r=Selection-Rpc 'dashboard' $args_ -AllowError
     Check 'invalid dashboard request preserves current grid' (-not$r.ok -and ((Selection-Rpc 'dashboard' @{op='state'}).ids-join',')-ceq"$a,$b")
 }
@@ -114,13 +124,28 @@ Check 'dashboard Escape closes without switching' (-not(Selection-Rpc 'dashboard
 $null=Selection-Rpc 'dashboard' @{ids="$a,$b"}
 [SelectionUi]::Button($h,0x201,($g.Left+35),($g.Top+40));[SelectionUi]::Button($h,0x202,($g.Left+35),($g.Top+40))
 Check 'dashboard click activates first tile' ((P12-Wait {(P12-Node $a).active}) -and -not(Selection-Rpc 'dashboard' @{op='state'}).open)
+Write-Screen ($esc+'[?1003h'+$esc+'[?1006h') $a
+$mouseBefore=P12-Input $a
+[SelectionUi]::Button($h,0x200,($g.Left+70),($g.Top+70))
+Check 'mouse-report sink is live before activation guard check' (P12-Wait {$bytes=P12-Input $a;$bytes-cne$mouseBefore -and $bytes.EndsWith('77,')})
+$mouseBefore=P12-Input $a
+$null=Selection-Rpc 'dashboard' @{ids="$a,$b"};$null=Shot 'p12-activation-grid'
+[SelectionUi]::Button($h,0x201,($g.Left+35),($g.Top+40))
+Check 'dashboard activation owns capture until release' ([SelectionUi]::Capture($h)-eq$h)
+[SelectionUi]::Button($h,0x200,($g.Left+75),($g.Top+75))
+[SelectionUi]::Button($h,0x202,($g.Left+75),($g.Top+75))
+Start-Sleep -Milliseconds 200
+Check 'dashboard activation consumes drag and release' ((P12-Input $a)-ceq$mouseBefore)
+Check 'dashboard activation releases capture' ([SelectionUi]::Capture($h)-eq[IntPtr]::Zero)
+Write-Screen ($esc+'[?1003l'+$esc+'[?1006l') $a
 
 $noticeCursor=(Selection-Rpc 'events').cursor
 $foreground=[P12Native]::GetForegroundWindow()
 $r=Selection-Rpc 'notify' @{title=('Long title '+('x'*200));body='P12 notice — 漢字'} $b
 Check 'notify returns in-app delivery and creates badge' ($r-like'notified*' -and (P12-Node $b).unread-ge1)
 Check 'notify does not steal foreground' ([P12Native]::GetForegroundWindow()-eq$foreground)
-Check 'notify event retains exact target/body' (@((Selection-Rpc 'events' @{since=$noticeCursor}).events|Where-Object{$_.type-eq'notification' -or $_.kind-eq'notification'}).Count-gt0)
+$noticeEvents=@((Selection-Rpc 'events' @{since=$noticeCursor}).events|Where-Object{$_.type-eq'notification'})
+Check 'notify event retains exact target/body' ($noticeEvents.Count-eq1 -and $noticeEvents[0].session-ceq$b -and $noticeEvents[0].info-ceq(('Long title '+('x'*200))+': P12 notice — 漢字'))
 $r=Selection-Rpc 'notify' @{body='bad'} 'missing' -AllowError
 Check 'notify missing target refuses' (-not$r.ok)
 $r=Selection-Rpc 'notify' @{body=('x'*4097)} $b -AllowError
@@ -132,6 +157,12 @@ $cr=[SelectionUi]::Rect($h);$status=[SelectionUi]::ChildRect($h,'msctls_statusba
 $noticeY=$cr.Bottom-($status.Bottom-$status.Top)-30
 [SelectionUi]::Button($h,0x201,($g.Left+30),$noticeY);[SelectionUi]::Button($h,0x202,($g.Left+30),$noticeY)
 Check 'banner click selects exact target and clears badge' ((P12-Wait {(P12-Node $b).active}) -and (P12-Node $b).unread-eq0)
+$null=Selection-Rpc 'notify' @{body='Keep until MRU commit'} $a
+$null=Selection-Rpc 'session.switch' @{op='begin'}
+for($walk=0;$walk-lt3 -and -not(P12-Node $a).active;$walk++){$null=Selection-Rpc 'session.switch' @{op='advance'}}
+Check 'MRU preview preserves target notice' ((P12-Node $a).active -and (P12-Node $a).unread-ge1)
+$null=Selection-Rpc 'session.switch' @{op='commit'}
+Check 'MRU commit clears selected target notice' ((P12-Node $a).unread-eq0)
 
 # Reorder preserves live membership and focused/active workspace identity, including persistence.
 $null=Selection-Rpc 'workspace.select' @{} $w2
@@ -142,6 +173,8 @@ Check 'workspace top reorders actual tree' ($tree.workspaces[0].name-eq'P12-two'
 Check 'workspace reorder preserves memberships' (@($tree.workspaces[0].sessions|Where-Object id -eq $c).Count-eq1 -and @($tree.workspaces[1].sessions|Where-Object id -eq $a).Count-eq1)
 $r=Selection-Rpc 'workspace.move' @{dir='typo'} '0' -AllowError
 Check 'bad workspace direction refuses unchanged' (-not$r.ok -and (Selection-Rpc 'tree').workspaces[0].name-eq'P12-two')
+$r=Selection-Rpc 'workspace.move' @{} '0' -AllowError
+Check 'missing workspace direction refuses unchanged' (-not$r.ok -and (Selection-Rpc 'tree').workspaces[0].name-eq'P12-two')
 $r=Selection-Rpc 'workspace.move' @{dir='top'} '999999999999999999' -AllowError
 Check 'overflowing workspace selector refuses' (-not$r.ok)
 $null=Selection-Rpc 'workspace.move' @{dir='bottom'} 'P12-two'
@@ -151,14 +184,46 @@ $state=Join-Path $profile ("agliteterm/sessions-$script:selectionPipe.tsv")
 Check 'workspace order persisted' ((Get-Content $state|Where-Object{$_-like"W`t*"})-join'|' -ceq "W`tP12-one|W`tP12-two")
 
 Start-Sleep -Milliseconds 500
+New-Item -ItemType Directory "$state.cleared" | Out-Null
+try {
+    $r=Selection-Rpc 'restore.clear' @{} -AllowError
+    Check 'unavailable clear marker refuses before deleting state' (-not$r.ok -and (Test-Path $state))
+} finally {Remove-Item -LiteralPath "$state.cleared"} # exact empty directory created by this fixture
+$blockedBackup=[IO.File]::Open("$state.bak",[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
+try {
+    $r=Selection-Rpc 'restore.clear' @{} -AllowError
+    Check 'locked backup reports partial clear failure' (-not$r.ok -and $r.error-like'*partial failure*' -and (Test-Path "$state.bak") -and -not(Test-Path $state))
+} finally {$blockedBackup.Dispose()}
 $null=Selection-Rpc 'restore.clear'
 Check 'restore clear removes primary backup and temp only' (-not(Test-Path $state) -and -not(Test-Path "$state.bak") -and -not(Test-Path "$state.tmp") -and (Test-Path $catalogPath))
+Check 'restore clear retains legacy re-import barrier' (Test-Path "$state.cleared" -PathType Leaf)
 Check 'restore clear leaves all live sessions' ((P12-Nodes).Count-eq3)
 Check 'restore clear is idempotent' ((Selection-Rpc 'restore.clear')-eq'no restore state')
 $null=Selection-Rpc 'session.rename' @{name='P12-B-after-clear'} $b
 Check 'later structural save recreates state as documented' (P12-Wait {Test-Path $state})
-$null=Selection-Rpc 'dashboard' @{ids="$a,$b"};Capture-P12Children
-$null=Selection-Rpc 'session.close' @{} $b
-Check 'dashboard prunes a closed session safely' ((P12-Wait {((Selection-Rpc 'dashboard' @{op='state'}).ids-join',')-ceq$a}))
+$null=Selection-Rpc 'session.select' @{} $a
+$null=Selection-Rpc 'dashboard' @{ids="$a,$b,$c"};$null=Shot 'p12-before-prune';Capture-P12Children
+[P12Native]::Redraw($h,$false)
+try {
+    $null=Selection-Rpc 'session.close' @{} $b
+    Check 'dashboard prunes a closed middle session safely' ((P12-Wait {((Selection-Rpc 'dashboard' @{op='state'}).ids-join',')-ceq"$a,$c"}))
+    [SelectionUi]::Button($h,0x201,([int](($g.Left+$g.Right)/2)+35),($g.Top+40))
+    [SelectionUi]::Button($h,0x202,([int](($g.Left+$g.Right)/2)+35),($g.Top+40))
+    Check 'stale dashboard rectangle cannot activate the next session' ((Selection-Rpc 'dashboard' @{op='state'}).open -and (P12-Node $a).active)
+} finally {[P12Native]::Redraw($h,$true)}
 $null=Selection-Rpc 'dashboard' @{close=$true}
+$null=Selection-Rpc 'workspace.move' @{dir='top'} 'P12-two'
+[void][LiteUi]::PostMessageW($h,0x111,[IntPtr]122,[IntPtr]::Zero) # actual Reopen Closed menu command (no default chord)
+Check 'reopen history follows its workspace after reorder' (P12-Wait {
+    $tree=Selection-Rpc 'tree'
+    @($tree.workspaces|Where-Object name -eq 'P12-one'|ForEach-Object{$_.sessions}|Where-Object name -eq 'P12-B-after-clear').Count-eq1
+})
+$reopened=P12-Nodes|Where-Object name -eq 'P12-B-after-clear'|Select-Object -First 1
+if(-not $reopened){throw 'P12 reopen did not produce expected session'}
+P12-Ready $reopened.id
+$newSplit=[string](Selection-Rpc 'session.split' @{op='on'} $reopened.id);P12-Ready $newSplit
+$null=Selection-Rpc 'session.select' @{} $a
+$null=Selection-Rpc 'notify' @{body='Survive pane promotion'} $reopened.id
+$null=Selection-Rpc 'session.split.close' @{} $reopened.id
+Check 'split promotion retains the logical session notification' ((P12-Node $reopened.id).unread-ge1)
 Capture-P12Children

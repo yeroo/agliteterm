@@ -2,12 +2,14 @@
 // All dashboard/banner state is UI-owned; session/workspace reads hold g_lock.
 static void pruneDashboard() {
     LockG hold;
+    const auto previous = g_dashIds;
     const auto selected = g_dashSelected < static_cast<int>(g_dashIds.size()) ? g_dashIds[g_dashSelected] : "";
     g_dashIds.erase(std::remove_if(g_dashIds.begin(), g_dashIds.end(), [](const std::string& id) {
         const int at = indexOfSessionId(id); return at < 0 || g_sessions[at]->hidden;
     }), g_dashIds.end());
     auto found = std::find(g_dashIds.begin(), g_dashIds.end(), selected);
     g_dashSelected = found == g_dashIds.end() ? 0 : static_cast<int>(found - g_dashIds.begin());
+    if (g_dashIds != previous) { g_dashCells.clear(); InvalidateRect(g_hwnd,nullptr,FALSE); }
     if (g_dashIds.empty()) g_dashboard = false;
 }
 static void selectRemainderSession(const std::string& id) {
@@ -125,6 +127,17 @@ static std::string clearRestoreState() {
     { LockG hold; stamp = ++g_saveStamp; }
     struct SaveHold { SaveHold() { EnterCriticalSection(&g_saveLock); } ~SaveHold() { LeaveCriticalSection(&g_saveLock); } } hold;
     if (g_savePublished > stamp) return ctlErr("restore clear: a newer save overtook this request; nothing cleared; retry");
+    // Durable per-instance evidence that absence is intentional, not an untouched legacy profile.
+    const auto marker = path + L".cleared";
+    HANDLE receipt = CreateFileW(marker.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if (receipt != INVALID_HANDLE_VALUE) {
+        const bool durable = FlushFileBuffers(receipt) != FALSE; CloseHandle(receipt);
+        if (!durable) return ctlErr("restore clear: intent marker could not be flushed; no state files removed");
+    } else {
+        const DWORD why = GetLastError(), attrs = GetFileAttributesW(marker.c_str());
+        if (why != ERROR_FILE_EXISTS || attrs == INVALID_FILE_ATTRIBUTES || (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
+            return ctlErr("restore clear: intent marker unavailable; no state files removed");
+    }
     // Fence older snapshots even on partial failure. Never nest the state lock inside the I/O lock.
     g_savePublished = stamp;
     int removed = 0; std::string failures;
@@ -140,6 +153,13 @@ static std::string clearRestoreState() {
 }
 static std::string remainderOnUi(const JsonReq& req) {
     const auto& cmd = req.get("cmd");
+    if (cmd == "workspace.move" || (cmd == "dashboard" && req.get("args.op") != "state" && req.get("args.close") != "true")) {
+        GUITHREADINFO gui{sizeof(gui)};
+        if (!GetGUIThreadInfo(GetCurrentThreadId(), &gui) ||
+            (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE)) ||
+            g_treeDrag || gui.hwndCapture == g_tree)
+            return ctlErr(cmd + ": finish the menu or sidebar drag first; unchanged");
+    }
     if (cmd == "broadcast") {
         bool next;
         if (!lite_remainder::toggle(req.get("args.op"), g_broadcast, next)) return ctlErr("broadcast: expected on/off/toggle/state/get; unchanged");
@@ -158,7 +178,7 @@ static std::string remainderOnUi(const JsonReq& req) {
           for (auto& s : g_closedStack) s.ws = lite_remainder::remap(s.ws, from, to);
           g_activeWs = lite_remainder::remap(g_activeWs, from, to); g_focusWs = lite_remainder::remap(g_focusWs, from, to);
         }
-        emitEvent("tree"); refreshTree();
+        emitEvent("tree"); refreshTree(false);
         if (!saveSessionState()) return ctlErr("workspace moved in memory, but state could not be saved");
         return ctlOkStr("moved");
     }
@@ -189,8 +209,11 @@ static std::string remainderOnUi(const JsonReq& req) {
         }
         if (!req.get("args.op").empty()) return ctlErr("dashboard: unknown op; unchanged");
         if (req.fields.count("args.close") && req.get("args.close") != "true" && req.get("args.close") != "false") return ctlErr("dashboard: close must be boolean");
-        if (req.get("args.close") == "true") { g_dashboard = false; g_dashCells.clear(); InvalidateRect(g_hwnd,nullptr,FALSE); return ctlOkStr("dashboard closed"); }
         if (!req.get("args.font-size").empty() && req.get("args.font-size") != "0") return ctlErr("dashboard: lite uses fixed-strike previews; font-size unsupported");
+        if (req.get("args.close") == "true") {
+            if (!req.get("args.ids").empty()) return ctlErr("dashboard: close cannot be combined with selectors; unchanged");
+            g_dashboard = false; g_dashCells.clear(); InvalidateRect(g_hwnd,nullptr,FALSE); return ctlOkStr("dashboard closed");
+        }
         if ((g_quickHwnd && IsWindowVisible(g_quickHwnd)) || (g_scratchHwnd && IsWindowVisible(g_scratchHwnd)) ||
             (g_overlayHwnd && IsWindowVisible(g_overlayHwnd))) return ctlErr("dashboard: close popup terminals first");
         std::vector<std::string> ids;

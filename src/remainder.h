@@ -14,7 +14,7 @@ inline bool toggle(const std::string& op, bool current, bool& next) {
 inline int destination(int from, int count, const std::string& dir) {
     if (from < 0 || from >= count) return -1;
     if (dir == "up") return (std::max)(0, from - 1);
-    if (dir.empty() || dir == "down") return (std::min)(count - 1, from + 1);
+    if (dir == "down") return (std::min)(count - 1, from + 1);
     if (dir == "top") return 0;
     if (dir == "bottom") return count - 1;
     return -1;

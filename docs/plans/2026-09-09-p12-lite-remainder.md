@@ -23,7 +23,8 @@ reviewers are Codex-only. No release/tag, canonical contract expansion or image 
   Ctrl+Shift+D split binding rather than silently reassigning it.
 - `restore.clear`: remove only this instance's saved state and automatic fallback/temp files,
   serialized against saves, fencing older snapshots. Keep live panes, pins and bindings unchanged.
-  Later structural changes/normal exit may save them again; this is not a close-all or permanent
+  Retain a per-instance clear-intent marker to prevent legacy re-import. Later ordinary app saves
+  may save them again; this is not a close-all or permanent
   disable operation. Report partial filesystem failures honestly, and never clear other instances.
 - `workspace.move`: up/down/top/bottom, resolved and applied atomically, updating every workspace
   index (including hidden sessions, active/focused workspace and saved state). Invalid or ambiguous

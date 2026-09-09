@@ -236,6 +236,12 @@ static void migrateFromLegacy() {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((cur + L"\\sessions*.tsv").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) { haveNew = true; FindClose(h); }
+    // Explicit clearing still means this profile was initialized. Otherwise removing its last
+    // state file would silently re-import old sessions AND overwrite preferences from legacy HKCU.
+    if (!haveNew) {
+        h = FindFirstFileW((cur + L"\\sessions*.tsv.cleared").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) { haveNew = true; FindClose(h); }
+    }
     if (haveNew) { logInfo("migrate: agliteterm state already present - legacy state left untouched"); return; }
 
     int files = 0;
@@ -2721,12 +2727,15 @@ static void closeSessionAt(int idx) {
     // ...and the other direction: a split shell that dies on its own (the user typed exit in it)
     // must not leave its owner pointing at nothing.
     for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
-    if (!cs->hidden) {   // remember the launch spec so it can be reopened (skip transient split/popup shells)
+    killSession(cs);
+    EnterCriticalSection(&g_lock);
+    idx = indexOfSession(cs); // host I/O above allowed another client to unlist/shift sessions
+    if (idx < 0) { LeaveCriticalSection(&g_lock); return; }
+    if (!cs->hidden) {   // snapshot + append ordered atomically against workspace.move
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
         g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args, cs->context });
     }
-    killSession(g_sessions[idx]);
-    EnterCriticalSection(&g_lock);
+    const Session* previousPrimary = displayedOwner();
     // Taken BEFORE the erase: the split pane's shell is hidden (never persisted, never in the tree)
     // but it is on screen in this window, so it still counts against "the window is empty". After the
     // erase the pane fixup below can repoint a pane at ANY surviving session — including a quick
@@ -2743,6 +2752,8 @@ static void closeSessionAt(int idx) {
     }
     if (g_sessions.empty()) g_pane[1] = -1;   // unsplit when the last pane dies
     resolveSplitForPrimary();                // pane 1 follows whichever session pane 0 now shows
+    auto* primary = displayedOwner();
+    if (primary && primary != previousPrimary) primary->notifications = 0;
     // "Emptied" means NOTHING IS LEFT ON SCREEN IN THIS WINDOW, which is neither the raw session
     // count nor the save's count. The save writes only non-hidden sessions, so a quick/scratch popup
     // (its own window) keeps g_sessions non-empty while the save sees zero — judged by the raw vector
@@ -2776,9 +2787,11 @@ static void closeSessionAt(int idx) {
 
 // Reopen the most recently closed session, relaunched with its remembered profile + cwd.
 static void reopenClosed() {
-    if (g_closedStack.empty()) return;
-    ClosedSpec sp = g_closedStack.back(); g_closedStack.pop_back();
-    if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws;
+    ClosedSpec sp;
+    { LockG hold;
+      if (g_closedStack.empty()) return;
+      sp = g_closedStack.back(); g_closedStack.pop_back();
+      if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws; }
     int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                             sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
@@ -2870,6 +2883,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->context = owner->context;
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
+            survivor->notifications = owner->notifications;
             survivor->horizontal = owner->horizontal;  // kept for the next `split on`
             survivor->splitRatio = owner->splitRatio;
             survivor->hidden = false;
@@ -5612,7 +5626,7 @@ static void updateStatus() {
 }
 // Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
 // UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
-static void refreshTree() {
+static void refreshTree(bool persist = true) {
     if (!g_tree) return;
     // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
     // here inline on a control-pipe thread, driving the UI thread's TreeView by cross-thread
@@ -5698,7 +5712,7 @@ static void refreshTree() {
     g_treeSyncing = false;
     }   // g_lock released
     updateStatus();
-    if (!g_restoring) saveSessionState();   // persist the workspace/session structure on every change
+    if (persist && !g_restoring) saveSessionState();   // callers may explicitly save once and report its result
 }
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
@@ -7570,8 +7584,8 @@ public:
         return TRUE;
     }
     void OnLButtonDown(UINT, CPoint pt) {
-        if (noticeClick(pt)) { g_attentionLeftUp = true; g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); return; }
-        if (g_dashboard) { g_attentionLeftUp = true; g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); dashboardClick(pt); return; }
+        if (noticeClick(pt)) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); return; }
+        if (g_dashboard) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); dashboardClick(pt); return; }
         if (inSplitter(pt.x, pt.y)) { g_splitDrag = true; SetCapture(); return; }   // grab the sidebar splitter
         if (g_palette) {   // click an item to run it; click anywhere else to dismiss
             if (PtInRect(&g_palList, POINT{ pt.x, pt.y })) {
@@ -7598,7 +7612,7 @@ public:
         SetFocus();
     }
     void OnLButtonDblClk(UINT, CPoint pt) {
-        if (GetTickCount64() < g_attentionDoubleUntil) { g_attentionLeftUp = true; return; }
+        if (GetTickCount64() < g_attentionDoubleUntil) { g_attentionLeftUp = true; SetCapture(); return; }
         if (g_dashboard) return;
         if (g_palette || inSplitter(pt.x, pt.y)) return;
         int pane;
@@ -7615,10 +7629,11 @@ public:
         SetFocus();
     }
     LRESULT OnCaptureChanged(UINT, WPARAM, LPARAM lp, BOOL&) {
-        if ((HWND)lp != m_hWnd) cancelDrag(m_hWnd);
+        if ((HWND)lp != m_hWnd) { g_attentionLeftUp = false; cancelDrag(m_hWnd); }
         return 0;
     }
     void OnMouseMove(UINT nFlags, CPoint pt) {
+        if (g_attentionLeftUp) return; // activation click still owns its drag/release sequence
         if (g_dashboard) return;
         if (g_splitDrag) {   // the splitter resizes the LEFT pane (the sidebar); terminal takes the rest
             RECT c; GetClientRect(&c);
@@ -7636,7 +7651,7 @@ public:
         if (nFlags & MK_LBUTTON) extendSelection(m_hWnd, pt.x, pt.y);
     }
     void OnLButtonUp(UINT, CPoint pt) {
-        if (g_attentionLeftUp) { g_attentionLeftUp = false; return; }
+        if (g_attentionLeftUp) { g_attentionLeftUp = false; if (GetCapture() == m_hWnd) ReleaseCapture(); return; }
         if (g_dashboard) return;
         if (g_splitDrag) { g_splitDrag = false; ReleaseCapture(); saveSidebarWidth(); return; }
         if (g_selWindow == m_hWnd) finishSelection(m_hWnd);
@@ -9448,8 +9463,11 @@ and keymap `dashboard` action open it; existing split shortcuts are unchanged. P
 returns open/selected/ids. Hidden/popup selectors, duplicate IDs and unavailable targets refuse.
 `workspace move --to up|down|top|bottom --target ID` preserves membership and active/focused identity;
 numeric workspace IDs remain order indices and change after a move. Names resolve exactly or uniquely.
+Workspace moves and dashboard opening refuse during menus or sidebar drags. Dashboard close cannot
+be combined with selectors, and nonzero font-size refuses even with close.
 `restore clear` removes only this instance's primary/backup/temp restore files, NOT live sessions,
-pins or bindings. Later structure changes or normal exit save them again. Failures report partial work.
+pins or bindings. A .cleared marker prevents legacy re-import; later ordinary app saves or normal exit
+save live state again. Failures report partial work.
 
 ## What this terminal does NOT have
 
@@ -9857,7 +9875,10 @@ static std::string ctlDispatch(const std::string& line) {
             } else if (op == "cancel") {
                 if (g_walk.active) pick = g_walk.startId;
                 g_walk = {};
-            } else { g_walk = {}; touchMruLocked(displayedOwner()); }
+            } else {
+                g_walk = {}; touchMruLocked(displayedOwner());
+                if (auto* primary = displayedOwner()) primary->notifications = 0;
+            }
             int idx = op == "cancel" ? visibleIndex(pick) : liveIndex(pick);
             if (idx >= 0) {
                 g_pane[0] = idx; g_focus = 0;
