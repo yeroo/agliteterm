@@ -609,11 +609,11 @@ static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices 
 // Caret state. A terminal cursor has to say two things: "input lands here" (blink) and "this window
 // has focus" (solid vs hollow). lite drew a static invert regardless, so switching sessions or
 // windows gave no cue at all that typing had moved. kCaretBlinkMs matches the main app's default
-// cursor-blink-ms. Caret runs always; relayout and selection-autoscroll timers run on demand.
+// cursor-blink-ms. Caret and HUD timers run continuously; relayout and selection run on demand.
 static bool g_winFocused = true;      // frame has keyboard focus (solid caret) vs not (hollow)
 static bool g_caretOn = true;         // blink phase
 static const UINT_PTR kCaretTimer = 1;
-// The relayout retry (see hostResize) — lite's SECOND timer, beside the caret blink. A ONE-SHOT
+// The relayout retry (see hostResize) is a ONE-SHOT
 // timer, not a posted message: a posted retry
 // outranks paint and input and re-posts itself from its own handler, so while a control-pipe thread
 // held g_resizeLock the UI thread spun at 100 % CPU painting nothing and accepting no keystrokes —
@@ -2391,12 +2391,13 @@ static void touchMruLocked(Session* s) {
     g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), s->id), g_mru.end());
     g_mru.insert(g_mru.begin(), s->id);
 }
-static void selectPrimary(int idx) {
+static void selectPrimary(int idx, bool activateWorkspace = true, Session* expected = nullptr) {
     {
         LockG hold;
+        if (expected) idx = indexOfSession(expected);
         if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
         g_pane[0] = idx;
-        g_activeWs = g_sessions[idx]->ws;
+        if (activateWorkspace) g_activeWs = g_sessions[idx]->ws;
         g_focus = 0;
         g_sessions[idx]->notifications = 0;
         touchMruLocked(g_sessions[idx]);
@@ -2406,7 +2407,7 @@ static void selectPrimary(int idx) {
 }
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
-                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false) {
+                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false) {
     profiles::Entry defaultProfile;
     if (!app) {
         const auto catalog = profileSnapshot();
@@ -2511,7 +2512,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
@@ -5535,7 +5536,7 @@ static void runKbAction(int a) {
         case KB_DASHBOARD: { JsonReq r; r.fields["cmd"] = "dashboard"; if (g_dashboard) r.fields["args.close"] = "true"; remainderOnUi(r); break; }
     }
 }
-static bool handleKeyDown(WPARAM vk) {
+static bool handleKeyDown(WPARAM vk, bool repeat = false) {
     if (g_dashboard) return dashboardKey(vk);
     endMarkModeIfMoved();
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
@@ -5572,7 +5573,10 @@ static bool handleKeyDown(WPARAM vk) {
         BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
         WORD combo = MAKEWORD((BYTE)vk, mods);
         if (customKey(combo)) return true;
-        if (mods) for (int a = 0; a < KB_COUNT; a++) if (g_keys[a] == combo) { runKbAction(a); return true; }
+        if (mods) for (int a = 0; a < KB_COUNT; a++) if (g_keys[a] == combo) {
+            if (a != KB_QUICK || !repeat) runKbAction(a);
+            return true;
+        }
     }
 
     // Ctrl+C with a selection COPIES; with nothing selected it falls straight through and the shell
@@ -5692,6 +5696,15 @@ static void refreshTree(bool persist = true) {
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return;
     }
+    // A program popup belongs to its captured session, not the current selection. Close it
+    // outside g_lock; destruction unlists its hidden shell and performs host I/O.
+    bool orphaned = false;
+    { LockG hold;
+      if (g_overlayHwnd && !g_overlayOwnerId.empty()) {
+          orphaned = true;
+          for (auto* s : g_sessions) if (!s->hidden && s->id == g_overlayOwnerId) { orphaned = false; break; }
+      } }
+    if (orphaned) DestroyWindow(g_overlayHwnd);
     {
     // Held for the rebuild only: this walks g_sessions and reads names that pipe threads mutate
     // under g_lock. updateStatus and saveSessionState below each take the lock themselves (the
@@ -6796,7 +6809,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             g_focusOverride = s;
-            g_swallowChar = handleKeyDown(w);
+            g_swallowChar = handleKeyDown(w, (l & (1LL << 30)) != 0);
             InvalidateRect(h, nullptr, FALSE);
             if (g_swallowChar) return 0;
             break;
@@ -6864,7 +6877,9 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             cancelDrag(h);
             Session** slot = (h == g_overlayHwnd) ? &g_overlaySession
                            : (h == g_scratchHwnd) ? &g_scratchSession : (h == g_quickHwnd) ? &g_quickSession : nullptr;
-            if (slot) {   // kill the transient window's session + clear its state
+            Session* retired = nullptr;
+            if (slot) {   // Atomic pointer-based unlist; never carry an unlocked vector index.
+                LockG hold;
                 if (g_focusOverride == *slot) g_focusOverride = nullptr;
                 // The popup's exit status, read off its marks BEFORE the session is killed (P5):
                 // `exit N` when the command completed, else the window-wide value stays as it was.
@@ -6873,13 +6888,27 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     std::string e = overlayExitOf(*slot);
                     if (!e.empty()) setLastOverlayExit(e);
                 }
-                if (*slot)
-                    for (int i = 0; i < (int)g_sessions.size(); i++)
-                        if (g_sessions[i] == *slot) { closeSessionAt(i); break; }
+                auto found = std::find(g_sessions.begin(), g_sessions.end(), *slot);
+                if (found != g_sessions.end()) {
+                    retired = *found;
+                    int index = (int)(found - g_sessions.begin());
+                    if (g_sel.sess == retired) g_sel.clear();
+                    emitEvent("session", retired->id, "closed");
+                    g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), retired->id), g_mru.end());
+                    g_sessions.erase(found);
+                    for (int p = 0; p < 2; ++p) {
+                        if (g_pane[p] == index) g_pane[p] = -1;
+                        else if (g_pane[p] > index) --g_pane[p];
+                    }
+                    emitEvent("tree");
+                }
                 *slot = nullptr;
                 if (h == g_overlayHwnd) {g_overlayHwnd = nullptr;g_overlayOwnerId.clear();}
                 else if(h==g_quickHwnd){g_quickHwnd=nullptr;g_quickPinned=false;}else g_scratchHwnd = nullptr;
             }
+            // Popup EOF never closes the library, even when it was the last shell.
+            if (retired) killSession(retired);
+            PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
             return 0;
         }
     }
@@ -7078,14 +7107,19 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
     std::vector<std::string> cargs{ "-NoExit", "-Command", overlayCommandLine(command) };   // P5: the FTCS-wrapped line, both slots' one command line
-    g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs);
+    g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
     if (!g_overlaySession) {
         logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
         DestroyWindow(g_overlayHwnd);   // WM_DESTROY clears g_overlayHwnd; a later `resize` is refused truthfully
         return;
     }
-    g_overlaySession->hidden = true; g_overlaySession->name = L"overlay";
-    {LockG hold;g_overlayOwnerId=ownerId;for(auto* s:g_sessions)if(!s->hidden&&s->id==ownerId)s->hud.reset();}
+    bool ownerAlive = false;
+    { LockG hold;
+      g_overlaySession->name = L"overlay";
+      for (auto* s : g_sessions) if (!s->hidden && s->id == ownerId) {
+          ownerAlive = true; g_overlayOwnerId = ownerId; s->hud.reset(); break;
+      } }
+    if (!ownerAlive) { DestroyWindow(g_overlayHwnd); return; }
     if (showPopupRaised(g_overlayHwnd)) g_focusOverride = g_overlaySession;   // see showPopupRaised
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);
 }
@@ -7351,11 +7385,12 @@ static void toggleFocusWs(int w) {
 // Configuration work is owned by a queue, not by a raw LPARAM. A timed-out caller can safely
 // leave while the UI finishes. Pending cancellation wins before any side effect; a running
 // timeout explicitly makes no promise about the result. Never wait here while holding g_lock.
+#include "ui_request.h"
 struct ConfigRequest {
     JsonReq request;
     std::string result;
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    std::atomic<int> state{0}; // pending, running, done, cancelled
+    ui_request::State state;
     ~ConfigRequest() { if (done) CloseHandle(done); }
 };
 static std::mutex g_configMutex;
@@ -7487,16 +7522,14 @@ static void drainConfigRequests() {
     std::deque<std::shared_ptr<ConfigRequest>> requests;
     { std::lock_guard<std::mutex> guard(g_configMutex); requests.swap(g_configRequests); }
     for (auto& call : requests) {
-        int pending = 0;
-        if (!call->state.compare_exchange_strong(pending, 1)) continue;
+        if (!call->state.start()) continue;
         try { call->result = configOnUi(call->request); }
         catch (...) { call->result = ctlErr("configuration request failed; outcome unknown; read back the setting"); }
         if(call->request.get("cmd")=="pick.open") {
-            int running=1;
-            if(!call->state.compare_exchange_strong(running,2)) {
+            call->state.publishPicker([&] {
                 try {auto reply=wave3::parse(call->result);if(wave3::boolean(reply,"ok")){auto* result=wave3::field(reply,"result");if(result)abortPicker(wave3::text(*result,"id",true));}}catch(...){logWarn("withdrawn picker rollback failed");}
-            }
-        } else call->state = 2;
+            });
+        } else call->state.finish();
         SetEvent(call->done);
     }
 }
@@ -7513,12 +7546,8 @@ static std::string dispatchConfig(const JsonReq& req) {
     }
     const bool picker= req.get("cmd")=="pick.open";
     if (WaitForSingleObject(call->done, picker?10000:5000) == WAIT_OBJECT_0) return call->result;
-    int pending = 0; bool cancelled = call->state.compare_exchange_strong(pending, 3);
-    if(picker&&!cancelled){
-        if(pending==2)return call->result;
-        int running=1;cancelled=call->state.compare_exchange_strong(running,3);
-        if(!cancelled&&running==2)return call->result;
-    }
+    bool cancelled = picker ? call->state.withdraw() : call->state.withdrawPending();
+    if (call->state.completed()) return call->result;
     {
         std::lock_guard<std::mutex> guard(g_configMutex);
         g_configRequests.erase(std::remove(g_configRequests.begin(), g_configRequests.end(), call), g_configRequests.end());
@@ -7650,10 +7679,10 @@ public:
         if (chr == L'\r') { sendBytes("\r", 1); return; }
         sendUtf8((wchar_t)chr);
     }
-    LRESULT OnKey(UINT, WPARAM wp, LPARAM, BOOL& bHandled) {
+    LRESULT OnKey(UINT, WPARAM wp, LPARAM lp, BOOL& bHandled) {
         if (g_treeDrag && wp == VK_ESCAPE) { endTreeDrag(false, { 0, 0 }); return 0; }   // cancel the drag
         // Reset per keydown; if a binding handled it, swallow the WM_CHAR TranslateMessage emits.
-        g_swallowChar = handleKeyDown(wp);
+        g_swallowChar = handleKeyDown(wp, (lp & (1LL << 30)) != 0);
         if (g_swallowChar) return 0;
         bHandled = FALSE;   // unhandled: let DefWindowProc do its thing (menu keys etc.)
         return 0;
@@ -8779,7 +8808,7 @@ static Session* resolveTarget(const std::string& target, std::string* why = null
     for (Session* s : g_sessions)
         if (s->paneId == target) return s;
     for (Session* s : g_sessions)
-        if (target.size() >= 4 && (s->id.compare(0, target.size(), target) == 0 ||
+        if (!s->hidden && target.size() >= 4 && (s->id.compare(0, target.size(), target) == 0 ||
                                    s->paneId.compare(0, target.size(), target) == 0)) return s;
 
     std::wstring wanted = widen(target);
@@ -9649,6 +9678,15 @@ static std::string ctlDispatch(const std::string& line) {
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
 
+    if (cmd == "config.set" && req.get("args.key") == "quick-terminal-hotkey") {
+        try {
+            auto root = wave3::parse(line);
+            const auto* args = wave3::field(root, "args");
+            if (!args) return ctlErr("config.set requires string args.value");
+            wave3::text(*args, "value", true);
+        } catch (const std::exception& ex) { return ctlErr(ex.what()); }
+    }
+
     if(waveCommand(cmd)) {
         try {wave3::parse(line);}catch(const std::exception& ex){return ctlErr(ex.what());}
         req.fields["wave3.raw"]=line;
@@ -9976,7 +10014,7 @@ static std::string ctlDispatch(const std::string& line) {
                       : (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size() ? g_activeWs : 0);
             }
         }
-        selectPrimary((int)g_sessions.size() - 1);
+        selectPrimary(-1, false, s); // caller placement must not change active workspace
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr(s->id);
     }
@@ -10659,7 +10697,20 @@ static std::string ctlDispatch(const std::string& line) {
                                                          : "resized to " + overlaySizeReason(rawMin));
         }
         std::string overlayOwner;
-        {LockG hold;if(target&&indexOfSession(target)>=0){auto* owner=splitOwnerOf(target);if(!owner)owner=target;if(!owner->hidden)overlayOwner=owner->id;}}
+        { LockG hold;
+          Session* shell = target;
+          if (tgt.empty() || tgt == "active") {
+              // Surface resolution may point at a pane cover or the existing program popup.
+              if (shell == g_overlaySession) {
+                  for (auto* s : g_sessions) if (!s->hidden && s->id == g_overlayOwnerId) { shell = s; break; }
+              } else {
+                  for (auto* s : g_sessions) if (s->overlay == shell) { shell = s; break; }
+              }
+          }
+          if (shell && indexOfSession(shell) >= 0) {
+              auto* owner = splitOwnerOf(shell); if (!owner) owner = shell;
+              if (!owner->hidden) overlayOwner = owner->id;
+          } }
         if(overlayOwner.empty())return ctlErr("overlay requires a live owning session");
         auto* rq = new OverlayReq{ command, effectivePct, overlayOwner };   // the number the reply names (see resize above)
         if (!PostMessageW(g_hwnd, WM_APP_OVERLAY, OVL_OPEN, (LPARAM)rq)) { delete rq; return ctlErr("the window is closing; nothing was opened"); }

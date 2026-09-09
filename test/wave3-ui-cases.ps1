@@ -23,12 +23,12 @@ public static class WaveUi {
  public static void Text(IntPtr h,string text){IntPtr r;if(SendMessageTimeoutW(h,12,IntPtr.Zero,text,2,5000,out r)==IntPtr.Zero)throw new Exception("Set owned text timed out");}
 }
 '@}
-function Wave-Set([string]$Key,[string]$Value,[string]$Registry,[int]$Stored){
+function Wave-Set([string]$Key,[string]$ConfigText,[string]$Registry,[int]$Stored){
     $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
     $prior=$script:selectionRegistry[$Registry].Expected
     try{Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
         {param($n) Read-RegistryGuardValue $regKey $n} `
-        {param($n,$state) $null=Wave-Rpc 'config.set' @{key=$Key;value=$Value}}
+        {param($n,$state) $null=Wave-Rpc 'config.set' @{key=$Key;value=$ConfigText}}
     }catch{if(Test-RegistryGuardValue (Read-RegistryGuardValue $regKey $Registry) $prior){$script:selectionRegistry[$Registry].Expected=$prior};throw
     }finally{$regKey.Dispose()}
 }
@@ -38,13 +38,24 @@ $waveProfile=Join-Path $script:selectionArtifact 'wave3-profile';New-Item -ItemT
 Start-SelectionSandbox $Exe $waveProfile
 $h=$script:selectionHwnd;$g=Selection-Geometry
 $owner=@((Wave-Rpc 'tree').workspaces.sessions)[0].id
+function Wave-HudPixels([string]$Name,[bool]$Bottom) {
+    $left=$g.Left; $top=$g.Top
+    if($Bottom){$left=$g.Right-220;$top=$g.Bottom-110}
+    $pixels=Selection-Capture $h $Name $left $top 220 110
+    return @($pixels|Where-Object {($_ -band 0xFFFFFF) -eq 0x123456}).Count
+}
+Check 'HUD paint fixture has no accent pixels' ((Wave-HudPixels 'p17-hud-before-bottom' $true) -eq 0 -and (Wave-HudPixels 'p17-hud-before-top' $false) -eq 0)
 $beforeForeground=[WaveUi]::GetForegroundWindow()
 $hud=Wave-Rpc 'session.hud.open' @{message="Cafe$([char]0x301)";detail='detail';spinner='dot';position='bottom-right';color='#123456';'size-percent'=40} $owner
-Check 'HUD NFC normalization and typed readback' ($hud.hud.message -eq "Caf$([char]0xE9)" -and $hud.hud.position -eq 'bottom-right' -and $hud.hud.backgroundColor -eq '123456' -and $hud.hud.sizePercent -eq 40)
+Check 'HUD NFC normalization and typed readback' ($hud.hud.message -eq "Caf$([char]0xE9)" -and $hud.hud.position -eq 'bottom-right' -and $hud.hud.backgroundColor -eq '#123456' -and $hud.hud.sizePercent -eq 40)
 Check 'HUD is passive' ([WaveUi]::GetForegroundWindow() -eq $beforeForeground)
+Check 'HUD paints at bottom-right' ((Wave-HudPixels 'p17-hud-open-bottom' $true) -gt 100)
 foreach($position in 'top-left','top-center','top-right','center-left','center','center-right','bottom-left','bottom-center','bottom-right'){
     $updated=Wave-Rpc 'session.hud.update' @{message=$position;position=$position} $owner
-    Check "HUD anchor $position" ($updated.hud.position -eq $position -and $updated.hud.backgroundColor -eq '123456')
+    Check "HUD anchor $position" ($updated.hud.position -eq $position -and $updated.hud.backgroundColor -eq '#123456')
+    if($position -eq 'top-left'){
+        Check 'HUD update moves pixels to top-left and clears prior anchor' ((Wave-HudPixels 'p17-hud-update-top' $false) -gt 100 -and (Wave-HudPixels 'p17-hud-update-bottom' $true) -eq 0)
+    }
 }
 foreach($bad in @(@{message=''},@{message="bad`nline"},@{message='x';spinner='bad'},@{message='x';position='bad'},@{message='x';'size-percent'=0},@{message='x';color='red'},@{message='x';unknown=$true})){
     Check 'HUD rejects invalid input without closing existing HUD' (Wave-Rpc 'session.hud.open' $bad $owner -Refusal)
@@ -52,6 +63,7 @@ foreach($bad in @(@{message=''},@{message="bad`nline"},@{message='x';spinner='ba
 Check 'HUD appears in tree' ([bool](@((Wave-Rpc 'tree').workspaces.sessions)|Where-Object id -eq $owner).hud)
 $null=Wave-Rpc 'session.overlay' @{action='close'} $owner
 Check 'generic overlay close dismisses HUD' (-not (@((Wave-Rpc 'tree').workspaces.sessions)|Where-Object id -eq $owner).hud)
+Check 'HUD close removes its pixels' ((Wave-HudPixels 'p17-hud-close-bottom' $true) -eq 0 -and (Wave-HudPixels 'p17-hud-close-top' $false) -eq 0)
 Check 'HUD update without HUD refuses' (Wave-Rpc 'session.hud.update' @{message='missing'} $owner -Refusal)
 Check 'foreign window selector refuses' (Wave-Rpc 'ping' @{} '' 'p17-not-this-window' -Refusal)
 
@@ -110,10 +122,32 @@ Check 'workspace expand tree state' (-not (@((Wave-Rpc 'tree').workspaces)|Where
 Check 'workspace bad direction refuses' (Wave-Rpc 'workspace.go' @{to='sideways'} -Refusal)
 Check 'tree includes pane-ordered conservative shell hints' ((@((Wave-Rpc 'tree').workspaces.sessions)|Where-Object id -eq $owner).PSObject.Properties.Name -contains 'foregroundShells')
 
+# A program overlay must disappear with its captured owner, not whichever row is selected later.
+$popupOwner=Wave-Rpc 'session.new' @{name='P17 popup owner'}
+$null=Wave-Rpc 'session.overlay' @{action='open';command="[Console]::WriteLine('P17-OVERLAY'); while (`$true) { Start-Sleep 1 }"} $popupOwner
+$program=[IntPtr]::Zero;$deadline=[DateTime]::UtcNow.AddSeconds(20)
+do{$program=[SelectionUi]::Window($script:selectionProc.Id,'AgwintermLitePopup');if($program -ne [IntPtr]::Zero){break};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $deadline)
+Check 'program popup lifetime fixture opened' ($program -ne [IntPtr]::Zero)
+$null=Wave-Rpc 'session.select' @{} $owner
+$null=Wave-Rpc 'session.close' @{} $popupOwner
+$deadline=[DateTime]::UtcNow.AddSeconds(20)
+while([WaveUi]::IsWindowVisible($program) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
+Check 'closing recorded owner closes its program popup' ($program -ne [IntPtr]::Zero -and -not [WaveUi]::IsWindowVisible($program))
+Check 'program popup owner close preserves another session' ([bool](@((Wave-Rpc 'tree').workspaces.sessions)|Where-Object id -eq $owner))
+
+$beforeQuickForeground=[WaveUi]::GetForegroundWindow()
 $null=Wave-Rpc 'quick' @{op='on'};$quick=[SelectionUi]::Window($script:selectionProc.Id,'AgwintermLitePopup')
-Check 'quick API show is visible and nonactivating' ($quick -ne [IntPtr]::Zero -and [WaveUi]::GetForegroundWindow() -eq $beforeForeground)
+Check 'quick API show is visible and nonactivating' ($quick -ne [IntPtr]::Zero -and [WaveUi]::IsWindowVisible($quick) -and [WaveUi]::GetForegroundWindow() -eq $beforeQuickForeground)
 Check 'quick omitted from library tree' (-not (@((Wave-Rpc 'tree').workspaces.sessions)|Where-Object {$_.id -like 'quick:*'}))
 Check 'quick library mutation refuses' (Wave-Rpc 'session.new' @{} '' 'quick' -Refusal)
+$quickReady=$false;$deadline=[DateTime]::UtcNow.AddSeconds(30)
+do {
+    $quickText=[string](Wave-Rpc 'session.text' @{} '' 'quick')
+    if($quickText -match '(?m)^PS [^\r\n]*>'){$quickReady=$true;break}
+    Start-Sleep -Milliseconds 200
+}while([DateTime]::UtcNow -lt $deadline)
+Check 'quick shell prompt ready before display fixture' $quickReady
+if(-not $quickReady){throw 'Quick shell prompt did not become ready'}
 $null=Wave-Rpc 'session.write' @{text=([string][char]27+'[2J'+[char]27+'[HP17-QUICK-RETAIN')} '' 'quick'
 Check 'explicit quick window routes content' ((Wave-Rpc 'session.text' @{} '' 'quick') -match 'P17-QUICK-RETAIN')
 $null=Wave-Rpc 'quick' @{op='off'}
@@ -124,8 +158,15 @@ $null=Wave-Rpc 'quick' @{op='off'}
 Check 'quick off hides popup' (-not [WaveUi]::IsWindowVisible($quick))
 Check 'cursor defaults readable' ((Wave-Rpc 'config.get' @{key='cursor-style'}) -eq 'bar' -and (Wave-Rpc 'config.get' @{key='cursor-blink-ms'}) -eq '530')
 Check 'quick default size and disabled hotkey readable' ((Wave-Rpc 'config.get' @{key='quick-terminal-size'}) -eq '70' -and (Wave-Rpc 'config.get' @{key='quick-terminal-hotkey'}) -eq '')
-foreach($bad in @(@{key='cursor-style';value='circle'},@{key='cursor-blink-ms';value='0'},@{key='quick-terminal-size';value='91'},@{key='quick-terminal-hotkey';value='win+k'})){
+$settingRegistry=@{'cursor-style'='CursorStyle';'cursor-blink-ms'='CursorBlinkMs';'quick-terminal-size'='QuickTerminalSize';'quick-terminal-hotkey'='QuickTerminalHotkey'}
+foreach($bad in @(@{key='cursor-style';value='circle'},@{key='cursor-blink-ms';value='0'},@{key='quick-terminal-size';value='91'},@{key='quick-terminal-hotkey';value='win+k'},@{key='quick-terminal-hotkey'},@{key='quick-terminal-hotkey';value=@{}},@{key='quick-terminal-hotkey';value=@()},@{key='quick-terminal-hotkey';value=$null})){
+    $priorConfig=Wave-Rpc 'config.get' @{key=$bad.key}
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    try{$priorRegistry=Read-RegistryGuardValue $regKey $settingRegistry[$bad.key]}finally{$regKey.Dispose()}
     Check 'invalid Wave3 setting refuses unchanged' (Wave-Rpc 'config.set' $bad -Refusal)
+    Check 'invalid setting preserves live value' ((Wave-Rpc 'config.get' @{key=$bad.key}) -ceq $priorConfig)
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    try{Check 'invalid setting preserves registry value' (Test-RegistryGuardValue (Read-RegistryGuardValue $regKey $settingRegistry[$bad.key]) $priorRegistry)}finally{$regKey.Dispose()}
 }
 foreach($style in @(@('block',1),@('underline',2),@('bar',0))){
     Wave-Set 'cursor-style' $style[0] 'CursorStyle' $style[1]
@@ -139,6 +180,10 @@ Wave-Set 'cursor-blink-ms' '530' 'CursorBlinkMs' 530
 if($env:CI -eq 'true'){
     # Registration only on a disposable desktop. No real global key injection is used.
     Wave-Set 'quick-terminal-hotkey' 'ctrl+alt+f10' 'QuickTerminalHotkey' 0x379
+    foreach($malformed in @(@{key='quick-terminal-hotkey'},@{key='quick-terminal-hotkey';value=@{}},@{key='quick-terminal-hotkey';value=@()},@{key='quick-terminal-hotkey';value=$null})){
+        Check 'malformed hotkey request refuses while binding enabled' (Wave-Rpc 'config.set' $malformed -Refusal)
+        Check 'malformed hotkey request does not clear enabled binding' ((Wave-Rpc 'config.get' @{key='quick-terminal-hotkey'}) -eq 'ctrl+alt+f10')
+    }
     $reserved=[WaveUi]::RegisterHotKey([IntPtr]::Zero,0x713,0x4003,0x7A)
     try{
         Check 'hotkey conflict fixture reserves distinct candidate' $reserved
@@ -147,4 +192,15 @@ if($env:CI -eq 'true'){
         Check 'hotkey conflict preserves prior binding' ((Wave-Rpc 'config.get' @{key='quick-terminal-hotkey'}) -eq 'ctrl+alt+f10')
     }finally{if($reserved){[void][WaveUi]::UnregisterHotKey([IntPtr]::Zero,0x713)}}
     Wave-Set 'quick-terminal-hotkey' '' 'QuickTerminalHotkey' 0
+    # Only disposable CI submits a shell command (to this fixture's dedicated quick pane).
+    $null=Wave-Rpc 'quick' @{op='on'}
+    $quick=[SelectionUi]::Window($script:selectionProc.Id,'AgwintermLitePopup')
+    $null=Wave-Rpc 'session.type' @{text="exit`r"} '' 'quick'
+    $deadline=[DateTime]::UtcNow.AddSeconds(20)
+    while([WaveUi]::IsWindowVisible($quick) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
+    Check 'quick EOF destroys the old popup' (-not [WaveUi]::IsWindowVisible($quick))
+    Check 'quick EOF leaves library alive' ([bool](Wave-Rpc 'ping'))
+    $null=Wave-Rpc 'quick' @{op='on'}
+    Check 'quick after EOF starts a fresh shell without old display marker' ((Wave-Rpc 'session.text' @{} '' 'quick') -notmatch 'P17-QUICK-RETAIN')
+    $null=Wave-Rpc 'quick' @{op='off'}
 }

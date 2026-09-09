@@ -64,7 +64,14 @@ jobs:
       - name: Check the contract against agwinterm
         shell: pwsh
         # Bootstrap only until canonical PR #272 merges; restore main URL before shipping.
-        run: ./tools/check-contract.ps1 -Url https://raw.githubusercontent.com/yeroo/agwinterm/e0541fa/tests/conformance/control-api.json
+        run: ./tools/check-contract.ps1 -Url https://raw.githubusercontent.com/yeroo/agwinterm/7c3357f48026cdf8bca945a1352edaf1bbc740fc/tests/conformance/control-api.json
+
+      - name: Wave 3 acceptance (guarded disposable desktop)
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          AGWINTERMCTL: ${{ github.workspace }}\bin\agwintermctl.exe
+        run: ./test/selection-ui.ps1 -Wave3Only -Strict
 
       # The checks agwinterm's CI never ran — they drive the BUILT exe (lite has no C++ unit-test
       # harness), so they only ever ran on a developer machine. Making them a merge gate is the
@@ -78,3 +85,11 @@ jobs:
         env:
           AGWINTERMCTL: ${{ github.workspace }}\bin\agwintermctl.exe
         run: ./test/run-all.ps1 -Strict
+
+      - name: Upload failed guarded acceptance artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarded-acceptance-failure
+          path: .revmux/selection-ui-*/
+          retention-days: 3
