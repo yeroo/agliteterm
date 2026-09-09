@@ -129,15 +129,16 @@ static std::string clearRestoreState() {
     if (g_savePublished > stamp) return ctlErr("restore clear: a newer save overtook this request; nothing cleared; retry");
     // Durable per-instance evidence that absence is intentional, not an untouched legacy profile.
     const auto marker = path + L".cleared";
-    HANDLE receipt = CreateFileW(marker.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-    if (receipt != INVALID_HANDLE_VALUE) {
-        const bool durable = FlushFileBuffers(receipt) != FALSE; CloseHandle(receipt);
-        if (!durable) return ctlErr("restore clear: intent marker could not be flushed; no state files removed");
-    } else {
-        const DWORD why = GetLastError(), attrs = GetFileAttributesW(marker.c_str());
-        if (why != ERROR_FILE_EXISTS || attrs == INVALID_FILE_ATTRIBUTES || (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
-            return ctlErr("restore clear: intent marker unavailable; no state files removed");
-    }
+    HANDLE receipt = CreateFileW(marker.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if (receipt == INVALID_HANDLE_VALUE) return ctlErr("restore clear: intent marker unavailable; no state files removed");
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool regular = GetFileInformationByHandle(receipt, &info) &&
+        !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    // Existing markers may be leftovers from an unsuccessful flush. Revalidate/flush every attempt.
+    const bool durable = regular && FlushFileBuffers(receipt) != FALSE;
+    CloseHandle(receipt);
+    if (!durable) return ctlErr("restore clear: intent marker could not be flushed; no state files removed");
     // Fence older snapshots even on partial failure. Never nest the state lock inside the I/O lock.
     g_savePublished = stamp;
     int removed = 0; std::string failures;

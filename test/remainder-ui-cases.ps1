@@ -201,6 +201,13 @@ Check 'restore clear leaves all live sessions' ((P12-Nodes).Count-eq3)
 Check 'restore clear is idempotent' ((Selection-Rpc 'restore.clear')-eq'no restore state')
 $null=Selection-Rpc 'session.rename' @{name='P12-B-after-clear'} $b
 Check 'later structural save recreates state as documented' (P12-Wait {Test-Path $state})
+$heldMarker=[IO.File]::Open("$state.cleared",[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+try {
+    $r=Selection-Rpc 'restore.clear' @{} -AllowError
+    Check 'existing marker must reopen for flushing before clear' (-not$r.ok -and (Test-Path $state))
+} finally {$heldMarker.Dispose()}
+$null=Selection-Rpc 'restore.clear'
+Check 'clear retries successfully after marker can be flushed' (-not(Test-Path $state) -and (Test-Path "$state.cleared" -PathType Leaf))
 $null=Selection-Rpc 'session.select' @{} $a
 $null=Selection-Rpc 'dashboard' @{ids="$a,$b,$c"};$null=Shot 'p12-before-prune';Capture-P12Children
 [P12Native]::Redraw($h,$false)
