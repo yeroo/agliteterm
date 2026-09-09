@@ -47,6 +47,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   **attention bell** that lights amber and jumps to the next blocked session, **flagged
   sessions** with a flagged-only view, **unread badges** (commands finished while a session was
   off-screen), workspace focus, sidebar **drag & drop**.
+- **Workspace attention**: opt-in keyboard broadcast, clickable notifications, fixed-strike live
+  dashboard previews, workspace reordering and explicit saved-state clearing. See
+  [behavior and safety boundaries](docs/workspace-attention.md).
 - **Terminals**: workspaces + sessions with restore, a 2-pane split (left/right or top/bottom,
   either side closable, the two swappable), quick / scratch / overlay
   popup terminals, a **pane overlay** — a command drawn over ONE pane's box, badged `overlay`,
