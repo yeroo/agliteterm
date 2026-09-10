@@ -10,6 +10,7 @@ function Send-Raw([string]$json){
 }
 function Nodes { @((Selection-Rpc 'tree').workspaces | ForEach-Object {$_.sessions}) }
 . "$PSScriptRoot/driving-cases.ps1"
+. "$PSScriptRoot/focus-status-ui-cases.ps1"
 
 # A private one-line sink: success proves payload delivery, never shell execution of that payload.
 $pasteFile=Join-Path $script:selectionArtifact 'paste-sink.txt'
