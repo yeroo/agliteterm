@@ -12,6 +12,7 @@ $shells=@((Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe
 $pwsh=(Get-Command pwsh -ErrorAction SilentlyContinue).Source
 if($pwsh){$shells+=$pwsh}elseif($Strict){throw 'PowerShell 7 required'}
 $cases=@(
+    @{command='Write-Output $s';profile='$s=''profile-visible''';code=0;text='profile-visible';exact='profile-visible'},
     @{command='$e="";$b="";$q=$false;$c=91;Write-Output COLLISION';code=0;text='COLLISION'},
     @{command='Write-Output "quoted ☃" # trailing comment';code=0;text='quoted'},
     @{command='"dangling';code=1;text='';error='terminator'},
@@ -33,7 +34,8 @@ foreach($shell in $shells){foreach($case in $cases){
     # Keep -Command parsing (the real host mode), not a second -EncodedCommand that could hide quoting bugs.
     $start=[Diagnostics.ProcessStartInfo]::new($shell);$start.UseShellExecute=$false;$start.CreateNoWindow=$true
     $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
-    $start.Arguments='-NoProfile -NonInteractive -Command "'+$wrapper+'"'
+    $prefix=if($case.profile){$case.profile+';'}else{''}
+    $start.Arguments='-NoProfile -NonInteractive -Command "'+$prefix+$wrapper+'"'
     $child=[Diagnostics.Process]::Start($start)
     try{
         $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
