@@ -31,6 +31,17 @@ $cases=@(
     @{command='Write-Error "failure" -ErrorAction Continue; return 42';code=1;text='42'},
     @{command='Write-Error "failure" -ErrorAction Continue; Write-Output recovered; return';code=0;text='recovered'},
     @{command='cmd.exe /d /c exit 7; return';code=7;text=''},
+    @{command='using namespace System.Text; [Encoding]::UTF8.WebName';code=0;text='utf-8';exact='utf-8'},
+    @{command='param($x=42) $x';code=0;text='42';exact='42'},
+    @{command='[CmdletBinding()]param($x=42) $x';code=0;text='42';exact='42'},
+    @{command='param() Write-Error failure -ErrorAction Continue;return';code=1;text=''},
+    @{command='begin {Write-Output BEGIN} process {Write-Output PROCESS} end {Write-Output END}';code=0;text='PROCESS'},
+    @{command='end {Write-Output END} begin <# { #> {Write-Output BEGIN}';code=0;text='END'},
+    @{command='dynamicparam { [Management.Automation.RuntimeDefinedParameterDictionary]::new() } end {42}';code=0;text='42';exact='42'},
+    @{command='begin {} end {Write-Error failure -ErrorAction Continue;return}';code=1;text=''},
+    @{command='trap {continue}; throw "handled"';code=1;text=''},
+    @{command='param()';code=0;text=''},
+    @{command='using namespace System.Text';code=0;text=''},
     @{command='cmd.exe /d /c exit 7';code=7;text=''},
     @{command='Write-Output ordinary';code=0;text='ordinary'}
     @{command=('Write-Output ''LONG-CONTEXT-OK''; # '+('context '*80));code=0;text='LONG-CONTEXT-OK';fits=$true}
