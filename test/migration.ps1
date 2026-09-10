@@ -15,6 +15,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot\ctl-path.ps1"
 . "$PSScriptRoot\owned-procs.ps1"
@@ -31,7 +33,7 @@ function Write-State([string]$Path, [string[]]$Lines) {
 $started = @()   # every window this run launched, for the teardown: the only ones it may stop
 $born = @{}      # pid -> start time, read while the window is alive (an exited Process may refuse it)
 function Start-Lite([string]$inst, [string]$root) {
-    $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru -Environment @{ LOCALAPPDATA = $root }
+    $p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $inst) -PassThru -Environment @{ LOCALAPPDATA = $root }
     Pin-Owned $p; $script:started += $p; $script:born[$p.Id] = $p.StartTime   # pinned: its exit bounds the host it spawned
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
@@ -42,7 +44,7 @@ function Start-Lite([string]$inst, [string]$root) {
 function Stop-Lite($p) {
     $p.CloseMainWindow() | Out-Null
     for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $p.Refresh(); if ($p.HasExited) { break } }
-    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    if (-not $p.HasExited) { $p.Kill() }
     Start-Sleep -Seconds 1
 }
 

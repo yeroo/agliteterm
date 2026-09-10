@@ -2,7 +2,12 @@
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly,[switch]$RemainderOnly,[switch]$Wave3Only,[switch]$ClipboardOnly)
 $ErrorActionPreference='Stop'
+. "$PSScriptRoot/test-registry-path.ps1"
 if($ClipboardOnly -and ($env:GITHUB_ACTIONS-ne 'true' -or (Test-Path 'C:/Users/boris/AI/bin/suite-token.py'))){throw 'Clipboard paste acceptance is disposable GitHub CI only; a suite token does not exclude unrelated clipboard writers'}
+if($DrivingOnly -or $RemainderOnly -or -not ($DrivingOnly -or $ConfigurationOnly -or $ShellConfigurationOnly -or $AgentIntegrationOnly -or $RemainderOnly -or $Wave3Only -or $ClipboardOnly)){
+    . "$PSScriptRoot/suite-policy.ps1"
+    Assert-LiteSuitePolicy @('selection-ui') # empty-clipboard fallback and dashboard paste acceptance
+}
 if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent+[int]$Wave3Only.IsPresent+[int]$ClipboardOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
@@ -26,7 +31,7 @@ if(Test-Path $hub){
 }elseif($env:CI -ne 'true'){Skip-Selection 'shared suite-token helper absent; no local interactive tests ran'}
 $script:selectionPipe='p7sel'+[guid]::NewGuid().ToString('N').Substring(0,10)
 $script:selectionProc=$null;$script:selectionHosts=@();$script:selectionLaunched=$false;$script:checks=0;$script:failures=0
-$clipboard=$null;$geoSaved=$false;$script:selectionRegistry=@{};$cleanupOk=$true;$regPath='Software\agliteterm';$skipReason=$null
+$clipboard=$null;$geoSaved=$false;$script:selectionRegistry=@{};$cleanupOk=$true;$regPath=Get-LiteTestRegistryPath;$skipReason=$null
 function Check([string]$name,[bool]$ok,[string]$detail=''){$script:checks++;if($ok){"PASS $name"}else{$script:failures++;"FAIL $name : $detail"}}
 try {
     . "$PSScriptRoot/selection-ui-env.ps1"
@@ -34,7 +39,8 @@ try {
     & "$PSScriptRoot/selection-ui-cleanup.unit.ps1"
     & "$PSScriptRoot/selection-ui-snapshot.unit.ps1"
     # Token excludes other cooperating suites, not the user's app. Do not adopt/stop a shared host.
-    if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){$skipReason='Existing lite/host: refusing isolated selection fixture';throw $skipReason}
+    if($env:AGLITETERM_TEST_RUN){. "$PSScriptRoot/suite-context.ps1";Assert-LiteSuiteContext}
+    elseif(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){$skipReason='Existing lite/host: refusing isolated selection fixture';throw $skipReason}
     $clipboard=Save-SelectionClipboard "$script:selectionArtifact/clipboard-before.dpapi"
     $reg=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regPath)
     $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset','Key_Broadcast','Key_Dashboard','Key_Quick','Key_NextWorkspace','Key_PreviousWorkspace','Key_WorkspaceCollapse')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})

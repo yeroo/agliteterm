@@ -13,6 +13,10 @@
 # Returns $null when none is present, so a caller can skip with a clear message instead of failing
 # with "the term 'agwintermctl.exe' is not recognized" fifty times.
 function Get-CtlPath {
+    if($env:AGLITETERM_TEST_RUN){
+        if(-not $env:AGLITETERM_TEST_CTL -or -not (Test-Path -LiteralPath $env:AGLITETERM_TEST_CTL)){throw 'Missing namespace forwarding adapter; use run-all supervisor'}
+        return $env:AGLITETERM_TEST_CTL
+    }
     $candidates = @(
         $env:AGWINTERMCTL,
         (Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\agwintermctl.exe'),

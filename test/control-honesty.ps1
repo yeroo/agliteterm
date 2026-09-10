@@ -20,6 +20,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
+. "$PSScriptRoot/suite-policy.ps1"
+Assert-LiteSuitePolicy @('control-honesty')
 $fail = 0
 $skipped = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
@@ -30,7 +34,7 @@ function Skip([string]$name, [string]$why) { $script:skipped++; "  SKIP  $name �
 
 "== control-honesty =="
 
-. "$PSScriptRoot\ui-lib.ps1"
+. "$PSScriptRoot/selection-ui-env.ps1"
 . "$PSScriptRoot\owned-procs.ps1"
 $ctl = Get-CtlPath
 if (-not $ctl) { "  SKIP  agwintermctl not found (set AGWINTERMCTL)"; exit ($Strict ? 1 : 0) }
@@ -209,7 +213,7 @@ function Nodes { Tree | ForEach-Object workspaces | ForEach-Object sessions }
 # CLI would never send (a JSON string, a float, a boolean) is a lite fact, and only a raw line
 # can pin it.
 function Send-Raw([string]$json) {
-    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $s.Pipe, [System.IO.Pipes.PipeDirection]::InOut)
+    $c = [IO.Pipes.NamedPipeClientStream]::new('.',(Get-LiteTestPipe $s.Pipe),[IO.Pipes.PipeDirection]::InOut)
     try {
         $c.Connect(3000)
         $enc = New-Object System.Text.UTF8Encoding($false)
@@ -221,11 +225,10 @@ function Send-Raw([string]$json) {
     } finally { $c.Dispose() }
 }
 
-# HKCU is NOT isolated by the sandbox (ui-lib's rules): the instance loads SidebarW/ShowSidebar
-# from the real profile and every set, hide and show below writes them back. Both are saved here
-# and put back in `finally`, whatever the checks did with them — and a value that was absent is
-# removed again, not written as a default.
-$regKey = 'HKCU:\Software\agliteterm'
+# The supervisor supplies private HKCU keys. Save and restore the values inside that namespace
+# so repeated cells agree; personal preference keys are never this fixture's target.
+. "$PSScriptRoot/test-registry-path.ps1"
+$regKey = 'HKCU:\'+(Get-LiteTestRegistryPath)
 # Key_Close too (P4): the close-chord checks bind it to Ctrl+Shift+W for this run only — keys are
 # read once at launch, so it is seeded before the sandbox starts and put back (or removed) after.
 # Theme too (#22): the second sandbox is seeded dark so the subclassed status painter runs.
@@ -240,7 +243,15 @@ function Restore-Reg {
     }
 }
 
+$honestyClipboard=$null
+function Honesty-Clip { Read-SelectionClipboardText $honestyClipboard }
+function Honesty-Copy([scriptblock]$Action,[scriptblock]$Expected) {
+    Invoke-SelectionClipboardCopy $honestyClipboard $Action $Expected ([Func[bool]]{
+        $s -and -not $s.Proc.HasExited -and [SelectionUi]::ClipboardOwnedBy($s.Proc.Id)
+    })
+}
 try {
+    $honestyClipboard=Save-SelectionClipboard (Join-Path $env:LOCALAPPDATA ('ctlhonesty-'+[guid]::NewGuid().ToString('N')+'.dpapi'))
     if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
     New-ItemProperty -Path $regKey -Name Key_Close -Value 0x0357 -PropertyType DWord -Force | Out-Null   # 'W' | (CONTROL|SHIFT) << 8
     $s = Start-Sandbox -Exe $exe -Ctl $ctl -Pipe 'ctlhonesty'
@@ -1140,7 +1151,7 @@ try {
         $so = "$bad.out"; $se = "$bad.err"
         foreach ($v in 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID', 'AGWINTERM_PIPE') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
         $p = Start-Process -FilePath $ctl -ArgumentList @('session', 'type', '--stdin', '--target', $oid, '--pipe', $s.Pipe, '--json') `
-                           -RedirectStandardInput $bad -RedirectStandardOutput $so -RedirectStandardError $se -NoNewWindow -Wait -PassThru
+                           -RedirectStandardInput $bad -RedirectStandardOutput $so -RedirectStandardError $se -WindowStyle Hidden -Wait -PassThru
         $err = [string](Get-Content $se -Raw -ErrorAction SilentlyContinue)
         Check "a lone 0x80 on --stdin: non-zero exit, the refusal names byte offset $($prefix.Length) and 0x80" ($p.ExitCode -ne 0 -and $err -match "byte offset $($prefix.Length)\b" -and $err -match '0x80') "exit $($p.ExitCode), stderr: $err, stdout: $(Get-Content $so -Raw -ErrorAction SilentlyContinue)"
         Start-Sleep -Milliseconds 2000
@@ -1565,7 +1576,7 @@ try {
         # on the same .tmp - g_saveLock serializes them; without it one publish fails or the file
         # interleaves, and the reply would describe a state that is not on disk. --
         $outs = @((New-TemporaryFile).FullName, (New-TemporaryFile).FullName)
-        $procs = @(0, 1 | ForEach-Object { Start-Process -FilePath $ctl -ArgumentList @('restore', 'capture', '--pipe', $s.Pipe, '--json') -NoNewWindow -PassThru -RedirectStandardOutput $outs[$_] })
+        $procs = @(0, 1 | ForEach-Object { Start-Process -FilePath $ctl -ArgumentList @('restore', 'capture', '--pipe', $s.Pipe, '--json') -WindowStyle Hidden -PassThru -RedirectStandardOutput $outs[$_] })
         $procs | ForEach-Object { [void]$_.WaitForExit(15000) }
         $both = @($outs | ForEach-Object { try { ConvertFrom-Json ((Get-Content $_ -Raw) -replace '\s+$', '') } catch { $null } })
         Remove-Item $outs -ErrorAction SilentlyContinue
@@ -2388,10 +2399,8 @@ try {
         Check 'and none of them opened anything: no popup, the words unchanged, no p5-ov-raw shell' ((OverlayHwnd) -eq [IntPtr]::Zero -and (Words $aid) -eq 'right' -and (Wait-Shell5 'p5-ov-raw' $false 500))
         $raw = Send-Ctl $s @('session', 'close', '--target', $ovg); $r = ConvertFrom-Json $raw
         Check 'session close --target <pane overlay id> is refused with the cover sentence, the overlay still up' (-not $r.ok -and [string]$r.error -eq "session close: '$ovg' is a scratch/overlay/quick pane, not a session; ``session scratch off``, ``session overlay close`` or ``quick off`` dismiss those. Nothing closed." -and (Resolves $ovg) -and (Wait-Shell5 'p5-ov-g' $true 1000)) "raw: $raw"
-        # A selection inside the overlay: a drag posted into the right box (clipboard.ps1's recipe, no
-        # input injected). The release auto-copies in lite (a convention of the window, not of the
-        # verb), so the clipboard is saved first, set to a sentinel right before the verb, and put back.
-        $savedClip = try { Get-Clipboard -Raw } catch { '' }
+        # Synchronous owned-window drag, including an exact receipt for release-triggered auto-copy.
+        # The outer fixture already holds the whole-format snapshot; sentinel writes use its ledger.
         Send-Ctl $s @('session', 'focus', 'right') | Out-Null
         Start-Sleep -Milliseconds 300
         $client = ClientSize $s.Hwnd
@@ -2400,17 +2409,22 @@ try {
         if ($tb -ne [IntPtr]::Zero) { $tr = New-Object LiteHonesty+RECT; [void][LiteHonesty]::GetWindowRect($tb, [ref]$tr); $tbH = $tr.Bottom - $tr.Top }
         $contentX = if (StateVisible) { (TreeWidth) + 6 } else { 0 }
         $rightX = $contentX + [int](($client[0] - $contentX) / 2) + 4
-        [LiteUi]::Drag($s.Hwnd, $rightX, $tbH + 4, $rightX + 200, $tbH + 90)
+        Honesty-Copy {
+            [SelectionUi]::Button($s.Hwnd,0x201,$rightX,($tbH+4))
+            for($step=1;$step-le 8;$step++){
+                [SelectionUi]::Button($s.Hwnd,0x200,($rightX+25*$step),($tbH+4+[int](86*$step/8)))
+            }
+            [SelectionUi]::Button($s.Hwnd,0x202,($rightX+200),($tbH+90))
+        } { [string](Get-CtlResult $s @('session','copy','--target',$ovg)) }
         Start-Sleep -Milliseconds 600
         $sentinel = "p5-clip-$(Get-Random)"
-        Set-Clipboard -Value $sentinel; Start-Sleep -Milliseconds 250
+        Write-SelectionClipboardMarker $honestyClipboard $sentinel
         $r = OvRead @('copy', '--pane', 'right', '--target', $aid)
         Check "after a drag inside the right box, overlay copy --pane right answers {text} with the selection: the overlay's marker" ([bool]$r.ok -and ([string]$r.result.text) -match 'p5-ov-g') "raw: $($script:lastRead)"
         Check "and session copy --target <overlay id> is the same selection (g_sel is the overlay's)" (([string](Get-CtlResult $s @('session', 'copy', '--target', $ovg))) -match 'p5-ov-g')
-        $clipNow = try { Get-Clipboard -Raw } catch { '' }
+        $clipNow = Honesty-Clip
         Check 'and the copy verb did not touch the clipboard' ($clipNow -eq $sentinel)
         Check "the selection is not the covered shell's: session copy --target <right pane id> is empty" (([string](Get-CtlResult $s @('session', 'copy', '--target', $sp9))) -eq '')
-        if ($savedClip) { Set-Clipboard -Value $savedClip } else { Set-Clipboard -Value ' ' }
         # Both slots: the words in slot order; a swap keeps the words and moves the text with the shells.
         $ovh = OpenP 'p5-ov-h' 'left' $aid
         Check 'setup: an overlay on the left too' ([bool]$ovh -and (Wait-PaneText $ovh 'p5-ov-h')) "raw: $($script:lastOpen)"
@@ -2758,10 +2772,18 @@ try {
 
     # ---- P6: selection verbs own one surface, including history and the alt-screen boundary -----
     '-- selection.* --'
-    $selectionClipboard = Get-Clipboard -Raw
     $selectionIds = @()
     try {
         function Selection([string]$op, [string]$id = 'active') {
+            if($op-in @('copy','finalize')){
+                $expectedSelectionText=[string](Get-CtlResult $s @('session','copy','--target',$id))
+                # session.copy exposes raw cells, including blank rows. selection.copy/finalize
+                # intentionally make no clipboard write for CR/LF/ASCII-space-only selections.
+                if($expectedSelectionText-cnotmatch '[^\r\n ]'){$expectedSelectionText=''}
+                $capture=@{Reply=$null}
+                Honesty-Copy { $capture.Reply=ConvertFrom-Json (Send-Ctl $s @('selection',$op,'--target',$id)) } { $expectedSelectionText }.GetNewClosure()
+                return $capture.Reply
+            }
             ConvertFrom-Json (Send-Ctl $s @('selection', $op, '--target', $id))
         }
         function Selected([string]$id) { [string](Get-CtlResult $s @('session', 'copy', '--target', $id)) }
@@ -2786,31 +2808,31 @@ try {
         Check 'selection all returns selected all and includes history plus the live grid' ($r.ok -and $r.result -eq 'selected all' -and $selected -match 'MARKER-1\r?\n' -and $selected -match 'MARKER-60' -and $selected -match 'SELECT-ME') "reply $($r | ConvertTo-Json -Compress)"
         $r = Selection 'clear' $sb
         Check 'clear on B returns cleared and preserves A selection' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq $selected -and (Selected $sb) -eq '')
-        Set-Clipboard -Value 'P6-CLIPBOARD-SENTINEL'
+        Write-SelectionClipboardMarker $honestyClipboard 'P6-CLIPBOARD-SENTINEL'
         foreach ($case in @(@('copy','no selection'), @('finalize','finalized (empty)'))) {
             $r = Selection $case[0] $sb
-            Check "selection $($case[0]) on B leaves A selection and clipboard untouched" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+            Check "selection $($case[0]) on B leaves A selection and clipboard untouched" ($r.ok -and $r.result -eq $case[1] -and (Selected $sa) -eq $selected -and (Honesty-Clip) -eq 'P6-CLIPBOARD-SENTINEL')
         }
         foreach ($op in 'all', 'copy', 'clear', 'finalize') {
             $r = Selection $op 'p6-no-such-session'
-            Check "selection $op refuses a missing target without changing selection or clipboard" (-not $r.ok -and $r.error -eq 'session not found' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq 'P6-CLIPBOARD-SENTINEL')
+            Check "selection $op refuses a missing target without changing selection or clipboard" (-not $r.ok -and $r.error -eq 'session not found' -and (Selected $sa) -eq $selected -and (Honesty-Clip) -eq 'P6-CLIPBOARD-SENTINEL')
         }
         $r = Selection 'copy' $sa
         Start-Sleep -Milliseconds 300
         $n = [Text.Encoding]::UTF8.GetByteCount($selected)
-        Check 'selection copy reports UTF-8 length, writes precisely session copy text, and clears highlight' ($r.ok -and $r.result -eq "copied $n chars" -and (Get-Clipboard -Raw) -eq $selected -and (Selected $sa) -eq '')
+        Check 'selection copy reports UTF-8 length, writes precisely session copy text, and clears highlight' ($r.ok -and $r.result -eq "copied $n chars" -and (Honesty-Clip) -eq $selected -and (Selected $sa) -eq '')
         $r = Selection 'copy' $sa
-        Check 'selection copy without a selection leaves the clipboard unchanged' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq $selected)
+        Check 'selection copy without a selection leaves the clipboard unchanged' ($r.ok -and $r.result -eq 'no selection' -and (Honesty-Clip) -eq $selected)
         $r = Selection 'clear' $sa
         Check 'selection clear with nothing selected still answers cleared' ($r.ok -and $r.result -eq 'cleared' -and (Selected $sa) -eq '')
         $r = ConvertFrom-Json (Send-Raw (@{cmd='selection.all'; target=$sa} | ConvertTo-Json -Compress))
         Check 'raw JSON selection.all reaches the same handler without the client' ($r.ok -and $r.result -eq 'selected all' -and (Selected $sa) -eq $selected)
         $r = Selection 'finalize' $sa
         Start-Sleep -Milliseconds 300
-        Check 'finalize copies and keeps the highlight' ($r.ok -and $r.result -eq 'finalized (copied)' -and (Selected $sa) -eq $selected -and (Get-Clipboard -Raw) -eq $selected)
+        Check 'finalize copies and keeps the highlight' ($r.ok -and $r.result -eq 'finalized (copied)' -and (Selected $sa) -eq $selected -and (Honesty-Clip) -eq $selected)
         Selection 'clear' $sa | Out-Null
         $r = Selection 'finalize' $sa
-        Check 'finalize without a selection is empty and leaves clipboard unchanged' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq $selected)
+        Check 'finalize without a selection is empty and leaves clipboard unchanged' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Honesty-Clip) -eq $selected)
 
         $ov = [string](Get-CtlResult $s @('session','overlay','open','echo P6-OVERLAY; Start-Sleep 300','--pane','left','--target',$sa))
         Check 'selection setup has an overlay with its own distinct output' ($ov -and (Wait-PaneText $ov 'P6-OVERLAY'))
@@ -2879,14 +2901,14 @@ try {
         Write-SelectionScreen $sa ($esc + '[?1049h' + $esc + '[2J' + $esc + '[HSELECT-BLANK-ME')
         Selection 'all' $sa | Out-Null
         Write-SelectionScreen $sa ($esc + '[2J')
-        Set-Clipboard -Value 'P6-BLANK-SENTINEL'
+        Write-SelectionClipboardMarker $honestyClipboard 'P6-BLANK-SENTINEL'
         $r = Selection 'copy' $sa
-        Check 'copy of live cells blanked by a TUI answers nothing to copy, clears selection and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL' -and (Selected $sa) -eq '')
+        Check 'copy of live cells blanked by a TUI answers nothing to copy, clears selection and keeps the clipboard' ($r.ok -and $r.result -eq 'nothing to copy' -and (Honesty-Clip) -eq 'P6-BLANK-SENTINEL' -and (Selected $sa) -eq '')
         $r = Selection 'copy' $sa
-        Check 'copy after blank copy answers no selection and keeps the clipboard' ($r.ok -and $r.result -eq 'no selection' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Check 'copy after blank copy answers no selection and keeps the clipboard' ($r.ok -and $r.result -eq 'no selection' -and (Honesty-Clip) -eq 'P6-BLANK-SENTINEL')
         Selection 'all' $sa | Out-Null
         $r = Selection 'finalize' $sa
-        Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Get-Clipboard -Raw) -eq 'P6-BLANK-SENTINEL')
+        Check 'finalize of blank cells is empty and preserves clipboard' ($r.ok -and $r.result -eq 'finalized (empty)' -and (Honesty-Clip) -eq 'P6-BLANK-SENTINEL')
         Write-SelectionScreen $sa ($esc + '[HSELECTION-STILL-BOUND')
         Check 'blank finalize kept the selection bound to its original cells' ((Selected $sa) -match 'SELECTION-STILL-BOUND')
         Write-SelectionScreen $sa ($esc + '[2J' + $esc + '[HCaf' + [char]0xE9 + ' ' + [char]0x4E2D)
@@ -2894,14 +2916,13 @@ try {
         $unicodeText = Selected $sa
         $r = Selection 'copy' $sa
         Start-Sleep -Milliseconds 300
-        Check 'copied N chars counts UTF-8 bytes on non-ASCII text while clipboard preserves that text' ($r.ok -and $r.result -eq "copied $([Text.Encoding]::UTF8.GetByteCount($unicodeText)) chars" -and [Text.Encoding]::UTF8.GetByteCount($unicodeText) -gt $unicodeText.Length -and (Get-Clipboard -Raw) -eq $unicodeText -and (Selected $sa) -eq '')
+        Check 'copied N chars counts UTF-8 bytes on non-ASCII text while clipboard preserves that text' ($r.ok -and $r.result -eq "copied $([Text.Encoding]::UTF8.GetByteCount($unicodeText)) chars" -and [Text.Encoding]::UTF8.GetByteCount($unicodeText) -gt $unicodeText.Length -and (Honesty-Clip) -eq $unicodeText -and (Selected $sa) -eq '')
         Write-SelectionScreen $sa ($esc + '[?1049l')
     } finally {
         Overlay @('close') | Out-Null
         Send-Ctl $s @('quick','off') | Out-Null
         if ($sa) { Send-Ctl $s @('session','scratch','off','--target',$sa) | Out-Null }
         foreach ($id in $selectionIds) { Send-Ctl $s @('session','close','--target',$id) | Out-Null }
-        Set-Clipboard -Value $(if ($null -eq $selectionClipboard) { '' } else { $selectionClipboard })
     }
 
     . "$PSScriptRoot/driving-cases.ps1"
@@ -2992,11 +3013,12 @@ finally {
     }
     # After the sandbox exits: its own shutdown save (if any) must not land after the restore.
     try { Restore-Reg } catch { Teardown-Failed "the registry could not be restored: $($_.Exception.Message)" }
+    try {if($honestyClipboard){Restore-SelectionClipboard $honestyClipboard}}catch{Teardown-Failed "clipboard recovery required: $($_.Exception.Message)"}
 }
 
 # A teardown the suite could not complete is a failure of the suite, above every check that passed.
 $tf = @(Take-TeardownFailures)
-if ($tf.Count) { "control-honesty: TEARDOWN INCOMPLETE: $($tf -join '; ')"; exit 1 }
+if ($tf.Count) { "control-honesty: TEARDOWN INCOMPLETE: $($tf -join '; ')"; exit 2 }
 if ($fail) { "control-honesty: $fail failed"; exit 1 }
 if ($skipped -and $Strict) { "control-honesty: $skipped skipped under -Strict"; exit 1 }
 "control-honesty: all passed$(if ($skipped) { " ($skipped skipped)" })"

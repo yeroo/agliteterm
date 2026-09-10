@@ -2,7 +2,7 @@
 '-- P17 Wave 3 guarded native acceptance --'
 function Wave-Rpc([string]$Command,[hashtable]$Arguments=@{},[string]$Target,[string]$Window,[switch]$Refusal){
     $body=@{cmd=$Command;args=$Arguments};if($Target){$body.target=$Target};if($Window){$body.window=$Window}
-    $pipeClient=[IO.Pipes.NamedPipeClientStream]::new('.',$script:selectionPipe,[IO.Pipes.PipeDirection]::InOut)
+    $pipeClient=[IO.Pipes.NamedPipeClientStream]::new('.',(Get-LiteTestPipe $script:selectionPipe),[IO.Pipes.PipeDirection]::InOut)
     try{$pipeClient.Connect(2000);$writer=[IO.StreamWriter]::new($pipeClient);$writer.AutoFlush=$true;$reader=[IO.StreamReader]::new($pipeClient)
         $writer.WriteLine(($body|ConvertTo-Json -Compress -Depth 15));$read=$reader.ReadLineAsync();if(-not $read.Wait(15000)){throw "Wave3 request timeout: $Command"}
         $reply=$read.Result|ConvertFrom-Json;if($Refusal){return (-not $reply.ok -and [bool]$reply.error)}
@@ -24,7 +24,7 @@ public static class WaveUi {
 }
 '@}
 function Wave-Set([string]$Key,[string]$ConfigText,[string]$Registry,[int]$Stored){
-    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath))
     $prior=$script:selectionRegistry[$Registry].Expected
     try{Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
         {param($n) Read-RegistryGuardValue $regKey $n} `
@@ -161,11 +161,11 @@ Check 'quick default size and disabled hotkey readable' ((Wave-Rpc 'config.get' 
 $settingRegistry=@{'cursor-style'='CursorStyle';'cursor-blink-ms'='CursorBlinkMs';'quick-terminal-size'='QuickTerminalSize';'quick-terminal-hotkey'='QuickTerminalHotkey'}
 foreach($bad in @(@{key='cursor-style';value='circle'},@{key='cursor-blink-ms';value='0'},@{key='quick-terminal-size';value='91'},@{key='quick-terminal-hotkey';value='win+k'},@{key='quick-terminal-hotkey'},@{key='quick-terminal-hotkey';value=@{}},@{key='quick-terminal-hotkey';value=@()},@{key='quick-terminal-hotkey';value=$null})){
     $priorConfig=Wave-Rpc 'config.get' @{key=$bad.key}
-    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))
     try{$priorRegistry=Read-RegistryGuardValue $regKey $settingRegistry[$bad.key]}finally{$regKey.Dispose()}
     Check 'invalid Wave3 setting refuses unchanged' (Wave-Rpc 'config.set' $bad -Refusal)
     Check 'invalid setting preserves live value' ((Wave-Rpc 'config.get' @{key=$bad.key}) -ceq $priorConfig)
-    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))
     try{Check 'invalid setting preserves registry value' (Test-RegistryGuardValue (Read-RegistryGuardValue $regKey $settingRegistry[$bad.key]) $priorRegistry)}finally{$regKey.Dispose()}
 }
 foreach($style in @(@('block',1),@('underline',2),@('bar',0))){

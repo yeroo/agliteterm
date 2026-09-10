@@ -3,6 +3,10 @@
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER)
 $ErrorActionPreference='Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
+. "$PSScriptRoot/suite-policy.ps1"
+Assert-LiteSuitePolicy @('clipboard')
 & "$PSScriptRoot/clipboard-acceptance.unit.ps1" -Strict:$Strict
 & "$PSScriptRoot/selection-ui.ps1" -Exe $Exe -Strict:$Strict -TokenOwner $TokenOwner -ClipboardOnly
 exit $LASTEXITCODE

@@ -5,8 +5,8 @@
 # Suite rules, and they are not negotiable:
 #   - ALWAYS a sandbox instance: --pipe <name> and a throwaway %LOCALAPPDATA%. lite is plain Win32
 #     and reads the environment, so the override really does isolate it — unlike agwinterm, where
-#     .NET resolves the known folder and needs --app-id instead. Settings, though, live in
-#     HKCU\Software\agliteterm and are NOT isolated: save and restore anything a case changes.
+#     .NET resolves the known folder and needs --app-id instead. Start-Sandbox requires the owned
+#     supervisor; AGLITETERM_TEST_RUN isolates settings, instance registration and host/control pipes.
 #   - NEVER inject global input. No keybd_event, no SendInput. Everything is PostMessage to this
 #     instance's own window handles, so whatever the user is typing in stays untouched. Ctrl+C is the
 #     one thing PostMessage cannot express alone (the modifier must be visible to GetKeyState), and
@@ -18,6 +18,7 @@
 # One build output here (bin\agliteterm.exe) - the two-Release-roots trap is agwinterm's. The
 # control client is an external dependency, resolved the way every other check resolves it.
 . "$PSScriptRoot\ctl-path.ps1"
+. "$PSScriptRoot/owned-window.ps1"
 
 function Resolve-Lite([string]$explicit) {
     foreach ($c in @($explicit, (Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\agliteterm.exe'))) {
@@ -169,6 +170,9 @@ function Start-Sandbox {
     param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][string]$Ctl,
           [Parameter(Mandatory)][string]$Pipe, [int]$Width = 1100, [int]$Height = 700)
 
+    . "$PSScriptRoot/suite-context.ps1"
+    Assert-LiteSuiteContext
+
     $home_ = Join-Path $env:TEMP ("$Pipe-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force $home_ | Out-Null
 
@@ -187,22 +191,23 @@ function Start-Sandbox {
     }
 
     try {
-        $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -PassThru `
+        $p = Start-Process $Exe -ArgumentList @('--pipe', $Pipe, '--no-restore') -WindowStyle Hidden -PassThru `
                                 -Environment @{ LOCALAPPDATA = $home_ }
     } finally {
         foreach ($v in $scrub) { if ($null -ne $saved[$v]) { [Environment]::SetEnvironmentVariable($v, $saved[$v]) } }
     }
     $s = [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; AppDir = $home_; Hwnd = [IntPtr]::Zero }
+    [void]$p.SafeHandle
     for ($i = 0; $i -lt 80; $i++) {
         Start-Sleep -Milliseconds 500
         if ((Send-Ctl $s @('ping')) -match '"ok":true') { break }
     }
     Start-Sleep 5
-    $s.Hwnd = $p.MainWindowHandle
+    $s.Hwnd = Get-OwnedLiteWindow $p -Show
     if ($s.Hwnd -ne [IntPtr]::Zero) {
         # A maximised window makes every coordinate in every case depend on the monitor.
-        if ([LiteUi]::IsZoomed($s.Hwnd)) { [void][LiteUi]::ShowWindow($s.Hwnd, 9); Start-Sleep 1 }
-        [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, 150, 100, $Width, $Height, 0x0004)
+        if ([LiteUi]::IsZoomed($s.Hwnd)) { [void][LiteUi]::ShowWindow($s.Hwnd, 4); Start-Sleep 1 }
+        [void][LiteUi]::SetWindowPos($s.Hwnd, [IntPtr]::Zero, 150, 100, $Width, $Height, 0x0014)
         Start-Sleep 2
     }
     return $s
@@ -221,14 +226,14 @@ function Connect-Sandbox {
             Select-Object -First 1
     if (-not $proc) { throw "no sandbox instance is running on pipe '$Pipe'" }
     $p = Get-Process -Id $proc.ProcessId
-    [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; Hwnd = $p.MainWindowHandle; AppDir = $null }
+    [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; Hwnd = (Get-OwnedLiteWindow $p); AppDir = $null }
 }
 
 function Stop-Sandbox {
     param([Parameter(Mandatory)]$S)
     if ($S.Proc -and -not $S.Proc.HasExited) { $S.Proc.CloseMainWindow() | Out-Null; Start-Sleep 3 }
-    if ($S.Proc -and -not $S.Proc.HasExited) { Stop-Process -Id $S.Proc.Id -Force }
-    if ($S.AppDir) { Remove-Item $S.AppDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($S.Proc -and -not $S.Proc.HasExited) { $S.Proc.Kill();if(-not $S.Proc.WaitForExit(10000)){throw 'Owned sandbox did not exit'} }
+    # Keep private app-data as evidence; the outer suite job owns all launched descendants.
 }
 
 function Send-Ctl {
