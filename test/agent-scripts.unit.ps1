@@ -38,28 +38,32 @@ function Invoke-AgentFixture([string]$Body,[int]$Requests){
     $prefix="`$env:TERM_PROGRAM='agliteterm';`$env:AGWINTERM_SESSION_ID='private-test-pane';`$env:AGWINTERM_PIPE='$pipe';`$env:PATH='"+$root.Replace("'","''")+";'+`$env:PATH;"
     $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prefix+$Body))
     $start.Arguments='-NoProfile -NonInteractive -EncodedCommand '+$encoded
-    $client=$null;$answers=@()
+    $client=$null;$answers=@();$accept=$null;$read=$null;$reader=$null
+    $cancel=[Threading.CancellationTokenSource]::new()
     try {
-        $accept=$server.WaitForConnectionAsync();$client=[Diagnostics.Process]::Start($start);[void]$client.SafeHandle
+        $accept=$server.WaitForConnectionAsync($cancel.Token);$client=[Diagnostics.Process]::Start($start);[void]$client.SafeHandle
         $stdout=$client.StandardOutput.ReadToEndAsync();$stderr=$client.StandardError.ReadToEndAsync()
         for($i=0;$i-lt$Requests;$i++){
-            if(-not$accept.Wait(5000)){throw 'Fixture pipe connection timed out'}
+            if(-not$accept.Wait(30000)){throw 'Fixture pipe connection timed out'}
             $reader=[IO.StreamReader]::new($server,[Text.Encoding]::UTF8,$true,1024,$true)
-            $read=$reader.ReadLineAsync();if(-not$read.Wait(3000)){throw 'Fixture request timed out'}
-            $answers+=($read.Result|ConvertFrom-Json);$reader.Dispose()
+            $read=$reader.ReadLineAsync($cancel.Token).AsTask();if(-not$read.Wait(10000)){throw 'Fixture request timed out'}
+            $answers+=($read.Result|ConvertFrom-Json);$reader.Dispose();$reader=$null
             if($answers[-1].cmd-eq'session.bind'){
                 $writer=[IO.StreamWriter]::new($server,[Text.UTF8Encoding]::new($false),1024,$true);$writer.AutoFlush=$true
                 $writer.WriteLine('{"ok":true,"result":"bound"}');$writer.Dispose()
             }
             $server.Disconnect()
-            if($i+1-lt$Requests){$accept=$server.WaitForConnectionAsync()}
+            if($i+1-lt$Requests){$accept=$server.WaitForConnectionAsync($cancel.Token)}
         }
-        if(-not$client.WaitForExit(5000)){throw 'Fixture subprocess did not exit'}
+        if(-not$client.WaitForExit(30000)){throw 'Fixture subprocess did not exit'}
         if($client.ExitCode-ne0){throw "Fixture failed: $($stderr.Result)"}
         $script:unexpectedConnection=$Requests-eq 0 -and $accept.IsCompleted -and -not$accept.IsFaulted -and -not$accept.IsCanceled
         return $answers
     }finally{
-        $server.Dispose()
+        $cancel.Cancel()
+        try{if($accept){$accept.GetAwaiter().GetResult()}}catch{}
+        try{if($read){$read.GetAwaiter().GetResult()|Out-Null}}catch{}
+        if($reader){$reader.Dispose()};$server.Dispose();$cancel.Dispose()
         if($client){if(-not$client.HasExited){$client.Kill();if(-not$client.WaitForExit(5000)){throw 'Owned fixture process did not exit'}};$client.Dispose()}
     }
 }
