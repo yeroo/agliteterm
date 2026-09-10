@@ -1,4 +1,18 @@
+#include <windows.h>
+static bool failDuplicate = false, failEvent = false;
+static BOOL TestDuplicate(HANDLE a,HANDLE b,HANDLE c,LPHANDLE d,DWORD e,BOOL f,DWORD g) {
+    if (failDuplicate) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    return DuplicateHandle(a,b,c,d,e,f,g);
+}
+static HANDLE TestEvent(LPSECURITY_ATTRIBUTES a,BOOL b,BOOL c,LPCWSTR d) {
+    if (failEvent) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+    return CreateEventW(a,b,c,d);
+}
+#define DuplicateHandle TestDuplicate
+#define CreateEventW TestEvent
 #include "../src/control_transport.h"
+#undef DuplicateHandle
+#undef CreateEventW
 #include <atomic>
 #include <cstdio>
 #include <functional>
@@ -24,6 +38,17 @@ static void readRequest(HANDLE pipe) { uint8_t buf[8]; DWORD n = 0; ReadFile(pip
 static void put(HANDLE pipe, const void* bytes, DWORD length) { DWORD n = 0; WriteFile(pipe, bytes, length, &n, nullptr); }
 static std::vector<uint8_t> request() { return { 4, 0, 0, 0, 'p', 'i', 'n', 'g' }; }
 int main() {
+    for (int kind = 0; kind < 2; ++kind) {
+        Fixture f([](HANDLE pipe) { readRequest(pipe); uint32_t n = 4; put(pipe,&n,4); put(pipe,"pong",4); Sleep(30); });
+        control_transport::Transport transport; auto req = request(); std::vector<uint8_t> reply;
+        control_transport::Failure reason;
+        failDuplicate = kind == 0; failEvent = kind == 1;
+        check(!transport.exchange(f.client,req,reply,500,&reason), "pre-issue setup failure refused");
+        check(reason.error == ERROR_NOT_ENOUGH_MEMORY && std::string(reason.stage) == "write", "setup failure identifies stage and error");
+        check(f.client != INVALID_HANDLE_VALUE, "pre-issue setup failure preserves channel");
+        failDuplicate = failEvent = false;
+        check(transport.exchange(f.client,req,reply,500), "untouched channel accepts subsequent exchange");
+    }
     for (int mode = 0; mode < 7; ++mode) {
         Fixture f([mode](HANDLE pipe) {
             readRequest(pipe);
@@ -73,6 +98,24 @@ int main() {
         check(!transport.exchange(f.client, req, reply, 25), "contention consumes caller deadline");
         check(GetTickCount64() - start < 500, "gate wait is bounded");
         caller.join(); check(first && f.client != INVALID_HANDLE_VALUE, "gate timeout preserves lock holder exchange");
+    }
+    {
+        // The second caller gets the gate, but not a fresh I/O timeout after its gate wait.
+        std::atomic<bool> entered{false};
+        Fixture f([&](HANDLE pipe) {
+            readRequest(pipe); entered = true; Sleep(150); uint32_t n = 4;
+            put(pipe,&n,4); put(pipe,"pong",4);
+            readRequest(pipe); Sleep(180); put(pipe,&n,4); put(pipe,"pong",4); Sleep(30);
+        });
+        control_transport::Transport transport; bool first = false;
+        std::thread caller([&] { auto req=request(); std::vector<uint8_t> reply; first=transport.exchange(f.client,req,reply,1000); });
+        while (!entered.load()) Sleep(1);
+        auto req=request(); std::vector<uint8_t> reply; control_transport::Failure reason;
+        auto start=GetTickCount64(); bool second=transport.exchange(f.client,req,reply,250,&reason);
+        caller.join();
+        check(first && !second, "gate plus subsequent I/O shares original deadline");
+        check(std::string(reason.stage)=="header" && reason.error==ERROR_TIMEOUT, "contender acquired gate then expired reading reply");
+        check(GetTickCount64()-start < 320 && f.client==INVALID_HANDLE_VALUE, "combined timeout retires second exchange within one budget");
     }
     {
         Fixture f([](HANDLE) { Sleep(250); });

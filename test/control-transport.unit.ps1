@@ -2,6 +2,9 @@
 param([string]$Exe,[switch]$Strict)
 $ErrorActionPreference='Stop'
 $repo=Split-Path $PSScriptRoot -Parent
+$main=Get-Content (Join-Path $repo 'src/main.cpp') -Raw
+if($main -notmatch 'static auto& g_controlTransport = \*new control_transport::Transport;'){throw 'Transport must outlive detached workers'}
+if($main -notmatch 'if \(out == ReqOutcome::NoReply \|\| g_control == INVALID_HANDLE_VALUE\) return HostHealth::Dead;'){throw 'Retired handshake channel must not fall back to HelloOnly'}
 $vswhere="${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
 $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if(-not $vs){throw 'MSVC required'}

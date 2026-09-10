@@ -1444,7 +1444,9 @@ static void logInit(int argc, wchar_t** argv) {
 
 // ---- control pipe: protobuf frames (4-byte LE length prefix) ----
 #include "control_transport.h"
-static control_transport::Transport g_controlTransport;
+// Detached control workers have process lifetime. Do not run a global mutex/vector destructor
+// concurrently with their final request during CRT shutdown.
+static auto& g_controlTransport = *new control_transport::Transport;
 // Why a request failed, for the one caller that has to tell the reasons apart. "The host sent a
 // frame lite could not decode" and "the host refused the command" look identical through the bool,
 // and the startup liveness probe needs them separated — see controlHandshake().
@@ -1469,8 +1471,10 @@ static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Repl
     memcpy(buf.data(), &len, 4);
     buf.resize(len + 4);
     std::vector<uint8_t> payload;
-    if (!g_controlTransport.exchange(g_control, buf, payload, 2000)) {
-        logWarn("control: request (cmd %d) failed or exceeded its 2s deadline; host outcome may be unknown", (int)req.which_cmd);
+    control_transport::Failure failure;
+    if (!g_controlTransport.exchange(g_control, buf, payload, 2000, &failure)) {
+        logWarn("control: request (cmd %d) failed at %s, Win32 error %lu (timeout=%lu); host outcome may be unknown",
+                (int)req.which_cmd, failure.stage, failure.error, (DWORD)ERROR_TIMEOUT);
         return false;
     }
     pb_istream_t is = pb_istream_from_buffer(payload.data(), payload.size());
@@ -1593,6 +1597,7 @@ static HostHealth controlHandshake() {
     ReqOutcome out = ReqOutcome::NoReply;
     if (request(req, &rep, &out))
         return rep.which_body == agwinterm_ptyhost_Reply_list_tag ? HostHealth::Healthy : HostHealth::HelloOnly;
+    if (out == ReqOutcome::NoReply || g_control == INVALID_HANDLE_VALUE) return HostHealth::Dead;
     if (out == ReqOutcome::Undecodable) {
         logWarn("pty-host: list replied with something this build cannot decode — the host is alive, "
                 "so lite starts; adoption of live sessions is unavailable this run");
