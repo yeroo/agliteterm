@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yeroo/agwinterm
-          ref: f2700ad8fbbc0f18a9afe6921c42bb768b3d5931
+          ref: c10d153351011b0399f78fcaacaeb351f2e18fd7
           path: .ci-full-cli
 
       - name: Setup shared CLI SDK
@@ -63,8 +63,7 @@ jobs:
       # rather than passing quietly.
       - name: Check the contract against agwinterm
         shell: pwsh
-        # Bootstrap only: remove -Url after agwinterm #273 merges, then require fresh CI.
-        run: ./tools/check-contract.ps1 -Url https://raw.githubusercontent.com/yeroo/agwinterm/f2700ad8fbbc0f18a9afe6921c42bb768b3d5931/tests/conformance/control-api.json
+        run: ./tools/check-contract.ps1
 
       - name: Wave 3 acceptance (guarded disposable desktop)
         shell: pwsh
