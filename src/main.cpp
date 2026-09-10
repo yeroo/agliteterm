@@ -6660,7 +6660,7 @@ static HICON loadAppIcon(bool small_) {
 // command's own in-band claim, not a security boundary or a host execution acknowledgement.
 #include "overlay_command.h"
 static std::string overlayCommandLine(const std::string& cmd) {
-    return overlay_command::line(base64(widen(cmd)));
+    return overlay_command::line(overlay_command::encode(cmd));
 }
 static bool overlayCommandFits(const std::string& line) {
     return overlay_command::fits(line, sizeof(((agwinterm_ptyhost_Create*)nullptr)->args[0]));

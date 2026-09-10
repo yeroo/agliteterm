@@ -2155,7 +2155,17 @@ try {
         # PowerShell-native sleep, not a child program: the pty-host's kill terminates the shell and
         # leaves a grandchild (a ping) running, for every shell kill in lite (the P3 block's Stop-Ping
         # is that), so a grandchild could not tell an orphaned slot from the host's own behaviour.
-        function Shell5([string]$marker) { @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape("echo $marker;") }) }
+        function Shell5([string]$marker) {
+            @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+                # The command is data inside the wrapper now; never execute a discovered command.
+                $line=[string]$_.CommandLine
+                $found=$line.Contains("echo $marker;")
+                foreach($match in [regex]::Matches($line,"FromBase64String\('([A-Za-z0-9+/=]+)'\)")){
+                    try {$decoded=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($match.Groups[1].Value));if($decoded.Contains("echo $marker;")){$found=$true}}catch{}
+                }
+                $found
+            })
+        }
         function Wait-Shell5([string]$marker, [bool]$present, [int]$ms = 10000) {
             for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Shell5 $marker).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
             return $false

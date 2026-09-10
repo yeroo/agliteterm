@@ -24,13 +24,15 @@ $cases=@(
     @{command='Write-Error "failure" -ErrorAction Continue';code=1;text=''},
     @{command='cmd.exe /d /c exit 7';code=7;text=''},
     @{command='Write-Output ordinary';code=0;text='ordinary'}
+    @{command=('Write-Output ''LONG-CONTEXT-OK''; # '+('context '*80));code=0;text='LONG-CONTEXT-OK';fits=$true}
 )
 $checks=0
 foreach($shell in $shells){foreach($case in $cases){
-    $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($case.command))
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($case.command))
     $wrapper=& $testExe $encoded
     if($LASTEXITCODE-ne 0){throw 'Production wrapper generation or capacity checks failed'}
     if($wrapper.Contains('"')){throw 'Wrapper must survive the host quoted command argument'}
+    if($case.fits -and [Text.Encoding]::UTF8.GetByteCount($wrapper)-ge 2048){throw 'Ordinary context-bearing command no longer fits the host argument'}
     # Keep -Command parsing (the real host mode), not a second -EncodedCommand that could hide quoting bugs.
     $start=[Diagnostics.ProcessStartInfo]::new($shell);$start.UseShellExecute=$false;$start.CreateNoWindow=$true
     $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true

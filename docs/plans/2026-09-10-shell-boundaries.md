@@ -3,7 +3,7 @@
 - `PSConsoleHostReadLine` captures the incoming `$?` before bridge work and restores it at the
   saved reader boundary. `$LASTEXITCODE`, draft text and reader arguments remain unchanged.
   Resume offers are returned, never executed by this wrapper.
-- Overlay commands are UTF-16LE/base64 data decoded into a child script scope. Parent profile
+- Overlay commands are UTF-8/base64 data decoded once into a child script scope. Parent profile
   functions remain available; ordinary `$e`, `$b`, `$q` and `$c` assignments cannot corrupt the
   parent's OSC 133 delimiters. Status is captured immediately after the command inside its scope
   (PowerShell 5.1 does not reliably propagate a non-terminating error through `&` as `$?`).
