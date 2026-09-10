@@ -74,11 +74,16 @@ if(-not $global:__agwLiteReadLine){
     if($reader -is [Management.Automation.FunctionInfo]){
         $global:__agwLiteReadLine=$reader.ScriptBlock
         function global:PSConsoleHostReadLine {
+            $priorStatus=$? # first statement, as in stock PSReadLine's lastRunStatus capture
             $null=Invoke-AgLiteBridgeRequest register
             $resume=Get-AgLiteResume
             # Return to the host's normal command pipeline, never execute inside prompt/readline.
             # A Ctrl+C that ends a resumed native agent must not cancel an enclosing prompt loop.
             if($resume){return $resume}
+            # $? is read-only. An ignored nonterminating cmdlet error restores false without
+            # adding to $Error, emitting an error record, or touching $LASTEXITCODE. No native
+            # command or private reflection is used; the next statement is the delegated reader.
+            if(-not $priorStatus){Microsoft.PowerShell.Utility\Write-Error 'Restore prior readline status' -ErrorAction Ignore}
             & $global:__agwLiteReadLine @args
         }
     }
