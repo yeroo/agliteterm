@@ -6,6 +6,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }

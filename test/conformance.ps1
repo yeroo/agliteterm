@@ -16,11 +16,16 @@ param(
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
     [string]$Spec = "$PSScriptRoot\control-api.json",
     # CI passes -Strict: a suite that skips is reporting success while checking nothing,
-    # which is worse than not running it at all. Locally a skip is the right answer.
+    # which is worse than not running it at all. This suite requires disposable CI, not a local skip.
     [switch]$Strict
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
+. "$PSScriptRoot/suite-policy.ps1"
+Assert-LiteSuitePolicy @('conformance')
+. "$PSScriptRoot/selection-ui-env.ps1"
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -89,12 +94,10 @@ $cliHasP4 = $probe -match 'Nothing sent'
 $probe = (& $ctl session overlay resize --pane left --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasP5 = $probe -match 'Nothing sent'
 
-# HKCU\Software\agliteterm is NOT per-sandbox (test/ui-lib.ps1 says so), and the contract's
-# `sidebar width 260` step is a real SET once the client understands it: it lands in the registry and
-# every later suite - and the user's own agliteterm - inherits it. clipboard's drag starts at x=200,
-# which is inside a 260 px sidebar, so it selected nothing and Ctrl+C had nothing to copy. Saved here
-# and restored in `finally`, the rule ui-lib states for anything a case changes.
-$regKey = 'HKCU:\Software\agliteterm'
+# Sidebar width is a real SET. Restore it between fixtures even in the supervisor's private
+# registry namespace, so subsequent geometry cases do not inherit this contract step's width.
+. "$PSScriptRoot/test-registry-path.ps1"
+$regKey = 'HKCU:\'+(Get-LiteTestRegistryPath)
 $savedSidebar = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).SidebarW } else { $null }
 # The reason a step cannot be SENT by the client at hand, or $null when it can. A skip names the
 # client's shortfall, not the step's, so the fix (set AGWINTERMCTL) is in the message.
@@ -134,7 +137,7 @@ function Expand-Args($argv) {
 
 # One control call. Returns the parsed envelope, or $null when the output was not JSON at all —
 # which is itself a contract violation worth reporting distinctly from ok:false.
-function Invoke-Ctl($argv, $InputText = $null) {
+function Invoke-CtlRaw($argv, $InputText = $null) {
     $start=[Diagnostics.ProcessStartInfo]::new($ctl)
     $start.UseShellExecute=$false;$start.CreateNoWindow=$true
     $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true;$start.RedirectStandardInput=$true
@@ -154,6 +157,16 @@ function Invoke-Ctl($argv, $InputText = $null) {
     }finally{$child.Dispose()}
 }
 
+function Invoke-Ctl($argv,$InputText=$null) {
+    if($argv.Count-ge 2 -and $argv[0]-eq 'selection' -and $argv[1]-in @('copy','finalize')){
+        $capture=@{Reply=$null}
+        Invoke-SelectionClipboardCopy $conformanceClipboard { $capture.Reply=Invoke-CtlRaw $argv $InputText } { '' } ([Func[bool]]{
+            $p -and -not $p.HasExited -and [SelectionUi]::ClipboardOwnedBy($p.Id)
+        })
+        return $capture.Reply
+    }
+    Invoke-CtlRaw $argv $InputText
+}
 # Session creation is acknowledged before the full UI publishes the target. Retry reads only.
 function Wait-Session([string]$Id, [switch]$Prompt) {
     $deadline=[DateTime]::UtcNow.AddSeconds(45)
@@ -195,8 +208,11 @@ function Test-Shape($resp, [string]$kind, $fields, [bool]$Payload = $false) {
     return $null
 }
 
-$p = Start-Process $Exe -ArgumentList @('--pipe', $pipe, '--no-restore') -PassThru
+$p=$null;$conformanceClipboard=$null;$cleanupOk=$true
 try {
+    $conformanceClipboard=Save-SelectionClipboard (Join-Path $env:LOCALAPPDATA ('conformance-'+[guid]::NewGuid().ToString('N')+'.dpapi'))
+    $p = Start-Process $Exe -ArgumentList @('--pipe', $pipe, '--no-restore') -WindowStyle Hidden -PassThru
+    [void]$p.SafeHandle
     # Wait for the pipe rather than sleeping a guessed amount: the first verb failing because the
     # app had not finished starting would look exactly like a broken verb.
     $up = $false
@@ -260,11 +276,7 @@ try {
     }
 }
 finally {
-    # Put the sidebar width back: the contract's `sidebar width 260` step is a real set, and HKCU is
-    # shared with every other suite and with the user's own agliteterm (see the note where it is saved).
-    if ($null -ne $savedSidebar) { Set-ItemProperty -Path $regKey -Name SidebarW -Value $savedSidebar -Type DWord -ErrorAction SilentlyContinue }
-    elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name SidebarW -ErrorAction SilentlyContinue }
-
+    $cleanupOk=Invoke-SelectionCleanup {
     # Close ONLY what this run created, by name, through the pipe — never by enumerating processes.
     # A blanket "stop every agliteterm" here would close the windows the developer is working in,
     # which is the exact accident this suite's rules exist to prevent.
@@ -274,9 +286,18 @@ finally {
             if ($w.name -like 'conf-*') { Invoke-Ctl @('window', 'close', $w.name) | Out-Null }
         }
     } catch { }
-    $p.CloseMainWindow() | Out-Null
-    Start-Sleep -Seconds 3
-    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    if($p -and -not $p.HasExited){
+        $p.CloseMainWindow()|Out-Null
+        if(-not $p.WaitForExit(5000)){$p.Kill();if(-not $p.WaitForExit(10000)){throw 'Owned conformance window did not exit'}}
+    }
+    } {
+        # This key belongs to the supervisor namespace, not personal preferences.
+        if ($null -ne $savedSidebar) { Set-ItemProperty -Path $regKey -Name SidebarW -Value $savedSidebar -Type DWord }
+        elseif (Test-Path $regKey) { Remove-ItemProperty -Path $regKey -Name SidebarW -ErrorAction SilentlyContinue }
+    } {
+        if($conformanceClipboard){Restore-SelectionClipboard $conformanceClipboard}
+    }
+    if(-not $cleanupOk){exit 2}
 }
 # A conformance suite that checks nothing must never report success. This is the guard for the
 # failure that actually happened: a silent empty run.

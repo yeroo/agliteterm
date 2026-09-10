@@ -11,6 +11,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -31,13 +33,13 @@ Remove-Item $log, "$log.old", $state, "$state.bak", "$state.tmp" -ErrorAction Si
 "== log-restore =="
 
 # --- run 1: create sessions, close, and expect a narrated save --------------------------------
-$p = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 7
 & $ctl session new --pipe $pipe 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 $p.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 4
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+if (-not $p.HasExited) { $p.Kill() }
 Start-Sleep -Seconds 1
 
 $text = Get-Content $log -Raw
@@ -52,7 +54,7 @@ if ($save.Success) {
 }
 
 # --- run 2: relaunch and expect a narrated restore ---------------------------------------------
-$p2 = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p2 = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 8
 $text2 = Get-Content $log -Raw
 # The log accumulates across runs, so read the LAST restore — the first one belongs to run 1.
@@ -70,7 +72,7 @@ if ($built.Success -and $save.Success) {
 }
 $p2.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 4
-if (-not $p2.HasExited) { Stop-Process -Id $p2.Id -Force }
+if (-not $p2.HasExited) { $p2.Kill() }
 Start-Sleep -Seconds 1
 
 # --- error case: a zero-byte state file must be NAMED, not silently ignored --------------------
@@ -78,7 +80,7 @@ Start-Sleep -Seconds 1
 # instead of the empty-file one — the check would still pass while testing something else entirely.
 Remove-Item $log, "$state.bak" -ErrorAction SilentlyContinue
 Set-Content -Path $state -Value '' -NoNewline
-$p3 = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p3 = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 8
 $text3 = Get-Content $log -Raw
 Check 'empty state file is reported as EMPTY' ($text3 -match 'restore: state file is EMPTY')
@@ -88,6 +90,6 @@ $alive = ((& $ctl tree --json --pipe $pipe 2>&1) -join '') -match '"ok":true'
 Check 'lite still answers after an empty state file' $alive
 $p3.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 4
-if (-not $p3.HasExited) { Stop-Process -Id $p3.Id -Force }
+if (-not $p3.HasExited) { $p3.Kill() }
 
 if ($fail) { "log-restore: $fail FAILED"; exit 1 } else { "log-restore: all passed"; exit 0 }
