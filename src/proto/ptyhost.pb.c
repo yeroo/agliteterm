@@ -27,6 +27,15 @@ PB_BIND(agwinterm_ptyhost_SessionRef, agwinterm_ptyhost_SessionRef, AUTO)
 PB_BIND(agwinterm_ptyhost_Resize, agwinterm_ptyhost_Resize, AUTO)
 
 
+PB_BIND(agwinterm_ptyhost_PrepareCreate, agwinterm_ptyhost_PrepareCreate, AUTO)
+
+
+PB_BIND(agwinterm_ptyhost_CreationRef, agwinterm_ptyhost_CreationRef, AUTO)
+
+
+PB_BIND(agwinterm_ptyhost_CreationReply, agwinterm_ptyhost_CreationReply, AUTO)
+
+
 PB_BIND(agwinterm_ptyhost_List, agwinterm_ptyhost_List, AUTO)
 
 
@@ -49,6 +58,8 @@ PB_BIND(agwinterm_ptyhost_SessionInfo, agwinterm_ptyhost_SessionInfo, AUTO)
 
 
 PB_BIND(agwinterm_ptyhost_ListReply, agwinterm_ptyhost_ListReply, 4)
+
+
 
 
 
