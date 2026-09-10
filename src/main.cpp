@@ -451,7 +451,7 @@ struct Session {
     HANDLE reader = nullptr;
     int cols = 0, rows = 0;     // geometry last pushed to the host (0 = never sized yet)
     int scrollOff = 0;          // rows scrolled up into history (0 = live)
-    bool exited = false;
+    std::atomic<bool> exited{false}; // reader EOF is observed by UI/control threads without a data race
     // Refusals in ONE episode of chasing a resize on the timer — not refusals ever. The retry timer
     // is armed from the rollback, and a host that keeps refusing would otherwise make that a 60 ms
     // forever-loop: a synchronous round trip per pane and popup sixteen times a second, each writing
@@ -4901,6 +4901,23 @@ static std::string pasteNormalize(std::string t) {
     return out;
 }
 
+// Caller owns no global session lock here. Bound untrusted clipboard memory before conversion;
+// malformed/oversized/non-text contents are unavailable, not an unbounded wchar_t scan.
+static std::string readClipboardText(HWND owner) {
+    if (!OpenClipboard(owner)) return {};
+    struct Close { ~Close() { CloseClipboard(); } } close;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (!h) return {};
+    const size_t bytes = GlobalSize(h);
+    if (bytes < sizeof(wchar_t) || bytes % sizeof(wchar_t) != 0 || bytes > 16u * 1024u * 1024u) return {};
+    const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(h));
+    if (!text) return {};
+    struct Unlock { HANDLE h; ~Unlock() { GlobalUnlock(h); } } unlock{h};
+    const wchar_t* end = std::find(text, text + bytes / sizeof(wchar_t), L'\0');
+    if (end == text + bytes / sizeof(wchar_t)) return {};
+    return narrow(std::wstring(text, end));
+}
+
 static void pasteClipboard() {
     if (g_dashboard) return;
     HANDLE data;
@@ -4912,22 +4929,10 @@ static void pasteClipboard() {
         data = s->data;
         emu_info(s->emu, &info);
     }
-    if (!OpenClipboard(g_hwnd)) return;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        wchar_t* w = (wchar_t*)GlobalLock(h);
-        if (w) {
-            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-            std::string u8(n > 0 ? n - 1 : 0, 0);
-            if (!u8.empty()) WideCharToMultiByte(CP_UTF8, 0, w, -1, &u8[0], n, nullptr, nullptr);
-            u8 = pasteNormalize(std::move(u8));
-            // Bracketed paste when the app enabled it (safer multiline paste), else raw.
-            if (info.bracketedPaste) u8 = "\x1b[200~" + u8 + "\x1b[201~";
-            ovIo(data, true, u8.data(), nullptr, (DWORD)u8.size());
-            GlobalUnlock(h);
-        }
-    }
-    CloseClipboard();
+    std::string u8 = pasteNormalize(readClipboardText(g_hwnd));
+    if (u8.empty()) return;
+    if (info.bracketedPaste) u8 = "\x1b[200~" + u8 + "\x1b[201~";
+    ovIo(data, true, u8.data(), nullptr, (DWORD)u8.size());
 }
 
 
@@ -10935,7 +10940,8 @@ static std::string ctlDispatch(const std::string& line) {
                 panes += "}";
             }
         }
-        // The first save from a pipe thread. The reply below describes a state that is ON DISK
+        // A zero-landed capture is a no-op: no save or refresh. For any replaced slots, the
+        // first save from a pipe thread makes the successful reply describe a state that is ON DISK
         // (agwinterm's rule): posting the refresh, which saves on the UI thread, would answer before
         // the file is written, and a kill in that window loses a capture the caller was told it had.
         // saveSessionState takes and releases g_lock itself and does its I/O under g_saveLock, so
@@ -11256,12 +11262,7 @@ static std::string ctlDispatch(const std::string& line) {
             if (target->exited) return ctlErr("the pane's process has exited");
         }
         std::string text = req.get("args.text");
-        if (text.empty() && OpenClipboard(nullptr)) {   // no text -> clipboard contents
-            if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
-                if (const wchar_t* wz = (const wchar_t*)GlobalLock(h)) { text = narrow(wz); GlobalUnlock(h); }
-            }
-            CloseClipboard();
-        }
+        if (text.empty()) text = readClipboardText(nullptr); // no text -> bounded clipboard contents
         // Same normalisation + bracketing as Ctrl+V (the main app shares one PasteTextInto for both);
         // this used to map \n -> \r WITHOUT collapsing CRLF, so clipboard text arrived as \r\r.
         text = pasteNormalize(std::move(text));
@@ -12111,14 +12112,14 @@ static bool restoreSessions() {
     if (!ps.splits.empty())
         logInfo("restore: %d of %zu split shell(s) rebuilt", splitsBuilt, ps.splits.size());
     // The layout (the L lines, P4) goes onto the owner whose split the P line just rebuilt: the axis
-    // and the order describe the PAIR, so with no pair — the split shell failed to start (an L for
+    // and the order describe the PAIR, so with no pair — either shell failed to start (an L for
     // an owner with no P line never reaches here; parseStateFile dropped it) — the line is dropped
     // and named rather than left on a lone session where the next `split on` would silently pick
     // it up. Set before resolveSplitForPrimary / syncPaneSizes below, which read it through paneRect.
     int layoutsSet = 0;
     for (const auto& ls : ps.layouts) {
         if (ls.owner < 0 || ls.owner >= (int)bySpec.size() || !bySpec[ls.owner]) {
-            logWarn("restore: layout for owner index %d dropped - its session was not restored", ls.owner);
+            logWarn("restore: layout for owner index %d dropped - its owner has no live shell", ls.owner);
             continue;
         }
         Session* owner = bySpec[ls.owner];

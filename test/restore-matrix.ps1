@@ -1444,6 +1444,15 @@ Seeded -Name 'layout-split-failed' `
         ((Get-Content (State $i) -Raw) -notmatch "(?m)^L`t")
 }
 
+# A failed owner remains visible, but has no live shell to own the split/layout.
+Seeded -Name 'layout-owner-failed' `
+    -Tsv "V1`nW`tws-owner-failed`nS`t0`tlayout-dead-owner`tC:\no-such-dir\no-such-owner-shell.exe`t$cwd`nS`t0`tlive-survivor`t`t$cwd`nP`t0`t`t$cwd`nL`t0`thorizontal`t1`nA`t1`n" -Assert {
+    param($a, $i)
+    ($a -match 'layout-dead-owner') -and ($a -match 'live-survivor') -and
+        (Log-Has $i 'restore: layout for owner index 0 dropped - its owner has no live shell') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^L`t")
+}
+
 # A default split (vertical, unswapped) writes NO L line: the file the second run wrote has exactly
 # the line types, in the order, that the P3-lite build wrote for the same tree — V1 W S D P A — so
 # a downgrade reads the same bytes it always did and a byte-for-byte fixture from before P4 is still
