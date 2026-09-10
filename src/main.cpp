@@ -1443,7 +1443,10 @@ static void logInit(int argc, wchar_t** argv) {
 }
 
 // ---- control pipe: protobuf frames (4-byte LE length prefix) ----
-static CRITICAL_SECTION g_reqLock;   // the control pipe is shared by the UI thread and the ctl server thread
+#include "control_transport.h"
+// Detached control workers have process lifetime. Do not run a global mutex/vector destructor
+// concurrently with their final request during CRT shutdown.
+static auto& g_controlTransport = *new control_transport::Transport;
 // Why a request failed, for the one caller that has to tell the reasons apart. "The host sent a
 // frame lite could not decode" and "the host refused the command" look identical through the bool,
 // and the startup liveness probe needs them separated — see controlHandshake().
@@ -1453,8 +1456,6 @@ static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Repl
     ReqOutcome sink;
     if (!outcome) outcome = &sink;
     *outcome = ReqOutcome::NoReply;
-    EnterCriticalSection(&g_reqLock);
-    struct Unlock { ~Unlock() { LeaveCriticalSection(&g_reqLock); } } unlock;
     // Sized from the generated worst case, not a round number: a Create carries 16 args of 2048 bytes
     // (35572 total), and the old 4 KB buffer meant a spec whose fields each passed fitsField could
     // still overflow the FRAME — pb_encode failed, request returned false with no log at all, and the
@@ -1468,18 +1469,15 @@ static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Repl
     }
     uint32_t len = (uint32_t)os.bytes_written;
     memcpy(buf.data(), &len, 4);
-    DWORD n = 0;
-    if (!WriteFile(g_control, buf.data(), len + 4, &n, nullptr)) return false;
-
-    uint32_t rlen = 0;
-    DWORD got = 0, need = 4;
-    while (need && ReadFile(g_control, (uint8_t*)&rlen + (4 - need), need, &got, nullptr) && got) need -= got;
-    if (need || rlen > 1 << 20) return false;
-    std::vector<uint8_t> payload(rlen);
-    need = rlen;
-    while (need && ReadFile(g_control, payload.data() + (rlen - need), need, &got, nullptr) && got) need -= got;
-    if (need) return false;
-    pb_istream_t is = pb_istream_from_buffer(payload.data(), rlen);
+    buf.resize(len + 4);
+    std::vector<uint8_t> payload;
+    control_transport::Failure failure;
+    if (!g_controlTransport.exchange(g_control, buf, payload, 2000, &failure)) {
+        logWarn("control: request (cmd %d) failed at %s, Win32 error %lu (timeout=%lu); host outcome may be unknown",
+                (int)req.which_cmd, failure.stage, failure.error, (DWORD)ERROR_TIMEOUT);
+        return false;
+    }
+    pb_istream_t is = pb_istream_from_buffer(payload.data(), payload.size());
     *reply = agwinterm_ptyhost_Reply_init_default;
     if (!pb_decode(&is, agwinterm_ptyhost_Reply_fields, reply)) { *outcome = ReqOutcome::Undecodable; return false; }
     if (!reply->ok) { *outcome = ReqOutcome::Refused; return false; }
@@ -1490,7 +1488,7 @@ static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Repl
 static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped) {
     // DATA pipes must be overlapped: a non-overlapped duplex pipe SERIALIZES the handle
     // (pending reader ReadFile blocks the UI thread's keystroke write — both the Rust
-    // host and this client hit that identical deadlock). Control stays sync.
+    // host and this client hit that identical deadlock). Control is also overlapped for deadlines.
     std::wstring full = L"\\\\.\\pipe\\" + name;
     DWORD flags = overlapped ? FILE_FLAG_OVERLAPPED : 0;
     for (int waited = 0; waited <= timeoutMs; waited += 100) {
@@ -1599,6 +1597,7 @@ static HostHealth controlHandshake() {
     ReqOutcome out = ReqOutcome::NoReply;
     if (request(req, &rep, &out))
         return rep.which_body == agwinterm_ptyhost_Reply_list_tag ? HostHealth::Healthy : HostHealth::HelloOnly;
+    if (out == ReqOutcome::NoReply || g_control == INVALID_HANDLE_VALUE) return HostHealth::Dead;
     if (out == ReqOutcome::Undecodable) {
         logWarn("pty-host: list replied with something this build cannot decode — the host is alive, "
                 "so lite starts; adoption of live sessions is unavailable this run");
@@ -1617,7 +1616,7 @@ static void connectControl() {
     bool spawned = false;
     const int kAttempts = 4;
     for (int attempt = 0; attempt < kAttempts; attempt++) {
-        g_control = openPipe(control, 0, false);
+        g_control = openPipe(control, 0, true);
         if (g_control == INVALID_HANDLE_VALUE && !spawned) {   // no host yet: start one
             spawned = true;
             STARTUPINFOW si{ sizeof(si) };
@@ -1628,7 +1627,7 @@ static void connectControl() {
                 fatal(L"could not start agwinterm-ptyhost.exe");
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            g_control = openPipe(control, 5000, false);
+            g_control = openPipe(control, 5000, true);
         }
         HostHealth health = g_control != INVALID_HANDLE_VALUE ? controlHandshake() : HostHealth::Dead;
         if (health == HostHealth::Healthy) {
@@ -1847,12 +1846,12 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
     // latch, the host and the emulator disagreeing for good — the pane stuck at a size nothing
     // asked for (#23).
     //
-    // g_lock is NOT held across request(). request() is a synchronous WriteFile/ReadFile on a
-    // non-overlapped pipe with no timeout, so a pty-host that is alive but not answering blocks
-    // this thread forever — and a child that stops draining its input can make exactly that happen
+    // g_lock is NOT held across request(). The overlapped control exchange is bounded to two
+    // seconds including contention. A pty-host that is alive but not answering can consume that
+    // entire budget — a child that stops draining its input can make exactly that happen
     // (the host's input pump blocks in write_all holding that session's pty mutex, and every Resize
-    // for it queues behind). With g_lock held that stall freezes paintPane, every reader thread,
-    // `tree` and the status bar: the whole window, unrecoverably (revmux r1 of P2-lite). The lock
+    // for it queues behind). Holding g_lock would needlessly stall paintPane, every reader thread,
+    // `tree` and the status bar as well. The lock
     // is taken for the latch, dropped for the round trip, and re-taken to publish the result.
     //
     // The UI thread never WAITS for this lock: if a pipe thread is mid-round-trip the UI thread
@@ -1930,7 +1929,8 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
         req.cmd.resize.rows = (uint32_t)rows;
         ReqOutcome why;
         if (!request(req, &rep, &why) && !s->exited) {
-            // The host did not take it: roll the latch back and ARM THE RETRY. "The next
+            // No accepted reply: roll the local latch back and ARM THE RETRY. A lost reply can
+            // mean the host applied it; do not claim transport failure proves non-execution. "The next
             // syncPaneSizes asks again" is not something anyone owns (see the top of this
             // function), and the early out above makes that reachable: while this request was in
             // flight the latch already advertised the new size, so a concurrent caller asking for
@@ -12245,7 +12245,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_resizeLock);
     InitializeCriticalSection(&g_saveLock);
-    InitializeCriticalSection(&g_reqLock);
     InitializeCriticalSection(&g_evtLock);
     InitializeCriticalSection(&g_statusLock);
     g_evtReady = true;   // from here on, anything worth reporting goes into the event log
