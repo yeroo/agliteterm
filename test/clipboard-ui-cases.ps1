@@ -8,13 +8,22 @@ try {
     Write-SelectionClipboardMarker $clipboard 'guarded-clipboard-probe'
     Check 'clipboard marker writes through whole-format guard' ((Clip)-ceq 'guarded-clipboard-probe')
     $sinkFile=Join-Path $script:selectionArtifact 'right-paste.txt'
-    $literal=$sinkFile.Replace("'","''")
-    $sink="[Console]::WriteLine('RIGHT-'+'PASTE-READY'); `$ok=[Console]::ReadLine() -ceq 'PASTED_OK'; [IO.File]::WriteAllText('$literal',[string]`$ok); [Environment]::Exit(0)"
-    $sinkId=[string](Selection-Rpc 'session.new' @{name='clipboard-paste-sink';command=$sink});$clipIds.Add($sinkId)
+    $sinkExe=Join-Path (Split-Path $PSScriptRoot -Parent) 'bin/clipboard-sink-unit/clipboard-sink.exe'
+    if(-not (Test-Path -LiteralPath $sinkExe)){throw 'Compile the native clipboard sink before acceptance'}
+    $catalogPath=Join-Path $profile 'agliteterm/profiles.json'
+    if(Test-Path -LiteralPath $catalogPath){throw 'Clipboard fixture refuses to overwrite an existing launch catalog'}
+    function Clip-Sink([string]$Result){
+        @{default='ClipboardShell';profiles=@(@{name='ClipboardSink';command=$sinkExe;args=@($Result);cwd=$script:selectionArtifact},@{name='ClipboardShell';command='powershell.exe';args=@('-NoLogo','-NoProfile','-NoExit');cwd=$script:selectionArtifact})}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath $catalogPath -Encoding utf8
+        Selection-Rpc 'profiles.reload'|Out-Null
+        $id=[string](Selection-Rpc 'session.new' @{name='clipboard-paste-sink';profile='ClipboardSink'})
+        $clipIds.Add($id)
+        if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $id)).Contains('RIGHT-PASTE-READY')})){throw 'Native sink did not establish no-echo console mode'}
+        return $id
+    }
+    $sinkId=Clip-Sink $sinkFile
     Selection-Rpc 'session.select' @{} $sinkId|Out-Null
     if(-not (ClipWait {@((Selection-Rpc 'tree').workspaces.sessions|Where-Object {$_.id-eq $sinkId -and $_.active}).Count-eq 1})){throw 'Private paste sink not selected'}
     if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $sinkId)).Contains('RIGHT-PASTE-READY')})){throw 'Private paste sink not ready'}
-    Write-Screen ($esc+'[?1000h'+$esc+'[?1006h') $sinkId
     Write-SelectionClipboardMarker $clipboard 'PASTED_OK'
     $geometry=Selection-Geometry
     [SelectionUi]::Button($h,0x204,($geometry.Left+25),($geometry.Top+25))
@@ -23,6 +32,17 @@ try {
     Check 'right-click pastes into a mouse-reporting pane' (ClipWait {(Test-Path -LiteralPath $sinkFile) -and (Get-Content -LiteralPath $sinkFile -Raw)-ceq 'True'})
     Check 'right-click paste does not mutate clipboard' ((Clip)-ceq 'PASTED_OK')
     Selection-Rpc 'session.close' @{} $sinkId|Out-Null;$clipIds.Remove($sinkId)|Out-Null
+
+    # Exercise actual ConPTY echo/control semantics with synthetic data, never a live clipboard read.
+    foreach($payload in @("SYNTHETIC-NO-ECHO`r",([string][char]3+"SYNTHETIC-NO-EXECUTE`r"),"wrong`rSYNTHETIC-SECOND-LINE`r")){
+        $resultFile=Join-Path $script:selectionArtifact ([guid]::NewGuid().ToString('N')+'.boolean')
+        $proofId=Clip-Sink $resultFile
+        Selection-Rpc 'session.type' @{text=$payload;'allow-control'=$true} $proofId|Out-Null
+        Check 'native sink terminates after synthetic console input' (ClipWait {@((Selection-Rpc 'tree').workspaces.sessions|Where-Object {$_.id-eq $proofId -and $_.exited}).Count-eq 1})
+        Check 'native sink persists only a boolean mismatch' ((Test-Path -LiteralPath $resultFile) -and (Get-Content -LiteralPath $resultFile -Raw)-ceq 'False')
+        Check 'actual console input is not echoed into the pane' (-not ([string](Selection-Rpc 'session.text' @{} $proofId)).Contains('SYNTHETIC-'))
+        Selection-Rpc 'session.close' @{} $proofId|Out-Null;$clipIds.Remove($proofId)|Out-Null
+    }
 
     # OSC 52 travels through actual child output, exercising the host-action drain.
     $oscId=[string](Selection-Rpc 'session.new' @{name='clipboard-osc52'});$clipIds.Add($oscId)
