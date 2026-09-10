@@ -410,6 +410,7 @@ struct Session {
     // it; sites that report a SESSION (the tree node's id, `session` in replies, `session closed`
     // events) use `id`. resolveTarget matches it exactly and by prefix, like `id`.
     std::string paneId;
+    std::string creationTicket;    // immutable host incarnation, not the reusable pane name
     // P4: the axis of this session's two panes, meaningful on a split owner only. The vocabulary,
     // stated here once (agwinterm SplitAxes, agterm's words): `vertical` = LEFT/RIGHT panes — lite's
     // only layout before P4, and the default of a session never split; `horizontal` = TOP/BOTTOM
@@ -1187,6 +1188,8 @@ struct LockG {
     LockG& operator=(const LockG&) = delete;
 };
 static HANDLE g_control = INVALID_HANDLE_VALUE;
+static uint32_t g_creationRevision = 0; // negotiated before worker threads start
+static uint32_t g_creationHostPid = 0;
 static std::vector<Session*> g_sessions;
 static WorkspaceNames g_workspaces = { L"workspace 1" };  // persisted names plus process-local stable identity
 static std::set<int> g_collapsedWorkspaces; // transient, under g_lock; remapped with workspace indices
@@ -1463,15 +1466,17 @@ static void logInit(int argc, wchar_t** argv) {
 
 // ---- control pipe: protobuf frames (4-byte LE length prefix) ----
 #include "control_transport.h"
+#include "creation_protocol.h"
 // Detached control workers have process lifetime. Do not run a global mutex/vector destructor
 // concurrently with their final request during CRT shutdown.
 static auto& g_controlTransport = *new control_transport::Transport;
 // Why a request failed, for the one caller that has to tell the reasons apart. "The host sent a
 // frame lite could not decode" and "the host refused the command" look identical through the bool,
 // and the startup liveness probe needs them separated — see controlHandshake().
-enum class ReqOutcome { NoReply, Undecodable, Refused, Ok };
+using ReqOutcome = creation_protocol::Outcome;
 static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Reply* reply,
-                    ReqOutcome* outcome = nullptr) {
+                    ReqOutcome* outcome = nullptr, control_transport::Transport* transport = nullptr,
+                    HANDLE* channel = nullptr) {
     ReqOutcome sink;
     if (!outcome) outcome = &sink;
     *outcome = ReqOutcome::NoReply;
@@ -1491,7 +1496,7 @@ static bool request(const agwinterm_ptyhost_Request& req, agwinterm_ptyhost_Repl
     buf.resize(len + 4);
     std::vector<uint8_t> payload;
     control_transport::Failure failure;
-    if (!g_controlTransport.exchange(g_control, buf, payload, 2000, &failure)) {
+    if (!(transport ? *transport : g_controlTransport).exchange(channel ? *channel : g_control, buf, payload, 2000, &failure)) {
         logWarn("control: request (cmd %d) failed at %s, Win32 error %lu (timeout=%lu); host outcome may be unknown",
                 (int)req.which_cmd, failure.stage, failure.error, (DWORD)ERROR_TIMEOUT);
         return false;
@@ -1516,6 +1521,43 @@ static HANDLE openPipe(const std::wstring& name, int timeoutMs, bool overlapped)
         Sleep(100);
     }
     return INVALID_HANDLE_VALUE;
+}
+
+static bool validCreationTicket(const char* ticket) {
+    return creation_protocol::validTicket(ticket);
+}
+
+// Cancellation alone may reconnect to an EXISTING host. Never spawn a host, replay Create,
+// or revive the global retired stream. Each receipt addresses the exact host-issued ticket.
+static bool cancelCreation(const char* id, const char* ticket) {
+    if (!validCreationTicket(ticket)) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const std::wstring hostId = g_testHostAppId.empty() ? std::wstring(kAppId) : g_testHostAppId;
+        HANDLE pipe = openPipe(hostId + L"-ptyhost", 200, true);
+        if (pipe == INVALID_HANDLE_VALUE) continue;
+        control_transport::Transport transport;
+        if (!creation_protocol::bindCancellationHost(g_creationHostPid, kProtocolVersion,
+            [&](const auto& hello, auto& reply) { return request(hello, &reply, nullptr, &transport, &pipe); })) {
+            if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+            continue;
+        }
+        agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
+        agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
+        req.which_cmd = agwinterm_ptyhost_Request_cancel_create_tag;
+        strcpy_s(req.cmd.cancel_create.id, id);
+        strcpy_s(req.cmd.cancel_create.ticket, ticket);
+        bool ok = request(req, &rep, nullptr, &transport, &pipe);
+        if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+        if (!ok || rep.which_body != agwinterm_ptyhost_Reply_creation_tag ||
+            strcmp(rep.body.creation.id, id) || strcmp(rep.body.creation.ticket, ticket)) continue;
+        if (rep.body.creation.phase == agwinterm_ptyhost_CreationPhase_CREATION_UNKNOWN) return true;
+        if (rep.body.creation.phase == agwinterm_ptyhost_CreationPhase_CREATION_CANCELLING) {
+            logWarn("session '%s': exact creation cancellation accepted; cleanup is still pending", id);
+            return false;
+        }
+    }
+    logWarn("session '%s': exact creation cleanup remains unproven; Create was not replayed", id);
+    return false;
 }
 
 #include "bounded_pipe_write.h"
@@ -1610,6 +1652,8 @@ static HostHealth controlHandshake() {
     req.which_cmd = agwinterm_ptyhost_Request_hello_tag;
     req.cmd.hello.protocol = kProtocolVersion;
     if (!request(req, &rep) || rep.which_body != agwinterm_ptyhost_Reply_hello_tag) return HostHealth::Dead;
+    g_creationRevision = rep.body.hello.creation_revision;
+    g_creationHostPid = rep.body.hello.pid;
     req = agwinterm_ptyhost_Request_init_default;
     rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_list_tag;
@@ -1961,6 +2005,7 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
         agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
         req.which_cmd = agwinterm_ptyhost_Request_resize_tag;
         strcpy_s(req.cmd.resize.id, s->paneId.c_str());
+        strcpy_s(req.cmd.resize.creation_ticket, s->creationTicket.c_str());
         req.cmd.resize.cols = (uint32_t)cols;
         req.cmd.resize.rows = (uint32_t)rows;
         ReqOutcome why;
@@ -2377,7 +2422,8 @@ static std::vector<Profile> listedProfiles() {
 // catalog default; remembered legacy empty-app specs explicitly select powershell.exe at callers.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint = false, bool hidden = false, uint64_t workspace = 0);   // fwd
+                              bool repaint = false, bool hidden = false, uint64_t workspace = 0,
+                              const char* creationTicket = "");   // fwd
 
 // The protocol's string fields are FIXED-SIZE arrays, and MSVC's strcpy_s does not truncate on an
 // oversize source — it invokes the CRT invalid-parameter handler, whose default terminates the
@@ -2563,9 +2609,14 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     // holds), a refused or unanswered list, or a host that gained sessions since startup all leave
     // g_seq pointing at an id already in use. So don't depend on the scan — take the host's "already
     // exists" at face value and step over it. Any other refusal is a real failure and returns.
-    ReqOutcome oc = ReqOutcome::NoReply;
-    for (int tries = 0; !request(req, &rep, &oc); tries++) {
-        if (oc != ReqOutcome::Refused || !strstr(rep.error, "already exists") || tries >= 64) return nullptr;
+    std::string creationTicket;
+    for (int tries = 0; ; ++tries) {
+        const auto attempt = creation_protocol::start(g_creationRevision >= 1, req, rep,
+            [](const auto& command, auto& response, auto& outcome) { return request(command, &response, &outcome); }, cancelCreation);
+        creationTicket = attempt.ticket;
+        if (attempt.status == creation_protocol::Status::Created) break;
+        // Only an explicit refusal authorizes a DIFFERENT id. Ambiguous/lost receipts never retry.
+        if (attempt.status != creation_protocol::Status::Conflict || tries >= 64) return nullptr;
         _snprintf_s(idbuf, _TRUNCATE, "%s%s-%d", quick?"quick:":"", g_idPrefix.c_str(), g_seq++);
         strcpy_s(req.cmd.create.id, idbuf);
         strcpy_s(req.cmd.create.env[3].value, idbuf);   // AGWINTERM_SESSION_ID
@@ -2573,12 +2624,13 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str());
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
         // same spec on every launch, so the leak compounds. Take it back.
         logWarn("session '%s' was created but could not be attached — killing it rather than leaking it", idbuf);
+        if (!creationTicket.empty()) { cancelCreation(idbuf, creationTicket.c_str()); return nullptr; }
         agwinterm_ptyhost_Request k = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply kr = agwinterm_ptyhost_Reply_init_default;
         k.which_cmd = agwinterm_ptyhost_Request_kill_tag;
@@ -2594,7 +2646,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
 /// running and can simply be picked back up, scrollback and all.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint, bool hidden, uint64_t workspace) {
+                              bool repaint, bool hidden, uint64_t workspace, const char* creationTicket) {
     { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -2607,6 +2659,8 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
         return nullptr;
     }
     strcpy_s(req.cmd.attach.id, id);
+    if (*creationTicket && !validCreationTicket(creationTicket)) return nullptr;
+    strcpy_s(req.cmd.attach.creation_ticket, creationTicket);
     // ADOPTION only: the shell has been running without a client and has already painted its screen,
     // but the adopting side gets a brand-new empty emulator and the host forwards only NEW output.
     // Today the screen does come back anyway — syncPaneSizes() after restore almost always asks for
@@ -2618,6 +2672,8 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // would race the shell's startup.
     req.cmd.attach.repaint = repaint;
     if (!request(req, &rep) || rep.which_body != agwinterm_ptyhost_Reply_attach_tag) return nullptr;
+    if ((g_creationRevision >= 1 && !validCreationTicket(rep.body.attach.creation_ticket)) ||
+        (*creationTicket && strcmp(creationTicket, rep.body.attach.creation_ticket))) return nullptr;
     // Adoption decides on g_hostLive, a snapshot taken before the window, the fonts, the toolbar and
     // the update check — seconds before this call. A shell that exits in between is still "adoptable"
     // per that snapshot, and attaching to it yields an immediate EOF: the saved session comes back as
@@ -2631,6 +2687,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
         agwinterm_ptyhost_Reply kr = agwinterm_ptyhost_Reply_init_default;
         k.which_cmd = agwinterm_ptyhost_Request_kill_tag;
         strcpy_s(k.cmd.kill.id, id);
+        strcpy_s(k.cmd.kill.creation_ticket, rep.body.attach.creation_ticket);
         request(k, &kr);
         return nullptr;
     }
@@ -2638,6 +2695,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     Session* s = new Session();
     s->id = id;
     s->paneId = id;                 // the shell's pane id: written here and nowhere else (P4)
+    s->creationTicket = rep.body.attach.creation_ticket;
     s->app = app ? app : "";        // remember the launch spec for session restore
     if (pargs) s->args = *pargs;
     s->cwd = cwd ? cwd : "";
@@ -2685,6 +2743,7 @@ struct HostSession {
     std::string id;
     bool exited = false;     // the shell behind it is gone: the host keeps the entry, attaching gets an EOF
     bool attached = false;   // another window is driving it right now — attaching would STEAL it
+    std::string creationTicket;
     bool adoptable() const { return !exited && !attached; }
 };
 static std::vector<HostSession> hostSessions() {
@@ -2704,7 +2763,8 @@ static std::vector<HostSession> hostSessions() {
     }
     for (pb_size_t i = 0; i < rep.body.list.sessions_count; i++) {
         const auto& si = rep.body.list.sessions[i];
-        out.push_back({ si.id, si.has_exited, si.attached });
+        if (g_creationRevision >= 1 && !validCreationTicket(si.creation_ticket)) continue;
+        out.push_back({ si.id, si.has_exited, si.attached, si.creation_ticket });
     }
     return out;
 }
@@ -2765,6 +2825,7 @@ static void killSession(Session* s) {
     { LockG hold; s->ompOperation.reset(); s->ompReady = false; }
     { LockG lk; if (g_sel.sess == s) g_sel.clear(); }   // keyed by session: don't outlive it
     if (s->paneId.empty()) return;        // restore placeholder: nothing on the host to kill
+    if (!s->creationTicket.empty()) { cancelCreation(s->paneId.c_str(), s->creationTicket.c_str()); return; }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_kill_tag;
@@ -11951,6 +12012,7 @@ static void reapExitedHostSessions() {
         agwinterm_ptyhost_Reply kr = agwinterm_ptyhost_Reply_init_default;
         k.which_cmd = agwinterm_ptyhost_Request_kill_tag;
         strcpy_s(k.cmd.kill.id, hs.id.c_str());
+        strcpy_s(k.cmd.kill.creation_ticket, hs.creationTicket.c_str());
         if (request(k, &kr)) logInfo("restore: reaped exited host session '%s'", hs.id.c_str());
     }
 }
@@ -12031,9 +12093,11 @@ static bool restoreSessions() {
         std::string want = si < savedIds.size() ? savedIds[si] : std::string();
         Session* s = nullptr;
         if (isAdoptable(want)) {
+            std::string expectedTicket;
+            for (const auto& hs : g_hostLive) if (hs.id == want) { expectedTicket = hs.creationTicket; break; }
             s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
-                              true);   // repaint: the shell already has a screen, ask it to redraw
+                              true, false, 0, expectedTicket.c_str());   // repaint, guarded against id reuse since the scan
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
             // The shell itself is untouched by a failed adopt (attach may well have succeeded and
             // only the data pipe refused), so it keeps running under an id nothing points at any
