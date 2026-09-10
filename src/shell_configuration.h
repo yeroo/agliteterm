@@ -13,8 +13,12 @@ class InputGate {
     bool written = false;
     unsigned long long reservation = 0, sequence = 0;
     std::atomic<bool> editable{true};
+    std::atomic<unsigned long long> policyVersion{0};
 public:
-    void setReadOnly(bool readOnly) { editable = !readOnly; }
+    void setReadOnly(bool readOnly) {
+        if (editable.exchange(!readOnly) != !readOnly) ++policyVersion;
+    }
+    unsigned long long policyGeneration() const { return policyVersion.load(); }
     unsigned long long reserve(unsigned waitMs = 1000) {
         std::unique_lock<std::timed_mutex> hold(mutex,std::defer_lock);
         if (!hold.try_lock_for(std::chrono::milliseconds(waitMs))) return 0;

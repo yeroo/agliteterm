@@ -4,7 +4,8 @@ struct OmpOperation {
     omp_protocol::State state;
     std::string nonce, path, bridge, result;
     std::shared_ptr<AgentHandle> shell;
-    uint64_t configGeneration = 0;
+    omp_config::Snapshot configSnapshot;
+    unsigned long long policyGeneration = 0;
     bool persist = false;
     explicit OmpOperation(uint64_t deadline) : state(deadline) {}
 };
@@ -14,7 +15,10 @@ static std::string ompNonce() {
     return narrow(std::wstring(text + 1, 36));
 }
 static bool ompPaneEligible(Session* pane, const OmpOperation& op) {
+    FfiEmuInfo info{};
     return indexOfSession(pane) >= 0 && !pane->exited && !pane->readOnly && !pane->adopted && !isCoverLocked(pane) &&
+        pane->inputGate.policyGeneration() == op.policyGeneration &&
+        pane->emu && emu_info(pane->emu, &info) && !info.isAltScreen &&
         pane->data != INVALID_HANDLE_VALUE && pane->agentBridgeToken == op.bridge &&
         pane->childPid == op.shell->pid && pane->childCreated == op.shell->born && op.shell->live();
 }
@@ -38,7 +42,9 @@ static std::string ompQueueOnUi(const JsonReq& req) {
     if (!agent_integration::uuid(op->nonce)) return ctlErr("omp: missing request identity");
     op->bridge = pane->agentBridgeToken; op->path = req.get("args.resolved-theme");
     op->persist = req.get("args.persist") == "true";
-    { std::lock_guard<std::mutex> guard(g_ompMutex); op->configGeneration = g_ompGeneration; }
+    op->policyGeneration = pane->inputGate.policyGeneration();
+    if (op->persist && !omp_config::snapshot(kRegKey, op->configSnapshot))
+        return ctlErr("omp: configuration could not be read; nothing applied or saved");
     pane->ompOperation = op;
     return ctlOkStr(op->nonce);
 }
@@ -97,7 +103,7 @@ static std::string ompBridge(const JsonReq& req, Session* pane) {
     const bool eligible = ompPaneEligible(pane, *op);
     if (!op->state.result(GetTickCount64(), req.get("args.success") == "true", eligible)) return ctlErr("omp: no claimed authorization");
     if (op->state.phase == omp_protocol::Phase::Applied) {
-        const bool saved = op->persist && op->state.persistAllowed && saveOmpTheme(op->path, op->configGeneration);
+        const bool saved = op->persist && op->state.persistAllowed && saveOmpTheme(op->path, &op->configSnapshot);
         if (op->persist && !saved) op->result = ctlErr("omp: shell applied theme, but persistence refused or failed (deadline, pane policy or newer configuration); nothing saved");
         else op->result = ctlOkStr("oh-my-posh theme applied" + std::string(saved ? "; saved for eligible new shells" : "; not persisted"));
     } else {

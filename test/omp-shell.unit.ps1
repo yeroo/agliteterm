@@ -22,11 +22,13 @@ function global:Invoke-AgLiteOmpRequest {
     throw 'Unexpected bridge mutation'
 }
 $checks=0
-foreach($prior in $true,$false){foreach($mode in 'same','change','fail','error','draft','expired','duplicate'){
+foreach($verbose in 'SilentlyContinue','Stop'){$VerbosePreference=$verbose
+foreach($prior in $true,$false){foreach($mode in 'same','change','fail','error','draft','expired','late','duplicate'){
     $global:idle=$mode-ne 'draft';$global:ompApplied=0;$global:reported=$null
     $global:requests=[Collections.Generic.List[string]]::new()
     $global:offer=@{lease=[guid]::NewGuid().ToString('D');path="C:\test's theme.omp.json";deadline=[Environment]::TickCount64+30000}
     if($mode-eq 'expired'){$global:offer.deadline=[Environment]::TickCount64-1}
+    if($mode-eq 'late'){$global:offer.deadline=[Environment]::TickCount64+500}
     $global:__agliteOmpExecuted=if($mode-eq 'duplicate'){$global:offer.lease}else{''}
     $env:AGLITE_OMP_UNIT_MODE=$mode
     function global:prompt {'ORIGINAL'}
@@ -43,7 +45,7 @@ foreach($prior in $true,$false){foreach($mode in 'same','change','fail','error',
     elseif($global:reported-ne $applied -or $global:requests.Count-ne 2){throw "Wrong result: $mode"};$checks++
     if($mode-ne 'change' -and -not [object]::ReferenceEquals($beforePrompt,$function:prompt)){throw "Unchanged prompt rewrapped: $mode"};$checks++
     if($mode-eq 'change' -and $global:__agwLiteP.ToString()-notmatch 'OMP-CHANGED'){throw 'New prompt not wrapped'};$checks++
-}}
+}}}
 "OMP shell handler: $checks checks passed; native fake tool, no shell host/profile/clipboard"
 '@
 $body=$body.Replace('__OMP__',(Join-Path $repo 'assets/agliteterm-omp.ps1').Replace("'","''")).Replace('__PROMPT__',(Join-Path $repo 'assets/agliteterm-prompt.ps1').Replace("'","''")).Replace('__TOOL__',$tool.Replace("'","''"))

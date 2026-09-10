@@ -17,6 +17,7 @@ int wmain(int argc,wchar_t** argv) {
         while(GetFileAttributesW(released.c_str())==INVALID_FILE_ATTRIBUTES){if(GetTickCount64()>=until)return 11;Sleep(10);}
     }
     if(!wcscmp(mode,L"slow"))Sleep(400);
+    if(!wcscmp(mode,L"late"))Sleep(4500);
     std::wstring script=L"[IO.File]::WriteAllText("+literal(receipt)+L","+literal(argv[4])+L"); function global:prompt { 'OMP-LIVE-READY> ' }";
     int size=WideCharToMultiByte(CP_UTF8,0,script.data(),(int)script.size(),nullptr,0,nullptr,nullptr);
     std::string utf8(size,'\0');WideCharToMultiByte(CP_UTF8,0,script.data(),(int)script.size(),&utf8[0],size,nullptr,nullptr);

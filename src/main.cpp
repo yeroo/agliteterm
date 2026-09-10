@@ -2351,14 +2351,11 @@ static bool resolveOmp(const std::string& name, std::string& path, std::string& 
     if (found == themes.end()) return false;
     path = found->second.second; return true;
 }
-static uint64_t g_ompGeneration = 1; // g_ompMutex, prevents late apply overwriting newer config
-static bool saveOmpTheme(const std::string& path, uint64_t expectedGeneration = 0) {
+#include "omp_config.h"
+static bool saveOmpTheme(const std::string& path, const omp_config::Snapshot* expected = nullptr) {
     std::lock_guard<std::mutex> guard(g_ompMutex);
-    if (expectedGeneration && expectedGeneration != g_ompGeneration) return false;
-    const auto wide = widen(path);
-    if (RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"OmpTheme", REG_SZ, wide.c_str(),
-                       static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) return false;
-    g_ompTheme = path; ++g_ompGeneration; return true;
+    if (!omp_config::save(kRegKey, widen(path), expected)) return false;
+    g_ompTheme = path; return true;
 }
 
 // Detected shells on this machine (the "voices"). PowerShell + cmd are always present.

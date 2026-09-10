@@ -307,12 +307,14 @@ newlines; older builds ignore K2 records. The API field remains capturedCommands
 
 `omp list` discovers local `.omp.json` themes, first-directory wins: POSH_THEMES_PATH, normal
 winget/scoop/chocolatey locations, then app-data `omp-themes`. `omp set NAME [--persist]` requests
-initialization only at an observed prompt in a fresh, writable PowerShell pane that has received
-no input. After any input (including a prior OMP request), or adoption, it refuses: terminal marks
-cannot prove an unfinished draft is empty. Use `config set omp-theme` for future shells instead.
-It also refuses
-unknown readiness, alternate-screen/readonly/exited/non-PowerShell panes. A successful reply means
-initialization was written without synchronous error, not that OMP succeeded. Theme content and
+initialization through the stock PSReadLine idle reader in PowerShell 7 (PSReadLine 2.2.6–2.x).
+Completed input and previous completed switches are allowed; a nonempty editing buffer refuses
+without submitting or clearing the draft. Adopted, unsupported-reader, alternate-screen, readonly,
+exited and non-PowerShell panes refuse. Use `config set omp-theme` for future shells instead.
+A successful reply confirms that native initialization and its generated script completed.
+A claimed request without a timely result reports an unknown outcome; do not retry automatically.
+Persistence requires timely success, unchanged pane policy and no newer saved configuration.
+Theme content and
 OMP-generated shell code may execute commands; only apply themes you trust.
 
 `config get/set omp-theme` reads or sets the path for eligible new PowerShell shells without

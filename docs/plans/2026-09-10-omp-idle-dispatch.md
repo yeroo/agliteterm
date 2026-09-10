@@ -26,7 +26,8 @@ a partial list or resolving a lower-priority theme after an unreadable directory
 ## Deadlines and outcomes
 
 - A UI-owned queue operation pins the shell PID/birth time, bridge token, request nonce and current
-  configuration generation. A pipe worker waits without holding the global lock or the UI thread.
+  pane-policy generation and (for persistence) shared registry revision/value. A pipe worker waits
+  without holding the global lock or the UI thread. Claim and result recheck normal-screen state.
 - The shell claims once after checking its actual editing buffer and sole console membership; the
   app also refuses a live direct child. Native OMP runs as an application, using the first PATH match.
 - The four-second deadline uses the shared monotonic boot clock. Expiry before a claim is definitively
@@ -36,19 +37,27 @@ a partial list or resolving a lower-priority theme after an unreadable directory
   partial side effects, including after close/read-only changes; this is trusted shell code, not a sandbox.
 - Only native exit zero permits evaluating generated code. Success is acknowledged after evaluation
   and prompt rewrapping; optional persistence also requires a timely result, unchanged pane policy
-  and unchanged configuration generation. Late results never persist; duplicates never apply twice.
+  and unchanged configuration revision/value. Every readonly transition advances the pane policy
+  generation, so on/off is not mistaken for unchanged. Cooperating windows in this desktop session
+  serialize configuration writes with a registry-key-scoped mutex and increment a persisted revision
+  before changing the theme. Same-value writes and ABA invalidate queued saves; a failed write may
+  conservatively invalidate one too. Late results never persist; duplicates never apply twice.
 - The handler preserves native exit status and existing error records. It never accepts, clears or
   rewrites PSReadLine input. Concurrent keystrokes remain queued until the idle callback returns.
 
 ## Evidence
 
-- `omp-protocol.unit`: 86 state-transition checks, including ineligible/duplicate/late/missing results.
-- `omp-shell.unit`: 84 actual-handler checks with a native fake tool, including exact quoted path,
+- `omp-protocol.unit`: state transitions, actual pane-eligibility checks, and actual shared-configuration
+  code with mocked registry/mutex APIs, including ineligible/duplicate/late/missing results and ABA.
+- `omp-shell.unit`: 192 actual-handler checks with a native fake tool, including exact quoted path,
   native failure, evaluation error, drafts, expiry, duplicate execution, unchanged/replaced prompts,
-  multiple PATH matches, native exit status and error-record identity.
+  multiple PATH matches, native exit status, error-record identity, VerbosePreference=Stop, and a
+  native initializer crossing the authorization deadline before returning generated code.
 - `omp-idle`: real PSReadLine with a private native fake OMP, exact theme and persistence readback,
   completed prior input, a single-line separator draft and a barrier-controlled concurrent draft.
-  Native failure must neither evaluate its output nor replace the persisted theme. Read-only refuses.
+  Native failure and overdue output must neither evaluate nor replace the persisted theme. Read-only
+  refuses; on/off during a claim prevents persistence. A second actual window's newer saved choice,
+  including ABA, must survive the first window's delayed result.
 - Actual shell tests run through the canonical token/owned-job supervisor with private profile,
   history and registry paths, no foreground or clipboard access. They do not execute installed OMP
   or modify a user profile. Unsupported PS5/custom-reader refusal is also covered in selection-ui.

@@ -78,7 +78,10 @@ function global:Invoke-AgLiteOmpIdle {
                 . $global:__aglitePromptAsset
             }
             $success=$true
-        } catch { Write-Verbose ("OMP idle initialization: " + $_.Exception.Message) }
+        } catch {
+            # A user's VerbosePreference=Stop must not suppress the failure acknowledgement.
+            try { Write-Verbose ("OMP idle initialization: " + $_.Exception.Message) } catch { }
+        }
         $null=Invoke-AgLiteOmpRequest 'omp-result' @{lease=[string]$offer.lease;success=$success;stage=$stage}
     } catch { }
     finally {

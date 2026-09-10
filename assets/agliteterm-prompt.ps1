@@ -74,7 +74,7 @@ if(-not $global:__agwLiteReadLine){
     # left untouched and never register a restart capability.
     if($reader -is [Management.Automation.FunctionInfo]){
         # Only the stock module's reader has the audited OnIdle/current-runspace contract.
-        # Custom readers and older PSReadLine remain untouched but cannot offer live OMP.
+        # Custom readers and older PSReadLine are preserved behind this wrapper, without live OMP.
         $global:__agliteOmpSupported=($PSVersionTable.PSVersion.Major-ge 7 -and $reader.ModuleName-eq 'PSReadLine' -and
             $reader.Module.Version-ge [version]'2.2.6' -and $reader.Module.Version-lt [version]'3.0')
         if($global:__agliteOmpSupported){. (Join-Path $PSScriptRoot 'agliteterm-omp.ps1')}

@@ -9,8 +9,12 @@ seeds RestoreCommands off and removes OmpTheme before launch, and restores both 
 receipt guards. It never enables captured replay in the real user's app. All K/B/R commands are
 harmless file markers created by this fixture. The fake OMP is a function inside an owned NoProfile
 PowerShell, installed via explicit startup argv rather than typing into its prompt. It is not an
-installed tool or user theme. OmpTheme is cleared before any restart. Live OMP requires a fresh
-pane with no prior input; a single-line draft and a second initialization must refuse unchanged.
+installed tool or user theme. OmpTheme is cleared before any restart. That unsupported reader must
+refuse live OMP. The separate token-guarded `test/omp-idle.ps1` uses real stock PSReadLine in an
+owned NoProfile PowerShell 7 and a private native fake tool. It covers repeat switching after completed
+input, draft refusal without submission, native failure, late output not being evaluated, readonly
+policy transitions and competing-window persistence. Success confirms completed initialization;
+missing timely results are unknown outcomes, never a reason to replay automatically.
 
 Required coverage: catalog reload/list/read-only file preservation; malformed/unreadable reload
 retains snapshot; exact/missing/ambiguous profile refusal before workspace mutation; selected/default
