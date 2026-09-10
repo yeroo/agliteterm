@@ -1800,7 +1800,21 @@ static bool fitSidebarToClient(int clientW) {
 // the shell underneath. Reads a pointer written under g_lock; the object is never freed, so a
 // stale read draws the old surface once, as g_sessions' own reads always could.
 static Session* surfaceOf(Session* shell) { return shell && shell->overlay ? shell->overlay : shell; }
+// Focus is an independent input to the status grid: changing panes or entering/leaving a popup
+// must publish it even when hostResize has no geometry change to report. Post (never Send) while
+// holding the recursive state lock, so a control-thread focus change cannot deadlock with paint.
+static void setFocusedPane(int pane) {
+    LockG hold;
+    g_focus = pane;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+}
+static void setFocusOverride(Session* surface) {
+    LockG hold;
+    g_focusOverride = surface;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+}
 static Session* focusedSession() {
+    LockG hold;
     if (g_focusOverride) return g_focusOverride;   // a popup terminal owns input while it's focused
     int idx = g_pane[g_focus];
     return (idx >= 0 && idx < (int)g_sessions.size()) ? surfaceOf(g_sessions[idx]) : nullptr;
@@ -1812,6 +1826,7 @@ static Session* focusedSession() {
 // session, and a surface verb is the only kind that means the cover. Reads g_pane as
 // focusedSession does.
 static Session* focusedShell() {
+    LockG hold;
     int idx = g_pane[g_focus];
     return (idx >= 0 && idx < (int)g_sessions.size()) ? g_sessions[idx] : nullptr;
 }
@@ -2362,7 +2377,7 @@ static void resolveSplitForPrimary() {
     int comp = prim ? indexOfSessionId(prim->splitId) : -1;
     if (prim && !prim->splitId.empty() && comp < 0) prim->splitId.clear();
     g_pane[1] = comp;
-    if (g_pane[1] < 0 && g_focus != 0) g_focus = 0;   // nothing to focus on the right any more
+    if (g_pane[1] < 0 && g_focus != 0) setFocusedPane(0);   // nothing to focus on the right any more
 }
 
 /// The same, then lay the panes out. Call after ANY change to g_pane[0] — that is what makes the
@@ -2399,7 +2414,7 @@ static void selectPrimary(int idx, bool activateWorkspace = true, Session* expec
         if (idx < 0 || idx >= (int)g_sessions.size() || g_sessions[idx]->hidden) return;
         g_pane[0] = idx;
         if (activateWorkspace) g_activeWs = g_sessions[idx]->ws;
-        g_focus = 0;
+        setFocusedPane(0);
         g_sessions[idx]->notifications = 0;
         touchMruLocked(g_sessions[idx]);
     }
@@ -2732,7 +2747,7 @@ static Session* unlistOverlayLocked(Session* shell) {
     if (!ov) return nullptr;
     shell->overlay = nullptr;
     if (g_sel.sess == ov) g_sel.clear();
-    if (g_focusOverride == ov) g_focusOverride = nullptr;
+    if (g_focusOverride == ov) setFocusOverride(nullptr);
     int oi = indexOfSession(ov);
     if (oi >= 0) {
         emitEvent("session", ov->id, "closed");
@@ -2947,7 +2962,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
         // the pointer, NOT on `displayed`: a selection survives a session switch, and an off-screen
         // promotion has the same slot to fix. The survivor's overlay is its surface: the same fix.
         if (g_sel.sess == survivor || (survivor->overlay && g_sel.sess == survivor->overlay)) g_sel.pane = 0;
-        if (displayed) { g_pane[1] = -1; g_focus = 0; }
+        if (displayed) { g_pane[1] = -1; setFocusedPane(0); }
         for (int p = 0; p < 2; p++) if (g_pane[p] > vi) g_pane[p]--;   // fix the surviving indices
         emitEvent("tree");
     }
@@ -2974,7 +2989,7 @@ static void toggleSplit() {
             s->hidden = true;
             prim->splitId = s->id;                   // the split belongs to THIS session
             prim->swapped = false;                   // a fresh split is in the default order; the axis is kept
-            g_pane[1] = (int)g_sessions.size() - 1; g_focus = 1;
+            g_pane[1] = (int)g_sessions.size() - 1; setFocusedPane(1);
             // newSession's own `tree` fired before splitId was set: a reader woken by it saw the
             // session without its split block. Say it again now that the structure is in place.
             emitEvent("tree");
@@ -5528,8 +5543,8 @@ static void runKbAction(int a) {
         // there — after a swap the left key reaches the split shell. The two rows are kept (one
         // registry name each, Key_FocusL / Key_FocusR, so a user's bindings survive) and named for
         // both axes rather than relabelled live: a binding is set once, for a layout that changes.
-        case KB_FOCUSL: g_focus = g_pane[1] >= 0 ? paneOfSlot(0) : 0; InvalidateRect(g_hwnd, nullptr, FALSE); break;
-        case KB_FOCUSR: if (g_pane[1] >= 0) g_focus = paneOfSlot(1); InvalidateRect(g_hwnd, nullptr, FALSE); break;
+        case KB_FOCUSL: { LockG hold; setFocusedPane(g_pane[1] >= 0 ? paneOfSlot(0) : 0); InvalidateRect(g_hwnd, nullptr, FALSE); break; }
+        case KB_FOCUSR: { LockG hold; if (g_pane[1] >= 0) setFocusedPane(paneOfSlot(1)); InvalidateRect(g_hwnd, nullptr, FALSE); break; }
         case KB_SCROLLUP: scrollFocused(+10); break;
         case KB_SCROLLDN: scrollFocused(-10); break;
         case KB_QUICK: togglePopupTerminal(false); break;
@@ -6791,7 +6806,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_SETFOCUS: {
             LockG hold;
-            g_focusOverride = s;
+            setFocusOverride(s);
             endMarkModeIfMoved();
             touchMruLocked(displayedOwner());
             PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
@@ -6799,7 +6814,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_KILLFOCUS: {
             {LockG hold;
-             if (g_focusOverride == s) g_focusOverride = nullptr;
+             if (g_focusOverride == s) setFocusOverride(nullptr);
              endMarkModeIfMoved();}
             PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
             if(h==g_quickHwnd&&!g_quickPinned)ShowWindow(h,SW_HIDE);
@@ -6816,13 +6831,13 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
-            g_focusOverride = s;
+            setFocusOverride(s);
             g_swallowChar = handleKeyDown(w, (l & (1LL << 30)) != 0);
             InvalidateRect(h, nullptr, FALSE);
             if (g_swallowChar) return 0;
             break;
         case WM_CHAR: {
-            g_focusOverride = s;
+            setFocusOverride(s);
             if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)w); return 0; }
             if (g_swallowChar) { g_swallowChar = false; return 0; }
             wchar_t wc = (wchar_t)w;
@@ -6841,7 +6856,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_LBUTTONDBLCLK: {
             if (!s || g_palette) return 0;
             RECT rc; GetClientRect(h, &rc);
-            { LockG lk; g_focusOverride = s; endMarkModeIfMoved(); }
+            { LockG lk; setFocusOverride(s); endMarkModeIfMoved(); }
             if (!mouseReportSurface(s, rc, GET_X_LPARAM(l), GET_Y_LPARAM(l), 0, true, false)) {
                 LockG lk;
                 if (indexOfSession(s) >= 0)
@@ -6888,7 +6903,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             Session* retired = nullptr;
             if (slot) {   // Atomic pointer-based unlist; never carry an unlocked vector index.
                 LockG hold;
-                if (g_focusOverride == *slot) g_focusOverride = nullptr;
+                if (g_focusOverride == *slot) setFocusOverride(nullptr);
                 // The popup's exit status, read off its marks BEFORE the session is killed (P5):
                 // `exit N` when the command completed, else the window-wide value stays as it was.
                 // Not when openOverlay is replacing this popup (the verb reset the value already).
@@ -7059,7 +7074,7 @@ static void togglePopupTerminal(bool scratch) {
         // A hide generates no WM_KILLFOCUS when the popup never had focus (it was shown
         // unactivated), so the override is dropped here rather than left pointing at a window the
         // user cannot see. Only ours to drop: another popup may own input.
-        if (g_focusOverride == sess) g_focusOverride = nullptr;
+        if (g_focusOverride == sess) setFocusOverride(nullptr);
         raiseIfAllowed(g_hwnd, false);
         return;
     }
@@ -7071,7 +7086,7 @@ static void togglePopupTerminal(bool scratch) {
     }
     // Only when it was actually activated: an unactivated popup gets the override from its own
     // WM_SETFOCUS if the user clicks into it.
-    if (showPopupRaised(hw)) g_focusOverride = sess;
+    if (showPopupRaised(hw)) setFocusOverride(sess);
     InvalidateRect(hw, nullptr, FALSE);
 }
 // Overlay: run a command in a popup over the active session (control-API session.overlay). One at a
@@ -7128,7 +7143,7 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
           ownerAlive = true; g_overlayOwnerId = ownerId; s->hud.reset(); break;
       } }
     if (!ownerAlive) { DestroyWindow(g_overlayHwnd); return; }
-    if (showPopupRaised(g_overlayHwnd)) g_focusOverride = g_overlaySession;   // see showPopupRaised
+    if (showPopupRaised(g_overlayHwnd)) setFocusOverride(g_overlaySession);   // see showPopupRaised
     InvalidateRect(g_overlayHwnd, nullptr, FALSE);
 }
 // `session overlay resize`: the popup that is open takes the new fraction; WM_SIZE in popupProc
@@ -7731,15 +7746,15 @@ public:
         // The sidebar is the native tree child, so clicks here are always in the terminal area.
         int pane;
         // Reporting I/O runs unlocked; beginSelection re-reads cell and eviction count together.
-        { LockG lk; if (hitTest(pt.x, pt.y, &pane)) g_focus = pane; }
+        { LockG lk; if (hitTest(pt.x, pt.y, &pane)) setFocusedPane(pane); }
         if (mouseReport(pt.x, pt.y, 0, true, false)) { SetFocus(); Invalidate(FALSE); return; }
         LockG lk;
         if (hitTest(pt.x, pt.y, &pane)) {
-            g_focus = pane;
+            setFocusedPane(pane);
             int si = g_pane[pane];                              // begin drag-select, bound to THIS session —
             Session* ss = (si >= 0 && si < (int)g_sessions.size()) ? surfaceOf(g_sessions[si]) : nullptr;   // the pane's surface (P5): a drag inside a covered box selects in the overlay
             RECT rc, pr; GetClientRect(&rc); paneRect(pane, rc, &pr);
-            g_focusOverride = nullptr;
+            setFocusOverride(nullptr);
             beginSelection(m_hWnd, ss, pane, pr, pt.x, pt.y);
         }
         SetFocus();
@@ -7751,7 +7766,7 @@ public:
         int pane;
         { LockG lk;
         if (!hitTest(pt.x, pt.y, &pane)) return;
-        g_focus = pane; g_focusOverride = nullptr;
+        setFocusedPane(pane); setFocusOverride(nullptr);
         }
         if (!mouseReport(pt.x, pt.y, 0, true, false)) {
             LockG lk;
@@ -7803,7 +7818,7 @@ public:
         //     selects a different row and so silently SWITCHES SESSION. Pasting a command and typing
         //     Enter then landed in a terminal the user was not looking at.
         int pane;
-        if (hitTest(pt.x, pt.y, &pane)) g_focus = pane;
+        if (hitTest(pt.x, pt.y, &pane)) setFocusedPane(pane);
         SetFocus();                                              // before the early return below
         // Paste WINS over the app's mouse reporting (main-app parity, Program.WndProc.cs). It used
         // to lose, and that made right-click paste dead exactly where it is wanted most: a TUI like
@@ -10040,7 +10055,7 @@ static std::string ctlDispatch(const std::string& line) {
             }
             int idx = op == "cancel" ? visibleIndex(pick) : liveIndex(pick);
             if (idx >= 0) {
-                g_pane[0] = idx; g_focus = 0;
+                g_pane[0] = idx; setFocusedPane(0);
                 g_activeWs = g_sessions[idx]->ws;
                 if (op != "cancel") touchMruLocked(g_sessions[idx]);
                 selected = true;
@@ -11151,7 +11166,7 @@ static std::string ctlDispatch(const std::string& line) {
             int slot;
             std::string why;
             if (!focusSlotFor(dir, owner->horizontal, slotOf(g_focus), &slot, &why)) return ctlErr(why);
-            g_focus = paneOfSlot(slot);
+            setFocusedPane(paneOfSlot(slot));
         }
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
@@ -12167,7 +12182,7 @@ static bool restoreSessions() {
         if (dead) refreshTree();
         return false;
     }
-    g_pane[0] = firstIdx; g_focus = 0;
+    g_pane[0] = firstIdx; setFocusedPane(0);
     { LockG hold; touchMruLocked(displayedOwner()); }
     resolveSplitForPrimary();   // ...and the restored session shows its own split, if it had one
     g_activeWs = (activeWs >= 0 && activeWs < (int)g_workspaces.size()) ? activeWs : 0;
