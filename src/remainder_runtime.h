@@ -174,9 +174,9 @@ static std::string remainderOnUi(const JsonReq& req) {
           const int to = lite_remainder::destination(from, static_cast<int>(g_workspaces.size()), req.get("args.dir"));
           if (to < 0) return ctlErr("workspace move: expected up/down/top/bottom; unchanged");
           if (to == from) return ctlOkStr("already at boundary");
-          auto name = g_workspaces[from]; g_workspaces.erase(g_workspaces.begin() + from); g_workspaces.insert(g_workspaces.begin() + to, name);
+          g_workspaces.move(from, to);
           for (auto* s : g_sessions) s->ws = lite_remainder::remap(s->ws, from, to);
-          for (auto& s : g_closedStack) s.ws = lite_remainder::remap(s.ws, from, to);
+          // Undo-close carries stable workspace identities, not indexes to remap.
           g_activeWs = lite_remainder::remap(g_activeWs, from, to); g_focusWs = lite_remainder::remap(g_focusWs, from, to);
           {std::set<int> next;for(int old:g_collapsedWorkspaces)next.insert(lite_remainder::remap(old,from,to));g_collapsedWorkspaces=std::move(next);}
         }

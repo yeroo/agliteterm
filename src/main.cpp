@@ -28,6 +28,7 @@
 #define AGWL_VERSION_STR "dev"
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
+#include "workspace_identity.h"
 #include <cmath>
 #include <cerrno>
 #include <climits>
@@ -1168,7 +1169,7 @@ struct LockG {
 };
 static HANDLE g_control = INVALID_HANDLE_VALUE;
 static std::vector<Session*> g_sessions;
-static std::vector<std::wstring> g_workspaces = { L"workspace 1" };  // session "folders" (groups)
+static WorkspaceNames g_workspaces = { L"workspace 1" };  // persisted names plus process-local stable identity
 static std::set<int> g_collapsedWorkspaces; // transient, under g_lock; remapped with workspace indices
 static bool g_broadcast = false; // UI-thread state, never persisted
 static bool g_dashboard = false;
@@ -2319,7 +2320,7 @@ static std::vector<Profile> listedProfiles() {
 // catalog default; remembered legacy empty-app specs explicitly select powershell.exe at callers.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint = false, bool hidden = false);   // fwd
+                              bool repaint = false, bool hidden = false, uint64_t workspace = 0);   // fwd
 
 // The protocol's string fields are FIXED-SIZE arrays, and MSVC's strcpy_s does not truncate on an
 // oversize source — it invokes the CRT invalid-parameter handler, whose default terminates the
@@ -2407,7 +2408,9 @@ static void selectPrimary(int idx, bool activateWorkspace = true, Session* expec
 }
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
-                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false) {
+                           const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false,
+                           uint64_t workspace = 0) {
+    { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     profiles::Entry defaultProfile;
     if (!app) {
         const auto catalog = profileSnapshot();
@@ -2512,7 +2515,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
@@ -2533,7 +2536,8 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
 /// running and can simply be picked back up, scrollback and all.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint, bool hidden) {
+                              bool repaint, bool hidden, uint64_t workspace) {
+    { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_attach_tag;
@@ -2579,7 +2583,6 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->app = app ? app : "";        // remember the launch spec for session restore
     if (pargs) s->args = *pargs;
     s->cwd = cwd ? cwd : "";
-    s->ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_activeWs : 0;   // into the active workspace
     s->emu = emu_new(cols, rows);
     if (!emu_set_scrollback(s->emu, g_scrollbackLines.load())) {
         if (s->emu) emu_free(s->emu);
@@ -2604,8 +2607,9 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // back without its HISTORY — the repaint above brings back the current screen, which is what
     // makes the pane look alive. The shell itself, and anything running in it, survives either way;
     // seeding the scrollback is a separate improvement.
-    s->reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr);
     EnterCriticalSection(&g_lock);
+    s->ws = g_workspaces.destination(workspace);
+    s->reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr);
     s->hidden=hidden;
     g_sessions.push_back(s);
     emitEvent("session", s->id, "created");
@@ -2712,7 +2716,7 @@ static void killSession(Session* s) {
 // What undo-close (Ctrl+Shift+T) puts back: the launch spec plus the two per-session texts, name
 // and context — a reopened session that came back with its name but not its context would have
 // lost a value the user was told was set (P3).
-struct ClosedSpec { std::wstring name; int ws; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
+struct ClosedSpec { std::wstring name; uint64_t workspace; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
 static bool closePaneOverlay(Session* shell);   // fwd (P5, defined with the overlay verbs' helpers)
@@ -2768,7 +2772,7 @@ static void closeSessionAt(int idx) {
     if (idx < 0) { LeaveCriticalSection(&g_lock); return; }
     if (!cs->hidden) {   // snapshot + append ordered atomically against workspace.move
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
-        g_closedStack.push_back({ cs->name, cs->ws, cs->app, cs->cwd, cs->args, cs->context });
+        g_closedStack.push_back({ cs->name, g_workspaces.token(cs->ws), cs->app, cs->cwd, cs->args, cs->context });
     }
     const Session* previousPrimary = displayedOwner();
     // Taken BEFORE the erase: the split pane's shell is hidden (never persisted, never in the tree)
@@ -2825,14 +2829,13 @@ static void reopenClosed() {
     ClosedSpec sp;
     { LockG hold;
       if (g_closedStack.empty()) return;
-      sp = g_closedStack.back(); g_closedStack.pop_back();
-      if (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) g_activeWs = sp.ws; }
+      sp = g_closedStack.back(); g_closedStack.pop_back(); }
     int c, r; newSessionGrid(g_focus, &c, &r);
     Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
-                            sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
+                            sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, sp.workspace);
     if (s) {
         { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
-        selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE);
+        selectPrimary(-1, true, s); InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 }
 static Session* closeSplitSide(Session* owner, bool closeOwner);   // fwd

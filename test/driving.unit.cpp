@@ -1,5 +1,6 @@
 #include "../src/driving.h"
 #include "../src/control.h"
+#include "../src/workspace_identity.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -10,6 +11,26 @@ static void check(bool ok, const char* name) {
     ++checks; std::printf("PASS %s\n", name);
 }
 int main() {
+    WorkspaceNames workspaces{L"first", L"duplicate", L"duplicate"};
+    const auto destination = workspaces.token(2);
+    int active = 1; // another caller selects a different workspace while the host create waits
+    check(workspaces.destination(destination) == 2 && active == 1, "create destination is independent of current workspace");
+    workspaces[2] = L"renamed";
+    check(workspaces.destination(destination) == 2, "rename preserves in-flight identity");
+    workspaces.erase(workspaces.begin());
+    check(workspaces.destination(destination) == 1, "deleting an earlier workspace reindexes the same identity");
+    workspaces.erase(workspaces.begin() + 1);
+    workspaces.push_back(L"renamed");
+    check(workspaces.destination(destination) == 0 && workspaces.token(1) != destination, "deleted workspace falls back, not to a replacement with the same name/index");
+    workspaces = std::vector<std::wstring>{L"duplicate", L"renamed"};
+    check(workspaces.index(destination) == -1, "whole catalog restore does not revive stale identities");
+    for (int from = 0; from < 3; ++from) for (int to = 0; to < 3; ++to) {
+        WorkspaceNames reordered{L"a", L"b", L"c"};
+        const auto moving = reordered.token(from);
+        const auto name = reordered[from];
+        reordered.move(from, to);
+        check(reordered.index(moving) == to && reordered[to] == name, "workspace reordering moves name and identity together");
+    }
     Cell ascii[] = {{'x',1},{' ',1},{'I',1},{'g',1},{'l',1},{'A',1},{' ',1}};
     auto a = driving::rowCells(ascii, 7);
     auto hits = driving::matches(a, driving::queryPoints(L"igLA"));
