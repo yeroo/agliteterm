@@ -1170,6 +1170,7 @@ struct LockG {
 };
 static HANDLE g_control = INVALID_HANDLE_VALUE;
 static uint32_t g_creationRevision = 0; // negotiated before worker threads start
+static uint32_t g_creationHostPid = 0;
 static std::vector<Session*> g_sessions;
 static WorkspaceNames g_workspaces = { L"workspace 1" };  // persisted names plus process-local stable identity
 static std::set<int> g_collapsedWorkspaces; // transient, under g_lock; remapped with workspace indices
@@ -1515,6 +1516,11 @@ static bool cancelCreation(const char* id, const char* ticket) {
         HANDLE pipe = openPipe(std::wstring(kAppId) + L"-ptyhost", 200, true);
         if (pipe == INVALID_HANDLE_VALUE) continue;
         control_transport::Transport transport;
+        if (!creation_protocol::bindCancellationHost(g_creationHostPid, kProtocolVersion,
+            [&](const auto& hello, auto& reply) { return request(hello, &reply, nullptr, &transport, &pipe); })) {
+            if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+            continue;
+        }
         agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
         req.which_cmd = agwinterm_ptyhost_Request_cancel_create_tag;
@@ -1627,6 +1633,7 @@ static HostHealth controlHandshake() {
     req.cmd.hello.protocol = kProtocolVersion;
     if (!request(req, &rep) || rep.which_body != agwinterm_ptyhost_Reply_hello_tag) return HostHealth::Dead;
     g_creationRevision = rep.body.hello.creation_revision;
+    g_creationHostPid = rep.body.hello.pid;
     req = agwinterm_ptyhost_Request_init_default;
     rep = agwinterm_ptyhost_Reply_init_default;
     req.which_cmd = agwinterm_ptyhost_Request_list_tag;

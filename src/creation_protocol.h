@@ -14,6 +14,19 @@ inline bool validTicket(const char* ticket) {
     return true;
 }
 
+// A fresh connection may land on a different server instance sharing the pipe name.
+// UNKNOWN proves absence only after a handshake binds the reply to the issuing host.
+template<class Exchange>
+bool bindCancellationHost(uint32_t expectedPid, uint32_t protocol, Exchange exchange) {
+    if (!expectedPid) return false;
+    agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
+    agwinterm_ptyhost_Reply reply = agwinterm_ptyhost_Reply_init_default;
+    req.which_cmd = agwinterm_ptyhost_Request_hello_tag;
+    req.cmd.hello.protocol = protocol;
+    return exchange(req, reply) && reply.which_body == agwinterm_ptyhost_Reply_hello_tag &&
+        reply.body.hello.protocol == protocol && reply.body.hello.pid == expectedPid && reply.body.hello.creation_revision >= 1;
+}
+
 // This function issues at most one Create. Only a proven explicit ID conflict can authorize the
 // caller to choose a different ID; a lost response never does, even if cleanup later succeeds.
 template<class Exchange, class Cancel>
