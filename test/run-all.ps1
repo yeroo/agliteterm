@@ -25,6 +25,17 @@ try {
             $acquireExit=$LASTEXITCODE
             $state=$raw|ConvertFrom-Json
             if($state.ok-isnot [bool]){throw 'Malformed canonical acquisition response'}
+            if($state.ok){
+                if($acquireExit-ne 0 -or $state.held-isnot [bool] -or -not $state.held -or
+                   $state.owner-isnot [string] -or $state.owner-cne $TokenOwner -or
+                   $state.run_id-isnot [string] -or $state.run_id-cne ('lite-suite-'+$run) -or
+                   $state.token-isnot [string] -or $state.token-cnotmatch '\A[0-9a-f]{64}\z' -or
+                   ($state.generation-isnot [int] -and $state.generation-isnot [long]) -or $state.generation-lt 1 -or
+                   $state.worktree-isnot [string] -or [string]::IsNullOrWhiteSpace($state.worktree) -or
+                   [IO.Path]::GetFullPath($state.worktree).TrimEnd('\','/')-ine [IO.Path]::GetFullPath($root).TrimEnd('\','/')){
+                    throw 'Incomplete or mismatched canonical acquisition receipt; do not launch'
+                }
+            }
         }catch{$cleanup=$false;throw} # helper may have acquired; an unreadable receipt is not proof of no lease
         if($acquireExit-ne 0 -or -not $state.ok){throw "Suite token unavailable: $raw"}
         $lease=$state;$receipt=Join-Path $artifact 'lease.json'
@@ -83,7 +94,10 @@ finally{
             $releaseExit=$LASTEXITCODE
             $raw|Set-Content -LiteralPath (Join-Path $artifact 'release.json')
             $state=$raw|ConvertFrom-Json
-            if($releaseExit-ne 0 -or $state.ok-isnot [bool] -or -not $state.ok){$cleanup=$false}
+            if($releaseExit-ne 0 -or $state.ok-isnot [bool] -or -not $state.ok -or
+               $state.held-isnot [bool] -or $state.held -or
+               ($state.released_generation-isnot [int] -and $state.released_generation-isnot [long]) -or
+               $state.released_generation-ne $lease.generation){$cleanup=$false}
         }catch{$cleanup=$false;"Canonical lease release is unproven: $_"}
     }
     "Lite suite supervisor: failed=$($failed-join ','); cleanup=$cleanup; artifacts=$artifact"

@@ -43,7 +43,19 @@ function python {
         if($Case-eq 'acquire-fail'){$global:LASTEXITCODE=1;return '{"ok":false}'}
         if($Case-eq 'acquire-malformed'){return '{"ok":'}
         if($Case-eq 'acquire-empty'){return ''}
-        return '{"ok":true,"owner":"fake-owner","token":"fake-token"}'
+        $receipt=@{ok=$true;held=$true;owner='fake-owner';token=('1'*64);generation=17;run_id=$args[($args.IndexOf('--run')+1)];worktree=$root}
+        switch($Case){
+            'acquire-incomplete' {return '{"ok":true}'}
+            'acquire-owner' {$receipt.owner='other'}
+            'acquire-run' {$receipt.run_id='other'}
+            'acquire-token' {$receipt.token=''}
+            'acquire-generation' {$receipt.generation=0}
+            'acquire-generation-type' {$receipt.generation='17'}
+            'acquire-not-held' {$receipt.held=$false}
+            'acquire-worktree' {$receipt.worktree=Join-Path $root 'other'}
+            'acquire-status-conflict' {$global:LASTEXITCODE=1}
+        }
+        return $receipt|ConvertTo-Json -Compress
     }
     if($Case-eq 'release-fail'){$global:LASTEXITCODE=1;return '{"ok":false}'}
     if($Case-eq 'release-rejected'){return '{"ok":false}'}
@@ -51,7 +63,14 @@ function python {
     if($Case-eq 'release-empty'){return ''}
     if($Case-eq 'release-wrong-type'){return '{"ok":"false"}'}
     if($Case-eq 'release-throws'){throw 'injected release invocation error'}
-    return '{"ok":true}'
+    $receipt=@{ok=$true;held=$false;released_generation=17}
+    switch($Case){
+        'release-incomplete' {return '{"ok":true}'}
+        'release-still-held' {$receipt.held=$true}
+        'release-generation' {$receipt.released_generation=18}
+        'release-generation-type' {$receipt.released_generation='17'}
+    }
+    return $receipt|ConvertTo-Json -Compress
 }
 function Set-Content {
     [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$Value,[string]$LiteralPath)

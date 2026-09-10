@@ -23,6 +23,12 @@ $cases=@(
     @{name='acquire-empty';code=2;start=0;release=0;delete=0},
     @{name='receipt-fail';code=1;start=0;release=1;delete=0}
 )
+foreach($name in 'acquire-incomplete','acquire-owner','acquire-run','acquire-token','acquire-generation','acquire-generation-type','acquire-not-held','acquire-worktree','acquire-status-conflict'){
+    $cases+=@{name=$name;code=2;start=0;release=0;delete=0}
+}
+foreach($name in 'release-incomplete','release-still-held','release-generation','release-generation-type'){
+    $cases+=@{name=$name;code=2;start=2;release=1;delete=1}
+}
 foreach($case in $cases){
     $dir=Join-Path $artifact $case.name;New-Item -ItemType Directory -Path $dir|Out-Null
     $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
