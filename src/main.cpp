@@ -378,6 +378,7 @@ static const InstanceInfo* findInstance(const std::vector<InstanceInfo>& v, cons
 // .ToUnixTimeSeconds()). Not milliseconds, not ticks: a caller subtracts it from its own clock.
 static long long epochNow() { return (long long)time(nullptr); }
 
+struct OmpOperation;
 struct Session {
     std::string id;
     bool readOnly = false;         // human input gate, per surface; never persisted
@@ -452,6 +453,8 @@ struct Session {
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     ULONGLONG childCreated = 0;    // birth identity captured at attach; agent lifecycle refuses unknown/reused PIDs
     std::string agentBridgeToken;  // prompt-process capability, not inherited by child agents
+    bool ompReady = false;
+    std::shared_ptr<OmpOperation> ompOperation; // g_lock; independent of agent restart leases
     // restore.capture (P3): the command line of the shell's foreground child as captured by the
     // last `restore capture`, persisted as K (ordinary) or K2 (escaped), read through `tree --json` as
     // capturedCommands. Empty = none (a capture that found nothing writes empty too — a fresh
@@ -1529,8 +1532,8 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     }
     // Session objects outlive unlisting and their reader; the pointer and mutex remain valid.
     // Resolve under g_lock, release it, then serialize the entire write. Never reacquire g_lock
-    // inside the gate. The pristine check and its initialization bytes are one operation
-    // relative to human input, API type/paste and restore replay. Non-editing protocol replies
+    // inside the gate. Input reservations serialize writes relative to human input,
+    // API type/paste and restore replay. Non-editing protocol replies
     // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
     if ((requireUntouched || reservation) && !inputPane) {
         if (guardRefused) *guardRefused = true;
@@ -2303,11 +2306,14 @@ static bool resolveOmp(const std::string& name, std::string& path, std::string& 
     if (found == themes.end()) return false;
     path = found->second.second; return true;
 }
-static bool saveOmpTheme(const std::string& path) {
+static uint64_t g_ompGeneration = 1; // g_ompMutex, prevents late apply overwriting newer config
+static bool saveOmpTheme(const std::string& path, uint64_t expectedGeneration = 0) {
+    std::lock_guard<std::mutex> guard(g_ompMutex);
+    if (expectedGeneration && expectedGeneration != g_ompGeneration) return false;
     const auto wide = widen(path);
     if (RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"OmpTheme", REG_SZ, wide.c_str(),
                        static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) return false;
-    std::lock_guard<std::mutex> guard(g_ompMutex); g_ompTheme = path; return true;
+    g_ompTheme = path; ++g_ompGeneration; return true;
 }
 
 // Detected shells on this machine (the "voices"). PowerShell + cmd are always present.
@@ -2756,6 +2762,7 @@ static void scanHostSessions() {
 }
 
 static void killSession(Session* s) {
+    { LockG hold; s->ompOperation.reset(); s->ompReady = false; }
     { LockG lk; if (g_sel.sess == s) g_sel.clear(); }   // keyed by session: don't outlive it
     if (s->paneId.empty()) return;        // restore placeholder: nothing on the host to kill
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
@@ -7454,6 +7461,7 @@ static std::mutex g_configMutex;
 static std::deque<std::shared_ptr<ConfigRequest>> g_configRequests;
 static bool g_settingsOpenQueued = false; // UI-owned; coalesce requests until the command runs
 static Session* resolveTarget(const std::string& target, std::string* why);
+static std::string ompQueueOnUi(const JsonReq& req);
 static std::string configOnUi(const JsonReq& req) {
     using configuration::Id;
     const auto& cmd = req.get("cmd");
@@ -7489,41 +7497,7 @@ static std::string configOnUi(const JsonReq& req) {
         updCheck(true);
         return g_updBusy ? ctlOkStr("app update requested; download, verification and restart are not yet confirmed") : ctlErr("app update could not start");
     }
-    if (cmd == "omp.set") {
-        HANDLE data = INVALID_HANDLE_VALUE;
-        {
-            LockG hold; std::string why;
-            Session* pane = resolveTarget(req.get("target"), &why);
-            if (!pane || pane->paneId != req.get("target")) return ctlErr("omp: target pane disappeared; nothing written or saved");
-            if (pane->readOnly || pane->exited || pane->data == INVALID_HANDLE_VALUE || !isPwshApp(pane->app.c_str()))
-                return ctlErr("omp: requires a live writable PowerShell pane; nothing written or saved");
-            // Marks locate a prompt line, not the PSReadLine buffer. Never append executable text
-            // to a draft. Without shell-side buffer acknowledgement, only a fresh untouched pane
-            // is eligible; output/Enter/Escape cannot reset this conservative lifetime guard.
-            if (pane->adopted)
-                return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
-            FfiEmuInfo info{}; FfiMark last{};
-            if (!pane->emu || !emu_info(pane->emu, &info) || info.isAltScreen || !info.markCount)
-                return ctlErr("omp: shell readiness is unknown; nothing written or saved");
-            std::vector<FfiMark> marks(info.markCount);
-            const auto count = emu_marks(pane->emu, marks.data(), info.markCount);
-            if (!count) return ctlErr("omp: shell readiness is unknown; nothing written or saved");
-            last = marks[count - 1];
-            if (last.promptLine < 0 || last.commandLine >= 0 || last.outputLine >= 0 ||
-                last.promptLine != static_cast<int64_t>(info.historyCount) + info.cursorRow)
-                return ctlErr("omp: pane is not at an observed prompt; nothing written or saved");
-            data = pane->data;
-        }
-        const auto command = narrow(ompInitialization(req.get("args.resolved-theme"))) + "\r";
-        bool guardRefused = false;
-        const DWORD written = ovIo(data, true, command.data(), nullptr, static_cast<DWORD>(command.size()), true, true, &guardRefused);
-        if (guardRefused)
-            return ctlErr("omp: input emptiness is unproven after input or adoption; use config set omp-theme for new shells; nothing written or saved");
-        if (written != command.size()) return ctlErr("omp: initialization write failed or was partial; nothing saved; shell outcome unknown");
-        if (req.get("args.persist") == "true" && !saveOmpTheme(req.get("args.resolved-theme")))
-            return ctlErr("omp: initialization written, but theme could not be saved");
-        return ctlOkStr("oh-my-posh initialization written" + std::string(req.get("args.persist") == "true" ? "; theme saved for eligible new shells" : "") + "; shell success not confirmed");
-    }
+    if (cmd == "omp.set") return ompQueueOnUi(req);
     if (cmd == "config.set" && name == "omp-theme") {
         const auto& path = req.get("args.resolved-theme");
         if (!saveOmpTheme(path)) return ctlErr("omp-theme could not be saved; configuration unchanged");
@@ -9612,10 +9586,13 @@ use exact ASCII-case-insensitive names. Unknown names and command+profile refuse
 The schema supports name/command/args/cwd; nonempty env/icon, elevate:true and unknown fields refuse.
 Args containing control characters refuse because launch-state TSV cannot preserve those bytes.
 
-`omp list` discovers local themes. `omp set NAME [--persist]` writes initialization only into an
-observed-prompt, fresh writable PowerShell pane that has received no input. After any input or
-adoption it refuses: marks cannot prove an empty draft. Use config omp-theme for future shells.
-Success means written, not confirmed executed.
+`omp list` discovers local themes. `omp set NAME [--persist]` applies through the bundled idle
+integration in PowerShell 7 with stock PSReadLine 2.2.6 through 2.x. It never types initialization
+into terminal input. The live, writable, non-adopted shell must acknowledge an empty editing buffer;
+drafts, attached children and unsupported/custom readers refuse. Completed prior input is allowed.
+Success confirms initialization completed; --persist saves only after timely confirmed success.
+A deadline before authorization means nothing applied; a missing result after authorization means
+outcome unknown, not saved, and must not be retried automatically. Use config omp-theme for future shells.
 Use trusted themes only: initialization evaluates OMP-generated shell code. No profiles are edited.
 `config set omp-theme NAME|PATH|none` sets/clears eligible future PowerShell initialization without
 typing into existing panes. Nonempty explicit profile args and adopted shells receive no injection.
@@ -9725,7 +9702,9 @@ static std::string installAgentSkill() {
 
 #include "commands_runtime.h"
 #include "install_runtime.h"
+static std::string ompBridge(const JsonReq& req, Session* pane);
 #include "agent_runtime.h"
+#include "omp_runtime.h"
 #include "remainder_runtime.h"
 #include "wave3_runtime.h"
 
@@ -9783,6 +9762,7 @@ static std::string ctlDispatch(const std::string& line) {
                 : "omp: " + incomplete + "; nothing written or saved");
         req.fields["args.resolved-theme"] = resolved;
         if (cmd == "omp.set") {
+            req.fields["args.omp-nonce"] = ompNonce();
             const auto& persist = req.get("args.persist");
             if (!persist.empty() && persist != "true" && persist != "false") return ctlErr("omp: persist must be boolean; nothing written or saved");
             LockG hold; std::string why;
@@ -9790,7 +9770,8 @@ static std::string ctlDispatch(const std::string& line) {
             if (!pane) return ctlErr("omp: target pane not found; nothing written or saved");
             req.fields["target"] = pane->paneId;
         }
-        return dispatchConfig(req);
+        const auto queued = dispatchConfig(req);
+        return cmd == "omp.set" ? ompAwait(req, queued) : queued;
     }
     if (cmd == "profiles.list") {
         const auto catalog = profileSnapshot(); std::string text;

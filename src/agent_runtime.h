@@ -202,6 +202,7 @@ static std::string agentBridge(const JsonReq& req) {
         if (pane->agentBridgeToken != token) return ctlErr("bridge capability mismatch");
     }
     const auto action = req.get("args.op");
+    if (action.rfind("omp-", 0) == 0) return ompBridge(req, pane);
     if (action != "claim" && action != "ack" && action != "received") return ctlErr("unknown bridge operation");
     std::shared_ptr<AgentOperation> op;
     {

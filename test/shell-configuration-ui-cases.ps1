@@ -110,10 +110,11 @@ $null=Selection-Rpc 'session.write' @{text=([string][char]27+'[?1049h')} $ompPan
 $answer=Selection-Rpc 'omp.set' @{name=$themeFile} $ompPane -AllowError
 Check 'OMP alternate screen refuses without mutation' (-not $answer.ok -and -not (Test-Path $ompSink))
 $null=Selection-Rpc 'session.write' @{text=([string][char]27+'[?1049l')} $ompPane
-$reply=Shell-Set '' $themeFile 'OmpTheme' @{Exists=$true;Kind=1;Value=$themeFile} -OmpLive -Pane $ompPane
-for($n=0;$n-lt 100 -and -not (Test-Path $ompSink);$n++){Start-Sleep -Milliseconds 100}
-Check 'OMP initialization writes exact quoted path to fake tool' ((Test-Path $ompSink) -and [IO.File]::ReadAllText($ompSink)-ceq "init|pwsh|--config|$themeFile")
-Check 'OMP reply distinguishes write from shell success' ($reply-match 'initialization written' -and $reply-match 'success not confirmed')
+$answer=Selection-Rpc 'omp.set' @{name=$themeFile;persist=$true} $ompPane -AllowError
+Check 'OMP unsupported PS5 reader refuses without executing fake function' (-not $answer.ok -and $answer.error-match 'supported idle integration' -and -not (Test-Path $ompSink))
+# Actual stock PSReadLine/native-application acceptance lives in omp-idle.ps1. This custom
+# PS5 fixture can configure future shells, but must never gain an input-injection fallback.
+$null=Shell-Set 'omp-theme' $themeFile 'OmpTheme' @{Exists=$true;Kind=1;Value=$themeFile}
 Check 'OMP persist readback is exact' ((Selection-Rpc 'config.get' @{key='omp-theme'})-ceq $themeFile)
 $draftPane=[string](Selection-Rpc 'session.new' @{profile='P10b-OMP';name='P10b-draft'})
 Shell-Ready $draftPane 'P10B-OMP-READY>'
@@ -122,11 +123,9 @@ $draft="[IO.File]::WriteAllText('$($draftSink.Replace("'","''"))','EXECUTED'); "
 $null=Selection-Rpc 'session.type' @{text=$draft} $draftPane
 Start-Sleep -Milliseconds 150
 $answer=Selection-Rpc 'omp.set' @{name=$themeFile} $draftPane -AllowError
-# A wrapped draft may invalidate the observed-prompt gate before the atomic input gate.
-# Both refusals must leave the draft unsubmitted; never accept a generic RPC failure here.
-Check 'OMP refuses a single-line draft without submitting it' (-not $answer.ok -and $answer.error-match 'emptiness is unproven|not at an observed prompt' -and -not (Test-Path $draftSink)) ($answer|ConvertTo-Json -Compress)
+Check 'OMP unsupported reader keeps a single-line draft unsubmitted' (-not $answer.ok -and $answer.error-match 'supported idle integration' -and -not (Test-Path $draftSink)) ($answer|ConvertTo-Json -Compress)
 $answer=Selection-Rpc 'omp.set' @{name=$themeFile} $ompPane -AllowError
-Check 'OMP conservatively refuses after prior initialization input' (-not $answer.ok -and $answer.error-match 'emptiness is unproven')
+Check 'OMP repeated unsupported request still refuses without execution' (-not $answer.ok -and $answer.error-match 'supported idle integration' -and -not (Test-Path $ompSink))
 foreach($setter in @(@{key='omp-theme'},@{key='omp-theme';value=''})){
     $answer=Selection-Rpc 'config.set' $setter -AllowError
     Check 'omitted or empty OMP value refuses without clearing' (-not $answer.ok -and (Selection-Rpc 'config.get' @{key='omp-theme'})-ceq $themeFile)
