@@ -222,7 +222,8 @@ overlay, no prompt after them (the command sleeps). Keep the reply `$ov` and the
 
 **Steps:**
 1. `session overlay copy --pane right`.
-2. Drag inside the RIGHT box — `test/clipboard.ps1`'s recipe, `PostMessage` `WM_LBUTTONDOWN` /
+2. Drag inside the RIGHT box — `Selection-Drag` in `test/selection-ui.ps1`, synchronous
+   `SelectionUi.Button` (`SendMessageTimeoutW`) dispatch of `WM_LBUTTONDOWN` /
    `WM_MOUSEMOVE` / `WM_LBUTTONUP` into the sandbox's own window at points inside the right pane's
    rect (x past the divider). Wait ~300 ms. Put `SENTINEL` on the clipboard AGAIN (the release
    copied; the case is about the verb).

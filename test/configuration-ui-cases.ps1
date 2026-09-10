@@ -32,7 +32,7 @@ Start-SelectionSandbox $Exe $profile
 $h=$script:selectionHwnd;$g=Selection-Geometry
 function Config-Get([string]$Name){[string](Selection-Rpc 'config.get' @{key=$Name})}
 function Config-Set([string]$SettingName,[string]$SettingText,[string]$Registry,[int]$Stored,[switch]$ThemeVerb,[int]$UiCommand=0) {
-    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath))
     $prior=$script:selectionRegistry[$Registry].Expected
     try {
         Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
@@ -92,7 +92,7 @@ foreach($args_ in @(@{key='unknown';value='true'},@{key='font-size';value='16'},
 Check 'unknown get refuses' (-not (Selection-Rpc 'config.get' @{key='unknown'} -AllowError).ok)
 Check 'theme catalog names actual lite modes' ([string](Selection-Rpc 'theme.list')-ceq "auto`nlight`ndark`nclassic")
 Check 'unknown theme refuses without changing mode' (-not (Selection-Rpc 'theme.set' @{name='invented'} -AllowError).ok -and (Config-Get 'theme')-eq 'dark')
-$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))
 try {Check 'single-key setters leave unrelated registry value intact' ($key.GetValue('P10UntouchedSentinel')-ceq 'not-a-setting-P10')}finally{$key.Dispose()}
 
 # Fresh versus existing replicas: the setting never evicts history from a running surface.
@@ -126,7 +126,7 @@ foreach($row in $rows){
 # Model another instance's successful save without changing this instance's runtime snapshot.
 # Each unrelated human toggle must preserve that exact shared-registry value.
 function Config-RegistryTheme {
-    $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\agliteterm')
+    $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))
     try {return $key.GetValue('Theme')}finally{$key.Dispose()}
 }
 Set-SelectionRegistry 'Theme' @{Exists=$true;Kind=4;Value=1}

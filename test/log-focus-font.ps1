@@ -10,6 +10,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
+. "$PSScriptRoot/owned-window.ps1"
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -42,9 +45,9 @@ Remove-Item $log, "$dir\sessions-$pipe.tsv" -ErrorAction SilentlyContinue
 
 "== log-focus-font =="
 
-$p = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 7
-$p.Refresh(); $h = $p.MainWindowHandle
+$h = Get-OwnedLiteWindow $p -Show
 & $ctl session new --pipe $pipe 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 
@@ -78,6 +81,6 @@ Check 'focus owner is the frame, not the tree' ($gi.hwndFocus -eq $h) "focus=$($
 
 $p.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 3
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+if (-not $p.HasExited) { $p.Kill() }
 
 if ($fail) { "log-focus-font: $fail FAILED"; exit 1 } else { "log-focus-font: all passed"; exit 0 }
