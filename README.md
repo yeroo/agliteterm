@@ -472,6 +472,7 @@ To build against a core you are changing:
 ## Tests
 
 ```powershell
+# Disposable CI only: the legacy aggregate suite is not yet safe on a shared desktop (#51).
 ./test/run-all.ps1
 ```
 

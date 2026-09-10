@@ -60,7 +60,7 @@ public static class SelectionUi {
  }
  static IntPtr Point(int x,int y){return (IntPtr)((y<<16)|(x&65535));}
  public static bool ClipboardOwnedBy(int pid){uint owner;var h=GetClipboardOwner();return h!=IntPtr.Zero && GetWindowThreadProcessId(h,out owner)!=0 && owner==(uint)pid;}
- public static void Button(IntPtr h,uint message,int x,int y){IntPtr result;if(SendMessageTimeoutW(h,message,message==0x202?IntPtr.Zero:(IntPtr)1,Point(x,y),2,5000,out result)==IntPtr.Zero)throw new InvalidOperationException("Owned button dispatch did not complete");}
+ public static void Button(IntPtr h,uint message,int x,int y){IntPtr result;int flags=message==0x202||message==0x205?0:message==0x204?2:1;if(SendMessageTimeoutW(h,message,(IntPtr)flags,Point(x,y),2,5000,out result)==IntPtr.Zero)throw new InvalidOperationException("Owned button dispatch did not complete");}
  public static void Wheel(IntPtr h,int x,int y,int notches){var p=new POINT{X=x,Y=y};ClientToScreen(h,ref p);for(int i=0;i<Math.Abs(notches);i++){PostMessageW(h,0x20A,(IntPtr)((notches>0?120:-120)<<16),Point(p.X,p.Y));System.Threading.Thread.Sleep(60);}System.Threading.Thread.Sleep(250);}
 }
 '@ }
@@ -186,6 +186,5 @@ function Save-SelectionClipboard([string]$RecoveryPath) {
 
 function Restore-SelectionClipboard($saved) {
     Restore-SelectionClipboardLedger $saved
-    # Delete only this run's saved original, after exact restoration (or proven no writes).
-    Remove-Item -LiteralPath $saved.RecoveryPath
+    # The caller retains the recovery file until ALL independent cleanup steps succeed.
 }
