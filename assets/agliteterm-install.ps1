@@ -82,6 +82,52 @@ function Test-InstallJsonShape([string]$Text){
         }
     }
 }
+# Catalog snapshot 2026-09-10, https://code.claude.com/docs/en/hooks
+# A dated supported catalog, not a claim to validate future extensions or permission-rule syntax.
+$hookModelEvents=@('PermissionDenied','PermissionRequest','PostToolBatch','PostToolUse','PostToolUseFailure','PreToolUse','Stop','SubagentStop','TaskCompleted','TaskCreated','TeammateIdle','UserPromptExpansion','UserPromptSubmit')
+$hookIoEvents=@('ConfigChange','CwdChanged','DirectoryAdded','Elicitation','ElicitationResult','FileChanged','InstructionsLoaded','MessageDisplay','Notification','PostCompact','PostModelSwitch','PreCompact','PreModelSwitch','SessionEnd','StopFailure','SubagentStart','WorktreeCreate','WorktreeRemove')
+$hookStartupEvents=@('SessionStart','Setup')
+$hookEvents=$hookModelEvents+$hookIoEvents+$hookStartupEvents
+$hookCommon=@{type='text';if='text';timeout='number';statusMessage='text';once='boolean'}
+$hookKinds=@{
+    command=@{command='requiredText';args='textArray';async='boolean';asyncRewake='boolean';shell='shell'}
+    http=@{url='requiredText';headers='textMap';allowedEnvVars='textArray'}
+    mcp_tool=@{server='requiredText';tool='requiredText';input='object'}
+    prompt=@{prompt='requiredText';model='text';continueOnBlock='boolean'}
+    agent=@{prompt='requiredText';model='text'}
+}
+$hookFields=@($hookCommon.Keys)+@($hookKinds.Values|ForEach-Object {$_.Keys})|Select-Object -Unique
+function Test-InstallHandler($Hook,[string]$Event){
+    if($Hook -isnot [pscustomobject]){throw 'Claude hook is not an object; unchanged'}
+    Test-InstallKeyCase $Hook $hookFields
+    if($Hook.type -isnot [string] -or @($hookKinds.Keys) -cnotcontains $Hook.type){throw 'Unknown Claude hook handler type; unchanged'}
+    if(($hookStartupEvents -ccontains $Event -and $Hook.type -cnotin @('command','mcp_tool')) -or
+       ($hookIoEvents -ccontains $Event -and $Hook.type -cin @('prompt','agent'))){throw "Claude hook type $($Hook.type) is unsupported for $Event; unchanged"}
+    $fields=$hookKinds[$Hook.type]
+    foreach($field in $fields.Keys){
+        if($fields[$field]-eq 'requiredText' -and ($Hook.$field -isnot [string] -or -not $Hook.$field.Trim())){throw "Claude hook requires text field $field; unchanged"}
+    }
+    foreach($property in $Hook.PSObject.Properties){
+        $name=$property.Name;$value=$property.Value
+        $rule=if($hookCommon.ContainsKey($name)){$hookCommon[$name]}elseif($fields.ContainsKey($name)){$fields[$name]}else{$null}
+        if(-not $rule){
+            if($hookFields -ccontains $name){throw "Claude hook field $name does not apply to $($Hook.type); unchanged"}
+            continue # Unknown optional fields are preserved, not normalized or guessed.
+        }
+        $valid=switch($rule){
+            'text' {$value -is [string]}
+            'requiredText' {$value -is [string] -and $value.Trim().Length-gt 0}
+            'boolean' {$value -is [bool]}
+            'shell' {$value -is [string] -and $value -cin @('bash','powershell')}
+            'textArray' {$value -is [Array] -and @($value|Where-Object {$_ -isnot [string]}).Count-eq 0}
+            'object' {$value -is [pscustomobject]}
+            'textMap' {$value -is [pscustomobject] -and @($value.PSObject.Properties|Where-Object {$_.Value -isnot [string]}).Count-eq 0}
+            'number' {($value -is [int] -or $value -is [long] -or $value -is [double] -or $value -is [decimal]) -and $value-ge 0 -and -not [double]::IsInfinity([double]$value) -and -not [double]::IsNaN([double]$value)}
+            default {$false}
+        }
+        if(-not $valid){throw "Claude hook field $name has invalid $rule value; unchanged"}
+    }
+}
 $mutex=New-Object Threading.Mutex($false,'Local\agliteterm-opt-in-install')
 $locked=$false
 try {
@@ -121,7 +167,7 @@ try {
             Test-InstallKeyCase $root @('hooks')
             if(-not $root.PSObject.Properties['hooks']){$root|Add-Member hooks ([pscustomobject]@{})}
             if($root.hooks -isnot [pscustomobject]){throw 'Claude hooks is not an object; unchanged'}
-            Test-InstallKeyCase $root.hooks @('UserPromptSubmit','PostToolUse','Stop','Notification')
+            Test-InstallKeyCase $root.hooks $hookEvents
             foreach($eventProperty in $root.hooks.PSObject.Properties){
                 if($eventProperty.Value -isnot [Array]){throw 'Claude hook event is not an array; unchanged'}
                 foreach($entry in $eventProperty.Value){
@@ -129,30 +175,7 @@ try {
                     if($entry -isnot [pscustomobject] -or $entry.hooks -isnot [Array]){throw 'Claude hook entry/hooks has invalid shape; unchanged'}
                     if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw 'Claude hook matcher is not text; unchanged'}
                     foreach($hook in $entry.hooks){
-                        Test-InstallKeyCase $hook @('type','command','url','server','tool','prompt','model','if','statusMessage','shell','once','async','asyncRewake','args','allowedEnvVars','timeout','headers','input')
-                        if($hook -isnot [pscustomobject] -or $hook.type -isnot [string]){throw 'Claude hook/type has invalid shape; unchanged'}
-                        # Documented handler union: https://code.claude.com/docs/en/hooks#hook-handler-fields
-                        $required=switch -CaseSensitive ($hook.type){
-                            'command' {@('command')};'http' {@('url')};'mcp_tool' {@('server','tool')}
-                            'prompt' {@('prompt')};'agent' {@('prompt')}
-                            default {throw 'Unknown Claude hook handler type; unchanged'}
-                        }
-                        foreach($field in $required){if($hook.$field -isnot [string] -or -not$hook.$field.Trim()){throw "Claude hook requires text field $field; unchanged"}}
-                        foreach($field in 'command','url','server','tool','prompt','model','if','statusMessage','shell'){
-                            if($hook.PSObject.Properties[$field] -and $hook.$field -isnot [string]){throw "Claude hook $field is not text; unchanged"}
-                        }
-                        foreach($field in 'once','async','asyncRewake'){
-                            if($hook.PSObject.Properties[$field] -and $hook.$field -isnot [bool]){throw "Claude hook $field is not boolean; unchanged"}
-                        }
-                        foreach($field in 'args','allowedEnvVars'){
-                            if($hook.PSObject.Properties[$field] -and ($hook.$field -isnot [Array] -or @($hook.$field|Where-Object {$_ -isnot [string]}).Count)){throw "Claude hook $field is not a text array; unchanged"}
-                        }
-                        if($hook.PSObject.Properties['timeout'] -and ($hook.timeout -isnot [ValueType] -or $hook.timeout -is [bool] -or $hook.timeout -lt 0)){throw 'Claude hook timeout is not a nonnegative number; unchanged'}
-                        if($hook.PSObject.Properties['headers'] -and ($hook.headers -isnot [pscustomobject] -or @($hook.headers.PSObject.Properties|Where-Object {$_.Value -isnot [string]}).Count)){throw 'Claude hook headers is not a text map; unchanged'}
-                        if($hook.PSObject.Properties['input'] -and $hook.input -isnot [pscustomobject]){throw 'Claude MCP hook input is not an object; unchanged'}
-                        if($hook.PSObject.Properties['shell'] -and $hook.shell -cnotin @('bash','powershell')){throw 'Claude hook shell is unsupported; unchanged'}
-                        if($hook.PSObject.Properties['command'] -and $hook.command -isnot [string]){throw 'Claude hook command is not text; unchanged'}
-                        if($hook.type-eq'command' -and $hook.command -isnot [string]){throw 'Claude command hook has no command text; unchanged'}
+                        Test-InstallHandler $hook $eventProperty.Name
                     }
                 }
             }
