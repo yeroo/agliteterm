@@ -118,11 +118,22 @@ function Start-Lite($inst) {
 }
 
 function Stop-Lite($p, [switch]$Kill) {
+    if ($p.HasExited) { return }
     if ($Kill) { $p.Kill(); Start-Sleep -Seconds 2; return }
     $p.CloseMainWindow() | Out-Null
     for ($i = 0; $i -lt 25; $i++) { Start-Sleep -Milliseconds 400; $p.Refresh(); if ($p.HasExited) { break } }
     if (-not $p.HasExited) { $p.Kill() }
     Start-Sleep -Seconds 1
+}
+
+# The isolated guard-after-empty cell has no other window sharing its host. Its frame can exit
+# before the host completes graceful shutdown; wait through pinned, birth-checked child handles
+# rather than racing the next client against that retiring control pipe. Never terminate a host.
+function Wait-SpawnedHostExit($window) {
+    foreach($row in @(Get-OwnedChildren $window.Id $window.StartTime 'agwinterm-ptyhost.exe' (Exit-Of $window))){
+        $hostProcess=Open-Owned $row
+        if($hostProcess){try{if(-not $hostProcess.WaitForExit(10000)){throw 'Private host did not finish shutdown before restart'}}finally{$hostProcess.Dispose()}}
+    }
 }
 
 # Best-effort teardown for a cell that threw part-way. A leaked instance keeps the pipe name, so the
@@ -731,11 +742,9 @@ if (-not $Only -or $Only -eq 'closed-last') {
     }
 }
 
-# The deliberate-empty mark must not LATCH, in either direction. Closing the last session sets it,
-# and driven over the control pipe the window does not actually go away (DestroyWindow is a no-op off
-# the UI thread), so a window keeps running with it set. Stuck on, a later save of real sessions is
-# judged against a stale "the user emptied this" and the file it writes cannot be trusted; stuck off,
-# a later empty is never written and closed sessions come back.
+# Closing the last session must save deliberate empty AND close the frame. A subsequent launch
+# must save new sessions normally, and closing its last split session must write empty again.
+# Do not depend on the former off-thread DestroyWindow bug to keep the empty frame alive.
 if (-not $Only -or $Only -eq 'guard-after-empty') {
     $inst = 'rm-guard-after-empty'
     Reset-Cell $inst
@@ -746,10 +755,14 @@ if (-not $Only -or $Only -eq 'guard-after-empty') {
         & $ctl session close (LastSessionId $inst) --pipe $inst 2>&1 | Out-Null   # window is now empty
         Start-Sleep -Seconds 3
         if (-not (Log-Has $inst 'save ok: 0 session')) { throw 'the window never reached the deliberate-empty save' }
+        if (-not $p.WaitForExit(10000)) { throw 'closing the last session did not close its window' }
+        Wait-SpawnedHostExit $p
+        Stop-Lite $p; $p = $null
+        $p = Start-Lite $inst
         # Not stuck ON: a real session created after that empty must still be saved normally.
-        & $ctl session new --pipe $inst 2>&1 | Out-Null
-        Start-Sleep -Seconds 2
+        # An empty restore seeds the fresh default pane; rename that exact live pane.
         $id = LastSessionId $inst
+        if (-not $id) { throw 'fresh launch after deliberate empty did not create a pane' }
         & $ctl session rename kept-after-empty --target $id --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 3
         $savedAfterEmpty = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -match 'kept-after-empty')
@@ -757,8 +770,9 @@ if (-not $Only -or $Only -eq 'guard-after-empty') {
         & $ctl session split on --pipe $inst 2>&1 | Out-Null
         Start-Sleep -Seconds 2
         & $ctl session close $id --pipe $inst 2>&1 | Out-Null
-        Start-Sleep -Seconds 3
-        $secondEmpty = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -notmatch 'kept-after-empty')
+        if (-not $p.WaitForExit(10000)) { throw 'second last-session close did not close its window' }
+        Wait-SpawnedHostExit $p
+        $secondEmpty = (Test-Path (State $inst)) -and ((Get-Content (State $inst) -Raw) -notmatch '(?m)^S\t')
         Stop-Lite $p; $p = $null
         $p2 = Start-Lite $inst
         Start-Sleep -Seconds 2

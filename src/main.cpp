@@ -166,7 +166,7 @@ static int g_sidebarW = kSidebarW;     // sidebar width IN EFFECT (what the layo
 static int g_sidebarWPref = kSidebarW;
 static bool g_showSidebar = true, g_showToolbar = true, g_showStatus = true;   // View menu toggles (persisted)
 static bool g_flagView = false;   // sidebar shows only flagged sessions (toolbar pennant / View menu)
-static int g_focusWs = -1;        // focused workspace: the sidebar shows only this one (-1 = all)
+static std::atomic<int> g_focusWs{-1}; // UI-owned changes; background save/probe snapshots may read
 
 static std::string narrow(const std::wstring& w);   // fwd (utf conversions live further down)
 
@@ -500,8 +500,8 @@ struct Session {
 };
 
 // Session::status is a std::string written from control-pipe threads (the session.status verb)
-// AND the UI thread (the Esc/Ctrl+C clear), and read from both (tree replies on pipe threads, the
-// sidebar and its custom-draw on the UI thread). g_lock deliberately does not cover it (it guards
+// AND the UI thread (the Esc/Ctrl+C clear), and read by UI-owned tree replies, sidebar paint and
+// worker-side agent checks. g_lock alone does not cover it (it guards
 // the emulators and the list shape), so it has its own section, like the event log has g_evtLock.
 // Short values live in the small-string buffer and never reallocate, which is why an unlocked
 // `waiting-for-user-approval` written under a concurrent `tree` was a use-after-free nobody had
@@ -578,9 +578,9 @@ static int sidebarSpan() { return g_showSidebar ? g_sidebarW + kSplitterW : 0; }
 static int toolbarTop()  { return g_showToolbar ? g_toolbarH : 0; }
 static bool g_splitDrag = false;   // dragging the sidebar splitter
 static bool g_treeDrag = false;    // dragging a session row in the sidebar (drag & drop)
-static int  g_dragIdx = -1;        // session index being dragged
+static LPARAM g_dragParam = 0;    // stable tree identity being dragged, never a vector index
 static HIMAGELIST g_dragImg = nullptr;   // TreeView_CreateDragImage ghost
-static int  g_armIdx = -1;         // session under a fresh left-press (drag candidate)
+static LPARAM g_armParam = 0;     // stable session identity under a fresh left-press
 static POINT g_armPt{};            // where that press landed (drag threshold)
 static HTREEITEM g_armItem = nullptr;
 static void relayout() {   // re-run the WM_SIZE layout + repaint after a toggle / splitter drag
@@ -600,7 +600,7 @@ static bool g_treeRenaming;     // an inline rename is starting: let the tree ho
 static bool g_restoring;         // true while rebuilding sessions at startup (suppresses state saves)
 static bool g_userEmptied;      // the user closed the LAST session: the one legitimate zero-session save
 static HTREEITEM g_ctxItem;     // right-clicked tree node (for the context menu)
-static LPARAM g_ctxParam;       // its lParam: >=0 session index, <0 = -(workspace+1)
+static LPARAM g_ctxParam;       // retained Session* (>0), negative workspace token, or invalid 0
 static HFONT g_fonts[4];        // [bold][italic]
 static std::wstring g_ttFace;   // the bundled TrueType face (Meslo Nerd, or Consolas fallback)
 // A font catalog entry: a face + the sizes it offers (cmd.exe-style face list + size dropdown).
@@ -1207,7 +1207,7 @@ static bool dashboardKey(WPARAM key);
 static void dashboardClick(POINT pt);
 static bool noticeClick(POINT pt);
 static std::string remainderOnUi(const JsonReq& req);
-static int g_activeWs = 0;           // workspace new sessions are created into
+static std::atomic<int> g_activeWs{0}; // workspace new sessions are created into
 static int g_pane[2] = { 0, -1 };   // session index per pane; pane[1] = -1 → no split
 static int g_focus = 0;             // focused pane (0/1)
 static int g_seq = 1;
@@ -1574,7 +1574,10 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     // inside the gate. The pristine check and its initialization bytes are one operation
     // relative to human input, API type/paste and restore replay. Non-editing protocol replies
     // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
-    if ((requireUntouched || reservation) && !inputPane) {
+    // An already-resolved request may race unlisting before this lookup. Never fall through to
+    // a raw write in that case: there is no longer a listed pane authorizing editing input.
+    // If found, the retained Session/gate stays valid even if unlisting happens after the lookup.
+    if ((write || requireUntouched || reservation) && !inputPane) {
         if (guardRefused) *guardRefused = true;
         return 0;
     }
@@ -2842,9 +2845,9 @@ static void closeSessionAt(int idx) {
     // A split shell exists only to be one session's second pane, so it dies with that session -
     // otherwise closing the owner would strand a running shell nothing can reach: it is hidden, so
     // it is in no tree and no sidebar. One level of recursion only; a split owns no split of its own.
-    if (!cs->splitId.empty()) {
-        int ci = indexOfSessionId(cs->splitId);
-        cs->splitId.clear();
+    int ci;
+    { LockG hold; ci = cs->splitId.empty() ? -1 : indexOfSessionId(cs->splitId); cs->splitId.clear(); }
+    if (ci >= 0) {
         if (ci >= 0 && ci != idx) {
             closeSessionAt(ci);                // ...and that shell's pane overlay with it (the recursion's own guard below)
             idx = indexOfSession(cs);          // the erase above may have shifted us
@@ -2860,7 +2863,7 @@ static void closeSessionAt(int idx) {
     }
     // ...and the other direction: a split shell that dies on its own (the user typed exit in it)
     // must not leave its owner pointing at nothing.
-    for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear();
+    { LockG hold; for (Session* other : g_sessions) if (other->splitId == cs->id) other->splitId.clear(); }
     killSession(cs);
     EnterCriticalSection(&g_lock);
     idx = indexOfSession(cs); // host I/O above allowed another client to unlist/shift sessions
@@ -3738,11 +3741,11 @@ static bool saveSessionState() {
         replayLine("R", &Session::restoreCmd);
         replayLine("B", &Session::agentResume);
     }
-    // Read under the lock, with the session list it describes: the flag is written from the
-    // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
+    // Read under the lock with the session list it describes: closeSessionAt is UI-owned, and
+    // the snapshot may also be requested by worker-side persistence. This flag gates both the
     // zero-session refusal and the .bak delete — the two decisions that can cost saved sessions.
     bool userEmptied = g_userEmptied;
-    // The A line's value is sampled here too: workspace.select writes g_activeWs from a pipe thread,
+    // The A line's value is sampled here too: workspace.select writes g_activeWs on the UI thread,
     // and a read after the release could put an OLDER workspace into a HIGHER-stamped buffer, which
     // the overtake guard below orders by stamp alone (revmux r2 of #28).
     int activeWs = g_activeWs;
@@ -4599,9 +4602,12 @@ afterGridPaint:;
             DeleteObject(b);
         }
     }
-    if (!preview && !s->hidden) {   // previewing is not marking a notification/command as seen
-        s->seenDone = doneMarks;
-        if (s->unread) { s->unread = 0; PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0); }
+    if (!preview) {   // readerThread accesses this bookkeeping under the same lock
+        LockG hold;
+        if (!s->hidden) {
+            s->seenDone = completedMarks(s);
+            if (s->unread) { s->unread = 0; PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0); }
+        }
     }
 
     // Scrollback indicator: thin right-edge stripe while scrolled.
@@ -5633,7 +5639,7 @@ static void runKbAction(int a) {
         case KB_FLAG: toggleFocusedFlag(); break;
         case KB_FLAGVIEW: toggleFlagView(); break;
         case KB_ATTENTION: nextBlocked(); break;
-        case KB_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;
+        case KB_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs.load() : g_activeWs.load()); break;
         case KB_READONLY: toggleReadOnly(); break;
         case KB_BROADCAST: { JsonReq r; r.fields["cmd"] = "broadcast"; remainderOnUi(r); break; }
         case KB_DASHBOARD: { JsonReq r; r.fields["cmd"] = "dashboard"; if (g_dashboard) r.fields["args.close"] = "true"; remainderOnUi(r); break; }
@@ -5788,6 +5794,23 @@ static void updateStatus() {
 }
 // Rebuild the native TreeView sidebar from the session list; select the focused pane's session.
 // UI-thread only (worker threads post WM_APP_REFRESHTREE instead).
+// Tree rows carry identities that survive reallocation, reorder and nested menu message loops.
+// Session objects are retained for process lifetime; an unlisted pointer never resolves again.
+static int treeSessionIndex(LPARAM value) {
+    if (value <= 0) return -1;
+    LockG hold;
+    return indexOfSession(reinterpret_cast<Session*>(value));
+}
+static LPARAM treeWorkspaceParam(int index) {
+    LockG hold;
+    const auto token = g_workspaces.token(index);
+    return token && token <= static_cast<uint64_t>(INTPTR_MAX) ? -static_cast<LPARAM>(token) : 0;
+}
+static int treeWorkspaceIndex(LPARAM value) {
+    if (value >= 0 || value == INTPTR_MIN) return -1;
+    LockG hold;
+    return g_workspaces.index(static_cast<uint64_t>(-value));
+}
 static void refreshTree(bool persist = true) {
     if (!g_tree) return;
     // Enforced, not merely documented: session.move, workspace.delete and workspace.focus reached
@@ -5821,8 +5844,7 @@ static void refreshTree(bool persist = true) {
     // pane's session — the hidden split shell when the split was focused, which has no row, so
     // nothing highlighted at all. `tree`'s `active` is judged the same way.
     int focusIdx = g_pane[0];
-    // Group sessions under their workspace ("folder"). lParam encodes the node: >=0 session index,
-    // <0 = -(workspace index + 1).
+    // lParam carries retained Session* (>0), negative workspace token, or invalid hint (0).
     bool anyShown = false;
     for (int w = 0; w < (int)g_workspaces.size(); w++) {
         if (g_focusWs >= 0 && w != g_focusWs) continue;   // focused workspace: show only it
@@ -5839,7 +5861,7 @@ static void refreshTree(bool persist = true) {
         wt.hInsertAfter = TVI_LAST;
         wt.item.mask = TVIF_TEXT | TVIF_PARAM;
         wt.item.pszText = (LPWSTR)wlabel.c_str();
-        wt.item.lParam = -(w + 1);
+        wt.item.lParam = treeWorkspaceParam(w);
         HTREEITEM wh = TreeView_InsertItem(g_tree, &wt);
         anyShown = true;
         int vis = 0;   // visible session number within the workspace
@@ -5865,7 +5887,7 @@ static void refreshTree(bool persist = true) {
             tis.item.stateMask = TVIS_BOLD;
             tis.item.state = (cls == AGST_BLOCKED) ? TVIS_BOLD : 0;
             tis.item.pszText = (LPWSTR)label.c_str();
-            tis.item.lParam = i;
+            tis.item.lParam = reinterpret_cast<LPARAM>(s);
             HTREEITEM h = TreeView_InsertItem(g_tree, &tis);
             if (i == focusIdx) sel = h;
         }
@@ -5876,13 +5898,13 @@ static void refreshTree(bool persist = true) {
         ti.hParent = TVI_ROOT; ti.hInsertAfter = TVI_LAST;
         ti.item.mask = TVIF_TEXT | TVIF_PARAM;
         ti.item.pszText = (LPWSTR)L"No flagged sessions (right-click one to flag)";
-        ti.item.lParam = -100000;
+        ti.item.lParam = 0;
         TreeView_InsertItem(g_tree, &ti);
     }
     if (sel) TreeView_SelectItem(g_tree, sel);
     for(HTREEITEM item=TreeView_GetRoot(g_tree);item;item=TreeView_GetNextSibling(g_tree,item)){
         TVITEMW ti{};ti.mask=TVIF_PARAM;ti.hItem=item;TreeView_GetItem(g_tree,&ti);
-        if(ti.lParam<0&&g_collapsedWorkspaces.count((int)(-ti.lParam-1)))TreeView_Expand(g_tree,item,TVE_COLLAPSE);
+        if(g_collapsedWorkspaces.count(treeWorkspaceIndex(ti.lParam)))TreeView_Expand(g_tree,item,TVE_COLLAPSE);
     }
     g_treeSyncing = false;
     }   // g_lock released
@@ -5922,9 +5944,15 @@ static WsDelete deleteWorkspace(int w) {
 // Acts on the RIGHT-CLICKED node (g_ctxParam), not the focused session, and dispatches inline via
 // TPM_RETURNCMD (no WM_COMMAND re-entrancy, no selection change — so the active terminal doesn't jump).
 static void showTreeContextMenu() {
-    bool isSession = g_ctxParam >= 0;
-    int si = isSession ? (int)g_ctxParam : -1;
-    int cws = isSession ? (si < (int)g_sessions.size() ? g_sessions[si]->ws : 0) : (int)(-g_ctxParam - 1);
+    const LPARAM targetParam = g_ctxParam;
+    HTREEITEM targetItem = nullptr; // resolved again only after the nested menu loop
+    bool isSession = targetParam > 0;
+    int si = treeSessionIndex(targetParam);
+    if (isSession && si < 0) return;
+    int cws = isSession ? g_sessions[si]->ws : treeWorkspaceIndex(targetParam);
+    const LPARAM workspaceParam = treeWorkspaceParam(cws);
+    std::vector<uint64_t> menuWorkspaces;
+    { LockG hold; for (int w = 0; w < (int)g_workspaces.size(); ++w) menuWorkspaces.push_back(g_workspaces.token(w)); }
     Session* duplicateSource = nullptr;
     { LockG hold; if (isSession && si >= 0 && si < (int)g_sessions.size()) duplicateSource = g_sessions[si]; }
     if (!isSession && (cws < 0 || cws >= (int)g_workspaces.size())) return;   // hint row etc.
@@ -5956,6 +5984,11 @@ static void showTreeContextMenu() {
     int id = (int)TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hwnd, nullptr);
     DestroyMenu(m);
     if (id == 0) return;   // dismissed
+    // TrackPopupMenu can execute queued controls. Re-resolve every delayed identity, including
+    // submenu destinations; a deleted row/workspace is not the item now occupying its index.
+    si = treeSessionIndex(targetParam);
+    cws = isSession && si >= 0 ? g_sessions[si]->ws : treeWorkspaceIndex(workspaceParam);
+    if ((isSession && si < 0) || cws < 0) return;
     switch (id) {
         case IDM_NEW: g_activeWs = cws; newSessionDialog(); break;
         case IDM_NEWWS: {
@@ -5986,7 +6019,23 @@ static void showTreeContextMenu() {
         case IDM_RENAME:
             // g_treeRenaming keeps treeProc's WM_SETFOCUS bounce out of the way until the edit
             // control exists (after that TreeView_GetEditControl answers for it).
-            if (g_ctxItem) { g_treeRenaming = true; SetFocus(g_tree); TreeView_EditLabel(g_tree, g_ctxItem); g_treeRenaming = false; }
+            // A nested menu loop may have rebuilt every HTREEITEM. Find the surviving identity's
+            // current row rather than retaining a handle into the deleted tree.
+            targetItem = nullptr;
+            for (HTREEITEM ws = TreeView_GetRoot(g_tree); ws && !targetItem; ws = TreeView_GetNextSibling(g_tree, ws)) {
+                TVITEMW row{}; row.mask=TVIF_PARAM; row.hItem=ws;
+                if (TreeView_GetItem(g_tree,&row) && row.lParam==targetParam) targetItem=ws;
+                for (HTREEITEM child=TreeView_GetChild(g_tree,ws); child && !targetItem; child=TreeView_GetNextSibling(g_tree,child)) {
+                    row.hItem=child;
+                    if (TreeView_GetItem(g_tree,&row) && row.lParam==targetParam) targetItem=child;
+                }
+            }
+            if (targetItem) {
+                TVITEMW current{}; current.mask=TVIF_PARAM; current.hItem=targetItem;
+                if (TreeView_GetItem(g_tree,&current) && current.lParam==targetParam) {
+                    g_treeRenaming = true; SetFocus(g_tree); TreeView_EditLabel(g_tree, targetItem); g_treeRenaming = false;
+                }
+            }
             break;
         case IDM_FLAG:
             if (isSession && si < (int)g_sessions.size()) toggleFlag(g_sessions[si]);
@@ -6001,9 +6050,10 @@ static void showTreeContextMenu() {
             if (!isSession) toggleFocusWs(cws);
             break;
         default:
-            if (isSession && id >= IDM_MOVE_BASE && id < IDM_MOVE_BASE + (int)g_workspaces.size()
+            if (isSession && id >= IDM_MOVE_BASE && id < IDM_MOVE_BASE + (int)menuWorkspaces.size()
                 && si < (int)g_sessions.size()) {
-                g_sessions[si]->ws = id - IDM_MOVE_BASE;   // move to workspace
+                { LockG hold; const int to=g_workspaces.index(menuWorkspaces[id-IDM_MOVE_BASE]);
+                  if(to<0)break; g_sessions[si]->ws = to; }
                 refreshTree();
             }
             break;
@@ -7157,7 +7207,7 @@ static void togglePopupTerminal(bool scratch) {
         hw = createPopupWindow(scratch ? L"agliteterm — scratch" : L"agliteterm — quick", 0.66, 0.6);
         RECT rc; GetClientRect(hw, &rc);
         sess = newSession(max(1, (int)(rc.right / g_cw)), max(1, (int)(rc.bottom / g_ch)));   // windowForSession routes to hw (set above)
-        if (sess) { sess->hidden = true; sess->name = scratch ? L"scratch" : L"quick"; }      // not in the sidebar / not persisted
+        if (sess) { LockG hold; sess->hidden = true; sess->name = scratch ? L"scratch" : L"quick"; }
     }
     // Only when it was actually activated: an unactivated popup gets the override from its own
     // WM_SETFOCUS if the user clicks into it.
@@ -7203,11 +7253,13 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
     if (g_overlayHwnd) { g_overlayReplacing = true; DestroyWindow(g_overlayHwnd); g_overlayReplacing = false; }
     setLastOverlayExit("no overlay");   // kOverlayNone's word (the P5 block, declared after this); again, for a by-hand caller
     int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
-    g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
+    const auto overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
+    { LockG hold; g_overlayHwnd = overlayHwnd; }
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
     std::vector<std::string> cargs{ "-NoExit", "-Command", commandLine };   // one wrapper for both slots
-    g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
+    auto* overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
+    { LockG hold; g_overlaySession = overlaySession; }
     if (!g_overlaySession) {
         logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
         DestroyWindow(g_overlayHwnd);   // WM_DESTROY clears g_overlayHwnd; a later `resize` is refused truthfully
@@ -7280,7 +7332,7 @@ static void endTreeDrag(bool drop, POINT treePt) {   // treePt in TREE-client co
     if (g_dragImg) { ImageList_Destroy(g_dragImg); g_dragImg = nullptr; }
     ReleaseCapture();
     TreeView_SelectDropTarget(g_tree, nullptr);
-    int from = g_dragIdx; g_dragIdx = -1;
+    int from = treeSessionIndex(g_dragParam); g_dragParam = 0;
     if (!drop || from < 0) return;
     TVHITTESTINFO ht{};
     ht.pt = treePt;
@@ -7288,11 +7340,11 @@ static void endTreeDrag(bool drop, POINT treePt) {   // treePt in TREE-client co
     if (!it) return;
     TVITEMW ti{}; ti.mask = TVIF_PARAM; ti.hItem = it;
     TreeView_GetItem(g_tree, &ti);
-    if (ti.lParam >= 0 && ti.lParam < (LPARAM)g_sessions.size()) {          // onto a session: insert before it
-        int tj = (int)ti.lParam;
+    int tj = treeSessionIndex(ti.lParam);
+    if (tj >= 0) {          // onto a session: insert before it
         if (tj != from) moveSessionTo(from, g_sessions[tj]->ws, tj);
     } else {                                                                 // onto a workspace: append there
-        int w = (int)(-ti.lParam - 1);
+        int w = treeWorkspaceIndex(ti.lParam);
         if (w >= 0 && w < (int)g_workspaces.size()) moveSessionTo(from, w, -1);
     }
 }
@@ -7366,15 +7418,15 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
             }
             break;
         case WM_LBUTTONDOWN: {
-            g_armIdx = -1;
+            g_armParam = 0;
             TVHITTESTINFO ht{};
             ht.pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
             HTREEITEM it = TreeView_HitTest(h, &ht);
             if (it && (ht.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT | TVHT_ONITEMINDENT))) {
                 TVITEMW ti{}; ti.mask = TVIF_PARAM; ti.hItem = it;
                 TreeView_GetItem(h, &ti);
-                if (ti.lParam >= 0 && ti.lParam < (LPARAM)g_sessions.size()) {
-                    g_armIdx = (int)ti.lParam; g_armPt = ht.pt; g_armItem = it;   // drag candidate
+                if (treeSessionIndex(ti.lParam) >= 0) {
+                    g_armParam = ti.lParam; g_armPt = ht.pt; g_armItem = it;   // drag candidate
                 }
             }
             break;   // default handling still selects the row
@@ -7389,9 +7441,11 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
                 ImageList_DragMove(pt.x, pt.y);
                 return 0;
             }
-            if (g_armIdx >= 0 && (w & MK_LBUTTON) &&
+            if (g_armParam > 0 && (w & MK_LBUTTON) &&
                 (abs(pt.x - g_armPt.x) > 4 || abs(pt.y - g_armPt.y) > 4)) {   // passed the drag threshold
-                g_dragIdx = g_armIdx; g_armIdx = -1;
+                TVITEMW current{};current.mask=TVIF_PARAM;current.hItem=g_armItem;
+                if(treeSessionIndex(g_armParam)<0 || !TreeView_GetItem(h,&current) || current.lParam!=g_armParam){g_armParam=0;break;}
+                g_dragParam = g_armParam; g_armParam = 0;
                 g_dragImg = TreeView_CreateDragImage(h, g_armItem);
                 if (g_dragImg) { ImageList_BeginDrag(g_dragImg, 0, 8, 8); ImageList_DragEnter(h, pt.x, pt.y); }
                 g_treeDrag = true;
@@ -7402,7 +7456,7 @@ static LRESULT CALLBACK treeProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
         }
         case WM_LBUTTONUP:
             if (g_treeDrag) { endTreeDrag(true, { GET_X_LPARAM(l), GET_Y_LPARAM(l) }); return 0; }
-            g_armIdx = -1;
+            g_armParam = 0;
             break;
         case WM_CAPTURECHANGED:
             if (g_treeDrag) endTreeDrag(false, { 0, 0 });   // something stole the mouse: cancel cleanly
@@ -7473,7 +7527,7 @@ static void toggleFlagView() {
 // lives on the workspace's context menu and in View). Focusing again, or focusing -1, unfocuses.
 static void toggleFocusWs(int w) {
     g_focusWs = (g_focusWs == w || w < 0 || w >= (int)g_workspaces.size()) ? -1 : w;
-    if (g_focusWs >= 0) g_activeWs = g_focusWs;   // new sessions land in the focused workspace
+    if (g_focusWs >= 0) g_activeWs = g_focusWs.load();   // new sessions land in the focused workspace
     if (g_hwnd) CheckMenuItem(GetMenu(g_hwnd), IDM_FOCUSWS, MF_BYCOMMAND | (g_focusWs >= 0 ? MF_CHECKED : MF_UNCHECKED));
     refreshTree();   // re-filters + updates the status bar + persists (O record)
 }
@@ -7486,8 +7540,11 @@ static void toggleFocusWs(int w) {
 // leave while the UI finishes. Pending cancellation wins before any side effect; a running
 // timeout explicitly makes no promise about the result. Never wait here while holding g_lock.
 #include "ui_request.h"
+#include "ui_ownership.h"
+static std::string ctlDispatch(const std::string& line);
 struct ConfigRequest {
     JsonReq request;
+    std::string controlLine; // nonempty: ordinary control verb, parsed/executed on the UI owner
     std::string result;
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     ui_request::State state;
@@ -7522,7 +7579,7 @@ static std::string configOnUi(const JsonReq& req) {
     }
     // Properties and Keyboard keep editable snapshots; refuse writes instead of silently losing
     // either the dialog's unsaved edits or the API change when its OK button applies that snapshot.
-    if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd) || (g_picker&&g_picker->active())) return ctlErr("a modal dialog or picker is open or queued; configuration unchanged");
+    if (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd) || (g_picker&&g_picker->active()) || TreeView_GetEditControl(g_tree)) return ctlErr("a modal dialog, picker or sidebar editor is open or queued; configuration unchanged");
     if (cmd == "broadcast" || cmd == "notify" || cmd == "dashboard" || cmd == "restore.clear" || cmd == "workspace.move") return remainderOnUi(req);
     if (cmd == "agent.update.open") return agentUpdateOnUi(req); // internal dispatch only, not a public control verb
     if (cmd.rfind("command.", 0) == 0) return commandOnUi(req);
@@ -7623,8 +7680,15 @@ static void drainConfigRequests() {
     { std::lock_guard<std::mutex> guard(g_configMutex); requests.swap(g_configRequests); }
     for (auto& call : requests) {
         if (!call->state.start()) continue;
-        try { call->result = configOnUi(call->request); }
-        catch (...) { call->result = ctlErr("configuration request failed; outcome unknown; read back the setting"); }
+        try {
+            if (!call->controlLine.empty()) {
+                if (call->request.get("cmd") != "tree" &&
+                    (g_settingsOpenQueued || !IsWindowEnabled(g_hwnd) || (g_picker && g_picker->active()) || TreeView_GetEditControl(g_tree)))
+                    call->result = ctlErr("a modal dialog, picker or sidebar editor is open or queued; control request unchanged");
+                else call->result = ctlDispatch(call->controlLine);
+            } else call->result = configOnUi(call->request);
+        }
+        catch (...) { call->result = ctlErr("UI request failed; outcome unknown; read back state before retrying"); }
         if(call->request.get("cmd")=="pick.open") {
             call->state.publishPicker([&] {
                 try {auto reply=wave3::parse(call->result);if(wave3::boolean(reply,"ok")){auto* result=wave3::field(reply,"result");if(result)abortPicker(wave3::text(*result,"id",true));}}catch(...){logWarn("withdrawn picker rollback failed");}
@@ -7633,8 +7697,10 @@ static void drainConfigRequests() {
         SetEvent(call->done);
     }
 }
-static std::string dispatchConfig(const JsonReq& req) {
-    auto call = std::make_shared<ConfigRequest>(); call->request = req;
+static std::string dispatchConfig(const JsonReq& req, const std::string& controlLine = {}) {
+    if (GetWindowThreadProcessId(g_hwnd, nullptr) == GetCurrentThreadId())
+        return controlLine.empty() ? configOnUi(req) : ctlDispatch(controlLine);
+    auto call = std::make_shared<ConfigRequest>(); call->request = req; call->controlLine = controlLine;
     if (!call->done) return ctlErr("configuration request could not be created");
     {
         std::lock_guard<std::mutex> guard(g_configMutex);
@@ -7653,6 +7719,8 @@ static std::string dispatchConfig(const JsonReq& req) {
         g_configRequests.erase(std::remove(g_configRequests.begin(), g_configRequests.end(), call), g_configRequests.end());
     }
     if(picker)return ctlErr("picker open withdrawn; in-flight construction will be discarded");
+    if (!controlLine.empty()) return ctlErr(cancelled ? "control request timed out before execution; nothing changed" :
+        "control request timed out after execution started; outcome unknown; read back state before retrying");
     return ctlErr(cancelled ? "configuration request timed out before execution; configuration unchanged" :
         "configuration request timed out; outcome unknown; read back the setting");
 }
@@ -8180,7 +8248,7 @@ public:
                     cd->nmcd.uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS);
                     r = CDRF_NEWFONT;
                 }
-                LPARAM p = cd->nmcd.lItemlParam;   // italicise "working" agent rows
+                LPARAM p = treeSessionIndex(cd->nmcd.lItemlParam);   // italicise "working" agent rows
                 if (p >= 0 && p < (LPARAM)g_sessions.size() && !g_sessions[p]->exited &&
                     statusClass(statusOf(g_sessions[p]).status) == AGST_WORKING && g_treeItalic) {
                     SelectObject(cd->nmcd.hdc, g_treeItalic);
@@ -8204,7 +8272,7 @@ public:
                 return r;
             }
             if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
-                LPARAM p = cd->nmcd.lItemlParam;
+                LPARAM p = treeSessionIndex(cd->nmcd.lItemlParam);
                 if (p >= 0 && p < (LPARAM)g_sessions.size()) {
                     bool flagged = false; int unread = 0; std::wstring ctx;
                     {   // session.context writes `context` on a pipe thread under g_lock; copy it
@@ -8323,16 +8391,16 @@ public:
         if (nm->idFrom == ID_TREE && nm->code == TVN_SELCHANGEDW && !g_treeSyncing) {
             auto* nt = (NMTREEVIEWW*)lp;
             LPARAM p = nt->itemNew.lParam;
-            if (p >= 0) {                                   // session node -> show it in the MAIN pane
-                int i = (int)p;
-                if (i < (int)g_sessions.size()) {
+            if (p > 0) {                                   // session node -> show it in the MAIN pane
+                int i = treeSessionIndex(p);
+                if (i >= 0 && i < (int)g_sessions.size()) {
                     selectPrimary(i);                      // tree drives the main pane, not the split shell
                     g_activeWs = g_sessions[i]->ws;         // new sessions follow the selected one's workspace
                     syncPaneSizes();
                     Invalidate(FALSE);
                 }
             } else {                                        // workspace node -> make it the active "folder"
-                int w = (int)(-p - 1);
+                int w = treeWorkspaceIndex(p);
                 if (w >= 0 && w < (int)g_workspaces.size()) g_activeWs = w;
             }
             // Keep typing going to the terminal, not the tree — but NOT with a direct SetFocus():
@@ -8342,7 +8410,7 @@ public:
             ::PostMessageW(m_hWnd, WM_APP_FOCUSTERM, 0, 0);
         }
         if(nm->idFrom==ID_TREE&&nm->code==TVN_ITEMEXPANDEDW&&!g_treeSyncing){
-            auto* tv=reinterpret_cast<NMTREEVIEWW*>(lp);if(tv->itemNew.lParam<0){LockG hold;int ws=(int)(-tv->itemNew.lParam-1);
+            auto* tv=reinterpret_cast<NMTREEVIEWW*>(lp);if(tv->itemNew.lParam<0){LockG hold;int ws=treeWorkspaceIndex(tv->itemNew.lParam);
                 if(ws>=0&&ws<(int)g_workspaces.size()){if(tv->itemNew.state&TVIS_EXPANDED)g_collapsedWorkspaces.erase(ws);else g_collapsedWorkspaces.insert(ws);}}
         }
         // A click on the ALREADY-selected row sends no TVN_SELCHANGED at all, so it needs the same
@@ -8365,13 +8433,14 @@ public:
         if (nm->idFrom == ID_TREE && nm->code == TVN_BEGINLABELEDITW) {   // seed the edit box with the bare name
             auto* di = (NMTVDISPINFOW*)lp;
             if (HWND ed = TreeView_GetEditControl(g_tree)) {
-                if (di->item.lParam >= 0) {
-                    int i = (int)di->item.lParam;
+                if (di->item.lParam > 0) {
+                    int i = treeSessionIndex(di->item.lParam);
+                    if(i<0)return TRUE;
                     std::wstring bn = (i < (int)g_sessions.size() && !g_sessions[i]->name.empty())
                                       ? g_sessions[i]->name : (L"session " + std::to_wstring(i + 1));
                     ::SetWindowTextW(ed, bn.c_str());
                 } else {
-                    int w = (int)(-di->item.lParam - 1);
+                    int w = treeWorkspaceIndex(di->item.lParam);
                     if (w >= 0 && w < (int)g_workspaces.size()) ::SetWindowTextW(ed, g_workspaces[w].c_str());
                 }
             }
@@ -8381,8 +8450,8 @@ public:
             auto* di = (NMTVDISPINFOW*)lp;
             if (di->item.pszText && di->item.pszText[0]) {
                 std::wstring txt = di->item.pszText;
-                if (di->item.lParam >= 0) { int i = (int)di->item.lParam; if (i < (int)g_sessions.size()) g_sessions[i]->name = txt; }
-                else { LockG hold; int w = (int)(-di->item.lParam - 1); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }   // read under g_lock by `tree`
+                if (di->item.lParam > 0) { LockG hold; int i = treeSessionIndex(di->item.lParam); if (i >= 0) g_sessions[i]->name = txt; }
+                else { LockG hold; int w = treeWorkspaceIndex(di->item.lParam); if (w >= 0 && w < (int)g_workspaces.size()) g_workspaces[w] = txt; }
                 ::PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // re-decorate with status/count
             }
             return 0;   // FALSE — we refresh the label ourselves
@@ -8431,7 +8500,7 @@ public:
             }
             case IDM_FLAG: toggleFocusedFlag(); break;
             case IDM_FLAGVIEW: toggleFlagView(); break;
-            case IDM_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs : g_activeWs); break;   // toggle on active ws
+            case IDM_FOCUSWS: toggleFocusWs(g_focusWs >= 0 ? g_focusWs.load() : g_activeWs.load()); break;   // toggle on active ws
             case IDM_ATTENTION: nextBlocked(); break;
             case IDM_RESTART: restartApp(); break;
             case IDM_SHOW: showMainWindow(); break;
@@ -9777,6 +9846,8 @@ static std::string ctlDispatch(const std::string& line) {
     size_t i = 0;
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
+    if (ui_ownership::dispatchToUi(cmd, req.get("args.action")) && GetWindowThreadProcessId(g_hwnd, nullptr) != GetCurrentThreadId())
+        return dispatchConfig(req, line); // no g_lock held; owned payload survives caller timeout
 
     if (cmd == "config.set" && req.get("args.key") == "quick-terminal-hotkey") {
         try {
@@ -9866,9 +9937,8 @@ static std::string ctlDispatch(const std::string& line) {
     if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
         const auto shellHints=waveShellHints();
-        // This runs on a control-pipe thread while another pipe thread's session.new can push_back
-        // into g_sessions (a realloc frees the buffer this loop indexes) and session.rename can
-        // reassign a name this loop reads. Both mutate under g_lock, so the walk holds it too.
+        // Structural snapshots are UI-owned; reader-thread emulator/unread updates still share
+        // g_lock, so hold it across the whole snapshot.
         LockG hold;
         std::string wss;
         for (int w = 0; w < (int)g_workspaces.size(); w++) {
@@ -10056,7 +10126,7 @@ static std::string ctlDispatch(const std::string& line) {
             wantWs = callerWorkspace(caller);   // -1 = fall through to the active workspace (step 3)
         }
 
-        workspace = g_workspaces.token(wantWs >= 0 ? wantWs : g_activeWs);
+        workspace = g_workspaces.token(wantWs >= 0 ? wantWs : g_activeWs.load());
         }
 
         int cols, rows;
@@ -10372,8 +10442,13 @@ static std::string ctlDispatch(const std::string& line) {
                 return ctlErr(emsg);
             }
         }
-        if (target->data == INVALID_HANDLE_VALUE || target->exited) return ctlErr("session type: pane has no live input");
-        if (ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
+        HANDLE data;
+        { LockG hold;
+          if(indexOfSession(target)<0)return ctlErr("session not found");
+          if (target->data == INVALID_HANDLE_VALUE || target->exited) return ctlErr("session type: pane has no live input");
+          data=target->data;
+        }
+        if (ovIo(data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
             return ctlErr("session type: input reserved or write failed/partial; shell outcome unknown");
         return ctlOkStr("typed");
     }
@@ -10472,9 +10547,9 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("status", target->id, "set"));
+            setStatus(target, st); // membership and status update share g_lock -> g_statusLock order
+            emitEvent("status", target->id, st); // publish in state-write order; id can change on promotion
         }
-        setStatus(target, st);
-        emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label
         return ctlOkStr("status set");
@@ -10789,7 +10864,7 @@ static std::string ctlDispatch(const std::string& line) {
     }
     // ---- agwintermctl-dialect verbs over the features lite has -------------------------------
     auto wsResolve = [&](const std::string& sel, bool defaultActive) -> int {
-        if (sel.empty() || sel == "active") return defaultActive ? g_activeWs : -1;
+        if (sel.empty() || sel == "active") return defaultActive ? g_activeWs.load() : -1;
         bool num = !sel.empty();
         for (char c : sel) if (!isdigit((unsigned char)c)) { num = false; break; }
         if (num) { int i2 = atoi(sel.c_str()); return (i2 >= 0 && i2 < (int)g_workspaces.size()) ? i2 : -1; }
@@ -11420,7 +11495,7 @@ static std::string ctlDispatch(const std::string& line) {
         std::string op = req.get("args.op");
         bool cur = g_focusWs >= 0;
         bool want = wantOn(op, cur);
-        if (want != cur) toggleFocusWs(want ? g_activeWs : g_focusWs);
+        if (want != cur) toggleFocusWs(want ? g_activeWs.load() : g_focusWs.load());
         return ctlOkStr(g_focusWs >= 0 ? "focused" : "unfocused");
     }
     if (cmd == "workspace.collapse" || cmd == "workspace.expand") {
@@ -11429,7 +11504,7 @@ static std::string ctlDispatch(const std::string& line) {
         for (HTREEITEM it = TreeView_GetRoot(g_tree); it; it = TreeView_GetNextSibling(g_tree, it)) {
             TVITEMW ti{}; ti.mask = TVIF_PARAM; ti.hItem = it;
             TreeView_GetItem(g_tree, &ti);
-            if (ti.lParam == -(w + 1)) { TreeView_Expand(g_tree, it, cmd == "workspace.expand" ? TVE_EXPAND : TVE_COLLAPSE); break; }
+            if (ti.lParam == treeWorkspaceParam(w)) { TreeView_Expand(g_tree, it, cmd == "workspace.expand" ? TVE_EXPAND : TVE_COLLAPSE); break; }
         }
         return ctlOkStr("ok");
     }
@@ -11967,7 +12042,7 @@ static Session* failedSpecSession(const RestoreSpec& sp, int cols, int rows) {
     s->app = sp.app;
     s->args = sp.args;
     s->cwd = sp.cwd;
-    s->ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_activeWs : 0;
+    s->ws = (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size()) ? g_activeWs.load() : 0;
     s->exited = true;
     s->failed = true;
     s->cols = cols; s->rows = rows;

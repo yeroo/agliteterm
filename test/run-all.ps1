@@ -3,8 +3,8 @@ param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[string[]]$Suite)
 $ErrorActionPreference='Stop';$PSNativeCommandUseErrorActionPreference=$false
 $all=@('suite-policy.unit','suite-job.unit','suite-ctl.unit','suite-supervisor.unit','test-registry.unit','targeting.unit','paste.unit','restore-readiness.unit','state-fence.unit','reopen.unit','ui-request.unit','conformance-validator.unit','wave3.unit','remainder.unit','commands.unit','agent-integration.unit','installers.unit','agent-scripts.unit','configuration.unit','driving.unit','owned-procs-checks','registry-guard.unit','clipboard-guard.tests','clipboard-receipt.unit','selection-clipboard.unit','log-basics','log-restore','log-focus-font','log-rotation','diagnose','migration','restore-matrix','conformance','clipboard','agbf-packs','control-read','control-honesty','selection-ui')
-$all=@('creation-protocol.unit','creation-host','control-transport.unit','focus-status.unit','control-honesty-clipboard.unit','readline-status.unit','overlay-command.unit')+$all
-$supported=$all+@('stress') # manual expensive stress remains explicit-only
+$all=@('ui-ownership.unit','ui-concurrency','creation-protocol.unit','creation-host','control-transport.unit','focus-status.unit','control-honesty-clipboard.unit','readline-status.unit','overlay-command.unit')+$all
+$supported=$all+@('stress','restore-empty') # explicit-only stress and narrow safe restore probe
 if($Suite){foreach($name in $Suite){if($name-cnotin $supported){throw "Unknown suite: $name"}}}else{$Suite=$all}
 . "$PSScriptRoot/suite-policy.ps1"
 Assert-LiteSuitePolicy $Suite
