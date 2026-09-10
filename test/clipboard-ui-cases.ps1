@@ -1,7 +1,7 @@
 # Dot-sourced only after whole-format/DPAPI snapshot, registry guard, lease and owned launch.
 if(-not $clipboard -or -not $script:selectionProc){throw 'Clipboard acceptance requires guarded fixture'}
 '-- Guarded legacy clipboard and host actions --'
-function ClipWait([scriptblock]$condition){for($n=0;$n-lt 100;$n++){if(& $condition){return $true};Start-Sleep -Milliseconds 100};return $false}
+function ClipWait([scriptblock]$condition,[int]$Attempts=100){for($n=0;$n-lt $Attempts;$n++){if(& $condition){return $true};Start-Sleep -Milliseconds 100};return $false}
 $clipIds=[Collections.Generic.List[string]]::new()
 try {
     # No probe precedes Save-SelectionClipboard. A sentinel write itself has an exact receipt.
@@ -69,6 +69,12 @@ Write-Host "DSR=<$($r-join ',')>"
     Selection-Rpc 'session.type' @{text=("& '"+$dsrFile.Replace("'","''")+"'`r")} $oscId|Out-Null
     Check 'DSR query receives its host-action response' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId))-match 'DSR=<27,91,(?:4[89]|5[0-7])(?:,(?:4[89]|5[0-7]))*,59,(?:4[89]|5[0-7])(?:,(?:4[89]|5[0-7]))*,82>'})
 
+    # One long-running pipeline spans BOTH Ctrl+C paths: copying must leave it running, while
+    # clearing the selection must let the translated ETX interrupt that exact same pipeline.
+    $promptNonce=[guid]::NewGuid().ToString('N')
+    $interruptPrompt='INTERRUPT-PROMPT-'+$promptNonce
+    Selection-Rpc 'session.type' @{text=("function global:prompt { 'INTERRUPT-'+'PROMPT-'+'"+$promptNonce+"' }; Write-Output ('INTERRUPT-'+'READY'); Microsoft.PowerShell.Utility\Start-Sleep -Seconds 120`r")} $oscId|Out-Null
+    if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains('INTERRUPT-READY')})){throw 'Interrupt fixture not ready'}
     Main-Screen;Write-Screen (($esc+'[H')+((1..80|ForEach-Object{'COPY-ME-MARKER'})-join "`r`n")) $oscId
     $geometry=Selection-Geometry
     Selection-Drag @($h,($geometry.Left+5),($geometry.Top+5),($geometry.Right-10),($geometry.Bottom-10),0)
@@ -77,12 +83,8 @@ Write-Host "DSR=<$($r-join ',')>"
     Write-SelectionClipboardMarker $clipboard 'BEFORE-CTRL-C'
     Invoke-SelectionClipboardCopy $clipboard { [LiteUi]::Chord($h,0x43,$false,3) } { $copyText } ([Func[bool]]{[SelectionUi]::ClipboardOwnedBy($script:selectionProc.Id)})
     Check 'Ctrl+C copies precisely the selected text' ((Clip)-ceq $copyText)
+    Check 'selected Ctrl+C consumes ETX without ending the running pipeline' (-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains($interruptPrompt)} -Attempts 20))
     Selection-Rpc 'selection.clear' @{} $oscId|Out-Null
-    # Observe a real command cancellation, not growth in an echoed draft.
-    $promptNonce=[guid]::NewGuid().ToString('N')
-    $interruptPrompt='INTERRUPT-PROMPT-'+$promptNonce
-    Selection-Rpc 'session.type' @{text=("function global:prompt { 'INTERRUPT-'+'PROMPT-'+'"+$promptNonce+"' }; Write-Output ('INTERRUPT-'+'READY'); Microsoft.PowerShell.Utility\Start-Sleep -Seconds 120`r")} $oscId|Out-Null
-    if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains('INTERRUPT-READY')})){throw 'Interrupt fixture not ready'}
     [LiteUi]::Chord($h,0x43,$false,3)
     # A fresh prompt proves the 120-second pipeline ended within this ten-second deadline.
     # Do not queue a follow-up command while cancellation may still be flushing console input.
