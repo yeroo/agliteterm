@@ -7,12 +7,12 @@ namespace overlay_command {
 // This is isolation from accidental collisions, not a sandbox against deliberately hostile code.
 inline std::string line(const std::string& encoded) {
     return "[Console]::Write([string][char]27+']133;A'+[char]7+[char]27+']133;C'+[char]7);"
-           "$LASTEXITCODE=$null;& {$__aglt=@{c=0;t=$args[0]};try{$__aglt.a=[scriptblock]::Create($__aglt.t).Ast;"
-           "foreach($__aglt_b in 'Clean','End','Process','Begin','DynamicParam'){$__aglt.p=$__aglt.a.PSObject.Properties[$__aglt_b+'Block'];if(!$__aglt.p){continue};"
-           "$__aglt.i=[int]::MaxValue;$__aglt.j=0;foreach($__aglt_n in @($__aglt.p.Value.Statements)+@($__aglt.p.Value.Traps)){if($__aglt_n){$__aglt.i=[Math]::Min($__aglt.i,$__aglt_n.Extent.StartOffset);$__aglt.j=[Math]::Max($__aglt.j,$__aglt_n.Extent.EndOffset)}};"
-           "if($__aglt.j){$__aglt.t=$__aglt.t.Insert($__aglt.j,[string][char]10*2+'}finally{$__aglt.q=$?;$__aglt.c=if($null-ne$LASTEXITCODE){$LASTEXITCODE}else{[int](!$__aglt.q)}}').Insert($__aglt.i,'try{');break}};"
-           "& ([scriptblock]::Create($__aglt.t));$__aglt.q=$?;if(!$__aglt.j){$__aglt.c=if($null-ne$LASTEXITCODE){$LASTEXITCODE}else{[int](!$__aglt.q)}}}catch{$__aglt.c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ea Continue};"
-           "[Console]::Write([string][char]27+']133;D;'+$__aglt.c+[char]7)} ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"')))";
+           "$LASTEXITCODE=$null;& {$__ag=@{c=0;j=0;t=$args[0]};try{$__ag.a=[scriptblock]::Create($__ag.t).Ast;"
+           "foreach($__ag_b in 'Clean','End','Process','Begin','DynamicParam'){$__ag.p=$__ag.a.PSObject.Properties[$__ag_b+'Block'];if(!$__ag.p-or!$__ag.p.Value){continue};"
+           "$__ag.i=[int]::MaxValue;$__ag.j=0;foreach($__ag_n in @($__ag.p.Value.Statements)+@($__ag.p.Value.Traps)){if($__ag_n){$__ag.i=[Math]::Min($__ag.i,$__ag_n.Extent.StartOffset);$__ag.j=[Math]::Max($__ag.j,$__ag_n.Extent.EndOffset)}};"
+           "if($__ag.j){$__ag.t=$__ag.t.Insert($__ag.j,[string][char]10*2+'}finally{$__ag.q=$?;$__ag.c=if($null-ne$LASTEXITCODE){$LASTEXITCODE}else{[int](!$__ag.q)}}').Insert($__ag.i,'try{');break}};"
+           "& ([scriptblock]::Create($__ag.t));$__ag.q=$?;if(!$__ag.j){$__ag.c=if($null-ne$LASTEXITCODE){$LASTEXITCODE}else{[int](!$__ag.q)}}}catch{$__ag.c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ea Continue};"
+           "[Console]::Write([string][char]27+']133;D;'+$__ag.c+[char]7)} ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"')))";
 }
 inline std::string encode(const std::string& text) {
     static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

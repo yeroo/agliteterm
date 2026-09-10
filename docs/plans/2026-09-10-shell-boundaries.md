@@ -7,7 +7,7 @@
   functions remain available; ordinary `$e`, `$b`, `$q` and `$c` assignments cannot corrupt the
   parent's OSC 133 delimiters. Status is captured in a `finally` immediately after the command inside its scope
   (PowerShell 5.1 does not reliably propagate a non-terminating error through `&` as `$?`).
-  Wrapper bookkeeping uses reserved `__aglt` and `__aglt_*` names, not ordinary profile variables (including
+  Wrapper bookkeeping uses reserved `__ag` and `__ag_*` names, not ordinary profile variables (including
   PowerShell `AllScope` variables). Explicit mutation of those internal names is outside this boundary.
 - Standalone parsing occurs before instrumentation; parse and terminating errors retain their
   error-stream diagnostic and emit `D;1`. An early `return` still runs the in-scope `finally`, so
