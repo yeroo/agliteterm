@@ -277,6 +277,14 @@ try {
     $ovSeen = $false
     for ($i = 0; $i -lt 50 -and -not $ovSeen; $i++) { if (([string](Get-PaneText $s $ovId)).Contains($ovMarker)) { $ovSeen = $true } else { Start-Sleep -Milliseconds 200 } }
     Check 'and the command RAN in it: `cmd /k echo <marker>` printed the marker into the overlay session' $ovSeen "overlay text: $(Get-PaneText $s $ovId)"
+    # Actual dispatch + popup replacement boundary, not merely the standalone capacity helper.
+    $oversizedCommand='Write-Output OVERLAY-CAPACITY-MUST-NOT-RUN; #' + ('x' * 1000)
+    $capacityCursor=[string](ConvertFrom-Json (Send-Ctl $s @('events'))).result.cursor
+    $oversizedReply=ConvertFrom-Json (Send-Raw (@{cmd='session.overlay';args=@{action='open';command=$oversizedCommand}}|ConvertTo-Json -Compress))
+    Check 'oversized popup open refuses before queued acknowledgement' (-not $oversizedReply.ok -and [string]$oversizedReply.error -match 'exceeds host argument capacity')
+    Start-Sleep -Milliseconds 500
+    $capacityEvents=@((ConvertFrom-Json (Send-Ctl $s @('events','--since',$capacityCursor))).result.events|Where-Object {$_.type-eq 'session' -and $_.info-eq 'created'})
+    Check 'oversized popup neither creates a session nor replaces existing popup' ($capacityEvents.Count-eq 0 -and (OverlayHwnd)-eq $h40 -and ([string](Get-PaneText $s $ovId)).Contains($ovMarker))
     $want40 = [int]($mainClient[0] * 0.4)
     $got = (ClientSize $h40)[0]
     Check "the popup's client width is 40% of the main window's (not the hard-coded 70%)" ([math]::Abs($got - $want40) -le $tol) "main client $($mainClient[0]), want ~$want40, got $got"
@@ -2147,7 +2155,17 @@ try {
         # PowerShell-native sleep, not a child program: the pty-host's kill terminates the shell and
         # leaves a grandchild (a ping) running, for every shell kill in lite (the P3 block's Stop-Ping
         # is that), so a grandchild could not tell an orphaned slot from the host's own behaviour.
-        function Shell5([string]$marker) { @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape("echo $marker;") }) }
+        function Shell5([string]$marker) {
+            @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+                # The command is data inside the wrapper now; never execute a discovered command.
+                $line=[string]$_.CommandLine
+                $found=$line.Contains("echo $marker;")
+                foreach($match in [regex]::Matches($line,"FromBase64String\('([A-Za-z0-9+/=]+)'\)")){
+                    try {$decoded=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($match.Groups[1].Value));if($decoded.Contains("echo $marker;")){$found=$true}}catch{}
+                }
+                $found
+            })
+        }
         function Wait-Shell5([string]$marker, [bool]$present, [int]$ms = 10000) {
             for ($i = 0; $i -lt ($ms / 200); $i++) { if ((@(Shell5 $marker).Count -gt 0) -eq $present) { return $true }; Start-Sleep -Milliseconds 200 }
             return $false
@@ -2329,6 +2347,15 @@ try {
         $ovg = OpenP 'p5-ov-g' 'right' $aid
         Check 'setup: an overlay on the right, its marker up' ([bool]$ovg -and (Wait-PaneText $ovg 'p5-ov-g') -and (Wait-Shell5 'p5-ov-g' $true)) "raw: $($script:lastOpen)"
         Check 'tree: paneOverlays is ["right"], an array, beside the split block' ((Words $aid) -eq 'right' -and (Node $aid).paneOverlays -is [Array] -and (SplitBlock $aid) -ne '') "words '$(Words $aid)'"
+        $capacityCursor=Cursor
+        $capacityRaw=Send-Raw (@{cmd='session.overlay';target=$aid;args=@{action='open';pane='left';command=$oversizedCommand}}|ConvertTo-Json -Compress)
+        $capacityReply=ConvertFrom-Json $capacityRaw
+        Check 'oversized pane open refuses before creation, keeping the other slot' (-not $capacityReply.ok -and [string]$capacityReply.error -match 'exceeds host argument capacity' -and (Words $aid)-eq 'right' -and (Resolves $ovg)) "raw: $capacityRaw"
+        Start-Sleep -Milliseconds 500
+        Check 'oversized pane open publishes no created session and no popup' ((EvSince $capacityCursor 'session')-eq 0 -and (OverlayHwnd)-eq [IntPtr]::Zero -and (Words $aid)-eq 'right')
+        $capacityRaw=Send-Raw (@{cmd='session.overlay';target=$aid;args=@{action='open';pane='left';'size-percent'=40;command=$oversizedCommand}}|ConvertTo-Json -Compress)
+        $capacityReply=ConvertFrom-Json $capacityRaw
+        Check 'pane usage refusal precedes oversized command refusal' (-not $capacityReply.ok -and [string]$capacityReply.error -like '--pane and --size-percent cannot be combined:*') "raw: $capacityRaw"
         $r = OvRead @('text', '--pane', 'right', '--target', $aid)
         Check "overlay text --pane right answers {text}: the overlay's buffer, the marker in it" ([bool]$r.ok -and $r.result.PSObject.Properties['text'] -and ([string]$r.result.text) -match 'p5-ov-g') "raw: $($script:lastRead)"
         Check 'and it is the same buffer session text --target <overlay id> reads' ((OvTextFlat @('text', '--pane', 'right', '--target', $aid)) -eq (PaneFlat $ovg)) "overlay text: $(OvTextFlat @('text', '--pane', 'right', '--target', $aid))`nsession text: $(PaneFlat $ovg)"

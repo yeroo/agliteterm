@@ -6730,23 +6730,17 @@ static HICON loadAppIcon(bool small_) {
 // parses: `OSC 133;A` and `C` before the command, `D;<code>` after it — the marks a shell
 // integration would emit, so `session output` on an overlay works as a side effect.
 //
-// The exit status rule (vocabulary bullet (c) of the plan): `exit N` is the exit status of the
-// command as PowerShell reports it — `$LASTEXITCODE` when the command ran a native program, else
-// 0 when `$?` is true and 1 when it is false. `$LASTEXITCODE` is nulled first so a value left by
-// the profile cannot be taken for the command's; `$?` is read as the FIRST statement after the
-// command, before anything else can overwrite it. A command that never completes (closed early,
-// a terminating error, or a command line that does not parse — then NOTHING here runs) emits no
-// `D`, and the slot's result stays what it was. The escapes are built from `[char]27` / `[char]7`,
-// never typed: the host quotes the argument for PowerShell's own command-line parser, and a
-// wrapper with no quote characters in it survives that parser on PS 5.1 and 7 alike. The trailer
-// sits on its OWN LINE: a command ending in a `#` comment ran to the end of the line, and with
-// the trailer on that same line it swallowed the `D` mark — `result` then said `no overlay
-// result` for a command that completed (revmux r1 of P5-lite). A newline is the one separator a
-// comment cannot eat; `$?` is still the first statement after the command.
+// The command is decoded as data and invoked in a child script scope: profile functions remain
+// available, ordinary $e/$b/$q/$c assignments and trailing comments cannot corrupt the trailer.
+// Native LASTEXITCODE wins, otherwise $? becomes 0/1; parse/terminating errors report 1. Closing
+// the shell early (including explicit `exit`) can still bypass the trailer. FTCS remains the
+// command's own in-band claim, not a security boundary or a host execution acknowledgement.
+#include "overlay_command.h"
 static std::string overlayCommandLine(const std::string& cmd) {
-    return "$e=[string][char]27;$b=[string][char]7;[Console]::Write($e+']133;A'+$b+$e+']133;C'+$b);$LASTEXITCODE=$null; "
-           + cmd +
-           "\n$q=$?; $c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}; [Console]::Write($e+']133;D;'+$c+$b)";
+    return overlay_command::line(overlay_command::encode(cmd));
+}
+static bool overlayCommandFits(const std::string& line) {
+    return overlay_command::fits(line, sizeof(((agwinterm_ptyhost_Create*)nullptr)->args[0]));
 }
 // The exit of the command an overlay session ran: `exit N` from the FIRST FTCS mark carrying an
 // exit — the wrapper's; a user's own shell-integration prompts, if any, come after it — or "" when
@@ -6787,16 +6781,19 @@ static bool shellDisplayed(const Session* shell) {
 // hook-up under one hold — so the reply is the overlay's id, read off state that exists. Refuses
 // (nullptr, *why set, nothing left behind) when the shell closed during the create or another
 // caller filled the slot meanwhile (#21's class: the slot was checked on another hold), or when
-// the host could not create the session. Never moves focus or selection (#230); a shell not on
+// the host could not create the session, or the encoded command exceeds its argument capacity.
+// Never moves focus or selection (#230); a shell not on
 // screen gets its overlay too, simply not painted until its session is selected.
 static Session* openPaneOverlay(Session* shell, const std::string& cmd, std::string* why) {
+    const auto commandLine = overlayCommandLine(cmd);
+    if (!overlayCommandFits(commandLine)) { *why = "encoded overlay command exceeds host argument capacity; nothing opened"; return nullptr; }
     int cols = 80, rows = 24;
     {
         LockG hold;
         if (indexOfSession(shell) < 0) { *why = "session not found"; return nullptr; }
         if (shell->cols >= 1 && shell->rows >= 1) { cols = shell->cols; rows = shell->rows; }
     }
-    std::vector<std::string> cargs{ "-NoExit", "-Command", overlayCommandLine(cmd) };
+    std::vector<std::string> cargs{ "-NoExit", "-Command", commandLine };
     Session* ov = newSession(cols, rows, "powershell.exe", &cargs);   // outside g_lock: a host round trip
     if (!ov) { *why = "overlay open: the session for the command could not be created; nothing opened"; return nullptr; }
     bool displayed = false, hooked = false;
@@ -7175,6 +7172,8 @@ static void togglePopupTerminal(bool scratch) {
 static const double kOverlayDefaultFraction = 0.7;
 static double overlayFraction(int sizePct) { return sizePct > 0 ? sizePct / 100.0 : kOverlayDefaultFraction; }
 static void openOverlay(const std::string& command, int sizePct, const std::string& ownerId) {
+    const auto commandLine = overlayCommandLine(command);
+    if (!overlayCommandFits(commandLine)) { logWarn("overlay: encoded command exceeds host argument capacity; nothing opened"); return; }
     { LockG hold; bool found=false; for(auto* s:g_sessions)if(!s->hidden&&s->id==ownerId){found=true;break;}
       if(!found){logWarn("overlay: owner closed before queued open");return;} }
     g_dashboard = false; g_dashCells.clear();
@@ -7189,7 +7188,7 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
     g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
-    std::vector<std::string> cargs{ "-NoExit", "-Command", overlayCommandLine(command) };   // P5: the FTCS-wrapped line, both slots' one command line
+    std::vector<std::string> cargs{ "-NoExit", "-Command", commandLine };   // one wrapper for both slots
     g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
     if (!g_overlaySession) {
         logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
@@ -10579,8 +10578,10 @@ static std::string ctlDispatch(const std::string& line) {
                         inferred = true;
                     }
         }
+        if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
+        if (action == "open" && !overlayCommandFits(overlayCommandLine(command)))
+            return ctlErr("encoded overlay command exceeds host argument capacity; nothing opened");
         if (paneIdx != kPaneSessionWide) {
-            if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
             // The target names the SESSION whose slot is meant: empty / `active` = the displayed
             // session (not focusedSession(): with the focused pane covered that is the overlay, and
             // the caller means the session's other slot as much as this one); a session id or name;
