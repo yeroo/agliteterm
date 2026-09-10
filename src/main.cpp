@@ -1529,7 +1529,8 @@ static bool validCreationTicket(const char* ticket) {
 static bool cancelCreation(const char* id, const char* ticket) {
     if (!validCreationTicket(ticket)) return false;
     for (int attempt = 0; attempt < 3; ++attempt) {
-        HANDLE pipe = openPipe(std::wstring(kAppId) + L"-ptyhost", 200, true);
+        const std::wstring hostId = g_testHostAppId.empty() ? std::wstring(kAppId) : g_testHostAppId;
+        HANDLE pipe = openPipe(hostId + L"-ptyhost", 200, true);
         if (pipe == INVALID_HANDLE_VALUE) continue;
         control_transport::Transport transport;
         if (!creation_protocol::bindCancellationHost(g_creationHostPid, kProtocolVersion,
