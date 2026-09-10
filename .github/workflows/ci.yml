@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yeroo/agwinterm
-          ref: 7209f530293b048c799f5d40aa397c4339efbda0
+          ref: 83f37b6549b11d337be5dfc2db832e187944b18e
           path: .ci-full-cli
 
       - name: Setup shared CLI SDK
