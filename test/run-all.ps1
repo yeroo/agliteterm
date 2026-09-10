@@ -23,10 +23,11 @@ try {
         try{
             $raw=& python $hub acquire --owner $TokenOwner --run ('lite-suite-'+$run) --worktree $root --holder-pid $PID --purpose 'Owned isolated Lite integration suites'
             $acquireExit=$LASTEXITCODE
+            $raw|Set-Content -LiteralPath (Join-Path $artifact 'acquisition.raw.json')
             $state=$raw|ConvertFrom-Json
             if($state.ok-isnot [bool]){throw 'Malformed canonical acquisition response'}
             if($state.ok){
-                if($acquireExit-ne 0 -or $state.held-isnot [bool] -or -not $state.held -or
+                if($state.held-isnot [bool] -or -not $state.held -or
                    $state.owner-isnot [string] -or $state.owner-cne $TokenOwner -or
                    $state.run_id-isnot [string] -or $state.run_id-cne ('lite-suite-'+$run) -or
                    $state.token-isnot [string] -or $state.token-cnotmatch '\A[0-9a-f]{64}\z' -or
@@ -37,9 +38,12 @@ try {
                 }
             }
         }catch{$cleanup=$false;throw} # helper may have acquired; an unreadable receipt is not proof of no lease
-        if($acquireExit-ne 0 -or -not $state.ok){throw "Suite token unavailable: $raw"}
+        if(-not $state.ok){throw "Suite token unavailable: $raw"}
         $lease=$state;$receipt=Join-Path $artifact 'lease.json'
         $lease|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $receipt
+        # A complete receipt can be the only supported recovery handle. Preserve it before
+        # classifying contradictory process status; retain the lease without launching/releasing.
+        if($acquireExit-ne 0){$cleanup=$false;throw 'Canonical helper returned conflicting status; receipt retained for recovery'}
         $env:AGLITETERM_TEST_RECEIPT=$receipt
     }elseif($env:CI-ne 'true'){throw 'Canonical suite token helper unavailable'}
     . "$PSScriptRoot/suite-job.ps1"

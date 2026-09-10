@@ -42,6 +42,14 @@ foreach($case in $cases){
         if($child.ExitCode-ne $case.code -or @($calls|Where-Object {$_-eq 'start'}).Count-ne $case.start -or
            @($calls|Where-Object {$_-eq 'release'}).Count-ne $case.release -or @($calls|Where-Object {$_-eq 'delete-key'}).Count-ne $case.delete){throw "Wrong supervisor result $($case.name): exit=$($child.ExitCode); calls=$calls; stdout=$($stdout.Result); stderr=$($stderr.Result)"}
         if($case.start -and ($calls.IndexOf('receipt')-lt 0 -or $calls.IndexOf('receipt')-gt $calls.IndexOf('create-key'))){throw 'Mutation preceded receipt'}
+        $rawReceipt=@(Get-ChildItem -LiteralPath $dir -Recurse -Filter acquisition.raw.json)
+        if($rawReceipt.Count-ne 1){throw 'Acquisition raw response was not retained'}
+        if($case.name-eq 'acquire-status-conflict'){
+            $savedReceipt=@(Get-ChildItem -LiteralPath $dir -Recurse -Filter lease.json)
+            if($savedReceipt.Count-ne 1 -or $calls.IndexOf('receipt')-lt 0){throw 'Conflicting status discarded the release receipt'}
+            $saved=Get-Content -LiteralPath $savedReceipt[0].FullName -Raw|ConvertFrom-Json
+            if($saved.token-cne ('1'*64) -or $saved.generation-ne 17 -or $saved.owner-cne 'fake-owner'){throw 'Recovery receipt identity changed'}
+        }
         "PASS supervisor $($case.name): starts=$($case.start), release=$($case.release), exit=$($case.code)"
     }finally{if(-not $child.HasExited){$child.Kill();$null=$child.WaitForExit(5000)};$child.Dispose()}
 }
