@@ -2237,7 +2237,7 @@ static bool localThemeFile(const std::wstring& path, std::string& resolved) {
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return false;
     resolved = narrow(full); return validOmpPath(resolved);
 }
-static std::map<std::string, std::pair<std::string, std::string>> ompCatalog() {
+static std::map<std::string, std::pair<std::string, std::string>> ompCatalog(std::string* incomplete = nullptr) {
     std::vector<std::wstring> dirs;
     auto add = [&](const std::wstring& base, const wchar_t* tail) { if (!base.empty()) dirs.push_back(base + tail); };
     add(environmentPath(L"POSH_THEMES_PATH"), L"");
@@ -2246,25 +2246,43 @@ static std::map<std::string, std::pair<std::string, std::string>> ompCatalog() {
     add(environmentPath(L"ProgramData"), L"\\chocolatey\\lib\\oh-my-posh\\tools\\themes");
     add(stateDir(), L"\\omp-themes");
     std::map<std::string, std::pair<std::string, std::string>> result;
+    if (incomplete) incomplete->clear();
+    auto failed = [&](const std::wstring& dir, DWORD error) {
+        const auto message = "incomplete theme discovery in " + narrow(dir) + " (Windows error " + std::to_string(error) + ")";
+        logWarn("omp: %s", message.c_str());
+        if (incomplete && incomplete->empty()) *incomplete = message;
+    };
     for (const auto& dir : dirs) {
         WIN32_FIND_DATAW data{}; HANDLE search = FindFirstFileW((dir + L"\\*.omp.json").c_str(), &data);
-        if (search == INVALID_HANDLE_VALUE) continue;
+        if (search == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND && error != ERROR_NO_MORE_FILES) failed(dir, error);
+            continue;
+        }
         size_t seen = 0;
-        do {
-            if (++seen > 4096) break;
+        for (;;) {
+            if (++seen > 4096) { failed(dir, ERROR_MORE_DATA); break; }
             std::string path;
-            if (!localThemeFile(dir + L"\\" + data.cFileName, path)) continue;
-            auto name = narrow(data.cFileName); name.resize(name.size() - 9);
-            result.emplace(profiles::folded(name), std::make_pair(name, path));
-        } while (FindNextFileW(search, &data));
+            if (localThemeFile(dir + L"\\" + data.cFileName, path)) {
+                auto name = narrow(data.cFileName); name.resize(name.size() - 9);
+                result.emplace(profiles::folded(name), std::make_pair(name, path));
+            }
+            if (!FindNextFileW(search, &data)) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_NO_MORE_FILES) failed(dir, error);
+                break;
+            }
+        }
         FindClose(search);
     }
     return result;
 }
-static bool resolveOmp(const std::string& name, std::string& path) {
+static bool resolveOmp(const std::string& name, std::string& path, std::string& incomplete) {
     if (!profiles::detail::clean(name, 259) || name.empty()) return false;
     if (localThemeFile(widen(name), path)) return true;
-    const auto themes = ompCatalog(); const auto found = themes.find(profiles::folded(name));
+    const auto themes = ompCatalog(&incomplete);
+    if (!incomplete.empty()) return false; // incomplete higher-priority directories can change the winner
+    const auto found = themes.find(profiles::folded(name));
     if (found == themes.end()) return false;
     path = found->second.second; return true;
 }
@@ -9732,17 +9750,20 @@ static std::string ctlDispatch(const std::string& line) {
     }
 
     if (cmd == "omp.list") {
-        std::string names;
-        for (const auto& item : ompCatalog()) { if (!names.empty()) names += '\n'; names += item.second.first; }
+        std::string names, incomplete;
+        const auto catalog = ompCatalog(&incomplete);
+        if (!incomplete.empty()) return ctlErr("omp: " + incomplete);
+        for (const auto& item : catalog) { if (!names.empty()) names += '\n'; names += item.second.first; }
         return ctlOkStr(names);
     }
     if (cmd == "omp.set" || (cmd == "config.set" && configuration::normalized(req.get("args.key")) == "omp-theme")) {
-        std::string resolved;
+        std::string resolved, incomplete;
         const auto& value = req.get(cmd == "omp.set" ? "args.name" : "args.value");
         if (cmd == "config.set" && (!req.fields.count("args.value") || value.empty()))
             return ctlErr("omp-theme requires a value (use none to clear); configuration unchanged");
-        if (!(cmd == "config.set" && value == "none") && !resolveOmp(value, resolved))
-            return ctlErr("oh-my-posh theme not found or path unsupported; nothing written or saved");
+        if (!(cmd == "config.set" && value == "none") && !resolveOmp(value, resolved, incomplete))
+            return ctlErr(incomplete.empty() ? "oh-my-posh theme not found or path unsupported; nothing written or saved"
+                : "omp: " + incomplete + "; nothing written or saved");
         req.fields["args.resolved-theme"] = resolved;
         if (cmd == "omp.set") {
             const auto& persist = req.get("args.persist");
