@@ -2,6 +2,7 @@
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly,[switch]$RemainderOnly,[switch]$Wave3Only,[switch]$ClipboardOnly)
 $ErrorActionPreference='Stop'
+if($ClipboardOnly -and ($env:GITHUB_ACTIONS-ne 'true' -or (Test-Path 'C:/Users/boris/AI/bin/suite-token.py'))){throw 'Clipboard paste acceptance is disposable GitHub CI only; a suite token does not exclude unrelated clipboard writers'}
 if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent+[int]$Wave3Only.IsPresent+[int]$ClipboardOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
@@ -339,6 +340,9 @@ finally{
         }
     } {
         if($null -ne $clipboard){Restore-SelectionClipboard $clipboard}
+    }
+    if($cleanupOk -and $null -ne $clipboard){
+        try{Remove-Item -LiteralPath $clipboard.RecoveryPath}catch{$cleanupOk=$false;"Clipboard recovery artifact cleanup failed: $_"}
     }
     if($cleanupOk){'Cleanup verified: owned windows/hosts exited; clipboard restored or proven untouched by fixture; touched registry values restored; no queued launches.'}
     if($ownLease -and $cleanupOk){

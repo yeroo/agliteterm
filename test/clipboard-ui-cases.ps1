@@ -9,7 +9,7 @@ try {
     Check 'clipboard marker writes through whole-format guard' ((Clip)-ceq 'guarded-clipboard-probe')
     $sinkFile=Join-Path $script:selectionArtifact 'right-paste.txt'
     $literal=$sinkFile.Replace("'","''")
-    $sink="[Console]::WriteLine('RIGHT-'+'PASTE-READY'); `$line=[Console]::ReadLine(); [IO.File]::WriteAllText('$literal',`$line)"
+    $sink="[Console]::WriteLine('RIGHT-'+'PASTE-READY'); `$ok=[Console]::ReadLine() -ceq 'PASTED_OK'; [IO.File]::WriteAllText('$literal',[string]`$ok); [Environment]::Exit(0)"
     $sinkId=[string](Selection-Rpc 'session.new' @{name='clipboard-paste-sink';command=$sink});$clipIds.Add($sinkId)
     Selection-Rpc 'session.select' @{} $sinkId|Out-Null
     if(-not (ClipWait {@((Selection-Rpc 'tree').workspaces.sessions|Where-Object {$_.id-eq $sinkId -and $_.active}).Count-eq 1})){throw 'Private paste sink not selected'}
@@ -20,7 +20,7 @@ try {
     [SelectionUi]::Button($h,0x204,($geometry.Left+25),($geometry.Top+25))
     [SelectionUi]::Button($h,0x205,($geometry.Left+25),($geometry.Top+25))
     Selection-Rpc 'session.type' @{text="`r"} $sinkId|Out-Null
-    Check 'right-click pastes into a mouse-reporting pane' (ClipWait {(Test-Path -LiteralPath $sinkFile) -and (Get-Content -LiteralPath $sinkFile -Raw)-ceq 'PASTED_OK'})
+    Check 'right-click pastes into a mouse-reporting pane' (ClipWait {(Test-Path -LiteralPath $sinkFile) -and (Get-Content -LiteralPath $sinkFile -Raw)-ceq 'True'})
     Check 'right-click paste does not mutate clipboard' ((Clip)-ceq 'PASTED_OK')
     Selection-Rpc 'session.close' @{} $sinkId|Out-Null;$clipIds.Remove($sinkId)|Out-Null
 
@@ -47,7 +47,7 @@ while($watch.ElapsedMilliseconds-lt 5000 -and ($r.Count-eq 0 -or $r[-1]-ne 82)){
 Write-Host "DSR=<$($r-join ',')>"
 '@|Set-Content -LiteralPath $dsrFile -Encoding utf8
     Selection-Rpc 'session.type' @{text=("& '"+$dsrFile.Replace("'","''")+"'`r")} $oscId|Out-Null
-    Check 'DSR query receives its host-action response' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId))-match 'DSR=<27,91[\d,]*,82>'})
+    Check 'DSR query receives its host-action response' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId))-match 'DSR=<27,91,(?:4[89]|5[0-7])(?:,(?:4[89]|5[0-7]))*,59,(?:4[89]|5[0-7])(?:,(?:4[89]|5[0-7]))*,82>'})
 
     Main-Screen;Write-Screen (($esc+'[H')+((1..80|ForEach-Object{'COPY-ME-MARKER'})-join "`r`n")) $oscId
     $geometry=Selection-Geometry
