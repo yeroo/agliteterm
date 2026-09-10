@@ -6704,7 +6704,8 @@ static bool shellDisplayed(const Session* shell) {
 // hook-up under one hold — so the reply is the overlay's id, read off state that exists. Refuses
 // (nullptr, *why set, nothing left behind) when the shell closed during the create or another
 // caller filled the slot meanwhile (#21's class: the slot was checked on another hold), or when
-// the host could not create the session. Never moves focus or selection (#230); a shell not on
+// the host could not create the session, or the encoded command exceeds its argument capacity.
+// Never moves focus or selection (#230); a shell not on
 // screen gets its overlay too, simply not painted until its session is selected.
 static Session* openPaneOverlay(Session* shell, const std::string& cmd, std::string* why) {
     const auto commandLine = overlayCommandLine(cmd);
@@ -10441,8 +10442,6 @@ static std::string ctlDispatch(const std::string& line) {
         if (!parsePaneWord(req, &paneIdx, &paneWhy)) return ctlErr(paneWhy);
         const std::string& t = req.get("target");
         std::string command = req.get("args.command");
-        if (action == "open" && !overlayCommandFits(overlayCommandLine(command)))
-            return ctlErr("encoded overlay command exceeds host argument capacity; nothing opened");
         // A pane overlay is always full-box: with a word, the two usage refusals before anything
         // (the CLI refused first; a raw client hears the same sentence; resize first, since a resize
         // always carries a size and would otherwise be refused as one, never naming the verb typed).
@@ -10504,8 +10503,10 @@ static std::string ctlDispatch(const std::string& line) {
                         inferred = true;
                     }
         }
+        if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
+        if (action == "open" && !overlayCommandFits(overlayCommandLine(command)))
+            return ctlErr("encoded overlay command exceeds host argument capacity; nothing opened");
         if (paneIdx != kPaneSessionWide) {
-            if (action == "open" && command.empty()) return ctlErr(kOverlayOpenNeedsCommand);
             // The target names the SESSION whose slot is meant: empty / `active` = the displayed
             // session (not focusedSession(): with the focused pane covered that is the overlay, and
             // the caller means the session's other slot as much as this one); a session id or name;

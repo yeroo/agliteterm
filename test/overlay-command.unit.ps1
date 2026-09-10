@@ -14,8 +14,12 @@ if($pwsh){$shells+=$pwsh}elseif($Strict){throw 'PowerShell 7 required'}
 $cases=@(
     @{command='$e="";$b="";$q=$false;$c=91;Write-Output COLLISION';code=0;text='COLLISION'},
     @{command='Write-Output "quoted ☃" # trailing comment';code=0;text='quoted'},
-    @{command='"dangling';code=1;text=''},
-    @{command='throw "intentional failure"';code=1;text=''},
+    @{command='"dangling';code=1;text='';error='terminator'},
+    @{command='throw "intentional failure"';code=1;text='';error='intentional failure'},
+    @{command='$ErrorActionPreference="Stop";Write-Error "terminating cmdlet"';code=1;text='';error='terminating cmdlet'},
+    @{command='return';code=0;text=''},
+    @{command='return 0';code=0;text='0'},
+    @{command='Write-Output trailing-backtick`';code=0;text='trailing-backtick';exact='trailing-backtick'},
     @{command='Write-Error "failure" -ErrorAction Continue';code=1;text=''},
     @{command='cmd.exe /d /c exit 7';code=7;text=''},
     @{command='Write-Output ordinary';code=0;text='ordinary'}
@@ -38,6 +42,11 @@ foreach($shell in $shells){foreach($case in $cases){
         if(-not $text.Contains($esc+']133;A'+$bel+$esc+']133;C'+$bel)){throw 'Missing wrapper start marks'}
         if(-not $text.Contains($esc+']133;D;'+$case.code+$bel)){throw "Wrong wrapper exit for $($case.command): stdout=$text stderr=$errors"}
         if($case.text -and -not $text.Contains($case.text)){throw 'Command output changed'}
+        if($case.error -and -not $errors.Contains($case.error)){throw "Diagnostic missing: $errors"}
+        if($case.exact){
+            $plain=[regex]::Replace($text,[regex]::Escape($esc)+']133;[^'+$bel+']*'+$bel,'').Trim()
+            if($plain-ne $case.exact){throw "Instrumentation leaked into command output: $plain"}
+        }
         $checks++;"PASS $([IO.Path]::GetFileName($shell)): $($case.command)"
     }finally{
         if(-not $child.HasExited){$child.Kill();if(-not $child.WaitForExit(5000)){throw 'Owned fixture did not exit'}}
