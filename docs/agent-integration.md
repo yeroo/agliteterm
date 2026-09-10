@@ -98,9 +98,8 @@ The shell claims a generated, quoted argv only at its `PSConsoleHostReadLine` bo
 after all retained descendants exited, a new snapshot shows no surviving shell children, and the
 shell reports itself as the sole attached console client (including late orphan checks). Resume
 is returned to PowerShell's normal command pipeline, never executed inside the prompt or appended
-to PSReadLine's draft. The prior readline function handles ordinary input; bridge probes change
-the `$?` it observes (including predictor feedback), but not the command's exit code or `$LASTEXITCODE`.
-Preserving that reader-status side channel is a follow-up. Unsupported
+to PSReadLine's draft. The prior readline function handles ordinary input and observes the incoming
+`$?` captured before bridge probes. `$LASTEXITCODE`, reader arguments and draft text are preserved. Unsupported
 alias/script readers are not replaced and do not register the bridge. State changes,
 unknown ownership, timeout or missing claim mean no resume dispatch. No fixed-delay fallback or
 name/PID-only process kill is used. Interrupt I/O has a bounded cancellable wait. Offers and acknowledgements
