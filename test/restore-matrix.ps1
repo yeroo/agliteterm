@@ -92,6 +92,18 @@ function SessionsOf($inst) {
 # The newest real session id in the tree.
 function LastSessionId($inst) { @(SessionsOf $inst | ForEach-Object { $_.id })[-1] }
 
+# Read-only readiness: never retype the command while waiting for its screen marker.
+function Wait-ScreenMarker([string]$Instance,[string]$Session,[string]$Marker,[int]$TimeoutMs=30000,[int]$PollMs=200) {
+    $clock=[Diagnostics.Stopwatch]::StartNew();$last='';$seen=$false
+    do {
+        $last=(& $ctl session text --target $Session --pipe $Instance 2>&1)-join "`n"
+        $seen=$LASTEXITCODE-eq 0 -and $last.Contains($Marker)
+        if($seen -or $clock.ElapsedMilliseconds-ge $TimeoutMs){break}
+        if($PollMs-gt 0){Start-Sleep -Milliseconds $PollMs}
+    } while($true)
+    @{Seen=$seen;Text=$last}
+}
+
 function Start-Lite($inst) {
     $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru
     Register-OwnedWindow $p                   # the root of the proof for anything typed into its panes
@@ -398,18 +410,19 @@ if (-not $Only -or $Only -eq 'killed-repaint') {
         $p = Start-Lite $inst
         $id = LastSessionId $inst
         & $ctl session type "echo ADOPTME-MARKER`n" --target $id --pipe $inst 2>&1 | Out-Null
-        Start-Sleep -Seconds 3
         # Prove the premise: without this, a `type` that never landed would make the cell assert
         # nothing and "fail" for a reason that has nothing to do with repaint.
-        $seenBefore = ((& $ctl session text --target $id --pipe $inst 2>&1) -join "`n") -match 'ADOPTME-MARKER'
+        $before=Wait-ScreenMarker $inst $id 'ADOPTME-MARKER'
+        $seenBefore=$before.Seen
+        if(-not $seenBefore){throw "Pre-kill readiness failed; no adoption trial performed. Last read: $($before.Text)"}
         Stop-Lite $p -Kill; $p = $null
 
         $p2 = Start-Lite $inst
-        Start-Sleep -Seconds 4                       # the repaint jiggle is async in the host
         $adopted = Log-Has $inst 'adopted live session'
         $id2 = LastSessionId $inst
-        $textAfter = (& $ctl session text --target $id2 --pipe $inst 2>&1) -join "`n"
-        $seenAfter = $textAfter -match 'ADOPTME-MARKER'
+        $after=Wait-ScreenMarker $inst $id2 'ADOPTME-MARKER'
+        $textAfter=$after.Text;$seenAfter=$after.Seen
+        $adopted = Log-Has $inst 'adopted live session'
         Stop-Lite $p2; $p2 = $null
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2 }
