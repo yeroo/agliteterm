@@ -97,6 +97,9 @@ $catalogBad+=@(
 )
 foreach($bad in $catalogBad){
     [IO.File]::WriteAllText($settings,$bad)
+    # Force a real pending helper update. Already-current destinations cannot detect a
+    # misplaced helper-copy loop that runs before validation but happens to be a no-op.
+    [IO.File]::WriteAllText((Join-Path $data 'agliteterm-agent-status.ps1'),'# deliberately stale private helper')
     # Include backup files and all helper destinations, not just the profile/settings originals.
     $before=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
     $r=Install hooks
@@ -105,6 +108,7 @@ foreach($bad in $catalogBad){
 }
 $validPrompt='{"hooks":{"PreToolUse":[{"hooks":[{"type":"prompt","prompt":"keep","continueOnBlock":true,"model":"m","timeout":2,"futureFlag":{"unchanged":false}}]}],"SessionStart":[{"hooks":[{"type":"mcp_tool","server":"s","tool":"t","input":{"anything":[1,true]}}]}]}}'
 [IO.File]::WriteAllText($settings,$validPrompt);$r=Install hooks;$kept=Get-Content -Raw $settings|ConvertFrom-Json
+Check 'positive install really updates the helper held stale by rejection cases' ([IO.File]::ReadAllText((Join-Path $data 'agliteterm-agent-status.ps1'))-cne '# deliberately stale private helper')
 Check 'prompt continueOnBlock and MCP startup handler preserve their fields' ($r.ok -and $kept.hooks.PreToolUse[0].hooks[0].continueOnBlock -eq $true -and $kept.hooks.PreToolUse[0].hooks[0].futureFlag.unchanged-eq $false -and $kept.hooks.SessionStart[0].hooks[0].input.anything.Count-eq 2)
 [IO.File]::WriteAllText($settings,$saved)
 foreach($bad in @('# >>> agliteterm hooks >>>', '# <<< agliteterm hooks <<<', "# >>> agliteterm hooks >>>`n# >>> agliteterm hooks >>>`n# <<< agliteterm hooks <<<")){
