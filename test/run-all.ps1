@@ -9,6 +9,10 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $failed = @()
+$global:LASTEXITCODE=0
+try { & "$PSScriptRoot/creation-protocol.unit.ps1" -Strict:$Strict }
+catch { "ERROR creation-protocol.unit: $_"; $global:LASTEXITCODE=1 }
+if($LASTEXITCODE-ne 0){$failed+='creation-protocol.unit'}
 # Selection UI checks use window-scoped messages and PrintWindow; qa/selection.md also records manual cases.
 # Local token-owning callers pass AGLITETERM_TEST_RECEIPT so selection-ui borrows that live lease.
 foreach ($t in 'control-transport.unit', 'targeting.unit', 'paste.unit', 'focus-status.unit', 'restore-readiness.unit', 'state-fence.unit', 'reopen.unit', 'ui-request.unit', 'conformance-validator.unit', 'wave3.unit', 'remainder.unit', 'commands.unit', 'agent-integration.unit', 'installers.unit', 'agent-scripts.unit', 'configuration.unit', 'driving.unit', 'owned-procs-checks', 'registry-guard.unit', 'clipboard-guard.tests', 'clipboard-receipt.unit', 'selection-clipboard.unit', 'log-basics', 'log-restore', 'log-focus-font', 'log-rotation', 'diagnose', 'migration', 'restore-matrix', 'conformance', 'clipboard', 'agbf-packs', 'control-read', 'control-honesty', 'selection-ui') {
