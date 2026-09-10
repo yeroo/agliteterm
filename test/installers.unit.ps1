@@ -71,6 +71,41 @@ $scoped.hooks.Notification[0].matcher='idle_prompt'
 [IO.File]::WriteAllText($settings,($scoped|ConvertTo-Json -Depth 100))
 $r=Install hooks;$scoped=Get-Content -Raw $settings|ConvertFrom-Json
 Check 'same hook command with other matcher does not suppress permission hook' ($r.ok -and @($scoped.hooks.Notification|Where-Object matcher -eq 'permission_prompt').Count-eq 1 -and @($scoped.hooks.Notification|Where-Object matcher -eq 'idle_prompt').Count-eq 1)
+# Independent dated catalog: correct spelling survives; every case-only event alias refuses.
+$events=@('SessionStart','Setup','UserPromptSubmit','UserPromptExpansion','PreToolUse','PermissionRequest','PermissionDenied','PostToolUse','PostToolUseFailure','PostToolBatch','Notification','MessageDisplay','SubagentStart','SubagentStop','TaskCreated','TaskCompleted','Stop','StopFailure','TeammateIdle','InstructionsLoaded','ConfigChange','CwdChanged','DirectoryAdded','FileChanged','WorktreeCreate','WorktreeRemove','PreCompact','PostCompact','PreModelSwitch','PostModelSwitch','Elicitation','ElicitationResult','SessionEnd')
+$catalog=[ordered]@{}
+foreach($event in $events){$catalog[$event]=@(@{hooks=@(@{type='command';command='keep-'+$event;args=@();shell='powershell';async=$false;asyncRewake=$false;once=$false;timeout=1.5;statusMessage='keep';extension=@{payload=@(1,'x')}})})}
+$catalog['FutureExtensionEvent']=@(@{hooks=@(@{type='command';command='future';futureField=@{n=2}})})
+$validCatalog=@{hooks=$catalog;extensionRoot=@{nested='unchanged'}}|ConvertTo-Json -Depth 100
+[IO.File]::WriteAllText($settings,$validCatalog);$r=Install hooks
+$kept=Get-Content -Raw $settings|ConvertFrom-Json
+Check 'all 33 dated event spellings and unknown extensions survive' ($r.ok -and @($events|Where-Object {$kept.hooks.$_[0].hooks[0].command-cne ('keep-'+$_)}).Count-eq 0 -and $kept.hooks.FutureExtensionEvent[0].hooks[0].futureField.n-eq 2 -and $kept.extensionRoot.nested-eq 'unchanged')
+$profileBefore=[IO.File]::ReadAllText($profile)
+$catalogBad=@($events|ForEach-Object {'{"hooks":{"'+$_.ToLowerInvariant()+'":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}'})
+$catalogBad+=@(
+    '{"hooks":{"PreToolUse":[{"hooks":[{"type":"prompt","prompt":"p","ContinueOnBlock":true}]}]}}',
+    '{"hooks":{"PreToolUse":[{"hooks":[{"type":"prompt","prompt":"p","continueOnBlock":"true"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"agent","prompt":"p","continueOnBlock":true}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"prompt","prompt":"p","async":true}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"u","command":"c"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"c","model":"m"}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"mcp_tool","server":"s","tool":"t","headers":{}}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"c","timeout":true}]}]}}',
+    '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"c","timeout":-1}]}]}}',
+    '{"hooks":{"SessionStart":[{"hooks":[{"type":"http","url":"u"}]}]}}',
+    '{"hooks":{"Notification":[{"hooks":[{"type":"prompt","prompt":"p"}]}]}}'
+)
+foreach($bad in $catalogBad){
+    [IO.File]::WriteAllText($settings,$bad)
+    # Include backup files and all helper destinations, not just the profile/settings originals.
+    $before=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+    $r=Install hooks
+    $after=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+    Check 'catalog case/type/applicability refusal precedes every destination write' (-not $r.ok -and $installExit-ne 0 -and $before-ceq $after -and $r.error.EndsWith('completed writes: '))
+}
+$validPrompt='{"hooks":{"PreToolUse":[{"hooks":[{"type":"prompt","prompt":"keep","continueOnBlock":true,"model":"m","timeout":2,"futureFlag":{"unchanged":false}}]}],"SessionStart":[{"hooks":[{"type":"mcp_tool","server":"s","tool":"t","input":{"anything":[1,true]}}]}]}}'
+[IO.File]::WriteAllText($settings,$validPrompt);$r=Install hooks;$kept=Get-Content -Raw $settings|ConvertFrom-Json
+Check 'prompt continueOnBlock and MCP startup handler preserve their fields' ($r.ok -and $kept.hooks.PreToolUse[0].hooks[0].continueOnBlock -eq $true -and $kept.hooks.PreToolUse[0].hooks[0].futureFlag.unchanged-eq $false -and $kept.hooks.SessionStart[0].hooks[0].input.anything.Count-eq 2)
 [IO.File]::WriteAllText($settings,$saved)
 foreach($bad in @('# >>> agliteterm hooks >>>', '# <<< agliteterm hooks <<<', "# >>> agliteterm hooks >>>`n# >>> agliteterm hooks >>>`n# <<< agliteterm hooks <<<")){
     [IO.File]::WriteAllText($profile,$bad)
