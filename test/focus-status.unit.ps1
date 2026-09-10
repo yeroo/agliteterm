@@ -6,6 +6,7 @@ $pane=[regex]::Match($source,'(?ms)^static void setFocusedPane\(int pane\) \{.*?
 $surface=[regex]::Match($source,'(?ms)^static void setFocusOverride\(Session\* surface\) \{.*?^\}')
 if(-not $pane.Success -or -not $surface.Success){throw 'Production focus setters missing'}
 $rest=$source.Replace($pane.Value,'').Replace($surface.Value,'')
+$rest+=((Get-ChildItem (Join-Path $repo 'src') -Filter '*.h'|ForEach-Object {Get-Content $_.FullName -Raw})-join "`n")
 if([regex]::Matches($rest,'\bg_focus\s*=(?!=)').Count-ne 1 -or [regex]::IsMatch($rest,'\bg_focusOverride\s*=(?!=)')){throw 'Focus assignments bypass the status-notifying setters'}
 $prefix=@'
 #include <cstdio>
@@ -22,11 +23,12 @@ int main(){
  setFocusedPane(1);if(g_focus!=1||messages!=1||held)++errors;
  setFocusedPane(0);if(g_focus!=0||messages!=2||held)++errors;
  setFocusOverride(&popup);if(g_focusOverride!=&popup||messages!=3||held)++errors;
+ setFocusOverride(&popup);if(messages!=3||held)++errors;
  setFocusOverride(nullptr);if(g_focusOverride||messages!=4||held)++errors;
  // Same pane index after owner selection still needs a fresh grid publication.
  setFocusedPane(0);if(messages!=5||held)++errors;
  g_hwnd=0;setFocusedPane(1);setFocusOverride(&popup);if(messages!=5||held)++errors;
- std::printf("focus status: 6 runtime checks + assignment coverage, %d failed\n",errors);return errors?1:0;
+ std::printf("focus status: 7 runtime checks + main/header assignment coverage, %d failed\n",errors);return errors?1:0;
 }
 '@
 $out=Join-Path $repo 'bin/focus-status-unit';New-Item -ItemType Directory -Force $out|Out-Null

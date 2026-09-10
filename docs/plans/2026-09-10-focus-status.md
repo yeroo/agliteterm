@@ -1,10 +1,11 @@
 # Focused pane status publication (#39)
 
-Every runtime change to the focused pane or popup surface goes through one locked setter that
-posts the status refresh to the main window. Keyboard, mouse, control commands, session changes,
+Runtime focus-variable assignments use locked setters; owner replacement behind an unchanged
+pane index may instead publish through the existing tree-refresh path. Keyboard, mouse, control commands, session changes,
 split promotion and popup dismissal therefore refresh the size/read-only/search label together.
-The message is posted, never synchronously sent while holding the session lock. Even assigning
-the same pane index posts an update: its owning session and grid may have changed.
+The setter message is posted, never synchronously sent while holding the session lock. Even assigning
+the same pane index posts an update: its owning session and grid may have changed. An unchanged
+popup override avoids redundant updates on each typed key.
 
 Focused session/shell resolution also takes the session lock before indexing the vector. This
 does not claim to complete the broader shared-state and stale sidebar-index work (#21/#43).

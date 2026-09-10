@@ -1119,7 +1119,7 @@ enum { OVL_OPEN = 0, OVL_RESIZE = 1 };   // WM_APP_OVERLAY wParam
 enum { HA_CLIP = 1, HA_NOTIFY = 2, HA_BELL = 3 };   // WM_APP_HOSTACT wParam
 #define WM_APP_SIDEBARW    (WM_APP + 9)   // control thread -> UI thread: g_sidebarW changed; relayout (if shown) and persist
 #define WM_APP_PANEEXIT    (WM_APP + 10)  // reader thread -> UI thread: a shell hit EOF (lParam = Session*); a split side collapses to its survivor (P4)
-#define WM_APP_UPDATESTATUS (WM_APP + 11) // any thread -> UI thread: a pane's grid changed; redraw the status bar's cols x rows (lite #25)
+#define WM_APP_UPDATESTATUS (WM_APP + 11) // any thread -> UI: refresh grid, focus, popup and status-state labels
 #define WM_APP_CONFIG       (WM_APP + 12) // drain owned configuration requests on the UI thread
 struct NotifyMsg { std::wstring title, body; };
 // Heap payload for one posted WM_APP_OVERLAY, freed by the handler — the way WM_APP_HOSTACT
@@ -1810,6 +1810,7 @@ static void setFocusedPane(int pane) {
 }
 static void setFocusOverride(Session* surface) {
     LockG hold;
+    if (g_focusOverride == surface) return;
     g_focusOverride = surface;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
@@ -2367,7 +2368,8 @@ static int indexOfSession(const Session* s) {
 /// Point pane 1 at the primary session's own split shell, or at nothing. A link whose shell has died
 /// (the user typed exit in it) is cleared here rather than left dangling.
 ///
-/// PURE: it touches pane state only. closeSessionAt needs that — it runs this while holding g_lock
+/// Changes pane state and may enqueue a status refresh, but never resizes, persists or sends
+/// synchronous window messages. closeSessionAt runs this while holding g_lock
 /// and before it has decided whether the user deliberately emptied the window, and a resize from
 /// here would let a save land ahead of that decision and overwrite the state the guard exists to
 /// protect. (It did: two restore-matrix cells caught it.)
@@ -6809,14 +6811,12 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             setFocusOverride(s);
             endMarkModeIfMoved();
             touchMruLocked(displayedOwner());
-            PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
             return 0;
         }
         case WM_KILLFOCUS: {
             {LockG hold;
              if (g_focusOverride == s) setFocusOverride(nullptr);
              endMarkModeIfMoved();}
-            PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
             if(h==g_quickHwnd&&!g_quickPinned)ShowWindow(h,SW_HIDE);
             return 0;
         }
@@ -7968,7 +7968,7 @@ public:
         if (g_toolbar) ::InvalidateRect(g_toolbar, nullptr, FALSE);   // bell re-reads anyBlocked()
         return 0;
     }
-    LRESULT OnUpdateStatus(UINT, WPARAM, LPARAM, BOOL&) { updateStatus(); return 0; }   // hostResize's post (lite #25)
+    LRESULT OnUpdateStatus(UINT, WPARAM, LPARAM, BOOL&) { updateStatus(); return 0; }
     LRESULT OnConfig(UINT, WPARAM, LPARAM, BOOL&) { drainConfigRequests(); return 0; }
     LRESULT OnTray(UINT, WPARAM, LPARAM lp, BOOL&) {
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) showTrayMenu();
