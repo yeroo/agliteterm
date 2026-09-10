@@ -79,10 +79,13 @@ Write-Host "DSR=<$($r-join ',')>"
     Check 'Ctrl+C copies precisely the selected text' ((Clip)-ceq $copyText)
     Selection-Rpc 'selection.clear' @{} $oscId|Out-Null
     # Observe a real command cancellation, not growth in an echoed draft.
-    Selection-Rpc 'session.type' @{text="Write-Output ('INTERRUPT-'+'READY'); Start-Sleep -Seconds 120`r"} $oscId|Out-Null
+    $promptNonce=[guid]::NewGuid().ToString('N')
+    $interruptPrompt='INTERRUPT-PROMPT-'+$promptNonce
+    Selection-Rpc 'session.type' @{text=("function global:prompt { 'INTERRUPT-'+'PROMPT-'+'"+$promptNonce+"' }; Write-Output ('INTERRUPT-'+'READY'); Microsoft.PowerShell.Utility\Start-Sleep -Seconds 120`r")} $oscId|Out-Null
     if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains('INTERRUPT-READY')})){throw 'Interrupt fixture not ready'}
     [LiteUi]::Chord($h,0x43,$false)
-    Selection-Rpc 'session.type' @{text="Write-Output ('INTERRUPT-'+'DONE')`r"} $oscId|Out-Null
-    Check 'Ctrl+C without selection interrupts the running child command' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains('INTERRUPT-DONE')})
+    # A fresh prompt proves the 120-second pipeline ended within this ten-second deadline.
+    # Do not queue a follow-up command while cancellation may still be flushing console input.
+    Check 'Ctrl+C without selection interrupts the running child command' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains($interruptPrompt)})
     Check 'interrupt with no selection preserves clipboard generation' ((Clip)-ceq $copyText)
 }finally{foreach($id in $clipIds){Selection-Rpc 'session.close' @{} $id -AllowError|Out-Null}}
