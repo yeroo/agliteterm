@@ -83,6 +83,13 @@ int main(){
  reset();old=snapshot();failDelete=path+L".bak";check(clearRestoreState().find("partial failure")!=std::string::npos);
  check(g_savePublished==2&&!files.count(path)&&files[path+L".bak"]=="backup");clearedIo=ioCalls;
  check(publish(path,"old",old));check(ioCalls==clearedIo&&!files.count(path));check(lockErrors==0&&heldState==0&&heldSave==0);
+ // Deliberate empty is per snapshot, never sticky publication state: empty -> populated ->
+ // transient empty refused -> deliberate empty accepted. Neither empty may resurrect a backup.
+ reset();check(publish(path,"",snapshot(),0,true));check(files[path].empty()&&!files.count(path+L".bak"));
+ check(publish(path,"kept-after-empty",snapshot()));check(files[path]=="kept-after-empty");
+ check(!publish(path,"",snapshot(),0,false));check(files[path]=="kept-after-empty");
+ check(publish(path,"",snapshot(),0,true));check(files[path].empty()&&!files.count(path+L".bak"));
+ check(lockErrors==0&&heldState==0&&heldSave==0);
  std::printf("state fence: %d checks, %d failed\n",checks,failed);return failed?1:0;
 }
 '@

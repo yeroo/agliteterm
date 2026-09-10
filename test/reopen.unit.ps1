@@ -33,10 +33,12 @@ $prefix=@'
 #include <map>
 #include <cstdlib>
 #include <cwchar>
+#include <atomic>
 #include "workspace_identity.h"
 struct Session {int ws=-1;std::wstring name,context;};
 WorkspaceNames g_workspaces{L"first",L"remembered",L"current"};
-int g_activeWs=2,g_focus=0,held=0,creates=0,lockErrors=0,selectedIndex=0;
+std::atomic<int> g_activeWs{2};
+int g_focus=0,held=0,creates=0,lockErrors=0,selectedIndex=0;
 void* g_hwnd=nullptr;constexpr bool FALSE=false;
 Session made,intruder;Session* selected=nullptr;std::vector<Session*> g_sessions;
 std::function<void()> duringHost;std::string appSeen,cwdSeen;std::vector<std::string> argsSeen;
