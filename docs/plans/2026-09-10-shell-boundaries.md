@@ -5,13 +5,13 @@
   Resume offers are returned, never executed by this wrapper.
 - Overlay commands are UTF-8/base64 data decoded once into a child script scope. Parent profile
   functions remain available; ordinary `$e`, `$b`, `$q` and `$c` assignments cannot corrupt the
-  parent's OSC 133 delimiters. Status is captured immediately after the command inside its scope
+  parent's OSC 133 delimiters. Status is captured in a `finally` immediately after the command inside its scope
   (PowerShell 5.1 does not reliably propagate a non-terminating error through `&` as `$?`).
   Wrapper bookkeeping uses reserved `__aglt133_*` names, not ordinary profile variables (including
   PowerShell `AllScope` variables). Explicit mutation of those internal names is outside this boundary.
 - Standalone parsing occurs before instrumentation; parse and terminating errors retain their
-  error-stream diagnostic and emit `D;1`. A normal early `return` derives status from the invocation
-  when the inner status trailer was skipped. Native exit codes are retained. A trailing comment
+  error-stream diagnostic and emit `D;1`. An early `return` still runs the in-scope `finally`, so
+  a preceding non-terminating error is not lost at the invocation boundary. Native exit codes are retained. A trailing comment
   cannot eat the status capture. Two newline boundaries prevent a trailing continuation backtick
   from consuming the instrumentation: standalone PowerShell accepts that trailing backtick, so
   it remains valid and its output is preserved, rather than being mislabeled a parse error.

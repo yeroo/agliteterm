@@ -27,6 +27,10 @@ $cases=@(
     @{command='return 0';code=0;text='0'},
     @{command='Write-Output trailing-backtick`';code=0;text='trailing-backtick';exact='trailing-backtick'},
     @{command='Write-Error "failure" -ErrorAction Continue';code=1;text=''},
+    @{command='Write-Error "failure" -ErrorAction Continue; return';code=1;text=''},
+    @{command='Write-Error "failure" -ErrorAction Continue; return 42';code=1;text='42'},
+    @{command='Write-Error "failure" -ErrorAction Continue; Write-Output recovered; return';code=0;text='recovered'},
+    @{command='cmd.exe /d /c exit 7; return';code=7;text=''},
     @{command='cmd.exe /d /c exit 7';code=7;text=''},
     @{command='Write-Output ordinary';code=0;text='ordinary'}
     @{command=('Write-Output ''LONG-CONTEXT-OK''; # '+('context '*80));code=0;text='LONG-CONTEXT-OK';fits=$true}
