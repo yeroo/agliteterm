@@ -13,6 +13,8 @@ $pwsh=(Get-Command pwsh -ErrorAction SilentlyContinue).Source
 if($pwsh){$shells+=$pwsh}elseif($Strict){throw 'PowerShell 7 required'}
 $cases=@(
     @{command='Write-Output $s';profile='$s=''profile-visible''';code=0;text='profile-visible';exact='profile-visible'},
+    @{command='Write-Output ($c+$q+$e+$b)';profile='$c=''C'';$q=''Q'';$e=''E'';$b=''B''';code=0;text='CQEB';exact='CQEB'},
+    @{command='return $c';profile='$c=''profile-return''';code=0;text='profile-return';exact='profile-return'},
     @{command='$e="";$b="";$q=$false;$c=91;Write-Output COLLISION';code=0;text='COLLISION'},
     @{command='Write-Output "quoted ☃" # trailing comment';code=0;text='quoted'},
     @{command='"dangling';code=1;text='';error='terminator'},

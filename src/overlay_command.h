@@ -7,8 +7,8 @@ namespace overlay_command {
 // This is isolation from accidental collisions, not a sandbox against deliberately hostile code.
 inline std::string line(const std::string& encoded) {
     return "[Console]::Write([string][char]27+']133;A'+[char]7+[char]27+']133;C'+[char]7);"
-           "$LASTEXITCODE=$null;& {$c=$null;try{& ([scriptblock]::Create(([scriptblock]::Create($args[0])).ToString()+[char]10+[char]10+"
-           "'$q=$?;$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1};Set-Variable -Name c -Scope 1 -Value $c'));$q=$?;if($null -eq $c){$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}}}catch{$c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ErrorAction Continue};"
+           "$LASTEXITCODE=$null;& {try{& ([scriptblock]::Create(([scriptblock]::Create($args[0])).ToString()+[char]10+[char]10+"
+           "'$q=$?;$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1};Set-Variable -Name c -Scope 1 -Value $c'));$q=$?;if(-not(Microsoft.PowerShell.Utility\\Get-Variable c -Scope 0 -ErrorAction Ignore)){$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}}}catch{$c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ErrorAction Continue};"
            "[Console]::Write([string][char]27+']133;D;'+$c+[char]7)} ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"')))";
 }
 inline std::string encode(const std::string& text) {
