@@ -225,10 +225,8 @@ function Send-Raw([string]$json) {
     } finally { $c.Dispose() }
 }
 
-# HKCU is NOT isolated by the sandbox (ui-lib's rules): the instance loads SidebarW/ShowSidebar
-# from the real profile and every set, hide and show below writes them back. Both are saved here
-# and put back in `finally`, whatever the checks did with them — and a value that was absent is
-# removed again, not written as a default.
+# The supervisor supplies private HKCU keys. Save and restore the values inside that namespace
+# so repeated cells agree; personal preference keys are never this fixture's target.
 . "$PSScriptRoot/test-registry-path.ps1"
 $regKey = 'HKCU:\'+(Get-LiteTestRegistryPath)
 # Key_Close too (P4): the close-chord checks bind it to Ctrl+Shift+W for this run only — keys are
@@ -2751,9 +2749,9 @@ try {
     try {
         function Selection([string]$op, [string]$id = 'active') {
             if($op-in @('copy','finalize')){
-                $expected=[string](Get-CtlResult $s @('session','copy','--target',$id))
+                $expectedSelectionText=[string](Get-CtlResult $s @('session','copy','--target',$id))
                 $capture=@{Reply=$null}
-                Honesty-Copy { $capture.Reply=ConvertFrom-Json (Send-Ctl $s @('selection',$op,'--target',$id)) } { $expected }
+                Honesty-Copy { $capture.Reply=ConvertFrom-Json (Send-Ctl $s @('selection',$op,'--target',$id)) } { $expectedSelectionText }.GetNewClosure()
                 return $capture.Reply
             }
             ConvertFrom-Json (Send-Ctl $s @('selection', $op, '--target', $id))
