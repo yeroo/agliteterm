@@ -131,7 +131,7 @@ public static class LiteUi {
         System.Threading.Thread.Sleep(300);
     }
 
-    public static void Chord(IntPtr h, int vk, bool shift) {
+    public static void Chord(IntPtr h, int vk, bool shift, int translatedChar = 0) {
         uint me = GetCurrentThreadId(), it = GetWindowThreadProcessId(h, IntPtr.Zero);
         if (!AttachThreadInput(me, it, true)) throw new Exception("Cannot attach owned window input queue");
         var before = new byte[256]; bool captured = false;
@@ -146,6 +146,11 @@ public static class LiteUi {
             // Keep modifiers until the owned UI actually consumes the chord, not a guessed delay.
             if (ChordMessage(h, 0x0100, (IntPtr)vk, (IntPtr)1, 2, 10000, out result) == IntPtr.Zero)
                 throw new Exception("Owned chord timed out");
+            // Sent WM_KEYDOWN bypasses the message loop's TranslateMessage. Supply its character
+            // explicitly when exercising fall-through (e.g. Ctrl+C -> ETX); a consumed binding
+            // must swallow this same WM_CHAR, exactly as it would for a physical key.
+            if (translatedChar != 0 && ChordMessage(h, 0x0102, (IntPtr)translatedChar, (IntPtr)1, 2, 10000, out result) == IntPtr.Zero)
+                throw new Exception("Owned chord character timed out");
             if (ChordMessage(h, 0x0101, (IntPtr)vk, (IntPtr)KeyUpLParam, 2, 10000, out result) == IntPtr.Zero)
                 throw new Exception("Owned chord release timed out");
         } finally {

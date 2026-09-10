@@ -75,7 +75,7 @@ Write-Host "DSR=<$($r-join ',')>"
     $copyText=Selected $oscId
     Check 'drag selection contains seeded marker (auto-copy receipted)' ($copyText.Contains('COPY-ME-MARKER'))
     Write-SelectionClipboardMarker $clipboard 'BEFORE-CTRL-C'
-    Invoke-SelectionClipboardCopy $clipboard { [LiteUi]::Chord($h,0x43,$false) } { $copyText } ([Func[bool]]{[SelectionUi]::ClipboardOwnedBy($script:selectionProc.Id)})
+    Invoke-SelectionClipboardCopy $clipboard { [LiteUi]::Chord($h,0x43,$false,3) } { $copyText } ([Func[bool]]{[SelectionUi]::ClipboardOwnedBy($script:selectionProc.Id)})
     Check 'Ctrl+C copies precisely the selected text' ((Clip)-ceq $copyText)
     Selection-Rpc 'selection.clear' @{} $oscId|Out-Null
     # Observe a real command cancellation, not growth in an echoed draft.
@@ -83,7 +83,7 @@ Write-Host "DSR=<$($r-join ',')>"
     $interruptPrompt='INTERRUPT-PROMPT-'+$promptNonce
     Selection-Rpc 'session.type' @{text=("function global:prompt { 'INTERRUPT-'+'PROMPT-'+'"+$promptNonce+"' }; Write-Output ('INTERRUPT-'+'READY'); Microsoft.PowerShell.Utility\Start-Sleep -Seconds 120`r")} $oscId|Out-Null
     if(-not (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains('INTERRUPT-READY')})){throw 'Interrupt fixture not ready'}
-    [LiteUi]::Chord($h,0x43,$false)
+    [LiteUi]::Chord($h,0x43,$false,3)
     # A fresh prompt proves the 120-second pipeline ended within this ten-second deadline.
     # Do not queue a follow-up command while cancellation may still be flushing console input.
     Check 'Ctrl+C without selection interrupts the running child command' (ClipWait {([string](Selection-Rpc 'session.text' @{} $oscId)).Contains($interruptPrompt)})
