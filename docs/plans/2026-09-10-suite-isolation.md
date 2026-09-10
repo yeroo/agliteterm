@@ -15,6 +15,8 @@ Plan in progress; not a local-run authorization or a completed safety claim.
   proves zero owned descendants before deleting its private registry namespace or releasing the
   lease. Unknown child cleanup, timeout, job failure or registry uncertainty retains the lease and
   stops further children. An ordinary assertion failure with proven cleanup may release normally.
+  Only child exits 0/1 are normalized results; all other exit codes stop scheduling as uncertain.
+  Unreadable acquisition/release replies and failed release artifacts also report cleanup uncertainty.
 - Clipboard still needs full-format snapshot-before-probe and individual copy receipts. A private
   registry namespace does not isolate the clipboard, foreground, mouse capture or shared host.
   The same validated run ID selects a private host pipe, so user windows cannot join its host
@@ -36,4 +38,7 @@ Plan in progress; not a local-run authorization or a completed safety claim.
   and a live descendant after the primary exits. Mocked supervisor tests execute the real
   scheduling/finally logic with substituted resource boundaries, including receipt failure and
   unknown registry ownership; they never acquire the real token or access real HKCU.
+- Hidden startup frames are discovered by the exact live launched PID and frame class, then shown
+  without activation. Physical pipe assertions use the same namespace mapping as the real client.
+  `-Suite stress` is supported explicitly but never added to the default aggregate workload.
 - Fault tests, read-only Codex review, isolated CI and then token-held owned live proof gate completion.

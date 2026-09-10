@@ -16,7 +16,7 @@ param(
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
     [string]$Spec = "$PSScriptRoot\control-api.json",
     # CI passes -Strict: a suite that skips is reporting success while checking nothing,
-    # which is worse than not running it at all. Locally a skip is the right answer.
+    # which is worse than not running it at all. This suite requires disposable CI, not a local skip.
     [switch]$Strict
 )
 

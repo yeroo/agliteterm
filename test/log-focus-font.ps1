@@ -12,6 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/suite-context.ps1"
 Assert-LiteSuiteContext
+. "$PSScriptRoot/owned-window.ps1"
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -46,7 +47,7 @@ Remove-Item $log, "$dir\sessions-$pipe.tsv" -ErrorAction SilentlyContinue
 
 $p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 7
-$p.Refresh(); $h = $p.MainWindowHandle
+$h = Get-OwnedLiteWindow $p -Show
 & $ctl session new --pipe $pipe 2>&1 | Out-Null
 Start-Sleep -Seconds 3
 

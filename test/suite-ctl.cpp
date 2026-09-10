@@ -29,11 +29,11 @@ int wmain(int argc,wchar_t** argv) {
     std::vector<std::wstring> args;bool pipe=false;
     for(int i=1;i<argc;i++){
         std::wstring arg=argv[i];
-        if(arg==L"--socket" || arg.rfind(L"--socket=",0)==0)return 2; // do not permit a transport escape
-        if(arg==L"--pipe"){
-            pipe=true;args.push_back(arg);
+        if(_wcsicmp(arg.c_str(),L"--socket")==0 || _wcsnicmp(arg.c_str(),L"--socket=",9)==0)return 2; // CLI options are case-insensitive
+        if(_wcsicmp(arg.c_str(),L"--pipe")==0){
+            pipe=true;args.push_back(L"--pipe");
             if(i+1<argc && std::wstring(argv[i+1]).rfind(L"--",0)!=0)args.push_back(lite_test_registry::endpoint(run,argv[++i]));
-        }else if(arg.rfind(L"--pipe=",0)==0){pipe=true;args.push_back(L"--pipe="+lite_test_registry::endpoint(run,arg.substr(7)));}
+        }else if(_wcsnicmp(arg.c_str(),L"--pipe=",7)==0){pipe=true;args.push_back(L"--pipe="+lite_test_registry::endpoint(run,arg.substr(7)));}
         else args.push_back(arg);
     }
     if(!pipe){auto inherited=env(L"AGWINTERM_PIPE");args.push_back(L"--pipe");args.push_back(lite_test_registry::endpoint(run,inherited.empty()?L"agliteterm":inherited));}

@@ -488,8 +488,8 @@ Rules the suite obeys, each learned from a real incident:
 `restore-matrix.ps1` is the big one: 34 cells covering kill vs. graceful close, two windows at once,
 interrupted writes, `.bak` fallback, bogus apps, and old and future file formats. The checks that
 drive the control pipe need `agwintermctl` — from an installed agwinterm, from `bin/` (the fetch
-pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. They skip with a message
-when it is absent rather than failing obscurely. A check that needs a client newer than the
+pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. The supervisor requires
+the real CLI before starting any suite and refuses if it is absent. A check that needs a client newer than the
 fetched release — `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field, all
 agwinterm #226; `session context` and `restore capture`, agwinterm #233; `session split --axis`,
 `split close`, `swap` and `focus`, agwinterm #238; `session overlay --pane`, `overlay copy` /

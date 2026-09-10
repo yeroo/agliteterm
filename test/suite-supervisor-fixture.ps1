@@ -10,7 +10,7 @@ public static class SuiteFake {
 public sealed class FakeSuiteJob {
  public void Start(string n,string e,string a,string c){SuiteFake.Note("start");}
  public bool Wait(int n){if(SuiteFake.Case=="deadline")throw new Exception("injected deadline");return true;}
- public int ExitCode(){return SuiteFake.Case=="unsafe"?2:SuiteFake.Case=="test-fail"?1:0;}
+ public int ExitCode(){return SuiteFake.Case=="abnormal"?unchecked((int)0xc0000005):SuiteFake.Case=="unsafe"?2:SuiteFake.Case=="test-fail"?1:0;}
  public void Finish(){SuiteFake.Note("finish");if(SuiteFake.Case=="job-fail")throw new Exception("injected job cleanup failure");}
 }
 public sealed class FakeSuiteKey {
@@ -41,14 +41,23 @@ function python {
     [SuiteFake]::Note([string]$args[1]);$global:LASTEXITCODE=0
     if($args[1]-eq 'acquire'){
         if($Case-eq 'acquire-fail'){$global:LASTEXITCODE=1;return '{"ok":false}'}
+        if($Case-eq 'acquire-malformed'){return '{"ok":'}
+        if($Case-eq 'acquire-empty'){return ''}
         return '{"ok":true,"owner":"fake-owner","token":"fake-token"}'
     }
+    if($Case-eq 'release-fail'){$global:LASTEXITCODE=1;return '{"ok":false}'}
+    if($Case-eq 'release-rejected'){return '{"ok":false}'}
+    if($Case-eq 'release-malformed'){return '{"ok":'}
+    if($Case-eq 'release-empty'){return ''}
+    if($Case-eq 'release-wrong-type'){return '{"ok":"false"}'}
+    if($Case-eq 'release-throws'){throw 'injected release invocation error'}
     return '{"ok":true}'
 }
 function Set-Content {
     [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$Value,[string]$LiteralPath)
     process{
-        if($LiteralPath.EndsWith('lease.json')){[SuiteFake]::Note('receipt');if($Case-eq 'receipt-fail'){throw 'injected receipt failure'}}
+        if([IO.Path]::GetFileName($LiteralPath)-ceq 'lease.json'){[SuiteFake]::Note('receipt');if($Case-eq 'receipt-fail'){throw 'injected receipt failure'}}
+        if([IO.Path]::GetFileName($LiteralPath)-ceq 'release.json' -and $Case-eq 'release-artifact-fail'){throw 'injected release artifact failure'}
         Microsoft.PowerShell.Management\Set-Content -LiteralPath $LiteralPath -Value $Value
     }
 }

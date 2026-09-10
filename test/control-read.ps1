@@ -108,11 +108,13 @@ try {
     $appLine = ($vout -split "`r?`n" | Where-Object { $_ -match '^app ' } | Select-Object -First 1)
     Check 'version prints an app line' ([bool]$appLine) "output: $vout"
     Check 'the app line carries the string ping answered' ($appLine -and $appLine.Contains($ping)) "line [$appLine], ping [$ping]"
-    Check "the app line names the sandbox's pipe" ($appLine -and $appLine.Contains("\\.\pipe\$($s.Pipe)")) "line [$appLine]"
+    . "$PSScriptRoot/test-registry-path.ps1"
+    $physicalPipe=Get-LiteTestPipe $s.Pipe
+    Check "the app line names the sandbox's pipe" ($appLine -and $appLine.Contains("\\.\pipe\$physicalPipe")) "line [$appLine]"
     Check 'the app line does not say unavailable' ($appLine -and $appLine -notmatch 'unavailable') "line [$appLine]"
     $vj = $null
     try { $vj = (& $ctl version --pipe $s.Pipe --json 2>&1 | Out-String) | ConvertFrom-Json } catch { }
-    Check 'version --json reports the app available with that version' ($vj -and $vj.app.available -eq $true -and [string]$vj.app.version -eq $ping -and [string]$vj.app.pipe -eq $s.Pipe) "json: $($vj | ConvertTo-Json -Compress)"
+    Check 'version --json reports the app available with that version' ($vj -and $vj.app.available -eq $true -and [string]$vj.app.version -eq $ping -and [string]$vj.app.pipe -eq $physicalPipe) "json: $($vj | ConvertTo-Json -Compress)"
 
     # --- the reply is a bare JSON integer -------------------------------------------------------
     $raw = CursorRaw $sid

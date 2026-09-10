@@ -3,8 +3,9 @@ param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
       [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[string[]]$Suite)
 $ErrorActionPreference='Stop';$PSNativeCommandUseErrorActionPreference=$false
 $all=@('suite-policy.unit','suite-job.unit','suite-ctl.unit','suite-supervisor.unit','test-registry.unit','targeting.unit','paste.unit','restore-readiness.unit','state-fence.unit','reopen.unit','ui-request.unit','conformance-validator.unit','wave3.unit','remainder.unit','commands.unit','agent-integration.unit','installers.unit','agent-scripts.unit','configuration.unit','driving.unit','owned-procs-checks','registry-guard.unit','clipboard-guard.tests','clipboard-receipt.unit','selection-clipboard.unit','log-basics','log-restore','log-focus-font','log-rotation','diagnose','migration','restore-matrix','conformance','clipboard','agbf-packs','control-read','control-honesty','selection-ui')
-$all=@('control-transport.unit')+$all
-if($Suite){foreach($name in $Suite){if($name-cnotin $all){throw "Unknown suite: $name"}}}else{$Suite=$all}
+$all=@('control-transport.unit','focus-status.unit')+$all
+$supported=$all+@('stress') # manual expensive stress remains explicit-only
+if($Suite){foreach($name in $Suite){if($name-cnotin $supported){throw "Unknown suite: $name"}}}else{$Suite=$all}
 . "$PSScriptRoot/suite-policy.ps1"
 Assert-LiteSuitePolicy $Suite
 $Exe=(Resolve-Path -LiteralPath $Exe).Path
@@ -19,9 +20,13 @@ try {
     if($env:AI_HUB -and [IO.Path]::GetFullPath($env:AI_HUB).TrimEnd('\')-ine 'C:\Users\boris\AI'){throw 'Do not redirect the canonical suite token store'}
     if(Test-Path -LiteralPath $hub){
         if([string]::IsNullOrWhiteSpace($TokenOwner)){throw 'Local suites require -TokenOwner (actual agent identity)'}
-        $raw=& python $hub acquire --owner $TokenOwner --run ('lite-suite-'+$run) --worktree $root --holder-pid $PID --purpose 'Owned isolated Lite integration suites'
-        $state=$raw|ConvertFrom-Json
-        if($LASTEXITCODE-ne 0 -or -not $state.ok){throw "Suite token unavailable: $raw"}
+        try{
+            $raw=& python $hub acquire --owner $TokenOwner --run ('lite-suite-'+$run) --worktree $root --holder-pid $PID --purpose 'Owned isolated Lite integration suites'
+            $acquireExit=$LASTEXITCODE
+            $state=$raw|ConvertFrom-Json
+            if($state.ok-isnot [bool]){throw 'Malformed canonical acquisition response'}
+        }catch{$cleanup=$false;throw} # helper may have acquired; an unreadable receipt is not proof of no lease
+        if($acquireExit-ne 0 -or -not $state.ok){throw "Suite token unavailable: $raw"}
         $lease=$state;$receipt=Join-Path $artifact 'lease.json'
         $lease|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $receipt
         $env:AGLITETERM_TEST_RECEIPT=$receipt
@@ -50,14 +55,14 @@ try {
             $watch=[Diagnostics.Stopwatch]::StartNew()
             while(-not $job.Wait(1000)){if($watch.Elapsed.TotalMinutes-ge 30){throw 'Suite deadline exceeded; clipboard/cleanup state requires recovery'}}
             $code=$job.ExitCode()
-            if($code-eq 2){$cleanup=$false}
+            if($code-notin 0,1){$cleanup=$false}
         }catch{$cleanup=$false;throw}
         finally{
             try{$job.Finish();$job=$null;"Owned job for $name has zero descendants"}catch{$cleanup=$false;throw}
         }
         if(Test-Path -LiteralPath $log){Get-Content -LiteralPath $log|Write-Host}
         if($code-ne 0){$failed+=$name}
-        if($code-eq 2){throw "Suite $name could not prove cleanup; no further children launched"}
+        if($code-notin 0,1){throw "Suite $name exited with unproven cleanup ($code); no further children launched"}
     }
 }catch{$failed+='supervisor';"FAILED: $($_.Exception.Message)"}
 finally{
@@ -73,10 +78,13 @@ finally{
     }
     foreach($name in $saved.Keys){[Environment]::SetEnvironmentVariable($name,$saved[$name])}
     if($lease -and $cleanup){
-        $raw=& python $hub release --owner $lease.owner --token $lease.token --cleanup-confirmed
-        $releaseExit=$LASTEXITCODE;$state=$raw|ConvertFrom-Json
-        $raw|Set-Content -LiteralPath (Join-Path $artifact 'release.json')
-        if($releaseExit-ne 0 -or -not $state.ok){$cleanup=$false}
+        try{
+            $raw=& python $hub release --owner $lease.owner --token $lease.token --cleanup-confirmed
+            $releaseExit=$LASTEXITCODE
+            $raw|Set-Content -LiteralPath (Join-Path $artifact 'release.json')
+            $state=$raw|ConvertFrom-Json
+            if($releaseExit-ne 0 -or $state.ok-isnot [bool] -or -not $state.ok){$cleanup=$false}
+        }catch{$cleanup=$false;"Canonical lease release is unproven: $_"}
     }
     "Lite suite supervisor: failed=$($failed-join ','); cleanup=$cleanup; artifacts=$artifact"
     Stop-Transcript|Out-Null

@@ -1,4 +1,4 @@
-# The session stress: run by hand before a LOCK change is reviewed, not by run-all.ps1 (it is slow,
+# The session stress: explicitly selected before a LOCK change is reviewed, not in the default run (it is slow,
 # and it proves the absence of a hang, which no per-verb check can).
 #
 # Shape (P1-lite r5, and again for P2-lite's #23, whose hostResize hold spans the pty-host round
@@ -16,11 +16,12 @@
 # on g_lock, a deadlock between a pipe thread and the UI thread, or a pane collapsed by a lost
 # resize each fail one of those.
 #
-# Usage: ./test/stress.ps1 [-Exe bin\agliteterm.exe] [-Sessions 80] [-BudgetSec 300]
+# Usage: ./test/run-all.ps1 -Suite stress -TokenOwner <actual-agent> -Strict
 param(
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
     [int]$Sessions = 80,
-    [int]$BudgetSec = 300
+    [int]$BudgetSec = 300,
+    [switch]$Strict
 )
 
 $ErrorActionPreference = 'Stop'

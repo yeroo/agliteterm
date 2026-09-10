@@ -18,6 +18,7 @@
 # One build output here (bin\agliteterm.exe) - the two-Release-roots trap is agwinterm's. The
 # control client is an external dependency, resolved the way every other check resolves it.
 . "$PSScriptRoot\ctl-path.ps1"
+. "$PSScriptRoot/owned-window.ps1"
 
 function Resolve-Lite([string]$explicit) {
     foreach ($c in @($explicit, (Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\agliteterm.exe'))) {
@@ -197,7 +198,7 @@ function Start-Sandbox {
         if ((Send-Ctl $s @('ping')) -match '"ok":true') { break }
     }
     Start-Sleep 5
-    $s.Hwnd = $p.MainWindowHandle
+    $s.Hwnd = Get-OwnedLiteWindow $p -Show
     if ($s.Hwnd -ne [IntPtr]::Zero) {
         # A maximised window makes every coordinate in every case depend on the monitor.
         if ([LiteUi]::IsZoomed($s.Hwnd)) { [void][LiteUi]::ShowWindow($s.Hwnd, 4); Start-Sleep 1 }
@@ -220,7 +221,7 @@ function Connect-Sandbox {
             Select-Object -First 1
     if (-not $proc) { throw "no sandbox instance is running on pipe '$Pipe'" }
     $p = Get-Process -Id $proc.ProcessId
-    [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; Hwnd = $p.MainWindowHandle; AppDir = $null }
+    [pscustomobject]@{ Proc = $p; Ctl = $Ctl; Pipe = $Pipe; Hwnd = (Get-OwnedLiteWindow $p); AppDir = $null }
 }
 
 function Stop-Sandbox {

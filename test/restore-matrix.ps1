@@ -11,9 +11,8 @@
 # House rules: sandbox instances only (never the default, which owns real user state), no global
 # input injection, and every cell gets its own instance name so cells cannot contaminate each other.
 #
-# One shared resource remains: the pty-host control pipe is keyed on the APP id, not the instance, so
-# every cell (and any lite window already open) talks to the same agwinterm-ptyhost.exe. Don't run
-# the suite with a real lite window open — the last instance out shuts the host down.
+# The supervisor supplies a private host app ID shared only by this run's cells; personal windows
+# and their host are outside that namespace and outside the owned job.
 param(
     [switch]$Strict,
     [string]$Exe = "$PSScriptRoot\..\bin\agliteterm.exe",
@@ -23,6 +22,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/suite-context.ps1"
 Assert-LiteSuiteContext
+. "$PSScriptRoot/owned-window.ps1"
 # agwintermctl exits nonzero while a pipe is still coming up, and Start-Lite polls it on purpose.
 # Pinned rather than assumed: with the native-command mapping on, that poll throws on its first
 # iteration and every cell fails for a reason that has nothing to do with restore.
@@ -112,7 +112,7 @@ function Start-Lite($inst) {
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         $r = (& $ctl tree --json --pipe $inst 2>&1) -join ''
-        if ($r -match '"ok":true') { return $p }
+        if ($r -match '"ok":true') { $null=Get-OwnedLiteWindow $p -Show; return $p }
     }
     throw "lite ($inst) did not answer its control pipe"
 }
@@ -568,8 +568,8 @@ function Restart-Cell {
 
         # File > Restart everything (IDM_RESTART = 103), posted — never injected globally.
         $p.Refresh()
-        if (-not $p.MainWindowHandle -or $p.MainWindowHandle -eq 0) { throw "no main window for $inst" }
-        [void][Win32Post]::PostMessageW($p.MainWindowHandle, 0x0111, [IntPtr]103, [IntPtr]::Zero)
+        $frame=Get-OwnedLiteWindow $p
+        [void][Win32Post]::PostMessageW($frame, 0x0111, [IntPtr]103, [IntPtr]::Zero)
 
         # Collect the relay while the old instance is still on its way out (it spawns cmd.exe, then
         # destroys its window); once more after, since the relay outlives its parent by the ping.

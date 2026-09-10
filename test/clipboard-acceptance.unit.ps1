@@ -1,4 +1,4 @@
-# Execute the actual CI gate and paste-sink expression with private redirected shells only.
+# Actual CI gate plus native sink fail-closed checks. Console echo/control proof is CI acceptance.
 param([string]$Exe,[switch]$Strict)
 $ErrorActionPreference='Stop'
 $tokens=$null;$errors=$null
@@ -17,31 +17,19 @@ try {
         $checks++
     }
 }finally{$env:GITHUB_ACTIONS=$priorCi;Remove-Item Function:/Test-Path}
-$cases=[Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot/clipboard-ui-cases.ps1",[ref]$tokens,[ref]$errors)
-if($errors){throw $errors}
-$assignment=$cases.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text-ceq '$sink'},$true)
-if(-not $assignment){throw 'Actual paste sink missing'}
-$artifact=Join-Path ([IO.Path]::GetTempPath()) ('lite-paste-sink-'+[guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $artifact|Out-Null
-$literal=(Join-Path $artifact 'result.txt').Replace("'","''")
-. ([scriptblock]::Create($assignment.Extent.Text))
-$shells=@((Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'),(Join-Path $PSHOME 'pwsh.exe'))
-foreach($shell in $shells){foreach($inputCase in @(@{text='PASTED_OK';result='True'},@{text='PRIVATE-UNPROVEN-TEXT';result='False'},@{text="wrong`r`nWrite-Output SHOULD-NOT-EXECUTE";result='False'})){
-    $file=Join-Path $artifact 'result.txt'
-    if([IO.File]::Exists($file)){Remove-Item -LiteralPath $file}
-    $start=[Diagnostics.ProcessStartInfo]::new($shell)
+$out=Join-Path (Split-Path $PSScriptRoot -Parent) 'bin/clipboard-sink-unit'
+& "$PSScriptRoot/build-clipboard-sink.ps1" -Output $out
+$result=Join-Path $out ([guid]::NewGuid().ToString('N')+'.boolean')
+foreach($withPath in $false,$true){
+    $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $out 'clipboard-sink.exe'))
     $start.UseShellExecute=$false;$start.CreateNoWindow=$true
     $start.RedirectStandardInput=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
-    $start.Arguments='-NoProfile -NonInteractive -NoExit -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($sink))
+    if($withPath){$start.ArgumentList.Add($result)}
     $child=[Diagnostics.Process]::Start($start)
     try {
-        $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
-        $child.StandardInput.WriteLine($inputCase.text);$child.StandardInput.Close()
-        if(-not $child.WaitForExit(15000)){throw 'Private paste sink did not terminate'}
-        if($child.ExitCode-ne 0 -or -not [IO.File]::Exists($file) -or [IO.File]::ReadAllText($file)-cne $inputCase.result){throw 'Paste sink did not record only the expected boolean'}
-        if($stdout.Result.Contains('SHOULD-NOT-EXECUTE') -or $stdout.Result.Contains('PRIVATE-UNPROVEN-TEXT') -or $stderr.Result){throw 'Paste sink disclosed input or resumed shell execution'}
+        $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync();$child.StandardInput.Close()
+        if(-not $child.WaitForExit(15000) -or $child.ExitCode-ne 2 -or $stdout.Result -or $stderr.Result -or [IO.File]::Exists($result)){throw 'Native sink failed to refuse missing arguments/non-console input before readiness or output'}
         $checks++
     }finally{if(-not $child.HasExited){$child.Kill();$null=$child.WaitForExit(5000)};$child.Dispose()}
-}}
-Remove-Item -LiteralPath (Join-Path $artifact 'result.txt');Remove-Item -LiteralPath $artifact
-"Clipboard acceptance: $checks private gate/sink checks passed; no clipboard or host access"
+}
+"Clipboard acceptance: $checks private admission/no-console checks passed; actual ConPTY echo/control checks require disposable CI"

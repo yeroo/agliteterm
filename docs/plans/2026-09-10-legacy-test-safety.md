@@ -7,8 +7,11 @@ It tests right-click paste into a mouse-reporting pane, real-child OSC 52 and DS
 copy and Ctrl+C interruption. Ledger reads/restoration refuse an unproven newer generation.
 Paste itself cannot atomically exclude unrelated clipboard writers, so `-ClipboardOnly` refuses
 local execution (including token-held runs). It requires disposable GitHub CI with no local hub.
-The paste sink stores only a boolean comparison and exits immediately, never recording pasted text
-or returning to a shell prompt that could execute additional pasted lines.
+The paste sink is a directly launched native executable, not an interactive shell. Before readiness
+it disables and verifies console echo and processed Ctrl+C input, and installs a control handler.
+It stores only a boolean comparison and exits; no interpreter can execute additional pasted lines.
+Disposable CI sends synthetic multiline/control-character input through the actual ConPTY and checks
+the pane for absence of echo. Redirected-input unit checks only prove no-console refusal, not echo behavior.
 
 This is the first migration, not completion of #51. The remaining legacy control-honesty,
 conformance, implicit registry writes and top-level runner still need equivalent guards. Those

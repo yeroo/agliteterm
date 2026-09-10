@@ -16,6 +16,10 @@ $cases=@(
     @{args=@('--pipe=\\.\pipe\ordinary','ping');expected=@(('--pipe='+$prefix+'ordinary'),'ping');code=7},
     @{args=@('ping');inherited=$prefix+'already';expected=@('ping','--pipe',($prefix+'already'));code=7},
     @{args=@('--socket','foreign');code=2},
+    @{args=@('--Socket','foreign');code=2},
+    @{args=@('--SOCKET=foreign');code=2},
+    @{args=@('--Pipe','ordinary','ping');expected=@('--pipe',($prefix+'ordinary'),'ping');code=7},
+    @{args=@('--PIPE=ordinary','ping');expected=@(('--pipe='+$prefix+'ordinary'),'ping');code=7},
     @{args=@('ping');run='../bad';code=2},
     @{args=@('ping');self=$true;code=2}
 )

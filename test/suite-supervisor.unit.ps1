@@ -6,11 +6,21 @@ $cases=@(
     @{name='success';code=0;start=2;release=1;delete=1},
     @{name='test-fail';code=1;start=2;release=1;delete=1},
     @{name='unsafe';code=2;start=1;release=0;delete=1},
+    @{name='abnormal';code=2;start=1;release=0;delete=1},
+    @{name='release-fail';code=2;start=2;release=1;delete=1},
+    @{name='release-rejected';code=2;start=2;release=1;delete=1},
+    @{name='release-malformed';code=2;start=2;release=1;delete=1},
+    @{name='release-empty';code=2;start=2;release=1;delete=1},
+    @{name='release-wrong-type';code=2;start=2;release=1;delete=1},
+    @{name='release-throws';code=2;start=2;release=1;delete=1},
+    @{name='release-artifact-fail';code=2;start=2;release=1;delete=1},
     @{name='deadline';code=2;start=1;release=0;delete=1},
     @{name='job-fail';code=2;start=1;release=0;delete=0},
     @{name='registry-fail';code=2;start=2;release=0;delete=1},
     @{name='marker-fail';code=2;start=0;release=0;delete=0},
     @{name='acquire-fail';code=1;start=0;release=0;delete=0},
+    @{name='acquire-malformed';code=2;start=0;release=0;delete=0},
+    @{name='acquire-empty';code=2;start=0;release=0;delete=0},
     @{name='receipt-fail';code=1;start=0;release=1;delete=0}
 )
 foreach($case in $cases){
