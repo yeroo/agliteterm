@@ -41,11 +41,11 @@ class Transport {
             if (!pending->ov.hEvent) { DWORD error = GetLastError(); delete pending; return fail(error); }
             pending->bytes.resize(length - offset);
             if (write) std::memcpy(pending->bytes.data(), bytes + offset, length - offset);
-            issuedAny = true;
             BOOL issued = write ? WriteFile(pending->pipe, pending->bytes.data(), length - offset, nullptr, &pending->ov)
                                 : ReadFile(pending->pipe, pending->bytes.data(), length - offset, nullptr, &pending->ov);
             DWORD error = issued ? ERROR_SUCCESS : GetLastError();
             if (!issued && error != ERROR_IO_PENDING) { delete pending; return fail(error); }
+            issuedAny = true; // Win32 accepted I/O, not merely an attempted call.
             const auto now = GetTickCount64();
             DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
             DWORD wait = WaitForSingleObject(pending->ov.hEvent, remaining);

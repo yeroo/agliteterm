@@ -1,5 +1,10 @@
 #include <windows.h>
 static bool failDuplicate = false, failEvent = false;
+static DWORD failWrite = ERROR_SUCCESS;
+static BOOL TestWrite(HANDLE a,LPCVOID b,DWORD c,LPDWORD d,LPOVERLAPPED e) {
+    if (failWrite) { SetLastError(failWrite); return FALSE; }
+    return WriteFile(a,b,c,d,e);
+}
 static BOOL TestDuplicate(HANDLE a,HANDLE b,HANDLE c,LPHANDLE d,DWORD e,BOOL f,DWORD g) {
     if (failDuplicate) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     return DuplicateHandle(a,b,c,d,e,f,g);
@@ -10,9 +15,11 @@ static HANDLE TestEvent(LPSECURITY_ATTRIBUTES a,BOOL b,BOOL c,LPCWSTR d) {
 }
 #define DuplicateHandle TestDuplicate
 #define CreateEventW TestEvent
+#define WriteFile TestWrite
 #include "../src/control_transport.h"
 #undef DuplicateHandle
 #undef CreateEventW
+#undef WriteFile
 #include <atomic>
 #include <cstdio>
 #include <functional>
@@ -38,15 +45,18 @@ static void readRequest(HANDLE pipe) { uint8_t buf[8]; DWORD n = 0; ReadFile(pip
 static void put(HANDLE pipe, const void* bytes, DWORD length) { DWORD n = 0; WriteFile(pipe, bytes, length, &n, nullptr); }
 static std::vector<uint8_t> request() { return { 4, 0, 0, 0, 'p', 'i', 'n', 'g' }; }
 int main() {
-    for (int kind = 0; kind < 2; ++kind) {
+    for (int kind = 0; kind < 5; ++kind) {
         Fixture f([](HANDLE pipe) { readRequest(pipe); uint32_t n = 4; put(pipe,&n,4); put(pipe,"pong",4); Sleep(30); });
         control_transport::Transport transport; auto req = request(); std::vector<uint8_t> reply;
         control_transport::Failure reason;
         failDuplicate = kind == 0; failEvent = kind == 1;
+        const DWORD writeErrors[] = {ERROR_INVALID_USER_BUFFER,ERROR_NOT_ENOUGH_MEMORY,ERROR_NOT_ENOUGH_QUOTA};
+        failWrite = kind >= 2 ? writeErrors[kind-2] : ERROR_SUCCESS;
         check(!transport.exchange(f.client,req,reply,500,&reason), "pre-issue setup failure refused");
-        check(reason.error == ERROR_NOT_ENOUGH_MEMORY && std::string(reason.stage) == "write", "setup failure identifies stage and error");
+        check(reason.error == (failWrite ? failWrite : ERROR_NOT_ENOUGH_MEMORY) && std::string(reason.stage) == "write", "setup failure identifies stage and error");
         check(f.client != INVALID_HANDLE_VALUE, "pre-issue setup failure preserves channel");
         failDuplicate = failEvent = false;
+        failWrite = ERROR_SUCCESS;
         check(transport.exchange(f.client,req,reply,500), "untouched channel accepts subsequent exchange");
     }
     for (int mode = 0; mode < 7; ++mode) {
