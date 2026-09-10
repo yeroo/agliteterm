@@ -15,8 +15,8 @@ $publication=[regex]::Match($attach.Value,'(?m)^    s->ws = .*?;\r?$')
 foreach($part in $closed,$reopen,$createCapture,$attachCapture,$attachCall,$publication){if(-not $part.Success){throw 'Production reopen/create/attach wiring missing'}}
 # The fake waits below must not silently relocate a production capture from after I/O to before it.
 foreach($pair in @(@($create,$createCapture),@($attach,$attachCapture))){
-    $firstRequest=$pair[0].Value.IndexOf('request(req,')
-    if($firstRequest -lt 0 -or $pair[1].Index -ge $firstRequest){throw 'Workspace capture must precede the first host request'}
+    $firstRequest=[regex]::Match($pair[0].Value,'\b(?:request|creation_protocol::start)\s*\(')
+    if(-not $firstRequest.Success -or $pair[1].Index -ge $firstRequest.Index){throw 'Workspace capture must precede the first host request or creation coordinator'}
 }
 $ctlStart=$source.IndexOf('    if (cmd == "session.new")')
 $ctlSource=$source.Substring($ctlStart,$source.IndexOf('    if (cmd == "session.switch")',$ctlStart)-$ctlStart)
@@ -53,7 +53,7 @@ int callerWs=-1;
 int callerWorkspace(const std::string&caller){return caller=="caller-pane"?callerWs:-1;}
 '@
 $attachFake=@'
-static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0){
+static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0,const char* creationTicket=""){
 '@ + "`n"+$attachCapture.Value+@'
 
     if(held)++lockErrors;
@@ -71,7 +71,7 @@ static Session* newSession(int cols,int rows,const char* app=nullptr,const std::
 '@ + "`n"+$createCapture.Value+@'
 
     ++creates;appSeen=app?app:"";cwdSeen=cwd?cwd:"";argsSeen=pargs?*pargs:std::vector<std::string>{};
-    const char* idbuf="private-created";
+    const char* idbuf="private-created";std::string creationTicket="private-test-ticket";
 '@ + "`n"+$attachCall.Value+@'
 
     g_sessions.push_back(&intruder); // another creator wins the vector's last slot before selection

@@ -9,6 +9,15 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
+/* Enum definitions */
+typedef enum _agwinterm_ptyhost_CreationPhase {
+    agwinterm_ptyhost_CreationPhase_CREATION_UNKNOWN = 0, /* cannot start or address a child under this ticket */
+    agwinterm_ptyhost_CreationPhase_CREATION_PREPARED = 1,
+    agwinterm_ptyhost_CreationPhase_CREATION_CREATING = 2,
+    agwinterm_ptyhost_CreationPhase_CREATION_LIVE = 3,
+    agwinterm_ptyhost_CreationPhase_CREATION_CANCELLING = 4 /* cleanup requested, NOT yet proven complete */
+} agwinterm_ptyhost_CreationPhase;
+
 /* Struct definitions */
 typedef struct _agwinterm_ptyhost_Hello {
     uint32_t protocol; /* must equal the host's version (2 = protobuf wire) */
@@ -32,22 +41,43 @@ typedef struct _agwinterm_ptyhost_Create {
     bool fresh_env_off; /* proto3 default false = freshEnv ON (matches v1 semantics) */
     pb_size_t env_count;
     agwinterm_ptyhost_Create_EnvEntry env[8];
+    char creation_ticket[33]; /* creation_revision >= 1: host-issued, single-use spawn authority */
 } agwinterm_ptyhost_Create;
 
 typedef struct _agwinterm_ptyhost_Attach {
     char id[128];
     bool repaint;
+    char creation_ticket[33]; /* optional expected incarnation; mismatch refuses */
 } agwinterm_ptyhost_Attach;
 
 typedef struct _agwinterm_ptyhost_SessionRef {
     char id[128];
+    char creation_ticket[33]; /* optional expected incarnation; mismatch refuses */
 } agwinterm_ptyhost_SessionRef;
 
 typedef struct _agwinterm_ptyhost_Resize {
     char id[128];
     uint32_t cols;
     uint32_t rows;
+    char creation_ticket[33]; /* optional expected incarnation; mismatch refuses */
 } agwinterm_ptyhost_Resize;
+
+/* Preparation never starts a child. A lost prepare reply may be abandoned safely. A client must
+ never allocate a replacement ticket or replay a legacy create after an ambiguous create reply. */
+typedef struct _agwinterm_ptyhost_PrepareCreate {
+    char id[128];
+} agwinterm_ptyhost_PrepareCreate;
+
+typedef struct _agwinterm_ptyhost_CreationRef {
+    char id[128];
+    char ticket[33];
+} agwinterm_ptyhost_CreationRef;
+
+typedef struct _agwinterm_ptyhost_CreationReply {
+    char id[128];
+    char ticket[33];
+    agwinterm_ptyhost_CreationPhase phase;
+} agwinterm_ptyhost_CreationReply;
 
 typedef struct _agwinterm_ptyhost_List {
     char dummy_field;
@@ -68,16 +98,21 @@ typedef struct _agwinterm_ptyhost_Request {
         agwinterm_ptyhost_SessionRef kill;
         agwinterm_ptyhost_List list;
         agwinterm_ptyhost_Shutdown shutdown;
+        agwinterm_ptyhost_PrepareCreate prepare_create;
+        agwinterm_ptyhost_CreationRef query_create;
+        agwinterm_ptyhost_CreationRef cancel_create;
     } cmd;
 } agwinterm_ptyhost_Request;
 
 typedef struct _agwinterm_ptyhost_HelloReply {
     uint32_t protocol;
     uint32_t pid;
+    uint32_t creation_revision; /* 0 = legacy limitations; 1 = prepare/query/cancel + incarnation checks */
 } agwinterm_ptyhost_HelloReply;
 
 typedef struct _agwinterm_ptyhost_CreateReply {
     char id[128];
+    char creation_ticket[33];
 } agwinterm_ptyhost_CreateReply;
 
 typedef struct _agwinterm_ptyhost_AttachReply {
@@ -94,6 +129,7 @@ typedef struct _agwinterm_ptyhost_AttachReply {
  so a reattached view is not dim-until-repaint. Empty when the host can't produce it (a Rust
  host without persist support yet); the client falls back to `scrollback`. */
     pb_callback_t scrollback_blob;
+    char creation_ticket[33];
 } agwinterm_ptyhost_AttachReply;
 
 typedef struct _agwinterm_ptyhost_SessionInfo {
@@ -105,6 +141,7 @@ typedef struct _agwinterm_ptyhost_SessionInfo {
     int32_t exit_code;
     pb_callback_t title;
     bool attached;
+    char creation_ticket[33];
 } agwinterm_ptyhost_SessionInfo;
 
 typedef struct _agwinterm_ptyhost_ListReply {
@@ -121,6 +158,7 @@ typedef struct _agwinterm_ptyhost_Reply {
         agwinterm_ptyhost_CreateReply create;
         agwinterm_ptyhost_AttachReply attach;
         agwinterm_ptyhost_ListReply list;
+        agwinterm_ptyhost_CreationReply creation;
     } body;
 } agwinterm_ptyhost_Reply;
 
@@ -129,36 +167,67 @@ typedef struct _agwinterm_ptyhost_Reply {
 extern "C" {
 #endif
 
+/* Helper constants for enums */
+#define _agwinterm_ptyhost_CreationPhase_MIN agwinterm_ptyhost_CreationPhase_CREATION_UNKNOWN
+#define _agwinterm_ptyhost_CreationPhase_MAX agwinterm_ptyhost_CreationPhase_CREATION_CANCELLING
+#define _agwinterm_ptyhost_CreationPhase_ARRAYSIZE ((agwinterm_ptyhost_CreationPhase)(agwinterm_ptyhost_CreationPhase_CREATION_CANCELLING+1))
+
+
+
+
+
+
+
+
+
+
+#define agwinterm_ptyhost_CreationReply_phase_ENUMTYPE agwinterm_ptyhost_CreationPhase
+
+
+
+
+
+
+
+
+
+
 /* Initializer values for message structs */
 #define agwinterm_ptyhost_Request_init_default   {0, {agwinterm_ptyhost_Hello_init_default}}
 #define agwinterm_ptyhost_Hello_init_default     {0}
-#define agwinterm_ptyhost_Create_init_default    {"", 0, 0, "", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, "", 0, 0, 0, 0, {agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default}}
+#define agwinterm_ptyhost_Create_init_default    {"", 0, 0, "", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, "", 0, 0, 0, 0, {agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default, agwinterm_ptyhost_Create_EnvEntry_init_default}, ""}
 #define agwinterm_ptyhost_Create_EnvEntry_init_default {"", ""}
-#define agwinterm_ptyhost_Attach_init_default    {"", 0}
-#define agwinterm_ptyhost_SessionRef_init_default {""}
-#define agwinterm_ptyhost_Resize_init_default    {"", 0, 0}
+#define agwinterm_ptyhost_Attach_init_default    {"", 0, ""}
+#define agwinterm_ptyhost_SessionRef_init_default {"", ""}
+#define agwinterm_ptyhost_Resize_init_default    {"", 0, 0, ""}
+#define agwinterm_ptyhost_PrepareCreate_init_default {""}
+#define agwinterm_ptyhost_CreationRef_init_default {"", ""}
+#define agwinterm_ptyhost_CreationReply_init_default {"", "", _agwinterm_ptyhost_CreationPhase_MIN}
 #define agwinterm_ptyhost_List_init_default      {0}
 #define agwinterm_ptyhost_Shutdown_init_default  {0}
 #define agwinterm_ptyhost_Reply_init_default     {0, "", 0, {agwinterm_ptyhost_HelloReply_init_default}}
-#define agwinterm_ptyhost_HelloReply_init_default {0, 0}
-#define agwinterm_ptyhost_CreateReply_init_default {""}
-#define agwinterm_ptyhost_AttachReply_init_default {"", 0, 0, 0, 0, 0, "", {{NULL}, NULL}, {{NULL}, NULL}}
-#define agwinterm_ptyhost_SessionInfo_init_default {"", 0, 0, 0, 0, 0, {{NULL}, NULL}, 0}
+#define agwinterm_ptyhost_HelloReply_init_default {0, 0, 0}
+#define agwinterm_ptyhost_CreateReply_init_default {"", ""}
+#define agwinterm_ptyhost_AttachReply_init_default {"", 0, 0, 0, 0, 0, "", {{NULL}, NULL}, {{NULL}, NULL}, ""}
+#define agwinterm_ptyhost_SessionInfo_init_default {"", 0, 0, 0, 0, 0, {{NULL}, NULL}, 0, ""}
 #define agwinterm_ptyhost_ListReply_init_default {0, {agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default, agwinterm_ptyhost_SessionInfo_init_default}}
 #define agwinterm_ptyhost_Request_init_zero      {0, {agwinterm_ptyhost_Hello_init_zero}}
 #define agwinterm_ptyhost_Hello_init_zero        {0}
-#define agwinterm_ptyhost_Create_init_zero       {"", 0, 0, "", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, "", 0, 0, 0, 0, {agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero}}
+#define agwinterm_ptyhost_Create_init_zero       {"", 0, 0, "", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, "", 0, 0, 0, 0, {agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero, agwinterm_ptyhost_Create_EnvEntry_init_zero}, ""}
 #define agwinterm_ptyhost_Create_EnvEntry_init_zero {"", ""}
-#define agwinterm_ptyhost_Attach_init_zero       {"", 0}
-#define agwinterm_ptyhost_SessionRef_init_zero   {""}
-#define agwinterm_ptyhost_Resize_init_zero       {"", 0, 0}
+#define agwinterm_ptyhost_Attach_init_zero       {"", 0, ""}
+#define agwinterm_ptyhost_SessionRef_init_zero   {"", ""}
+#define agwinterm_ptyhost_Resize_init_zero       {"", 0, 0, ""}
+#define agwinterm_ptyhost_PrepareCreate_init_zero {""}
+#define agwinterm_ptyhost_CreationRef_init_zero  {"", ""}
+#define agwinterm_ptyhost_CreationReply_init_zero {"", "", _agwinterm_ptyhost_CreationPhase_MIN}
 #define agwinterm_ptyhost_List_init_zero         {0}
 #define agwinterm_ptyhost_Shutdown_init_zero     {0}
 #define agwinterm_ptyhost_Reply_init_zero        {0, "", 0, {agwinterm_ptyhost_HelloReply_init_zero}}
-#define agwinterm_ptyhost_HelloReply_init_zero   {0, 0}
-#define agwinterm_ptyhost_CreateReply_init_zero  {""}
-#define agwinterm_ptyhost_AttachReply_init_zero  {"", 0, 0, 0, 0, 0, "", {{NULL}, NULL}, {{NULL}, NULL}}
-#define agwinterm_ptyhost_SessionInfo_init_zero  {"", 0, 0, 0, 0, 0, {{NULL}, NULL}, 0}
+#define agwinterm_ptyhost_HelloReply_init_zero   {0, 0, 0}
+#define agwinterm_ptyhost_CreateReply_init_zero  {"", ""}
+#define agwinterm_ptyhost_AttachReply_init_zero  {"", 0, 0, 0, 0, 0, "", {{NULL}, NULL}, {{NULL}, NULL}, ""}
+#define agwinterm_ptyhost_SessionInfo_init_zero  {"", 0, 0, 0, 0, 0, {{NULL}, NULL}, 0, ""}
 #define agwinterm_ptyhost_ListReply_init_zero    {0, {agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero, agwinterm_ptyhost_SessionInfo_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -175,12 +244,22 @@ extern "C" {
 #define agwinterm_ptyhost_Create_de_elevate_tag  8
 #define agwinterm_ptyhost_Create_fresh_env_off_tag 9
 #define agwinterm_ptyhost_Create_env_tag         10
+#define agwinterm_ptyhost_Create_creation_ticket_tag 11
 #define agwinterm_ptyhost_Attach_id_tag          1
 #define agwinterm_ptyhost_Attach_repaint_tag     2
+#define agwinterm_ptyhost_Attach_creation_ticket_tag 3
 #define agwinterm_ptyhost_SessionRef_id_tag      1
+#define agwinterm_ptyhost_SessionRef_creation_ticket_tag 2
 #define agwinterm_ptyhost_Resize_id_tag          1
 #define agwinterm_ptyhost_Resize_cols_tag        2
 #define agwinterm_ptyhost_Resize_rows_tag        3
+#define agwinterm_ptyhost_Resize_creation_ticket_tag 4
+#define agwinterm_ptyhost_PrepareCreate_id_tag   1
+#define agwinterm_ptyhost_CreationRef_id_tag     1
+#define agwinterm_ptyhost_CreationRef_ticket_tag 2
+#define agwinterm_ptyhost_CreationReply_id_tag   1
+#define agwinterm_ptyhost_CreationReply_ticket_tag 2
+#define agwinterm_ptyhost_CreationReply_phase_tag 3
 #define agwinterm_ptyhost_Request_hello_tag      1
 #define agwinterm_ptyhost_Request_create_tag     2
 #define agwinterm_ptyhost_Request_attach_tag     3
@@ -189,9 +268,14 @@ extern "C" {
 #define agwinterm_ptyhost_Request_kill_tag       6
 #define agwinterm_ptyhost_Request_list_tag       7
 #define agwinterm_ptyhost_Request_shutdown_tag   8
+#define agwinterm_ptyhost_Request_prepare_create_tag 9
+#define agwinterm_ptyhost_Request_query_create_tag 10
+#define agwinterm_ptyhost_Request_cancel_create_tag 11
 #define agwinterm_ptyhost_HelloReply_protocol_tag 1
 #define agwinterm_ptyhost_HelloReply_pid_tag     2
+#define agwinterm_ptyhost_HelloReply_creation_revision_tag 3
 #define agwinterm_ptyhost_CreateReply_id_tag     1
+#define agwinterm_ptyhost_CreateReply_creation_ticket_tag 2
 #define agwinterm_ptyhost_AttachReply_pipe_tag   1
 #define agwinterm_ptyhost_AttachReply_cols_tag   2
 #define agwinterm_ptyhost_AttachReply_rows_tag   3
@@ -201,6 +285,7 @@ extern "C" {
 #define agwinterm_ptyhost_AttachReply_modes_tag  7
 #define agwinterm_ptyhost_AttachReply_scrollback_tag 8
 #define agwinterm_ptyhost_AttachReply_scrollback_blob_tag 9
+#define agwinterm_ptyhost_AttachReply_creation_ticket_tag 10
 #define agwinterm_ptyhost_SessionInfo_id_tag     1
 #define agwinterm_ptyhost_SessionInfo_cols_tag   2
 #define agwinterm_ptyhost_SessionInfo_rows_tag   3
@@ -209,6 +294,7 @@ extern "C" {
 #define agwinterm_ptyhost_SessionInfo_exit_code_tag 6
 #define agwinterm_ptyhost_SessionInfo_title_tag  7
 #define agwinterm_ptyhost_SessionInfo_attached_tag 8
+#define agwinterm_ptyhost_SessionInfo_creation_ticket_tag 9
 #define agwinterm_ptyhost_ListReply_sessions_tag 1
 #define agwinterm_ptyhost_Reply_ok_tag           1
 #define agwinterm_ptyhost_Reply_error_tag        2
@@ -216,6 +302,7 @@ extern "C" {
 #define agwinterm_ptyhost_Reply_create_tag       4
 #define agwinterm_ptyhost_Reply_attach_tag       5
 #define agwinterm_ptyhost_Reply_list_tag         6
+#define agwinterm_ptyhost_Reply_creation_tag     7
 
 /* Struct field encoding specification for nanopb */
 #define agwinterm_ptyhost_Request_FIELDLIST(X, a) \
@@ -226,7 +313,10 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,detach,cmd.detach),   4) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,resize,cmd.resize),   5) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,kill,cmd.kill),   6) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,list,cmd.list),   7) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,shutdown,cmd.shutdown),   8)
+X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,shutdown,cmd.shutdown),   8) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,prepare_create,cmd.prepare_create),   9) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,query_create,cmd.query_create),  10) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,cancel_create,cmd.cancel_create),  11)
 #define agwinterm_ptyhost_Request_CALLBACK NULL
 #define agwinterm_ptyhost_Request_DEFAULT NULL
 #define agwinterm_ptyhost_Request_cmd_hello_MSGTYPE agwinterm_ptyhost_Hello
@@ -237,6 +327,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (cmd,shutdown,cmd.shutdown),   8)
 #define agwinterm_ptyhost_Request_cmd_kill_MSGTYPE agwinterm_ptyhost_SessionRef
 #define agwinterm_ptyhost_Request_cmd_list_MSGTYPE agwinterm_ptyhost_List
 #define agwinterm_ptyhost_Request_cmd_shutdown_MSGTYPE agwinterm_ptyhost_Shutdown
+#define agwinterm_ptyhost_Request_cmd_prepare_create_MSGTYPE agwinterm_ptyhost_PrepareCreate
+#define agwinterm_ptyhost_Request_cmd_query_create_MSGTYPE agwinterm_ptyhost_CreationRef
+#define agwinterm_ptyhost_Request_cmd_cancel_create_MSGTYPE agwinterm_ptyhost_CreationRef
 
 #define agwinterm_ptyhost_Hello_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   protocol,          1)
@@ -253,7 +346,8 @@ X(a, STATIC,   SINGULAR, STRING,   cwd,               6) \
 X(a, STATIC,   SINGULAR, BOOL,     verbatim,          7) \
 X(a, STATIC,   SINGULAR, BOOL,     de_elevate,        8) \
 X(a, STATIC,   SINGULAR, BOOL,     fresh_env_off,     9) \
-X(a, STATIC,   REPEATED, MESSAGE,  env,              10)
+X(a, STATIC,   REPEATED, MESSAGE,  env,              10) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,  11)
 #define agwinterm_ptyhost_Create_CALLBACK NULL
 #define agwinterm_ptyhost_Create_DEFAULT NULL
 #define agwinterm_ptyhost_Create_env_MSGTYPE agwinterm_ptyhost_Create_EnvEntry
@@ -266,21 +360,42 @@ X(a, STATIC,   SINGULAR, STRING,   value,             2)
 
 #define agwinterm_ptyhost_Attach_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   id,                1) \
-X(a, STATIC,   SINGULAR, BOOL,     repaint,           2)
+X(a, STATIC,   SINGULAR, BOOL,     repaint,           2) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,   3)
 #define agwinterm_ptyhost_Attach_CALLBACK NULL
 #define agwinterm_ptyhost_Attach_DEFAULT NULL
 
 #define agwinterm_ptyhost_SessionRef_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   id,                1)
+X(a, STATIC,   SINGULAR, STRING,   id,                1) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,   2)
 #define agwinterm_ptyhost_SessionRef_CALLBACK NULL
 #define agwinterm_ptyhost_SessionRef_DEFAULT NULL
 
 #define agwinterm_ptyhost_Resize_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   id,                1) \
 X(a, STATIC,   SINGULAR, UINT32,   cols,              2) \
-X(a, STATIC,   SINGULAR, UINT32,   rows,              3)
+X(a, STATIC,   SINGULAR, UINT32,   rows,              3) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,   4)
 #define agwinterm_ptyhost_Resize_CALLBACK NULL
 #define agwinterm_ptyhost_Resize_DEFAULT NULL
+
+#define agwinterm_ptyhost_PrepareCreate_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   id,                1)
+#define agwinterm_ptyhost_PrepareCreate_CALLBACK NULL
+#define agwinterm_ptyhost_PrepareCreate_DEFAULT NULL
+
+#define agwinterm_ptyhost_CreationRef_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   id,                1) \
+X(a, STATIC,   SINGULAR, STRING,   ticket,            2)
+#define agwinterm_ptyhost_CreationRef_CALLBACK NULL
+#define agwinterm_ptyhost_CreationRef_DEFAULT NULL
+
+#define agwinterm_ptyhost_CreationReply_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   id,                1) \
+X(a, STATIC,   SINGULAR, STRING,   ticket,            2) \
+X(a, STATIC,   SINGULAR, UENUM,    phase,             3)
+#define agwinterm_ptyhost_CreationReply_CALLBACK NULL
+#define agwinterm_ptyhost_CreationReply_DEFAULT NULL
 
 #define agwinterm_ptyhost_List_FIELDLIST(X, a) \
 
@@ -298,22 +413,26 @@ X(a, STATIC,   SINGULAR, STRING,   error,             2) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,hello,body.hello),   3) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,create,body.create),   4) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (body,attach,body.attach),   5) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (body,list,body.list),   6)
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,list,body.list),   6) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (body,creation,body.creation),   7)
 #define agwinterm_ptyhost_Reply_CALLBACK NULL
 #define agwinterm_ptyhost_Reply_DEFAULT NULL
 #define agwinterm_ptyhost_Reply_body_hello_MSGTYPE agwinterm_ptyhost_HelloReply
 #define agwinterm_ptyhost_Reply_body_create_MSGTYPE agwinterm_ptyhost_CreateReply
 #define agwinterm_ptyhost_Reply_body_attach_MSGTYPE agwinterm_ptyhost_AttachReply
 #define agwinterm_ptyhost_Reply_body_list_MSGTYPE agwinterm_ptyhost_ListReply
+#define agwinterm_ptyhost_Reply_body_creation_MSGTYPE agwinterm_ptyhost_CreationReply
 
 #define agwinterm_ptyhost_HelloReply_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   protocol,          1) \
-X(a, STATIC,   SINGULAR, UINT32,   pid,               2)
+X(a, STATIC,   SINGULAR, UINT32,   pid,               2) \
+X(a, STATIC,   SINGULAR, UINT32,   creation_revision,   3)
 #define agwinterm_ptyhost_HelloReply_CALLBACK NULL
 #define agwinterm_ptyhost_HelloReply_DEFAULT NULL
 
 #define agwinterm_ptyhost_CreateReply_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   id,                1)
+X(a, STATIC,   SINGULAR, STRING,   id,                1) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,   2)
 #define agwinterm_ptyhost_CreateReply_CALLBACK NULL
 #define agwinterm_ptyhost_CreateReply_DEFAULT NULL
 
@@ -326,7 +445,8 @@ X(a, STATIC,   SINGULAR, BOOL,     has_exited,        5) \
 X(a, STATIC,   SINGULAR, INT32,    exit_code,         6) \
 X(a, STATIC,   SINGULAR, STRING,   modes,             7) \
 X(a, CALLBACK, REPEATED, STRING,   scrollback,        8) \
-X(a, CALLBACK, SINGULAR, BYTES,    scrollback_blob,   9)
+X(a, CALLBACK, SINGULAR, BYTES,    scrollback_blob,   9) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,  10)
 #define agwinterm_ptyhost_AttachReply_CALLBACK pb_default_field_callback
 #define agwinterm_ptyhost_AttachReply_DEFAULT NULL
 
@@ -338,7 +458,8 @@ X(a, STATIC,   SINGULAR, UINT32,   child_pid,         4) \
 X(a, STATIC,   SINGULAR, BOOL,     has_exited,        5) \
 X(a, STATIC,   SINGULAR, INT32,    exit_code,         6) \
 X(a, CALLBACK, SINGULAR, STRING,   title,             7) \
-X(a, STATIC,   SINGULAR, BOOL,     attached,          8)
+X(a, STATIC,   SINGULAR, BOOL,     attached,          8) \
+X(a, STATIC,   SINGULAR, STRING,   creation_ticket,   9)
 #define agwinterm_ptyhost_SessionInfo_CALLBACK pb_default_field_callback
 #define agwinterm_ptyhost_SessionInfo_DEFAULT NULL
 
@@ -355,6 +476,9 @@ extern const pb_msgdesc_t agwinterm_ptyhost_Create_EnvEntry_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_Attach_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_SessionRef_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_Resize_msg;
+extern const pb_msgdesc_t agwinterm_ptyhost_PrepareCreate_msg;
+extern const pb_msgdesc_t agwinterm_ptyhost_CreationRef_msg;
+extern const pb_msgdesc_t agwinterm_ptyhost_CreationReply_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_List_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_Shutdown_msg;
 extern const pb_msgdesc_t agwinterm_ptyhost_Reply_msg;
@@ -372,6 +496,9 @@ extern const pb_msgdesc_t agwinterm_ptyhost_ListReply_msg;
 #define agwinterm_ptyhost_Attach_fields &agwinterm_ptyhost_Attach_msg
 #define agwinterm_ptyhost_SessionRef_fields &agwinterm_ptyhost_SessionRef_msg
 #define agwinterm_ptyhost_Resize_fields &agwinterm_ptyhost_Resize_msg
+#define agwinterm_ptyhost_PrepareCreate_fields &agwinterm_ptyhost_PrepareCreate_msg
+#define agwinterm_ptyhost_CreationRef_fields &agwinterm_ptyhost_CreationRef_msg
+#define agwinterm_ptyhost_CreationReply_fields &agwinterm_ptyhost_CreationReply_msg
 #define agwinterm_ptyhost_List_fields &agwinterm_ptyhost_List_msg
 #define agwinterm_ptyhost_Shutdown_fields &agwinterm_ptyhost_Shutdown_msg
 #define agwinterm_ptyhost_Reply_fields &agwinterm_ptyhost_Reply_msg
@@ -387,16 +514,19 @@ extern const pb_msgdesc_t agwinterm_ptyhost_ListReply_msg;
 /* agwinterm_ptyhost_SessionInfo_size depends on runtime parameters */
 /* agwinterm_ptyhost_ListReply_size depends on runtime parameters */
 #define AGWINTERM_PTYHOST_PTYHOST_PB_H_MAX_SIZE  agwinterm_ptyhost_Request_size
-#define agwinterm_ptyhost_Attach_size            132
-#define agwinterm_ptyhost_CreateReply_size       130
+#define agwinterm_ptyhost_Attach_size            166
+#define agwinterm_ptyhost_CreateReply_size       164
 #define agwinterm_ptyhost_Create_EnvEntry_size   259
-#define agwinterm_ptyhost_Create_size            35568
-#define agwinterm_ptyhost_HelloReply_size        12
+#define agwinterm_ptyhost_Create_size            35602
+#define agwinterm_ptyhost_CreationRef_size       164
+#define agwinterm_ptyhost_CreationReply_size     166
+#define agwinterm_ptyhost_HelloReply_size        18
 #define agwinterm_ptyhost_Hello_size             6
 #define agwinterm_ptyhost_List_size              0
-#define agwinterm_ptyhost_Request_size           35572
-#define agwinterm_ptyhost_Resize_size            142
-#define agwinterm_ptyhost_SessionRef_size        130
+#define agwinterm_ptyhost_PrepareCreate_size     130
+#define agwinterm_ptyhost_Request_size           35606
+#define agwinterm_ptyhost_Resize_size            176
+#define agwinterm_ptyhost_SessionRef_size        164
 #define agwinterm_ptyhost_Shutdown_size          0
 
 #ifdef __cplusplus
