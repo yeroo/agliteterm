@@ -39,6 +39,17 @@ $cases=@(
     @{command='end {Write-Output END} begin <# { #> {Write-Output BEGIN}';code=0;text='END'},
     @{command='dynamicparam { [Management.Automation.RuntimeDefinedParameterDictionary]::new() } end {42}';code=0;text='42';exact='42'},
     @{command='begin {} end {Write-Error failure -ErrorAction Continue;return}';code=1;text=''},
+    @{command='begin {Write-Error failure -ErrorAction Continue} end {if(-not $?){throw "abort"}}';code=1;text='';error='abort'},
+    @{command='begin {Write-Error failure -ErrorAction Continue} process {if(-not $?){throw "abort"}}';code=1;text='';error='abort'},
+    @{command='process {Write-Error failure -ErrorAction Continue} end {if(-not $?){throw "abort"}}';code=1;text='';error='abort'},
+    @{command='end {if(-not $?){throw "abort"}} begin {Write-Error failure -ErrorAction Continue}';code=1;text='';error='abort'},
+    @{command='begin {Write-Error failure -ErrorAction Continue} end {}';code=1;text=''},
+    @{command='param($x=$(cmd.exe /d /c exit 7))';code=7;text=''},
+    @{command='param($x=$(cmd.exe /d /c exit 0))';code=0;text=''},
+    @{command='param($x=$(cmd.exe /d /c exit 7)) end {}';code=7;text=''},
+    @{command='end {42} clean {"discarded"}';code=0;text='42';exact='42';ps7=$true},
+    @{command='end {Write-Error failure -ErrorAction Continue} clean {if(-not $?){throw "abort"}}';code=1;text='';error='abort';ps7=$true},
+    @{command='end {cmd.exe /d /c exit 7} clean {}';code=7;text='';ps7=$true},
     @{command='trap {continue}; throw "handled"';code=1;text=''},
     @{command='param()';code=0;text=''},
     @{command='using namespace System.Text';code=0;text=''},
@@ -48,6 +59,7 @@ $cases=@(
 )
 $checks=0
 foreach($shell in $shells){foreach($case in $cases){
+    if($case.ps7 -and [IO.Path]::GetFileName($shell)-ine 'pwsh.exe'){continue}
     $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($case.command))
     $wrapper=& $testExe $encoded
     if($LASTEXITCODE-ne 0){throw 'Production wrapper generation or capacity checks failed'}
