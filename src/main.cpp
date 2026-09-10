@@ -500,8 +500,8 @@ struct Session {
 };
 
 // Session::status is a std::string written from control-pipe threads (the session.status verb)
-// AND the UI thread (the Esc/Ctrl+C clear), and read from both (tree replies on pipe threads, the
-// sidebar and its custom-draw on the UI thread). g_lock deliberately does not cover it (it guards
+// AND the UI thread (the Esc/Ctrl+C clear), and read by UI-owned tree replies, sidebar paint and
+// worker-side agent checks. g_lock alone does not cover it (it guards
 // the emulators and the list shape), so it has its own section, like the event log has g_evtLock.
 // Short values live in the small-string buffer and never reallocate, which is why an unlocked
 // `waiting-for-user-approval` written under a concurrent `tree` was a use-after-free nobody had
@@ -1574,7 +1574,10 @@ static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
     // inside the gate. The pristine check and its initialization bytes are one operation
     // relative to human input, API type/paste and restore replay. Non-editing protocol replies
     // bypass the gate so the reader cannot deadlock behind a backpressured editing write.
-    if ((requireUntouched || reservation) && !inputPane) {
+    // An already-resolved request may race unlisting before this lookup. Never fall through to
+    // a raw write in that case: there is no longer a listed pane authorizing editing input.
+    // If found, the retained Session/gate stays valid even if unlisting happens after the lookup.
+    if ((write || requireUntouched || reservation) && !inputPane) {
         if (guardRefused) *guardRefused = true;
         return 0;
     }
@@ -3738,11 +3741,11 @@ static bool saveSessionState() {
         replayLine("R", &Session::restoreCmd);
         replayLine("B", &Session::agentResume);
     }
-    // Read under the lock, with the session list it describes: the flag is written from the
-    // control-pipe thread (closeSessionAt) while this can run on the UI one, and it gates both the
+    // Read under the lock with the session list it describes: closeSessionAt is UI-owned, and
+    // the snapshot may also be requested by worker-side persistence. This flag gates both the
     // zero-session refusal and the .bak delete — the two decisions that can cost saved sessions.
     bool userEmptied = g_userEmptied;
-    // The A line's value is sampled here too: workspace.select writes g_activeWs from a pipe thread,
+    // The A line's value is sampled here too: workspace.select writes g_activeWs on the UI thread,
     // and a read after the release could put an OLDER workspace into a HIGHER-stamped buffer, which
     // the overtake guard below orders by stamp alone (revmux r2 of #28).
     int activeWs = g_activeWs;
@@ -5942,7 +5945,7 @@ static WsDelete deleteWorkspace(int w) {
 // TPM_RETURNCMD (no WM_COMMAND re-entrancy, no selection change — so the active terminal doesn't jump).
 static void showTreeContextMenu() {
     const LPARAM targetParam = g_ctxParam;
-    const HTREEITEM targetItem = g_ctxItem;
+    HTREEITEM targetItem = nullptr; // resolved again only after the nested menu loop
     bool isSession = targetParam > 0;
     int si = treeSessionIndex(targetParam);
     if (isSession && si < 0) return;
@@ -5984,7 +5987,7 @@ static void showTreeContextMenu() {
     // TrackPopupMenu can execute queued controls. Re-resolve every delayed identity, including
     // submenu destinations; a deleted row/workspace is not the item now occupying its index.
     si = treeSessionIndex(targetParam);
-    cws = treeWorkspaceIndex(workspaceParam);
+    cws = isSession && si >= 0 ? g_sessions[si]->ws : treeWorkspaceIndex(workspaceParam);
     if ((isSession && si < 0) || cws < 0) return;
     switch (id) {
         case IDM_NEW: g_activeWs = cws; newSessionDialog(); break;
@@ -6016,6 +6019,17 @@ static void showTreeContextMenu() {
         case IDM_RENAME:
             // g_treeRenaming keeps treeProc's WM_SETFOCUS bounce out of the way until the edit
             // control exists (after that TreeView_GetEditControl answers for it).
+            // A nested menu loop may have rebuilt every HTREEITEM. Find the surviving identity's
+            // current row rather than retaining a handle into the deleted tree.
+            targetItem = nullptr;
+            for (HTREEITEM ws = TreeView_GetRoot(g_tree); ws && !targetItem; ws = TreeView_GetNextSibling(g_tree, ws)) {
+                TVITEMW row{}; row.mask=TVIF_PARAM; row.hItem=ws;
+                if (TreeView_GetItem(g_tree,&row) && row.lParam==targetParam) targetItem=ws;
+                for (HTREEITEM child=TreeView_GetChild(g_tree,ws); child && !targetItem; child=TreeView_GetNextSibling(g_tree,child)) {
+                    row.hItem=child;
+                    if (TreeView_GetItem(g_tree,&row) && row.lParam==targetParam) targetItem=child;
+                }
+            }
             if (targetItem) {
                 TVITEMW current{}; current.mask=TVIF_PARAM; current.hItem=targetItem;
                 if (TreeView_GetItem(g_tree,&current) && current.lParam==targetParam) {
@@ -9830,7 +9844,7 @@ static std::string ctlDispatch(const std::string& line) {
     size_t i = 0;
     if (!jsonParseObject(line, i, "", req)) return ctlErr("invalid JSON");
     const std::string& cmd = req.get("cmd");
-    if (ui_ownership::dispatchToUi(cmd) && GetWindowThreadProcessId(g_hwnd, nullptr) != GetCurrentThreadId())
+    if (ui_ownership::dispatchToUi(cmd, req.get("args.action")) && GetWindowThreadProcessId(g_hwnd, nullptr) != GetCurrentThreadId())
         return dispatchConfig(req, line); // no g_lock held; owned payload survives caller timeout
 
     if (cmd == "config.set" && req.get("args.key") == "quick-terminal-hotkey") {
@@ -9921,9 +9935,8 @@ static std::string ctlDispatch(const std::string& line) {
     if (cmd == "ping") return ctlOkStr("agliteterm " + narrow(updVersion()));
     if (cmd == "tree") {   // real structure: workspaces with their sessions, flags, unread, focus
         const auto shellHints=waveShellHints();
-        // This runs on a control-pipe thread while another pipe thread's session.new can push_back
-        // into g_sessions (a realloc frees the buffer this loop indexes) and session.rename can
-        // reassign a name this loop reads. Both mutate under g_lock, so the walk holds it too.
+        // Structural snapshots are UI-owned; reader-thread emulator/unread updates still share
+        // g_lock, so hold it across the whole snapshot.
         LockG hold;
         std::string wss;
         for (int w = 0; w < (int)g_workspaces.size(); w++) {
@@ -10532,8 +10545,8 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("status", target->id, "set"));
+            setStatus(target, st); // membership and status update share g_lock -> g_statusLock order
         }
-        setStatus(target, st);
         emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label

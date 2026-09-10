@@ -23,8 +23,10 @@ int main() {
         "workspace.select","workspace.delete","workspace.move","sidebar","sidebar.width","font","font.inc","quick"})
         check(ui_ownership::dispatchToUi(cmd));
     for(const std::string cmd: {"ping","events","session.type","session.paste","session.write",
-        "session.text","session.output","session.copy","surface.cursor","agent.bridge"})
+        "session.text","session.output","session.copy","session.status","surface.cursor","agent.bridge"})
         check(!ui_ownership::dispatchToUi(cmd));
+    for(const std::string action: {"text","copy","result"}) check(!ui_ownership::dispatchToUi("session.overlay",action));
+    for(const std::string action: {"open","close","resize","","invalid"}) check(ui_ownership::dispatchToUi("session.overlay",action));
     Session a,b,c;g_sessions={&a,&b};
     LPARAM old=reinterpret_cast<LPARAM>(&b);
     check(treeSessionIndex(old)==1);

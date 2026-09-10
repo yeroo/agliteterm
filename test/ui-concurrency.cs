@@ -33,15 +33,23 @@ public static class LiteConcurrencyProbe
     {
         var ids = new HashSet<string>();
         foreach (var ws in Call(pipe, "tree").GetProperty("workspaces").EnumerateArray())
+        {
+            string identity = ws.GetProperty("id").GetString();
+            Check(ids.Add("workspace:" + identity + ":" + ws.GetProperty("name").GetString()), "Tree has duplicate workspace identity");
             foreach (var session in ws.GetProperty("sessions").EnumerateArray())
-                Check(ids.Add(session.GetProperty("id").GetString()), "Tree has duplicate session identity");
+            {
+                string sessionId = session.GetProperty("id").GetString();
+                Check(ids.Add("session:" + sessionId), "Tree has duplicate session identity");
+                ids.Add("placement:" + sessionId + ":" + identity);
+            }
+        }
         return ids;
     }
     public static int Run(string pipe)
     {
         checks = 0;
         var baseline = Snapshot(pipe);
-        Check(baseline.Count > 0, "Baseline pane must exist");
+        Check(baseline.Any(id => id.StartsWith("session:")), "Baseline pane must exist");
         var jobs = new List<Task>();
         for (int worker = 0; worker < 2; ++worker)
         {
@@ -75,7 +83,7 @@ public static class LiteConcurrencyProbe
         jobs.Add(Task.Run(() => { for (int n = 0; n < 40; ++n) { Snapshot(pipe); Thread.Sleep(20); } }));
         // WhenAll settles every worker even when one fails; no queued writes outlive the fixture.
         Task.WhenAll(jobs).GetAwaiter().GetResult();
-        Check(baseline.SetEquals(Snapshot(pipe)), "Concurrent actions lost or replaced an unrelated pane");
+        Check(baseline.SetEquals(Snapshot(pipe)), "Concurrent actions changed baseline workspaces, panes, or their placement");
         return checks;
     }
 }

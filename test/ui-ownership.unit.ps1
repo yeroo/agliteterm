@@ -15,3 +15,12 @@ $testExe=Join-Path $out 'ui-ownership-unit.exe'
 if($LASTEXITCODE-ne 0){throw 'UI ownership fixture compile failed'}
 & $testExe
 if($LASTEXITCODE-ne 0){throw 'UI ownership fixture failed'}
+$io=[regex]::Match($main,'(?ms)^static DWORD ovIo\(.*?^\}')
+if(-not $io.Success){throw 'Actual I/O function missing'}
+$ioCpp=Join-Path $out 'input-ownership-unit.cpp'
+[IO.File]::WriteAllText($ioCpp,(Get-Content "$PSScriptRoot/input-ownership.unit.cpp" -Raw).Replace('// ACTUAL_OV_IO',$io.Value))
+$ioExe=Join-Path $out 'input-ownership-unit.exe'
+& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /std:c++17 /EHsc /W4 /utf-8 /I `"$repo/src`" `"$ioCpp`" /Fe:`"$ioExe`" /Fo:`"$out/input-ownership-unit.obj`""
+if($LASTEXITCODE-ne 0){throw 'Input ownership fixture compile failed'}
+& $ioExe
+if($LASTEXITCODE-ne 0){throw 'Input ownership fixture failed'}
