@@ -7,9 +7,9 @@ namespace overlay_command {
 // This is isolation from accidental collisions, not a sandbox against deliberately hostile code.
 inline std::string line(const std::string& encoded) {
     return "[Console]::Write([string][char]27+']133;A'+[char]7+[char]27+']133;C'+[char]7);"
-           "$LASTEXITCODE=$null;& {try{& ([scriptblock]::Create(([scriptblock]::Create($args[0])).ToString()+[char]10+[char]10+"
-           "'$q=$?;$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1};Set-Variable -Name c -Scope 1 -Value $c'));$q=$?;if(-not(Microsoft.PowerShell.Utility\\Get-Variable c -Scope 0 -ErrorAction Ignore)){$c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($q){0}else{1}}}catch{$c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ErrorAction Continue};"
-           "[Console]::Write([string][char]27+']133;D;'+$c+[char]7)} ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"')))";
+           "$LASTEXITCODE=$null;& {$__aglt133_c=$null;try{& ([scriptblock]::Create(([scriptblock]::Create($args[0])).ToString()+[char]10+[char]10+"
+           "'$__aglt133_q=$?;$__aglt133_c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($__aglt133_q){0}else{1};Microsoft.PowerShell.Utility\\Set-Variable -Name __aglt133_c -Scope 1 -Value $__aglt133_c'));$__aglt133_q=$?;if($null -eq $__aglt133_c){$__aglt133_c=if($null -ne $LASTEXITCODE){$LASTEXITCODE}elseif($__aglt133_q){0}else{1}}}catch{$__aglt133_c=1;Microsoft.PowerShell.Utility\\Write-Error -ErrorRecord $_ -ErrorAction Continue};"
+           "[Console]::Write([string][char]27+']133;D;'+$__aglt133_c+[char]7)} ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+encoded+"')))";
 }
 inline std::string encode(const std::string& text) {
     static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

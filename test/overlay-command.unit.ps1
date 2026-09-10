@@ -15,6 +15,9 @@ $cases=@(
     @{command='Write-Output $s';profile='$s=''profile-visible''';code=0;text='profile-visible';exact='profile-visible'},
     @{command='Write-Output ($c+$q+$e+$b)';profile='$c=''C'';$q=''Q'';$e=''E'';$b=''B''';code=0;text='CQEB';exact='CQEB'},
     @{command='return $c';profile='$c=''profile-return''';code=0;text='profile-return';exact='profile-return'},
+    @{command='return $c';profile='New-Variable -Name c -Value 91 -Option AllScope';code=0;text='91';exact='91'},
+    @{command='Write-Output $c';profile='New-Variable -Name c -Value 91 -Option AllScope';code=0;text='91';exact='91'},
+    @{command='cmd.exe /d /c exit 7';profile='New-Variable -Name q -Value $false -Option AllScope';code=7;text=''},
     @{command='$e="";$b="";$q=$false;$c=91;Write-Output COLLISION';code=0;text='COLLISION'},
     @{command='Write-Output "quoted ☃" # trailing comment';code=0;text='quoted'},
     @{command='"dangling';code=1;text='';error='terminator'},
@@ -48,7 +51,8 @@ foreach($shell in $shells){foreach($case in $cases){
         if(-not $text.Contains($esc+']133;A'+$bel+$esc+']133;C'+$bel)){throw 'Missing wrapper start marks'}
         if(-not $text.Contains($esc+']133;D;'+$case.code+$bel)){throw "Wrong wrapper exit for $($case.command): stdout=$text stderr=$errors"}
         if($case.text -and -not $text.Contains($case.text)){throw 'Command output changed'}
-        if($case.error -and -not $errors.Contains($case.error)){throw "Diagnostic missing: $errors"}
+        # Windows PowerShell wraps formatted errors at the host width; compare words, not layout.
+        if($case.error -and -not ([regex]::Replace($errors,'\s+',' ')).Contains($case.error)){throw "Diagnostic missing: $errors"}
         if($case.exact){
             $plain=[regex]::Replace($text,[regex]::Escape($esc)+']133;[^'+$bel+']*'+$bel,'').Trim()
             if($plain-ne $case.exact){throw "Instrumentation leaked into command output: $plain"}

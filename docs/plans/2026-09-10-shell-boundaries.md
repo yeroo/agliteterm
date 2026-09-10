@@ -7,6 +7,8 @@
   functions remain available; ordinary `$e`, `$b`, `$q` and `$c` assignments cannot corrupt the
   parent's OSC 133 delimiters. Status is captured immediately after the command inside its scope
   (PowerShell 5.1 does not reliably propagate a non-terminating error through `&` as `$?`).
+  Wrapper bookkeeping uses reserved `__aglt133_*` names, not ordinary profile variables (including
+  PowerShell `AllScope` variables). Explicit mutation of those internal names is outside this boundary.
 - Standalone parsing occurs before instrumentation; parse and terminating errors retain their
   error-stream diagnostic and emit `D;1`. A normal early `return` derives status from the invocation
   when the inner status trailer was skipped. Native exit codes are retained. A trailing comment
