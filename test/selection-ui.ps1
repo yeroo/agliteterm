@@ -4,6 +4,10 @@ param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
 $ErrorActionPreference='Stop'
 . "$PSScriptRoot/test-registry-path.ps1"
 if($ClipboardOnly -and ($env:GITHUB_ACTIONS-ne 'true' -or (Test-Path 'C:/Users/boris/AI/bin/suite-token.py'))){throw 'Clipboard paste acceptance is disposable GitHub CI only; a suite token does not exclude unrelated clipboard writers'}
+if($DrivingOnly -or $RemainderOnly -or -not ($DrivingOnly -or $ConfigurationOnly -or $ShellConfigurationOnly -or $AgentIntegrationOnly -or $RemainderOnly -or $Wave3Only -or $ClipboardOnly)){
+    . "$PSScriptRoot/suite-policy.ps1"
+    Assert-LiteSuitePolicy @('selection-ui') # empty-clipboard fallback and dashboard paste acceptance
+}
 if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent+[int]$Wave3Only.IsPresent+[int]$ClipboardOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))

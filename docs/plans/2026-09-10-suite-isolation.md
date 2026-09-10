@@ -23,10 +23,14 @@ Plan in progress; not a local-run authorization or a completed safety claim.
   the unchanged verb to the real CLI with that endpoint. Raw JSON fixtures use the same mapping.
 - Standalone unsafe legacy entry points must refuse without the supervisor's validated environment;
   guarded selection entry points retain their existing standalone token/restore behavior.
-- `clipboard`, `control-honesty` and `conformance` intentionally exercise paste or foreground
+- `clipboard`, `control-honesty`, `conformance` and unfiltered `selection-ui` exercise paste or foreground
   transfer. They remain disposable-GitHub-CI-only even with a lease. The aggregate runner refuses
   these locally before acquiring or mutating; use explicit safe subsets for local evidence.
   This is a deliberate safety boundary, not permission to omit the full `-Strict` CI merge gate.
+  The same gate covers direct `selection-ui -DrivingOnly` (empty-clipboard fallback) and
+  `-RemainderOnly` (dashboard paste interception); other explicit selection filters keep their
+  guarded local token behavior. If a regression bypasses an expected paste refusal, a shared
+  desktop's newer clipboard text must not become the acceptance sink's input.
 - The forwarding adapter has private argv/UTF-8 stdin/stdout/stderr/exit-code regression checks.
   Owned-job tests cover refusal to adopt an existing job, failed startup, repeated start refusal,
   and a live descendant after the primary exits. Mocked supervisor tests execute the real
