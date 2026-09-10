@@ -29,6 +29,7 @@
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
 #include "workspace_identity.h"
+#include "session_command.h"
 #include <cmath>
 #include <cerrno>
 #include <climits>
@@ -2003,7 +2004,7 @@ static void hostResize(Session* s, int cols, int rows, bool fromRetry = false) {
     }
     // The host knows the SHELL, and a shell's host id is its paneId: after a promotion (closeSplitSide)
     // the session id sits on a shell born under another id, so every host request keys on paneId.
-    if (!s->paneId.empty()) {   // a restore placeholder has no host session — only its emulator resizes
+    if (!s->paneId.empty() && !s->failed) { // local failure surfaces only resize their emulator
         agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
         req.which_cmd = agwinterm_ptyhost_Request_resize_tag;
@@ -2511,9 +2512,40 @@ static void selectPrimary(int idx, bool activateWorkspace = true, Session* expec
     PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
 }
 
+static Session* failedCommandSession(int cols, int rows, const char* app,
+                                     const std::vector<std::string>* args, const char* cwd,
+                                     uint64_t workspace, const char* reason) {
+    auto* s = new Session();
+    s->app = app ? app : "";
+    if (args) s->args = *args;
+    s->cwd = cwd ? cwd : "";
+    s->exited = true; s->failed = true;
+    s->cols = cols; s->rows = rows;
+    s->emu = emu_new(cols, rows);
+    if (!s->emu || !emu_set_scrollback(s->emu, g_scrollbackLines.load())) {
+        if (s->emu) emu_free(s->emu);
+        delete s; return nullptr;
+    }
+    std::string message = "\r\n  [agliteterm] could not start the session:\r\n  " +
+        std::string(reason && *reason ? reason : "command creation failed") + "\r\n  app: " + s->app + "\r\n";
+    if (!s->cwd.empty()) message += "  cwd: " + s->cwd + "\r\n";
+    {
+        LockG hold;
+        // A new local id cannot alias the failed/conflicting host creation attempt.
+        s->id = g_idPrefix + "-failed-" + std::to_string(g_seq++);
+        s->paneId = s->id;
+        s->ws = g_workspaces.destination(workspace);
+        emu_feed(s->emu, (const uint8_t*)message.data(), (uint32_t)message.size());
+        g_sessions.push_back(s); g_userEmptied = false;
+        emitEvent("session", s->id, "created"); emitEvent("tree");
+    }
+    PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+    return s;
+}
+
 static Session* newSession(int cols, int rows, const char* app = nullptr,
                            const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false,
-                           uint64_t workspace = 0) {
+                           uint64_t workspace = 0, bool explicitCommand = false) {
     { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     profiles::Entry defaultProfile;
     if (!app) {
@@ -2534,6 +2566,9 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     req.cmd.create.cols = (uint32_t)cols;
     req.cmd.create.rows = (uint32_t)rows;
     const char* useApp = app ? app : "powershell.exe";
+    auto failed = [&](const char* reason) -> Session* {
+        return explicitCommand ? failedCommandSession(cols, rows, useApp, pargs, cwd, workspace, reason) : nullptr;
+    };
     if (!fitsField(useApp, sizeof agwinterm_ptyhost_Create::app)) {
         // Nothing could launch this anyway. Returning nullptr lets restore keep it as a named dead
         // session (failedSpecSession) instead of losing the entry — or killing the process.
@@ -2550,7 +2585,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
                      "starting in the default directory instead", strlen(cwd), sizeof agwinterm_ptyhost_Create::cwd - 1);
     }
     std::string enc;
-    if (pargs && !pargs->empty()) {                     // explicit profile args -> run app + args as-is
+    if (pargs && (explicitCommand || !pargs->empty())) { // explicit command args, including zero, are exact
         // The wire holds 16 args (proto/ptyhost.options). The old cap of 4 silently rewrote the
         // command line of any profile with more than four — saved in full, relaunched truncated.
         const int kMaxArgs = (int)(sizeof agwinterm_ptyhost_Create::args / sizeof agwinterm_ptyhost_Create::args[0]);
@@ -2616,7 +2651,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         creationTicket = attempt.ticket;
         if (attempt.status == creation_protocol::Status::Created) break;
         // Only an explicit refusal authorizes a DIFFERENT id. Ambiguous/lost receipts never retry.
-        if (attempt.status != creation_protocol::Status::Conflict || tries >= 64) return nullptr;
+        if (attempt.status != creation_protocol::Status::Conflict || tries >= 64) return failed(rep.error);
         _snprintf_s(idbuf, _TRUNCATE, "%s%s-%d", quick?"quick:":"", g_idPrefix.c_str(), g_seq++);
         strcpy_s(req.cmd.create.id, idbuf);
         strcpy_s(req.cmd.create.env[3].value, idbuf);   // AGWINTERM_SESSION_ID
@@ -2630,12 +2665,13 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
         // same spec on every launch, so the leak compounds. Take it back.
         logWarn("session '%s' was created but could not be attached — killing it rather than leaking it", idbuf);
-        if (!creationTicket.empty()) { cancelCreation(idbuf, creationTicket.c_str()); return nullptr; }
+        if (!creationTicket.empty()) { cancelCreation(idbuf, creationTicket.c_str()); return failed("command was created but could not be attached"); }
         agwinterm_ptyhost_Request k = agwinterm_ptyhost_Request_init_default;
         agwinterm_ptyhost_Reply kr = agwinterm_ptyhost_Reply_init_default;
         k.which_cmd = agwinterm_ptyhost_Request_kill_tag;
         strcpy_s(k.cmd.kill.id, idbuf);
         request(k, &kr);
+        return failed("command was created but could not be attached");
     }
     return s;
 }
@@ -2824,7 +2860,7 @@ static void scanHostSessions() {
 static void killSession(Session* s) {
     { LockG hold; s->ompOperation.reset(); s->ompReady = false; }
     { LockG lk; if (g_sel.sess == s) g_sel.clear(); }   // keyed by session: don't outlive it
-    if (s->paneId.empty()) return;        // restore placeholder: nothing on the host to kill
+    if (s->paneId.empty() || s->failed) return; // local failure surface: nothing on the host to kill
     if (!s->creationTicket.empty()) { cancelCreation(s->paneId.c_str(), s->creationTicket.c_str()); return; }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -9202,11 +9238,19 @@ agwintermctl session status idle        # done
 
 ## Run something in a session
 
-One call creates the session, names it, and runs the command as its shell:
+One call creates the session, names it, and runs PowerShell code with an interactive prompt afterward:
 
 ```
 agwintermctl session new --name build --command "npm test" --cwd C:\src\app
 ```
+
+`--command-mode direct` launches executable + arguments with Windows quoting and no added shell.
+Use a matching updated `agwintermctl`; older clients do not send this option. Direct mode refuses
+`--wait`. In default PowerShell mode `--wait` leaves the same interactive prompt open; explicit
+`exit` ends PowerShell. An exited standalone pane retains output but accepts no further input.
+A mode or `--wait` requires a nonempty command; command and `--profile` are mutually exclusive.
+Both products refuse oversized launches: 259 UTF-8 bytes for the executable, 16 arguments,
+2047 UTF-8 bytes each. Use a `.ps1` helper for longer startup sequences.
 
 **A bare `session new` lands in YOUR workspace** - the one holding the pane whose
 `AGWINTERM_SESSION_ID` the CLI sends as the caller - not in whichever workspace happens to be
@@ -10064,8 +10108,24 @@ static std::string ctlDispatch(const std::string& line) {
         std::string command = req.get("args.command");
         profiles::Entry selectedProfile;
         const bool namedProfile = req.fields.count("args.profile") != 0;
+        bool hasMode = false;
+        std::string mode;
+        try {
+            const auto root = wave3::parse(line);
+            if (const auto* args = wave3::field(root, "args")) {
+                if (const auto* value = wave3::field(*args, "command-mode")) {
+                    if (value->kind != wave3::Value::String)
+                        return ctlErr("session.new: command-mode must be powershell or direct; nothing created");
+                    hasMode = true; mode = value->text;
+                }
+            }
+        } catch (const std::exception& ex) { return ctlErr(ex.what()); }
+        const auto wait = req.get("args.wait");
+        session_command::Launch launch;
+        std::string launchError;
+        if (!session_command::create(command, hasMode ? &mode : nullptr, wait == "true" || wait == "1",
+                                     namedProfile, launch, launchError)) return ctlErr(launchError);
         if (namedProfile) {
-            if (!command.empty()) return ctlErr("session.new: command and profile are mutually exclusive; nothing created");
             const auto catalog = profileSnapshot();
             const auto* selected = catalog.find(req.get("args.profile"));
             if (!selected) return ctlErr("session.new: profile not found; nothing created");
@@ -10133,17 +10193,12 @@ static std::string ctlDispatch(const std::string& line) {
 
         // --command runs it as the session's shell, which is the whole point: the caller wants the
         // command RUNNING, not typed into a prompt that may not be ready to receive it yet.
-        std::vector<std::string> cargs;
-        const char* app = nullptr;
-        if (!command.empty()) {
-            app = "powershell.exe";
-            cargs.push_back("-NoExit");     // keep the pane alive after it finishes, like the full app
-            cargs.push_back("-Command");
-            cargs.push_back(command);
-        }
+        auto cargs = launch.args;
+        const bool explicitCommand = !launch.app.empty();
+        const char* app = explicitCommand ? launch.app.c_str() : nullptr;
         if (namedProfile) { app = selectedProfile.command.c_str(); cargs = selectedProfile.args; }
-        Session* s = newSession(cols, rows, app, cargs.empty() ? nullptr : &cargs,
-                                cwd.empty() ? nullptr : cwd.c_str(), false, false, workspace);
+        Session* s = newSession(cols, rows, app, explicitCommand || !cargs.empty() ? &cargs : nullptr,
+                                cwd.empty() ? nullptr : cwd.c_str(), false, false, workspace, explicitCommand);
         if (!s) return ctlErr("create failed");
         // The attach publication already resolved the stable token, including deletion fallback.
         { LockG hold; if (!name.empty()) s->name = widen(tsvField(name)); }

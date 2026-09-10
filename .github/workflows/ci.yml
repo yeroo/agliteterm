@@ -38,11 +38,11 @@ jobs:
         run: ./build.ps1
 
       # Fetch/build above may stage a release-era CLI. Stage the source-pinned CLI LAST.
-      - name: Checkout the shared Wave 3 CLI
+      - name: Checkout the shared command-mode CLI
         uses: actions/checkout@v4
         with:
           repository: yeroo/agwinterm
-          ref: c10d153351011b0399f78fcaacaeb351f2e18fd7
+          ref: 83f37b6549b11d337be5dfc2db832e187944b18e
           path: .ci-full-cli
 
       - name: Setup shared CLI SDK
