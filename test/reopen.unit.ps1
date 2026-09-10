@@ -13,11 +13,26 @@ $attachCapture=[regex]::Match($attach.Value,$capturePattern)
 $attachCall=[regex]::Match($create.Value,'(?m)^    Session\* s = attachSession\(.*?;\r?$')
 $publication=[regex]::Match($attach.Value,'(?m)^    s->ws = .*?;\r?$')
 foreach($part in $closed,$reopen,$createCapture,$attachCapture,$attachCall,$publication){if(-not $part.Success){throw 'Production reopen/create/attach wiring missing'}}
+# The fake waits below must not silently relocate a production capture from after I/O to before it.
+foreach($pair in @(@($create,$createCapture),@($attach,$attachCapture))){
+    $firstRequest=$pair[0].Value.IndexOf('request(req,')
+    if($firstRequest -lt 0 -or $pair[1].Index -ge $firstRequest){throw 'Workspace capture must precede the first host request'}
+}
+$ctlStart=$source.IndexOf('    if (cmd == "session.new")')
+$ctlSource=$source.Substring($ctlStart,$source.IndexOf('    if (cmd == "session.switch")',$ctlStart)-$ctlStart)
+$resolveStart=$ctlSource.IndexOf('        uint64_t workspace = 0;')
+$resolveEnd=$ctlSource.IndexOf('        int cols, rows;',$resolveStart)
+$resolve=$ctlSource.Substring($resolveStart,$resolveEnd-$resolveStart)
+$ctlCreate=[regex]::Match($ctlSource,'(?m)^        Session\* s = newSession\(cols, rows, app, cargs.empty\(\)[\s\S]*?;')
+if(-not $ctlCreate.Success -or $ctlSource.IndexOf('s->ws =') -ge 0){throw 'Control creation must use attach placement, without later index/name rebinding'}
 $prefix=@'
 #include <string>
 #include <vector>
 #include <functional>
 #include <cstdio>
+#include <map>
+#include <cstdlib>
+#include <cwchar>
 #include "workspace_identity.h"
 struct Session {int ws=-1;std::wstring name,context;};
 WorkspaceNames g_workspaces{L"first",L"remembered",L"current"};
@@ -29,6 +44,11 @@ struct LockG {LockG(){++held;}~LockG(){--held;}};
 void newSessionGrid(int,int*c,int*r){*c=80;*r=24;}
 void selectPrimary(int index,bool,Session* expected=nullptr){selectedIndex=index;selected=expected;}
 void InvalidateRect(void*,void*,bool){}
+struct Request {std::map<std::string,std::string> args;std::string get(const char*key)const{auto i=args.find(key);return i==args.end()?"":i->second;}};
+std::wstring widen(const std::string&s){return std::wstring(s.begin(),s.end());}
+Session* ctlErr(const std::string&){return nullptr;}
+int callerWs=-1;
+int callerWorkspace(const std::string&caller){return caller=="caller-pane"?callerWs:-1;}
 '@
 $attachFake=@'
 static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0){
@@ -83,6 +103,22 @@ int main(){
  // Ordinary create also freezes its destination before the host wait.
  g_workspaces=std::vector<std::wstring>{L"first",L"second"};g_activeWs=1;
  duringHost=[&]{g_activeWs=0;};newSession(80,24);check(made.ws==1);
+ // Actual control destination-resolution block and actual newSession call, not a test copy.
+ for(int mode=0;mode<5;++mode)for(int replacement=0;replacement<2;++replacement){
+   g_workspaces=std::vector<std::wstring>{L"first",L"target",L"active"};g_activeWs=2;callerWs=1;held=lockErrors=0;
+   Request req;
+   if(mode==0)req.args["args.workspace"]="1";
+   if(mode==1)req.args["args.workspace-name"]="target";
+   if(mode==2)req.args["args.caller"]="caller-pane";
+   if(mode==3)req.args["caller"]="caller-pane";
+   if(mode==4){req.args["args.workspace-name"]="created";req.args["args.create-workspace"]="true";}
+   int target=mode==4?3:1;
+   duringHost=[&]{check(held==0);LockG hold;g_activeWs=0;
+     if(replacement){g_workspaces.erase(g_workspaces.begin()+target);g_workspaces.push_back(mode==4?L"created":L"target");}
+     else g_workspaces[target]=L"renamed during host wait";
+   };
+   check(controlCreate(req)==&made);check(made.ws==(replacement?0:target));check(lockErrors==0&&held==0);
+ }
  std::printf("reopen: %d checks, %d failed\n",checks,failed);return failed?1:0;
 }
 '@
@@ -91,7 +127,8 @@ $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC
 if(-not $vs){throw 'MSVC required'}
 $out=Join-Path $repo 'bin/reopen-unit';New-Item -ItemType Directory -Force $out|Out-Null
 $generated=Join-Path $out 'reopen.generated.cpp'
-[IO.File]::WriteAllText($generated,($prefix+"`n"+$closed.Value+"`nstd::vector<ClosedSpec> g_closedStack;`n"+$attachFake+"`n"+$createFake+"`n"+$reopen.Value+"`n"+$tests),[Text.UTF8Encoding]::new($false))
+$ctlFake="static Session* controlCreate(const Request& req){`n"+$resolve+"`nint cols=80,rows=24;const char*app=nullptr;std::vector<std::string>cargs;std::string cwd;`n"+$ctlCreate.Value+"`nreturn s;}`n"
+[IO.File]::WriteAllText($generated,($prefix+"`n"+$closed.Value+"`nstd::vector<ClosedSpec> g_closedStack;`n"+$attachFake+"`n"+$createFake+"`n"+$reopen.Value+"`n"+$ctlFake+$tests),[Text.UTF8Encoding]::new($false))
 $testExe=Join-Path $out 'reopen-unit.exe'
 & cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /EHsc /W4 /std:c++20 /utf-8 /I`"$repo/src`" `"$generated`" /Fe:`"$testExe`" /Fo:`"$out/reopen-unit.obj`""
 if($LASTEXITCODE -ne 0){throw 'Reopen unit compile failed'}

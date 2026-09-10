@@ -9931,11 +9931,10 @@ static std::string ctlDispatch(const std::string& line) {
         // wire); a top-level `caller` is accepted too for a hand-written line. It is never the
         // target: session.new stays targetless, and a target would turn a stale value into "session
         // not found" instead of the fallback.
+        uint64_t workspace = 0;
+        { // Resolve and capture one identity atomically, before either host wait.
+        LockG destinationHold;
         int wantWs = -1;
-        // The NAME of the workspace wantWs points at, captured with the index and re-found under the
-        // lock after the create: an index is only valid until someone deletes an earlier workspace
-        // (revmux r2). Empty when wantWs stays -1.
-        std::wstring wantWsName;
         std::string wsArg = req.get("args.workspace");
         std::string wsName = req.get("args.workspace-name");
         std::string wsCreate = req.get("args.create-workspace");
@@ -9945,24 +9944,27 @@ static std::string ctlDispatch(const std::string& line) {
         if (!wsArg.empty()) {
             bool digits = wsArg.find_first_not_of("0123456789") == std::string::npos;
             int n = digits ? atoi(wsArg.c_str()) : -1;
-            { LockG hold; if (n >= 0 && n < (int)g_workspaces.size()) { wantWs = n; wantWsName = g_workspaces[n]; } }
+            { LockG hold; if (n >= 0 && n < (int)g_workspaces.size()) { wantWs = n; } }
             if (wantWs < 0) return ctlErr("no workspace '" + wsArg + "' (ids are the indices `tree` reports)");
         } else if (!wsName.empty()) {
             std::wstring want = widen(wsName);
             { LockG hold;
               for (int w = 0; w < (int)g_workspaces.size(); w++)
-                  if (_wcsicmp(g_workspaces[w].c_str(), want.c_str()) == 0) { wantWs = w; wantWsName = g_workspaces[w]; break; } }
+                  if (_wcsicmp(g_workspaces[w].c_str(), want.c_str()) == 0) { wantWs = w; break; } }
             if (wantWs < 0) {
                 if (wsCreate != "true" && wsCreate != "1")
                     return ctlErr("no workspace named '" + wsName + "' (pass --create-workspace to make it)");
                 // `tree` walks this vector under g_lock; the index is taken under the SAME hold, or two
                 // concurrent creators both read the trailing size and are told the same number
-                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; wantWsName = want; }
+                { LockG hold; g_workspaces.push_back(want); wantWs = (int)g_workspaces.size() - 1; }
             }
         } else {
             std::string caller = req.get("args.caller");
             if (caller.empty()) caller = req.get("caller");
-            wantWs = callerWorkspace(caller, &wantWsName);   // -1 = fall through to the active workspace (step 3)
+            wantWs = callerWorkspace(caller);   // -1 = fall through to the active workspace (step 3)
+        }
+
+        workspace = g_workspaces.token(wantWs >= 0 ? wantWs : g_activeWs);
         }
 
         int cols, rows;
@@ -9980,48 +9982,10 @@ static std::string ctlDispatch(const std::string& line) {
         }
         if (namedProfile) { app = selectedProfile.command.c_str(); cargs = selectedProfile.args; }
         Session* s = newSession(cols, rows, app, cargs.empty() ? nullptr : &cargs,
-                                cwd.empty() ? nullptr : cwd.c_str());
+                                cwd.empty() ? nullptr : cwd.c_str(), false, false, workspace);
         if (!s) return ctlErr("create failed");
-        // tsvField: the name reaches the state file, where a tab or newline would forge a record.
-        if (!name.empty()) s->name = widen(tsvField(name));
-        // Re-checked under the lock for all three sources of wantWs (--workspace, a created
-        // --workspace-name, the caller's own). The INDEX is the answer and the name is only how a
-        // shift is detected: the index was resolved BEFORE the host round trip that made the
-        // session, and another client's workspace.delete erases a name and shifts every later index
-        // down under g_lock in between. Checking only the RANGE (r1) left the worse half —
-        // [A,B,C,D] with B deleted makes index 2 name D, so the session lands in a workspace nobody
-        // asked for (r2). Re-resolving by NAME FIRST was worse still, because nothing keeps names
-        // unique and the first match won (r3). So: the index if the name still sits there, else the
-        // nearest match, else the active workspace with a log line.
-        {
-            LockG hold;
-            if (wantWs >= 0) {
-                // The INDEX is the answer; the name only detects that it moved. Re-resolving by name
-                // first was worse than the range check it replaced: nothing keeps workspace names
-                // unique (`workspace new --name dev` twice, or a delete making the generated
-                // "workspace 3" repeat), so the first-match scan sent the session to a DIFFERENT
-                // workspace with the same name, deterministically and unlogged (revmux r3).
-                int found = -1;
-                if (wantWs < (int)g_workspaces.size() && g_workspaces[wantWs] == wantWsName)
-                    found = wantWs;                                  // nothing moved: the common path
-                else
-                    // It moved. Prefer the first match AT OR AFTER where it was; failing that the
-                    // NEAREST one below, because a delete shifts indices down by as little as one
-                    // and the first match in the list can be a different workspace that happens to
-                    // share the name — `[A, dev, X, dev]` with X deleted leaves the target at 2,
-                    // not at 1 (revmux r4).
-                    for (int w = 0; w < (int)g_workspaces.size(); w++)
-                        if (g_workspaces[w] == wantWsName) {
-                            if (found < 0 || w >= wantWs || w > found) found = w;
-                            if (w >= wantWs) break;
-                        }
-                if (found < 0)
-                    logWarn("session.new: workspace '%s' is gone (deleted or renamed) since it was resolved; the session lands in the active one instead",
-                            narrow(wantWsName).c_str());
-                s->ws = found >= 0 ? found
-                      : (g_activeWs >= 0 && g_activeWs < (int)g_workspaces.size() ? g_activeWs : 0);
-            }
-        }
+        // The attach publication already resolved the stable token, including deletion fallback.
+        { LockG hold; if (!name.empty()) s->name = widen(tsvField(name)); }
         selectPrimary(-1, false, s); // caller placement must not change active workspace
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return ctlOkStr(s->id);

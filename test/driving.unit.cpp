@@ -22,8 +22,9 @@ int main() {
     workspaces.erase(workspaces.begin() + 1);
     workspaces.push_back(L"renamed");
     check(workspaces.destination(destination) == 0 && workspaces.token(1) != destination, "deleted workspace falls back, not to a replacement with the same name/index");
+    const auto stillLive = workspaces.token(1);
     workspaces = std::vector<std::wstring>{L"duplicate", L"renamed"};
-    check(workspaces.index(destination) == -1, "whole catalog restore does not revive stale identities");
+    check(workspaces.index(stillLive) == -1, "whole catalog restore invalidates previously live identities");
     for (int from = 0; from < 3; ++from) for (int to = 0; to < 3; ++to) {
         WorkspaceNames reordered{L"a", L"b", L"c"};
         const auto moving = reordered.token(from);
