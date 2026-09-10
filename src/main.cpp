@@ -211,6 +211,22 @@ static const wchar_t* kInstKey       = L"Software\\agliteterm\\Instances";
 static const wchar_t* kLegacyProduct = L"agwinterm-lite";
 static const wchar_t* kLegacyRegKey  = L"Software\\agwinterm-lite";
 
+#include "test_registry.h"
+static std::wstring g_testCurrentKey, g_testLegacyKey, g_testInstancesKey, g_testHostAppId, g_testRun;
+static bool configureTestRegistry() {
+    wchar_t run[33]{};
+    SetLastError(ERROR_SUCCESS);
+    const DWORD size = GetEnvironmentVariableW(L"AGLITETERM_TEST_RUN", run, 33);
+    if (!size && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return true; // ordinary app unchanged
+    if (size != 32 || !lite_test_registry::paths(run, g_testCurrentKey, g_testLegacyKey, g_testInstancesKey)) return false;
+    kRegKey = g_testCurrentKey.c_str();
+    kLegacyRegKey = g_testLegacyKey.c_str();
+    kInstKey = g_testInstancesKey.c_str();
+    g_testHostAppId = L"agliteterm-test-" + std::wstring(run);
+    g_testRun = run;
+    return true;
+}
+
 /// The per-user state root. One helper, because the rename has to be paired with a migration and
 /// every caller must agree on where "old" and "new" live: sessions, the .bak generation, the log
 /// and the update payloads all sit here.
@@ -1608,8 +1624,9 @@ static HostHealth controlHandshake() {
 }
 
 static void connectControl() {
-    std::wstring control = std::wstring(kAppId) + L"-ptyhost";
-    std::wstring cmd = L"\"" + exeDir() + L"\\agwinterm-ptyhost.exe\" --pipe " + kAppId;
+    const std::wstring hostId = g_testHostAppId.empty() ? std::wstring(kAppId) : g_testHostAppId;
+    std::wstring control = hostId + L"-ptyhost";
+    std::wstring cmd = L"\"" + exeDir() + L"\\agwinterm-ptyhost.exe\" --pipe " + hostId;
     // At most ONE host is started per launch. The host serves its pipe with PIPE_UNLIMITED_INSTANCES,
     // so a second one can bind the same name and clients get split between them — sessions created
     // against host A are invisible to a client that lands on host B. Retrying is for waiting out a
@@ -2490,7 +2507,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     req.cmd.create.env_count = 7;
     setEnv(0, "AGWINTERM", "1");
     setEnv(1, "AGWINTERM_ENABLED", "1");
-    std::string pipeNarrow = g_argPipe.empty() ? narrow(kAppId) : narrow(g_argPipe);
+    std::string pipeNarrow = narrow(lite_test_registry::endpoint(g_testRun, g_argPipe.empty() ? std::wstring(kAppId) : g_argPipe));
     setEnv(2, "AGWINTERM_PIPE", pipeNarrow.c_str());
     setEnv(3, "AGWINTERM_SESSION_ID", idbuf);
     setEnv(4, "AGWINTERM_PANE_ID", idbuf);
@@ -11606,7 +11623,7 @@ static DWORD WINAPI ctlClientThread(void* param) {
 /// working through the rename. The agent skill and the hooks need no alias — they read
 /// AGWINTERM_PIPE, which sessions get with the new name.
 static DWORD WINAPI ctlServerThreadFor(void* arg) {
-    std::wstring pipeName = L"\\\\.\\pipe\\" + std::wstring((const wchar_t*)arg);
+    std::wstring pipeName = L"\\\\.\\pipe\\" + lite_test_registry::endpoint(g_testRun, (const wchar_t*)arg);
     for (;;) {
         HANDLE pipe = CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_DUPLEX,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -12217,6 +12234,8 @@ static void parseLaunchArgs() {
     }
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+    // Invalid test isolation must fail before any migration, instance registration or preference IO.
+    if (!configureTestRegistry()) return 2;
     _Module.Init(nullptr, inst);   // ATL/WTL module (window class registration lives here)
     parseLaunchArgs();
     if (g_argBenchAgbf) return agbfBench();   // headless pack benchmark, no window/session

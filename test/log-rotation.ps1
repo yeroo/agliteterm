@@ -11,6 +11,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -32,7 +34,7 @@ Set-Content -Path $log -Value ('x' * 1048600) -NoNewline     # just over 1 MiB
 $preSize = (Get-Item $log).Length
 Check 'seeded an oversized log' ($preSize -gt 1048576) "size=$preSize"
 
-$p = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 7
 Check 'rotated to .old' (Test-Path "$log.old") "$log.old"
 if (Test-Path "$log.old") { Check 'the .old copy holds the previous content' ((Get-Item "$log.old").Length -gt 1048576) }
@@ -41,13 +43,13 @@ Check 'a fresh log was started' ($new.Length -lt 10240) "size=$($new.Length)"
 Check 'the fresh log has the startup banner' ((Get-Content $log -Raw) -match 'starting')
 $p.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 3
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+if (-not $p.HasExited) { $p.Kill() }
 
 # --- per-instance isolation: two instances must not share a file -----------------------------
 $a = 'logiso1'; $b = 'logiso2'
 Remove-Item "$dir\agliteterm-$a.log", "$dir\agliteterm-$b.log", "$dir\sessions-$a.tsv", "$dir\sessions-$b.tsv" -ErrorAction SilentlyContinue
-$pa = Start-Process $Exe -ArgumentList @('--pipe', $a) -PassThru
-$pb = Start-Process $Exe -ArgumentList @('--pipe', $b) -PassThru
+$pa = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $a) -PassThru
+$pb = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $b) -PassThru
 Start-Sleep -Seconds 9
 Check 'instance A has its own log' (Test-Path "$dir\agliteterm-$a.log")
 Check 'instance B has its own log' (Test-Path "$dir\agliteterm-$b.log")
@@ -60,7 +62,7 @@ if ((Test-Path "$dir\agliteterm-$a.log") -and (Test-Path "$dir\agliteterm-$b.log
 foreach ($proc in @($pa, $pb)) {
     $proc.CloseMainWindow() | Out-Null
     Start-Sleep -Seconds 2
-    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    if (-not $proc.HasExited) { $proc.Kill() }
 }
 
 if ($fail) { "log-rotation: $fail FAILED"; exit 1 } else { "log-rotation: all passed"; exit 0 }

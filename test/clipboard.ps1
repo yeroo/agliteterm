@@ -21,6 +21,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -209,7 +211,7 @@ try {
 }
 finally {
     if ($p -and -not $p.HasExited) { $p.CloseMainWindow() | Out-Null; Start-Sleep 3 }
-    if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    if ($p -and -not $p.HasExited) { $p.Kill() }
     if ($savedClip) { Set-Clipboard -Value $savedClip }
     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
 }

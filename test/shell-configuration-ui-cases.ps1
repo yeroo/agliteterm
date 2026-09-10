@@ -2,7 +2,7 @@
 if(-not $script:selectionProc -or -not $clipboard){throw 'Shell configuration requires guarded fixture'}
 '-- P10b guarded shell configuration --'
 function Shell-Set([string]$Setting,[string]$Text,[string]$RegName,$ExpectedState,[switch]$OmpLive,[string]$Pane='active') {
-    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath))
     $prior=$script:selectionRegistry[$RegName].Expected
     try {
         Set-RegistryGuardValue $script:selectionRegistry $RegName $ExpectedState {

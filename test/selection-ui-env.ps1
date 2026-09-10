@@ -66,7 +66,7 @@ public static class SelectionUi {
 '@ }
 
 function Selection-Rpc([string]$cmd,[hashtable]$args_=@{},[string]$target='active',[switch]$AllowError) {
-    $client=[IO.Pipes.NamedPipeClientStream]::new('.',$script:selectionPipe,[IO.Pipes.PipeDirection]::InOut)
+    $client=[IO.Pipes.NamedPipeClientStream]::new('.',(Get-LiteTestPipe $script:selectionPipe),[IO.Pipes.PipeDirection]::InOut)
     try {
         $client.Connect(2000);$writer=[IO.StreamWriter]::new($client);$writer.AutoFlush=$true;$reader=[IO.StreamReader]::new($client)
         $writer.WriteLine((@{cmd=$cmd;target=$target;args=$args_}|ConvertTo-Json -Compress -Depth 10))
@@ -129,10 +129,10 @@ function Stop-SelectionSandbox {
         if(-not $script:selectionProc.WaitForExit(10000)){$script:selectionProc.Kill();if(-not $script:selectionProc.WaitForExit(5000)){throw 'Owned window did not exit'}}
     }
     foreach($owned in $script:selectionHosts){if(-not $owned.HasExited){
-        if(@(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'").Count){throw 'Other lite window exists; shared host retained'}
+        if(-not $env:AGLITETERM_TEST_RUN -and @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe'").Count){throw 'Other lite window exists; shared host retained'}
         $owned.Kill();if(-not $owned.WaitForExit(5000)){throw 'Owned host did not exit'}
     }}
-    if($script:selectionLaunched -and @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){
+    if($script:selectionLaunched -and -not $env:AGLITETERM_TEST_RUN -and @(Get-CimInstance Win32_Process -Filter "Name='agliteterm.exe' OR Name='agwinterm-ptyhost.exe'").Count){
         throw 'Lite/host residue remains after owned teardown; refusing to kill an unproven process or release the token'
     }
     $script:selectionProc=$null;$script:selectionHosts=@()
@@ -140,7 +140,7 @@ function Stop-SelectionSandbox {
     if($registryFault){throw "Registry conflict before window exit: $registryFault"}
 }
 function Set-SelectionRegistry([string]$Name,$State) {
-    $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\agliteterm')
+    $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath))
     try {
         Set-RegistryGuardValue $script:selectionRegistry $Name $State `
             {param($n) Read-RegistryGuardValue $key $n} `

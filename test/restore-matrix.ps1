@@ -21,6 +21,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 # agwintermctl exits nonzero while a pipe is still coming up, and Start-Lite polls it on purpose.
 # Pinned rather than assumed: with the native-command mapping on, that poll throws on its first
 # iteration and every cell fails for a reason that has nothing to do with restore.
@@ -105,7 +107,7 @@ function Wait-ScreenMarker([string]$Instance,[string]$Session,[string]$Marker,[i
 }
 
 function Start-Lite($inst) {
-    $p = Start-Process $Exe -ArgumentList @('--pipe', $inst) -PassThru
+    $p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $inst) -PassThru
     Register-OwnedWindow $p                   # the root of the proof for anything typed into its panes
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
@@ -223,7 +225,7 @@ function Cell {
     # A stop the ledger could not complete fails the cell: a PASS over a ping still running under a
     # dead shell would be the old sweep's lie with better manners.
     $tf = @(Take-TeardownFailures)
-    if ($tf.Count) { $ok = $false; $err = (@($err, "TEARDOWN INCOMPLETE: $($tf -join '; ')") | Where-Object { $_ }) -join ' | ' }
+    if ($tf.Count) { throw "TEARDOWN INCOMPLETE: $($tf -join '; '); no later cells may run" }
 
     if ($ok) {
         "  PASS  {0,-22} [{1}]" -f $Name, $after
@@ -598,7 +600,7 @@ function Restart-Cell {
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2; Stop-Owned-Relaunch $relays $inst $known }
     $script:teardownIncomplete += @(Take-TeardownFailures)
-    if ($script:teardownIncomplete.Count -and -not $err) { $err = "TEARDOWN INCOMPLETE: $($script:teardownIncomplete -join ', ')" }
+    if ($script:teardownIncomplete.Count) { throw "TEARDOWN INCOMPLETE: $($script:teardownIncomplete -join ', '); no later cells may run" }
 
     if (-not $err -and $after -eq $before -and (SessionCount $before) -ge 2) {
         "  PASS  {0,-22} [{1}]" -f $Name, $after
@@ -1257,7 +1259,7 @@ if ($cliHasP4) {
             $script:cellNotes += @(Stop-AllOwnedPings); Stop-Leftover $p; Stop-Leftover $p2
         }
         $tf = @(Take-TeardownFailures)
-        if ($tf.Count) { $ok = $false; $err = (@($err, "TEARDOWN INCOMPLETE: $($tf -join '; ')") | Where-Object { $_ }) -join ' | ' }
+        if ($tf.Count) { throw "TEARDOWN INCOMPLETE: $($tf -join '; '); no later cells may run" }
         if ($ok) { "  PASS  {0,-22} [{1}]" -f 'foreign-shell', $detail }
         else { $script:failed += 'foreign-shell'; "  FAIL  {0,-22}" -f 'foreign-shell'; if ($err) { "        error:  $err" }; "        detail: $detail" }
         $script:cellNotes | Select-Object -Unique

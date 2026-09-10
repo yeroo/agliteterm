@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/suite-context.ps1"
+Assert-LiteSuiteContext
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { "  PASS  $name" }
@@ -26,7 +28,7 @@ Remove-Item $log, "$log.old" -ErrorAction SilentlyContinue
 "== log-basics =="
 
 # --- 1. the log is created and carries the startup lines -------------------------------------
-$p = Start-Process $Exe -ArgumentList @('--pipe', $pipe) -PassThru
+$p = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', $pipe) -PassThru
 Start-Sleep -Seconds 7
 Check 'log file created' (Test-Path $log) $log
 $text = if (Test-Path $log) { Get-Content $log -Raw } else { '' }
@@ -41,14 +43,14 @@ Check 'readable while lite is running' $readable
 
 $p.CloseMainWindow() | Out-Null
 Start-Sleep -Seconds 3
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+if (-not $p.HasExited) { $p.Kill() }
 
 # --- 3. error case: an unwritable profile must not stop lite ----------------------------------
 # Point %LOCALAPPDATA% at a file (not a directory) so every path under it is unopenable. lite must
 # still start and serve the control pipe — logging degrades to a no-op, it is never fatal.
 $bogusRoot = Join-Path ([IO.Path]::GetTempPath()) ("lite-nolog-" + [Guid]::NewGuid().ToString('N'))
 Set-Content -Path $bogusRoot -Value 'not a directory'
-$p2 = Start-Process $Exe -ArgumentList @('--pipe', "$pipe-nolog") -PassThru -Environment @{ LOCALAPPDATA = $bogusRoot }
+$p2 = Start-Process $Exe -WindowStyle Hidden -ArgumentList @('--pipe', "$pipe-nolog") -PassThru -Environment @{ LOCALAPPDATA = $bogusRoot }
 Start-Sleep -Seconds 7
 $p2.Refresh()
 Check 'starts with an unwritable profile' (-not $p2.HasExited) "exit 0x$('{0:X8}' -f $(if ($p2.HasExited) { $p2.ExitCode } else { 0 }))"
@@ -61,7 +63,7 @@ if (-not $p2.HasExited) {
     } else { "  SKIP  still serves the control pipe (no agwintermctl)" }
     $p2.CloseMainWindow() | Out-Null
     Start-Sleep -Seconds 3
-    if (-not $p2.HasExited) { Stop-Process -Id $p2.Id -Force }
+    if (-not $p2.HasExited) { $p2.Kill() }
 }
 Remove-Item $bogusRoot -ErrorAction SilentlyContinue
 
