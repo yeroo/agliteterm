@@ -15,7 +15,7 @@ static void pruneDashboard() {
 static void selectRemainderSession(const std::string& id) {
     { LockG hold; const int at = indexOfSessionId(id);
       if (at < 0 || g_sessions[at]->hidden) return;
-      g_activeWs = g_sessions[at]->ws; g_pane[0] = at; g_focus = 0;
+      g_activeWs = g_sessions[at]->ws; g_pane[0] = at; setFocusedPane(0);
       g_sessions[at]->notifications = 0; touchMruLocked(g_sessions[at]); }
     syncSplitToPrimary(); refreshTree(); InvalidateRect(g_hwnd, nullptr, FALSE);
 }

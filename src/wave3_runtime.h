@@ -145,7 +145,7 @@ static void quickVisibility(const std::string& op,bool human){
     const bool show=op=="on"||(op=="toggle"&&!visible);
     if(!show){
         g_quickPinned=false;if(g_quickHwnd)ShowWindow(g_quickHwnd,SW_HIDE);
-        {LockG hold;if(g_focusOverride==g_quickSession)g_focusOverride=nullptr;}
+        {LockG hold;if(g_focusOverride==g_quickSession)setFocusOverride(nullptr);}
         return;
     }
     if(!g_quickHwnd){
