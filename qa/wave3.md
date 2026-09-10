@@ -21,6 +21,13 @@ including shared conformance and run-all -Strict. No release/tag/install.
 
 ## Candidate evidence
 
+Final confirmation was completed on 2026-09-10: revmux task `feat-p17-lite-wave3`,
+round `04-final-confirmation`, scope `baaac5b..ac4896a`, exit 0, both Codex reviewers
+reported with no degradation and no findings. Synthesis completed; verification had
+no findings to process. This closes the earlier unfinished review gate; it does not
+relabel those failed runs. Receipt: PR65 comment 5610410922. Final exact-head CI34408508506
+passed before merge `bc741988`, including Wave3 GUI110 and full guarded UI575 checks.
+
 - Lite `baaac5b`, CI34388447789: all strict checks passed; dedicated Wave3 GUI110
   and full guarded UI575 checks, both zero failures with verified cleanup.
 - Canonical companion PR272 merged as `49328bced2d28b8cd7c8db34d527d8486aa63ec0`.

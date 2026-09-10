@@ -231,6 +231,9 @@ gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
 
 - `session readonly on|off|toggle|state|get [--target ID]` blocks human keys, paste and reporting
   mouse events. API typing/writing and terminal replies still work; API paste explicitly refuses.
+- `session paste` refuses an observed exited/readonly target before clipboard access. Empty or
+  unavailable text returns `nothing to paste`; `pasted` means input was handed off without a
+  synchronous error, not proof of application execution. Partial/failed writes refuse; do not retry blindly.
   The flag is per surface and resets on restart. Status shows READ-ONLY; the Edit/palette toggle
   has an unbound `Key_ReadOnly` binding.
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.

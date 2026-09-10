@@ -37,12 +37,12 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
-      # Fetch/build above may stage a release-era CLI. Stage the P16 source-pinned CLI LAST.
+      # Fetch/build above may stage a release-era CLI. Stage the source-pinned CLI LAST.
       - name: Checkout the shared Wave 3 CLI
         uses: actions/checkout@v4
         with:
           repository: yeroo/agwinterm
-          ref: 7af9b0751aa73dc9e79b7e3de593e50bea76b331
+          ref: f2700ad8fbbc0f18a9afe6921c42bb768b3d5931
           path: .ci-full-cli
 
       - name: Setup shared CLI SDK
@@ -63,7 +63,8 @@ jobs:
       # rather than passing quietly.
       - name: Check the contract against agwinterm
         shell: pwsh
-        run: ./tools/check-contract.ps1
+        # Bootstrap only: remove -Url after agwinterm #273 merges, then require fresh CI.
+        run: ./tools/check-contract.ps1 -Url https://raw.githubusercontent.com/yeroo/agwinterm/f2700ad8fbbc0f18a9afe6921c42bb768b3d5931/tests/conformance/control-api.json
 
       - name: Wave 3 acceptance (guarded disposable desktop)
         shell: pwsh

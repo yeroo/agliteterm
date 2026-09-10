@@ -11,6 +11,26 @@ function Send-Raw([string]$json){
 function Nodes { @((Selection-Rpc 'tree').workspaces | ForEach-Object {$_.sessions}) }
 . "$PSScriptRoot/driving-cases.ps1"
 
+# A private one-line sink: success proves payload delivery, never shell execution of that payload.
+$pasteFile=Join-Path $script:selectionArtifact 'paste-sink.txt'
+$pasteCommand="[Console]::WriteLine('STABILIZE-'+'PASTE-READY'); `$line=[Console]::ReadLine(); [IO.File]::WriteAllText('"+$pasteFile.Replace("'","''")+"',`$line); [Environment]::Exit(0)"
+$pasteId=[string](Selection-Rpc 'session.new' @{name='paste-sink';command=$pasteCommand})
+try {
+    if(-not (P9WaitText $pasteId 'STABILIZE-PASTE-READY')){throw 'Paste sink not ready'}
+    Write-SelectionClipboardMarker $clipboard ''
+    $beforePaste=[Agwinterm.Win32ControlTest.ClipboardGuard]::Api.Sequence()
+    Check 'empty clipboard returns nothing to paste' ((Selection-Rpc 'session.paste' @{} $pasteId)-eq 'nothing to paste')
+    Check 'empty paste leaves clipboard generation unchanged' ([Agwinterm.Win32ControlTest.ClipboardGuard]::Api.Sequence()-eq $beforePaste)
+    Check 'live paste reports accepted input' ((Selection-Rpc 'session.paste' @{text="Safe-Paste-Payload`r`n"} $pasteId)-eq 'pasted')
+    $deadline=[DateTime]::UtcNow.AddSeconds(8)
+    do {if((P9Node $pasteId).exited){break};Start-Sleep -Milliseconds 50} while([DateTime]::UtcNow-lt $deadline)
+    Check 'paste sink received exactly one normalized line' ((Test-Path $pasteFile) -and (Get-Content $pasteFile -Raw)-ceq 'Safe-Paste-Payload')
+    Check 'paste sink exit observed' ([bool](P9Node $pasteId).exited)
+    $r=Selection-Rpc 'session.paste' @{} $pasteId -AllowError
+    Check 'exited pane refuses before clipboard fallback' (-not $r.ok -and $r.error-eq "the pane's process has exited")
+    Check 'refused paste leaves clipboard generation unchanged' ([Agwinterm.Win32ControlTest.ClipboardGuard]::Api.Sequence()-eq $beforePaste)
+} finally {Selection-Rpc 'session.close' @{} $pasteId -AllowError|Out-Null}
+
 # Geometry refusal has an observable before/after ratio, not just an error string.
 $id=[string](Selection-Rpc 'session.new' @{name='P9-geometry'})
 Selection-Rpc 'session.select' @{} $id | Out-Null

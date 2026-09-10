@@ -10950,8 +10950,8 @@ static std::string ctlDispatch(const std::string& line) {
         // with a higher stamp, which can land moments later — even before this reply is sent — so
         // neither "the checkpoint is not on disk" nor a prediction about the next restart is a
         // claim the verb can stand behind (revmux r2 of #28, lite #29, and its round 1).
-        bool onDisk = saveSessionState();
-        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        bool onDisk = written == 0 || saveSessionState();
+        if (written != 0) PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         if (!onDisk)
             return ctlErr("restore capture: " + std::to_string(written) + " pane(s) were captured into memory but the state "
                           "file could not be written (see the log) — this save did not put the checkpoint on disk. "
@@ -11253,6 +11253,7 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (target->readOnly) return ctlErr("session paste: '" + target->paneId + "' is read-only; nothing pasted");
+            if (target->exited) return ctlErr("the pane's process has exited");
         }
         std::string text = req.get("args.text");
         if (text.empty() && OpenClipboard(nullptr)) {   // no text -> clipboard contents
@@ -11264,16 +11265,21 @@ static std::string ctlDispatch(const std::string& line) {
         // Same normalisation + bracketing as Ctrl+V (the main app shares one PasteTextInto for both);
         // this used to map \n -> \r WITHOUT collapsing CRLF, so clipboard text arrived as \r\r.
         text = pasteNormalize(std::move(text));
-        if (!text.empty() && target->data != INVALID_HANDLE_VALUE) {
-            FfiEmuInfo pinfo{};
-            EnterCriticalSection(&g_lock);
-            emu_info(target->emu, &pinfo);
-            LeaveCriticalSection(&g_lock);
-            if (pinfo.bracketedPaste) text = "\x1b[200~" + text + "\x1b[201~";
-            if (ovIo(target->data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
-                return ctlErr("session paste: input reserved or write failed/partial; shell outcome unknown");
+        if (text.empty()) return ctlOkStr("nothing to paste");
+        HANDLE data = INVALID_HANDLE_VALUE;
+        FfiEmuInfo pinfo{};
+        {
+            LockG hold;
+            if (indexOfSession(target) < 0) return ctlErr("session not found");
+            if (target->readOnly) return ctlErr("session paste: '" + target->paneId + "' is read-only; nothing pasted");
+            if (target->exited) return ctlErr("the pane's process has exited");
+            data = target->data;
+            if (data == INVALID_HANDLE_VALUE) return ctlErr("session paste: pane has no live input");
+            if (!emu_info(target->emu, &pinfo)) return ctlErr("session paste: pane state unavailable; nothing pasted");
         }
-        else return ctlErr(text.empty() ? "session paste: no text available; nothing pasted" : "session paste: pane has no live input");
+        if (pinfo.bracketedPaste) text = "\x1b[200~" + text + "\x1b[201~";
+        if (ovIo(data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
+            return ctlErr("session paste: input reserved or write failed/partial; shell outcome unknown");
         return ctlOkStr("pasted");
     }
     if (cmd == "session.go") {   // dir: next|prev|first|last|next-attention|prev-attention
@@ -12111,7 +12117,10 @@ static bool restoreSessions() {
     // it up. Set before resolveSplitForPrimary / syncPaneSizes below, which read it through paneRect.
     int layoutsSet = 0;
     for (const auto& ls : ps.layouts) {
-        if (ls.owner < 0 || ls.owner >= (int)bySpec.size() || !bySpec[ls.owner]) continue;
+        if (ls.owner < 0 || ls.owner >= (int)bySpec.size() || !bySpec[ls.owner]) {
+            logWarn("restore: layout for owner index %d dropped - its session was not restored", ls.owner);
+            continue;
+        }
         Session* owner = bySpec[ls.owner];
         if (splitOf[ls.owner]) {
             LockG hold;
