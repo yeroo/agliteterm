@@ -7253,11 +7253,13 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
     if (g_overlayHwnd) { g_overlayReplacing = true; DestroyWindow(g_overlayHwnd); g_overlayReplacing = false; }
     setLastOverlayExit("no overlay");   // kOverlayNone's word (the P5 block, declared after this); again, for a by-hand caller
     int W, H; overlayOuterSize(overlayFraction(sizePct), W, H);
-    g_overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
+    const auto overlayHwnd = createPopupWindowPx(L"agliteterm — overlay", W, H);
+    { LockG hold; g_overlayHwnd = overlayHwnd; }
     RECT rc; GetClientRect(g_overlayHwnd, &rc);
     int cols = max(1, (int)(rc.right / g_cw)), rows = max(1, (int)(rc.bottom / g_ch));
     std::vector<std::string> cargs{ "-NoExit", "-Command", commandLine };   // one wrapper for both slots
-    g_overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
+    auto* overlaySession = newSession(cols, rows, "powershell.exe", &cargs, nullptr, false, true);
+    { LockG hold; g_overlaySession = overlaySession; }
     if (!g_overlaySession) {
         logWarn("overlay: the session for '%s' could not be created; the popup was not shown", command.c_str());
         DestroyWindow(g_overlayHwnd);   // WM_DESTROY clears g_overlayHwnd; a later `resize` is refused truthfully
@@ -10546,8 +10548,8 @@ static std::string ctlDispatch(const std::string& line) {
             if (indexOfSession(target) < 0) return ctlErr("session not found");
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("status", target->id, "set"));
             setStatus(target, st); // membership and status update share g_lock -> g_statusLock order
+            emitEvent("status", target->id, st); // publish in state-write order; id can change on promotion
         }
-        emitEvent("status", target->id, st);
         InvalidateRect(g_hwnd, nullptr, FALSE);
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // update the tree's status label
         return ctlOkStr("status set");

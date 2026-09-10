@@ -24,3 +24,12 @@ $ioExe=Join-Path $out 'input-ownership-unit.exe'
 if($LASTEXITCODE-ne 0){throw 'Input ownership fixture compile failed'}
 & $ioExe
 if($LASTEXITCODE-ne 0){throw 'Input ownership fixture failed'}
+$status=[regex]::Match($main,'(?ms)^    if \(cmd == "session.status"\) \{.*?(?=^    if \(cmd == "session.close"\))')
+if(-not $status.Success){throw 'Actual status branch missing'}
+$statusCpp=Join-Path $out 'status-ownership-unit.cpp'
+[IO.File]::WriteAllText($statusCpp,(Get-Content "$PSScriptRoot/status-ownership.unit.cpp" -Raw).Replace('// ACTUAL_STATUS_BRANCH',$status.Value))
+$statusExe=Join-Path $out 'status-ownership-unit.exe'
+& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /std:c++17 /EHsc /W4 /utf-8 `"$statusCpp`" /Fe:`"$statusExe`" /Fo:`"$out/status-ownership-unit.obj`""
+if($LASTEXITCODE-ne 0){throw 'Status ownership fixture compile failed'}
+& $statusExe
+if($LASTEXITCODE-ne 0){throw 'Status ownership fixture failed'}
