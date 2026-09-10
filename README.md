@@ -125,8 +125,9 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   row, no session line in the state file) is refused. `restore capture [--target ID]` captures the foreground command
   of every real pane, or of the one named, into a per-pane slot (the newest child of the pane's
   shell that is not a shell or prompt helper: the full app's default denylist, fixed in lite),
-  **saves before it answers**, and reports per pane — `null` when the shell had nothing but a
+  **saves before it answers when at least one slot is replaced**, and reports per pane — `null` when the shell had nothing but a
   shell running, and null is written too, so a fresh capture replaces an older checkpoint. The
+  zero-landed call (all snapshotted targets closed during the query) is a no-op without a save or refresh. The
   slots read back as `capturedCommands` from `tree --json`, keyed by pane id, and persist as a
   `K` line (lossless `K2` for tabs/newlines). Its `replayOnRestore` reports the **default-off `restore-commands` setting**. With opt-in,
   fresh restored shells can replay K; bindings B win over pins R, which win over K. Adopted, closed,
@@ -231,6 +232,10 @@ gh attestation verify agliteterm-setup-<version>.exe --repo yeroo/agliteterm
 
 - `session readonly on|off|toggle|state|get [--target ID]` blocks human keys, paste and reporting
   mouse events. API typing/writing and terminal replies still work; API paste explicitly refuses.
+- `session paste` refuses an observed exited/readonly target before clipboard access.
+  Unterminated or odd-sized UTF-16 clipboard blocks, and blocks larger than 16 MiB, are unavailable.
+  Empty or unavailable text returns `nothing to paste`; `pasted` means input was handed off without a
+  synchronous error, not proof of application execution. Partial/failed writes refuse; do not retry blindly.
   The flag is per surface and resets on restart. Status shows READ-ONLY; the Edit/palette toggle
   has an unbound `Key_ReadOnly` binding.
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.

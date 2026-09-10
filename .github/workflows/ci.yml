@@ -37,12 +37,12 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
-      # Fetch/build above may stage a release-era CLI. Stage the P16 source-pinned CLI LAST.
+      # Fetch/build above may stage a release-era CLI. Stage the source-pinned CLI LAST.
       - name: Checkout the shared Wave 3 CLI
         uses: actions/checkout@v4
         with:
           repository: yeroo/agwinterm
-          ref: 7af9b0751aa73dc9e79b7e3de593e50bea76b331
+          ref: c10d153351011b0399f78fcaacaeb351f2e18fd7
           path: .ci-full-cli
 
       - name: Setup shared CLI SDK

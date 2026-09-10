@@ -2655,12 +2655,10 @@ try {
         Start-Sleep -Milliseconds 300
         Check 'flag clear --target <overlay id> is not refused: it takes no target and unflags every session' ([bool]$r.ok -and [string]$r.result -eq 'cleared' -and -not [bool](Node $aid).flagged) "raw: $raw, flagged $((Node $aid).flagged)"
         if ($flag0) { Send-Ctl $s @('session', 'flag', 'on', '--target', $aid) | Out-Null }
-        # `lines` past int range: the CLI refuses it as not a whole number (its own int32 parse —
-        # the sentence is the CLI's and is wrong about a valid whole number: agwinterm #254, lite
-        # #42; this pins what the CLI does today, not that it is right); a raw client's number
-        # saturates to "everything" on the server — neither wraps to a small N.
+        # CLI and raw counts both saturate without wrapping or calling a valid integer malformed.
         $raw = Send-Ctl $s @('session', 'text', '--lines', '99999999999', '--target', $sp9)
-        Check '--lines 99999999999 is refused by the CLI, nothing sent' ($raw -match [regex]::Escape((LinesRefusal '99999999999')) -and -not ($raw -match '"ok"')) "raw: $raw"
+        $r = ConvertFrom-Json $raw
+        Check '--lines 99999999999 saturates through the CLI' ([bool]$r.ok -and [string]$r.result -eq (Get-PaneText $s $sp9)) "raw: $raw"
         $raw = RawText $sp9 '"lines":99999999999'; $r = ConvertFrom-Json $raw
         Check 'a raw lines 99999999999 (past int range) is the whole buffer, not a wrapped small count' ([bool]$r.ok -and [string]$r.result -eq (Get-PaneText $s $sp9)) "raw: $raw"
         # ---- a layout change regrids the overlay (r1: the sizing line was untested) ----
