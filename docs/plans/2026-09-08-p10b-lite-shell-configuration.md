@@ -58,13 +58,14 @@ Discover installed `.omp.json` files with deterministic case-insensitive names a
 priority. Name or explicit existing local path resolves without running content. Reject newline/NUL
 in inputs; quote paths as PowerShell literals. No network or theme execution during list/validation.
 Live initialization requires an exact PowerShell executable identity, a live writable pane, and a
-known shell-ready state; do not type into a running child or an unfinished draft. Since terminal
-marks do not expose the shell's edit buffer, live set is conservatively restricted to fresh panes
-with no prior input. The guard is sticky across commands; adopted panes also refuse. Configuring
-future shells remains available. Broader live switching needs shell-side empty-buffer confirmation.
-Say initialization was written/requested,
-not successfully applied. Check synchronous write length. Persist only when requested; report any
-partial outcome if a write or persistence fails. Persisted theme applies only to eligible fresh
+known shell-ready state; do not type into a running child or an unfinished draft. The post-P17
+implementation uses stock PSReadLine 2.2.6–2.x in PowerShell 7 to confirm an empty buffer on idle,
+then claims a bounded, one-use authorization. Completed input and completed switches are allowed;
+adopted and unsupported readers refuse. Configuring future shells remains available.
+Success means the native initializer and generated code completed, not merely that input was written.
+An overdue claimed request is unknown and must not be automatically replayed; late native output
+is not evaluated. Persist only on timely success with unchanged pane policy and saved configuration;
+report partial application if persistence fails. Persisted theme applies only to eligible fresh
 implicit PowerShell prompt setup, not adopted shells or explicit arbitrary profile args.
 
 ## Gates

@@ -1,4 +1,5 @@
 # Per-process launch integration, never installed into or written to a user profile.
+$global:__aglitePromptAsset=$PSCommandPath
 if(-not $global:__agliteBridgeToken){$global:__agliteBridgeToken=[guid]::NewGuid().ToString('D')}
 if(-not ('AgLitePromptConsole' -as [type])){
     Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class AgLitePromptConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetConsoleProcessList([Out] uint[] processes, uint count); }'
@@ -72,6 +73,11 @@ if(-not $global:__agwLiteReadLine){
     # Preserve an existing function, including custom readers. Unsupported aliases/scripts are
     # left untouched and never register a restart capability.
     if($reader -is [Management.Automation.FunctionInfo]){
+        # Only the stock module's reader has the audited OnIdle/current-runspace contract.
+        # Custom readers and older PSReadLine are preserved behind this wrapper, without live OMP.
+        $global:__agliteOmpSupported=($PSVersionTable.PSVersion.Major-ge 7 -and $reader.ModuleName-eq 'PSReadLine' -and
+            $reader.Module.Version-ge [version]'2.2.6' -and $reader.Module.Version-lt [version]'3.0')
+        if($global:__agliteOmpSupported){. (Join-Path $PSScriptRoot 'agliteterm-omp.ps1')}
         $global:__agwLiteReadLine=$reader.ScriptBlock
         function global:PSConsoleHostReadLine {
             $priorStatus=$? # first statement, as in stock PSReadLine's lastRunStatus capture
@@ -80,11 +86,15 @@ if(-not $global:__agwLiteReadLine){
             # Return to the host's normal command pipeline, never execute inside prompt/readline.
             # A Ctrl+C that ends a resumed native agent must not cancel an enclosing prompt loop.
             if($resume){return $resume}
+            if($global:__agliteOmpSupported){$null=Invoke-AgLiteOmpRequest 'omp-ready' @{reader='psreadline-idle-v1'}}
             # $? is read-only. An ignored nonterminating cmdlet error restores false without
             # adding to $Error, emitting an error record, or touching $LASTEXITCODE. No native
             # command or private reflection is used; the next statement is the delegated reader.
-            if(-not $priorStatus){Microsoft.PowerShell.Utility\Write-Error 'Restore prior readline status' -ErrorAction Ignore}
-            & $global:__agwLiteReadLine @args
+            $global:__agliteOmpReading=$global:__agliteOmpSupported
+            try {
+                if(-not $priorStatus){Microsoft.PowerShell.Utility\Write-Error 'Restore prior readline status' -ErrorAction Ignore}
+                & $global:__agwLiteReadLine @args
+            } finally {$global:__agliteOmpReading=$false}
         }
     }
 }

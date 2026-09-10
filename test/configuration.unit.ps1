@@ -14,3 +14,6 @@ $compile = "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /nologo /EHsc /W4 /utf
 if ($LASTEXITCODE -ne 0) { throw 'configuration unit compile failed' }
 & $testExe
 if ($LASTEXITCODE -ne 0) { throw 'configuration unit checks failed' }
+& "$PSScriptRoot/omp-discovery.unit.ps1" -Strict:$Strict
+& "$PSScriptRoot/omp-protocol.unit.ps1" -Strict:$Strict
+& "$PSScriptRoot/omp-shell.unit.ps1" -Strict:$Strict
