@@ -2777,6 +2777,9 @@ try {
         function Selection([string]$op, [string]$id = 'active') {
             if($op-in @('copy','finalize')){
                 $expectedSelectionText=[string](Get-CtlResult $s @('session','copy','--target',$id))
+                # session.copy exposes raw cells, including blank rows. selection.copy/finalize
+                # intentionally make no clipboard write for CR/LF/ASCII-space-only selections.
+                if($expectedSelectionText-cnotmatch '[^\r\n ]'){$expectedSelectionText=''}
                 $capture=@{Reply=$null}
                 Honesty-Copy { $capture.Reply=ConvertFrom-Json (Send-Ctl $s @('selection',$op,'--target',$id)) } { $expectedSelectionText }.GetNewClosure()
                 return $capture.Reply

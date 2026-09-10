@@ -54,6 +54,8 @@ function python {
             'acquire-not-held' {$receipt.held=$false}
             'acquire-worktree' {$receipt.worktree=Join-Path $root 'other'}
             'acquire-status-conflict' {$global:LASTEXITCODE=1}
+            'conflict-raw-fail' {$global:LASTEXITCODE=1}
+            'conflict-receipt-fail' {$global:LASTEXITCODE=1}
         }
         return $receipt|ConvertTo-Json -Compress
     }
@@ -75,7 +77,8 @@ function python {
 function Set-Content {
     [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$Value,[string]$LiteralPath)
     process{
-        if([IO.Path]::GetFileName($LiteralPath)-ceq 'lease.json'){[SuiteFake]::Note('receipt');if($Case-eq 'receipt-fail'){throw 'injected receipt failure'}}
+        if([IO.Path]::GetFileName($LiteralPath)-ceq 'lease.json'){[SuiteFake]::Note('receipt');if($Case-in 'receipt-fail','conflict-receipt-fail'){throw 'injected receipt failure'}}
+        if([IO.Path]::GetFileName($LiteralPath)-ceq 'acquisition.raw.json' -and $Case-in 'raw-artifact-fail','conflict-raw-fail'){throw 'injected raw evidence failure'}
         if([IO.Path]::GetFileName($LiteralPath)-ceq 'release.json' -and $Case-eq 'release-artifact-fail'){throw 'injected release artifact failure'}
         Microsoft.PowerShell.Management\Set-Content -LiteralPath $LiteralPath -Value $Value
     }

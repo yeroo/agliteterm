@@ -21,7 +21,10 @@ $cases=@(
     @{name='acquire-fail';code=1;start=0;release=0;delete=0},
     @{name='acquire-malformed';code=2;start=0;release=0;delete=0},
     @{name='acquire-empty';code=2;start=0;release=0;delete=0},
-    @{name='receipt-fail';code=1;start=0;release=1;delete=0}
+    @{name='receipt-fail';code=1;start=0;release=1;delete=0},
+    @{name='raw-artifact-fail';code=1;start=0;release=1;delete=0},
+    @{name='conflict-raw-fail';code=1;start=0;release=1;delete=0},
+    @{name='conflict-receipt-fail';code=1;start=0;release=1;delete=0}
 )
 foreach($name in 'acquire-incomplete','acquire-owner','acquire-run','acquire-token','acquire-generation','acquire-generation-type','acquire-not-held','acquire-worktree','acquire-status-conflict'){
     $cases+=@{name=$name;code=2;start=0;release=0;delete=0}
@@ -43,7 +46,8 @@ foreach($case in $cases){
            @($calls|Where-Object {$_-eq 'release'}).Count-ne $case.release -or @($calls|Where-Object {$_-eq 'delete-key'}).Count-ne $case.delete){throw "Wrong supervisor result $($case.name): exit=$($child.ExitCode); calls=$calls; stdout=$($stdout.Result); stderr=$($stderr.Result)"}
         if($case.start -and ($calls.IndexOf('receipt')-lt 0 -or $calls.IndexOf('receipt')-gt $calls.IndexOf('create-key'))){throw 'Mutation preceded receipt'}
         $rawReceipt=@(Get-ChildItem -LiteralPath $dir -Recurse -Filter acquisition.raw.json)
-        if($rawReceipt.Count-ne 1){throw 'Acquisition raw response was not retained'}
+        $expectedRaw=if($case.name-in 'raw-artifact-fail','conflict-raw-fail'){0}else{1}
+        if($rawReceipt.Count-ne $expectedRaw){throw 'Wrong acquisition raw response persistence'}
         if($case.name-eq 'acquire-status-conflict'){
             $savedReceipt=@(Get-ChildItem -LiteralPath $dir -Recurse -Filter lease.json)
             if($savedReceipt.Count-ne 1 -or $calls.IndexOf('receipt')-lt 0){throw 'Conflicting status discarded the release receipt'}

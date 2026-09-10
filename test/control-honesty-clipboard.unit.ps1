@@ -12,13 +12,16 @@ foreach($name in 'Selection','Honesty-Copy'){
 function Invoke-SelectionClipboardCopy($Ledger,[scriptblock]$Action,[scriptblock]$Expected,[Func[bool]]$Owner){
     & $Action|Out-Null
     $actual=[string](& $Expected)
-    if($actual-cne $script:wanted){throw "Clipboard expectation shadowed: [$actual] instead of [$script:wanted]"}
+    if($actual-cne $script:expectedText){throw "Clipboard expectation wrong: [$actual] instead of [$script:expectedText]"}
 }
 function Get-CtlResult($S,$Argv){return $script:wanted}
 function Send-Ctl($S,$Argv){return '{"ok":true,"result":"fixture result"}'}
 $s=$null;$honestyClipboard=$null;$checks=0
-foreach($text in '', 'exact nonempty selection'){foreach($op in 'copy','finalize'){
-    $script:wanted=$text
+foreach($case in @(@{raw='';expected=''},@{raw='exact nonempty selection';expected='exact nonempty selection'},
+                  @{raw=" `r`n  `n";expected=''},@{raw="`t";expected="`t"},
+                  @{raw=[string][char]0xA0;expected=[string][char]0xA0},@{raw=" text `r`n";expected=" text `r`n"})){
+foreach($op in 'copy','finalize'){
+    $script:wanted=$case.raw;$script:expectedText=$case.expected
     $reply=Selection $op 'private-fixture-id'
     if(-not $reply.ok -or $reply.result-cne 'fixture result'){throw 'Selection action reply was lost'}
     $checks++

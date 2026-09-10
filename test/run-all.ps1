@@ -23,7 +23,6 @@ try {
         try{
             $raw=& python $hub acquire --owner $TokenOwner --run ('lite-suite-'+$run) --worktree $root --holder-pid $PID --purpose 'Owned isolated Lite integration suites'
             $acquireExit=$LASTEXITCODE
-            $raw|Set-Content -LiteralPath (Join-Path $artifact 'acquisition.raw.json')
             $state=$raw|ConvertFrom-Json
             if($state.ok-isnot [bool]){throw 'Malformed canonical acquisition response'}
             if($state.ok){
@@ -37,9 +36,17 @@ try {
                     throw 'Incomplete or mismatched canonical acquisition receipt; do not launch'
                 }
             }
-        }catch{$cleanup=$false;throw} # helper may have acquired; an unreadable receipt is not proof of no lease
+        }catch{
+            $cleanup=$false # malformed identity cannot authorize release; retain evidence if storage permits
+            try{$raw|Set-Content -LiteralPath (Join-Path $artifact 'acquisition.raw.json')}catch{}
+            throw
+        }
+        # Establish ownership in memory before ANY fallible artifact write. A storage failure
+        # before launch then releases this valid unused lease from finally instead of losing it.
+        if($state.ok){$lease=$state}
+        $raw|Set-Content -LiteralPath (Join-Path $artifact 'acquisition.raw.json')
         if(-not $state.ok){throw "Suite token unavailable: $raw"}
-        $lease=$state;$receipt=Join-Path $artifact 'lease.json'
+        $receipt=Join-Path $artifact 'lease.json'
         $lease|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $receipt
         # A complete receipt can be the only supported recovery handle. Preserve it before
         # classifying contradictory process status; retain the lease without launching/releasing.
