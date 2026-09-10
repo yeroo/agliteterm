@@ -29,6 +29,7 @@
 #endif
 #include <algorithm>    // std::stable_sort (command-palette ranking)
 #include "workspace_identity.h"
+#include "session_command.h"
 #include <cmath>
 #include <cerrno>
 #include <climits>
@@ -2513,7 +2514,7 @@ static void selectPrimary(int idx, bool activateWorkspace = true, Session* expec
 
 static Session* newSession(int cols, int rows, const char* app = nullptr,
                            const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false,
-                           uint64_t workspace = 0) {
+                           uint64_t workspace = 0, bool explicitCommand = false) {
     { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     profiles::Entry defaultProfile;
     if (!app) {
@@ -2550,7 +2551,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
                      "starting in the default directory instead", strlen(cwd), sizeof agwinterm_ptyhost_Create::cwd - 1);
     }
     std::string enc;
-    if (pargs && !pargs->empty()) {                     // explicit profile args -> run app + args as-is
+    if (pargs && (explicitCommand || !pargs->empty())) { // explicit command args, including zero, are exact
         // The wire holds 16 args (proto/ptyhost.options). The old cap of 4 silently rewrote the
         // command line of any profile with more than four — saved in full, relaunched truncated.
         const int kMaxArgs = (int)(sizeof agwinterm_ptyhost_Create::args / sizeof agwinterm_ptyhost_Create::args[0]);
@@ -9202,11 +9203,19 @@ agwintermctl session status idle        # done
 
 ## Run something in a session
 
-One call creates the session, names it, and runs the command as its shell:
+One call creates the session, names it, and runs PowerShell code with an interactive prompt afterward:
 
 ```
 agwintermctl session new --name build --command "npm test" --cwd C:\src\app
 ```
+
+`--command-mode direct` launches executable + arguments with Windows quoting and no added shell.
+Use a matching updated `agwintermctl`; older clients do not send this option. Direct mode refuses
+`--wait`. In default PowerShell mode `--wait` leaves the same interactive prompt open; explicit
+`exit` ends PowerShell. An exited standalone pane retains output but accepts no further input.
+A mode or `--wait` requires a nonempty command; command and `--profile` are mutually exclusive.
+Both products refuse oversized launches: 259 UTF-8 bytes for the executable, 16 arguments,
+2047 UTF-8 bytes each. Use a `.ps1` helper for longer startup sequences.
 
 **A bare `session new` lands in YOUR workspace** - the one holding the pane whose
 `AGWINTERM_SESSION_ID` the CLI sends as the caller - not in whichever workspace happens to be
@@ -10064,8 +10073,24 @@ static std::string ctlDispatch(const std::string& line) {
         std::string command = req.get("args.command");
         profiles::Entry selectedProfile;
         const bool namedProfile = req.fields.count("args.profile") != 0;
+        bool hasMode = false;
+        std::string mode;
+        try {
+            const auto root = wave3::parse(line);
+            if (const auto* args = wave3::field(root, "args")) {
+                if (const auto* value = wave3::field(*args, "command-mode")) {
+                    if (value->kind != wave3::Value::String)
+                        return ctlErr("session.new: command-mode must be powershell or direct; nothing created");
+                    hasMode = true; mode = value->text;
+                }
+            }
+        } catch (const std::exception& ex) { return ctlErr(ex.what()); }
+        const auto wait = req.get("args.wait");
+        session_command::Launch launch;
+        std::string launchError;
+        if (!session_command::create(command, hasMode ? &mode : nullptr, wait == "true" || wait == "1",
+                                     namedProfile, launch, launchError)) return ctlErr(launchError);
         if (namedProfile) {
-            if (!command.empty()) return ctlErr("session.new: command and profile are mutually exclusive; nothing created");
             const auto catalog = profileSnapshot();
             const auto* selected = catalog.find(req.get("args.profile"));
             if (!selected) return ctlErr("session.new: profile not found; nothing created");
@@ -10133,17 +10158,12 @@ static std::string ctlDispatch(const std::string& line) {
 
         // --command runs it as the session's shell, which is the whole point: the caller wants the
         // command RUNNING, not typed into a prompt that may not be ready to receive it yet.
-        std::vector<std::string> cargs;
-        const char* app = nullptr;
-        if (!command.empty()) {
-            app = "powershell.exe";
-            cargs.push_back("-NoExit");     // keep the pane alive after it finishes, like the full app
-            cargs.push_back("-Command");
-            cargs.push_back(command);
-        }
+        auto cargs = launch.args;
+        const bool explicitCommand = !launch.app.empty();
+        const char* app = explicitCommand ? launch.app.c_str() : nullptr;
         if (namedProfile) { app = selectedProfile.command.c_str(); cargs = selectedProfile.args; }
-        Session* s = newSession(cols, rows, app, cargs.empty() ? nullptr : &cargs,
-                                cwd.empty() ? nullptr : cwd.c_str(), false, false, workspace);
+        Session* s = newSession(cols, rows, app, explicitCommand || !cargs.empty() ? &cargs : nullptr,
+                                cwd.empty() ? nullptr : cwd.c_str(), false, false, workspace, explicitCommand);
         if (!s) return ctlErr("create failed");
         // The attach publication already resolved the stable token, including deletion fallback.
         { LockG hold; if (!name.empty()) s->name = widen(tsvField(name)); }

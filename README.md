@@ -502,3 +502,9 @@ one, before any pipe is opened) and SKIPs on an older one
 (`-Strict` turns that into a failure, which is the release gate). To run them all, point `$env:AGWINTERMCTL` at an agwinterm
 dev build: `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
 
+
+### Session command launching
+
+`session new --command` runs PowerShell code and leaves an interactive prompt in both terminals.
+Use `--command-mode direct` for executable + arguments without a shell.
+See [command launching and migration](docs/session-commands.md), including `--wait` and portable workbench scripts.
