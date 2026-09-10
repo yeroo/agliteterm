@@ -1,8 +1,8 @@
 # Keyboard/mouse selection parity. Run locally under the shared hub token; CI is an isolated host.
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict,
-      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly,[switch]$RemainderOnly,[switch]$Wave3Only)
+      [string]$TokenOwner=$env:AGLITETERM_TEST_OWNER,[switch]$DrivingOnly,[switch]$ConfigurationOnly,[switch]$ShellConfigurationOnly,[switch]$AgentIntegrationOnly,[switch]$RemainderOnly,[switch]$Wave3Only,[switch]$ClipboardOnly)
 $ErrorActionPreference='Stop'
-if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent+[int]$Wave3Only.IsPresent)-gt 1){throw 'Choose only one suite filter'}
+if(([int]$DrivingOnly.IsPresent+[int]$ConfigurationOnly.IsPresent+[int]$ShellConfigurationOnly.IsPresent+[int]$AgentIntegrationOnly.IsPresent+[int]$RemainderOnly.IsPresent+[int]$Wave3Only.IsPresent+[int]$ClipboardOnly.IsPresent)-gt 1){throw 'Choose only one suite filter'}
 $PSNativeCommandUseErrorActionPreference=$false
 $script:selectionArtifact=Join-Path (Split-Path $PSScriptRoot -Parent) ('.revmux/selection-ui-'+(Get-Date -Format yyyyMMddTHHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
 New-Item -ItemType Directory $script:selectionArtifact -Force | Out-Null
@@ -89,6 +89,7 @@ try {
         Write-Screen ($esc+'[6;3H') # known caret; surface.cursor exposes only a column
     }
     function Shot([string]$name){Selection-Capture $h $name $g.Left $g.Top ([math]::Min(350,$g.Right-$g.Left)) ([math]::Min(200,$g.Bottom-$g.Top))}
+    if($ClipboardOnly){. "$PSScriptRoot/clipboard-ui-cases.ps1"}else{
     if(-not $Wave3Only -and -not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly){
     Seed-Main
     $before=Shot 'wheel-before';[SelectionUi]::Wheel($h,($g.Left+100),($g.Top+60),3);$after=Shot 'wheel-after'
@@ -318,6 +319,7 @@ try {
     if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly){. "$PSScriptRoot/remainder-ui-cases.ps1"}
     }
     if(-not $DrivingOnly -and -not $ConfigurationOnly -and -not $ShellConfigurationOnly -and -not $AgentIntegrationOnly -and -not $RemainderOnly){. "$PSScriptRoot/wave3-ui-cases.ps1"}
+    }
 }catch{if($skipReason){"SKIP selection-ui: $skipReason";if($Strict){$script:failures++}}else{$script:failures++;"FAIL selection UI aborted: $($_.Exception.Message)"}}
 finally{
     $cleanupOk=Invoke-SelectionCleanup {
