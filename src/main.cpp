@@ -9422,9 +9422,10 @@ owner - a flag or a name on its hidden shell is one nobody can see), on a pane v
 close`, the split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a
 focused split pane is the unsplit the chord does) - because the overlay has no identity of its own
 (no node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
-shell's id keeps P4's meaning on every verb but two: `session select` shows the session the pane
-belongs to (the focus on slot 0) and `session context` refuses every hidden id (a split shell has
-no row and no session line to keep a context in); `--target <pane id>` reaches the shell
+shell's id keeps P4's meaning on every verb but three: `session select` shows the session the pane
+belongs to (the focus on slot 0), and `session context` and `session rename` refuse every hidden id
+(a split shell has no row, no session line and no name field on its `P` line, so a context or a name
+written on it is shown nowhere and gone at the next start); `--target <pane id>` reaches the shell
 **underneath** (`session text` reads the surface underneath); `--target <overlay id>` reaches the
 overlay from anywhere on the surface verbs and is refused as a cover by EVERY other verb - the
 structural ones (`session close`, `select`, `context`, `split`, `split close`, `swap`, `restore
@@ -10369,9 +10370,11 @@ static std::string ctlDispatch(const std::string& line) {
     // written on it is one nobody can see), the session that shell belongs to (splitOwnerOf); the
     // PANE-class verbs (`session close`, the split verbs, `restore capture`: P4's rule — a pane id
     // reaches that shell, `close` on the focused split pane is the unsplit the chord does) keep the
-    // shell. An EXPLICIT id keeps its meaning on every verb but two (a split shell's id reaches that
-    // shell — except on `session select`, below, which shows the session the pane belongs to with
-    // the focus on slot 0, and on `session context`, which refuses every hidden id; `--target
+    // shell. An EXPLICIT id keeps its meaning on every verb but three (a split shell's id reaches
+    // that shell — except on `session select`, below, which shows the session the pane belongs to
+    // with the focus on slot 0, and on `session context` and `session rename`, which refuse every
+    // hidden id for the same reason this comment gives above: a name written on a hidden shell is
+    // one nobody can see, and accepting one answered ok:true for exactly that; `--target
     // <overlay id>` reaches the overlay on the surface verbs and is refused as a cover by every
     // other verb: the structural refusals and sessionIdentityCover — `session flag clear` alone
     // takes no target at all). Each cover guard re-checks the target is still listed first: a
@@ -10989,6 +10992,24 @@ static std::string ctlDispatch(const std::string& line) {
             LockG hold;
             if (indexOfSession(target) < 0) return ctlErr("session not found");   // closed since the resolve (#21's class)
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("rename", target->id, "renamed"));
+            // A hidden session — a split shell, a quick, scratch or overlay cover — is reachable by
+            // id through resolveTarget, but a name on it is one nobody can see or use, and three
+            // things say so: `tree` skips hidden sessions, so the name is drawn nowhere; resolveTarget
+            // refuses a hidden session BY NAME ("not addressable by name"), so the name it just set
+            // cannot be used to address anything; and a split's `P` line in the state file has no name
+            // field, so it is gone at the next start. Accepting answered ok:true ("renamed") for all
+            // three at once — the caller renames a pane to address it by name, is told "renamed", and
+            // then gets "session not found". Refused for the reason session.context refuses the same
+            // target, in the same shape, naming the id; the comment on the `active` mapping in
+            // resolveTarget already states the rule ("a flag or a name written on it is one nobody can
+            // see"). REFUSED rather than rerouted to splitOwnerOf: a rename the caller did not ask for
+            // would silently name the OWNER session, and the target a verb acts on is not something to
+            // widen behind the caller's back.
+            if (target->hidden)
+                return ctlErr("session rename: '" + target->id + "' is a split, scratch, overlay or quick pane; "
+                              "it has no sidebar row to draw a name in and no name field in the state file, so a "
+                              "name on it is shown nowhere, cannot be resolved by name and is gone at the next "
+                              "start. Rename its session, or address the pane by id. Nothing changed.");
             // The name and the context (session.context, below) are two separate fields: a rename
             // writes this one and leaves `context` exactly as it was, and neither is derived from
             // the other.

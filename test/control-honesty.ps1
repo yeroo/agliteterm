@@ -1470,6 +1470,20 @@ try {
         Check 'session context on the split shell is refused, naming the id and why (no row, no session line)' `
             (-not $r.ok -and [string]$r.error -eq "session context: '$splitId' is a split, scratch, overlay or quick pane; it has no sidebar row and no session line in the state file, so it has no context to set. Nothing changed.") "raw: $raw"
         Check 'and nothing appeared in the tree, and the owner kept its own context' (@(Nodes).Count -eq $before -and (CtxOf $cid) -eq 'by name')
+
+        # -- and `session rename` refuses the same target, for the same reason plus one more --------
+        # A split's `P` line in the state file has no name field, so a name written on a hidden shell
+        # is drawn nowhere (`tree` skips hidden sessions), cannot be used to address anything
+        # (resolveTarget: "not addressable by name") and is gone at the next start. It used to answer
+        # ok:true, "renamed": the caller renames a pane in order to address it by name, is told it
+        # worked, and then gets "session not found".
+        $raw = Send-Ctl $s @('session', 'rename', 'hidden-name', '--target', $splitId); $r = ConvertFrom-Json $raw
+        Check 'session rename on the split shell is refused, naming the id and why (no row, no name field)' `
+            (-not $r.ok -and [string]$r.error -eq "session rename: '$splitId' is a split, scratch, overlay or quick pane; it has no sidebar row to draw a name in and no name field in the state file, so a name on it is shown nowhere, cannot be resolved by name and is gone at the next start. Rename its session, or address the pane by id. Nothing changed.") "raw: $raw"
+        Check 'and the owner kept its own name' ([string](CtxNode $cid).name -eq 'ctx-renamed') "name: $([string](CtxNode $cid).name)"
+        Check 'and the refused name resolves to nothing' (-not (ConvertFrom-Json (Send-Ctl $s @('session', 'status', '--target', 'hidden-name'))).ok)
+        Check 'and the split pane is still there (a refusal changed nothing structural)' (@(Nodes).Count -eq $before -and -not (CtxNode $splitId))
+
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
         Start-Sleep -Milliseconds 300
 
