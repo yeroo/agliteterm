@@ -3596,6 +3596,85 @@ static bool captureForeground(const std::vector<DWORD>& shellPids, std::map<DWOR
     return true;
 }
 
+// A pane a capture is about: the Session, its pane id, the id of the session that OWNS it (its own,
+// or the visible session's for a split shell) and the shell pid the query may ask about.
+struct CapPane { Session* s; std::string id, owner; DWORD pid; };
+
+// SNAPSHOT (phase 1) for the callers that mean every real pane: each visible session (the pane its
+// S line restores) followed by its split shell (the pane its P line restores), in list order — tree
+// order. Caller holds g_lock; the pids are read here so the query can run without it.
+static void snapshotRealPanes(std::vector<CapPane>* out) {
+    for (Session* s : g_sessions) {
+        if (s->hidden) continue;
+        out->push_back({ s, s->paneId, s->id, livePid(s) });
+        if (s->splitId.empty()) continue;
+        for (Session* sh : g_sessions)
+            if (sh->id == s->splitId) { out->push_back({ sh, sh->paneId, s->id, livePid(sh) }); break; }
+    }
+}
+
+// WRITE (phase 3): every slot the snapshot still owns gets what the query found for its shell. Null
+// is written too (an empty slot): a fresh capture replaces the previous checkpoint, including with
+// nothing — "the shell had no non-denylisted child" is an answer, and keeping a stale command would
+// misreport something that is no longer running. A pane closed between the snapshot and here is
+// skipped rather than written to; the id is re-checked as well as the pointer, since a freed
+// Session's address can be reused. The id compared is the PANE id the snapshot recorded: paneId is
+// written once and never rewritten, while `id` moves onto a promoted survivor (closeSplitSide) and
+// would reject the very pane this was meant to validate (revmux r1: every promoted session silently
+// dropped). Takes g_lock itself — both callers run the lock-free query immediately before it.
+//
+// Returns the slots written (null included). `panesJson`, when asked for, is restore.capture's
+// per-pane reply array in snapshot order, with the non-null ones counted into `captured`; the
+// quit-time caller has no reply and passes neither.
+static int applyForegroundCapture(const std::vector<CapPane>& snap, const std::map<DWORD, std::string>& found,
+                                  std::string* panesJson = nullptr, int* captured = nullptr) {
+    int written = 0;
+    LockG hold;
+    for (const auto& p : snap) {
+        if (indexOfSession(p.s) < 0 || p.s->paneId != p.id) continue;
+        auto f = p.pid ? found.find(p.pid) : found.end();
+        p.s->capturedCmd = f != found.end() ? f->second : std::string();
+        written++;
+        if (!panesJson) continue;
+        if (!panesJson->empty()) *panesJson += ",";
+        *panesJson += "{\"pane\":\"" + jsonEscape(p.id) + "\",\"session\":\"" + jsonEscape(p.owner) + "\",\"captured\":";
+        if (p.s->capturedCmd.empty()) *panesJson += "null";
+        else { *panesJson += "\"" + jsonEscape(p.s->capturedCmd) + "\""; if (captured) (*captured)++; }
+        *panesJson += "}";
+    }
+    return written;
+}
+
+// The quit-time capture: the same three phases `restore capture` runs, for every real pane, with no
+// reply and no save of its own — OnDestroy saves right after.
+//
+// agwinterm has always done this from its close path (Program.WndProc WM_CLOSE ->
+// SaveState(captureCommands: true) -> CaptureCommandsIntoPanes). lite had the query and the verb but
+// nothing calling them at shutdown, so a restored pane's slot was empty unless somebody had run
+// `restore capture` by hand — and then it held whatever was running at that moment, minutes or hours
+// earlier, not at the close. With restore-commands on, replay therefore had nothing to replay.
+//
+// Called while the shells are still ALIVE: the walk reads their children, and after killSession
+// there is nothing left to read.
+//
+// The caller gates it on restore-commands, as agwinterm gates its own call: with the opt-in off no
+// slot written here would ever be replayed, and a command line can carry anything the user typed, so
+// the state file is not the place to put it unasked. `restore capture` is a request and stays ungated.
+static void captureCommandsIntoPanes() {
+    std::vector<CapPane> snap;
+    { LockG hold; snapshotRealPanes(&snap); }
+    std::vector<DWORD> pids;
+    for (const auto& p : snap) if (p.pid) pids.push_back(p.pid);
+    std::map<DWORD, std::string> found;
+    // A query that could not run leaves every slot as it was: the checkpoint from the last explicit
+    // capture is better than nothing, and captureForeground has already logged why. The quit does
+    // not stop for it.
+    if (!captureForeground(pids, &found)) return;
+    int written = applyForegroundCapture(snap, found);
+    logInfo("quit capture: %d of %d pane(s) had a foreground command, %d slot(s) written",
+            (int)found.size(), (int)snap.size(), written);
+}
+
 static std::string sessionLiveCwd(const Session* s) {
     // livePid, not childPid: after the shell exits the pid is stale and Windows recycles it, so a
     // save could persist SOME OTHER process's cwd as this session's (the same hole restore.capture
@@ -8564,6 +8643,10 @@ public:
         KillTimer(kCaretTimer);
         KillTimer(kReplayTimer);
         saveWindowRect();                        // remember window size + position for next launch
+        // What each pane is RUNNING, into its slot, before the save and before killSession takes the
+        // shells whose children the query reads: agwinterm's SaveState(captureCommands: true), gated
+        // the same way — see captureCommandsIntoPanes.
+        if (g_restoreCommands.load()) captureCommandsIntoPanes();
         saveSessionState();                      // final save with LIVE cwds — while the shells are
                                                  // still alive to answer the PEB query; the periodic
                                                  // saves only fire on structural changes, not on cd
@@ -11105,7 +11188,6 @@ static std::string ctlDispatch(const std::string& line) {
         // with a non-null capture, `panes` in snapshot order with `pane` (the pane's id), `session`
         // (the owner's id) and `captured` (string | null). `replayOnRestore` reports the current
         // restore-commands opt-in; it does not promise any pane ran a command. B > R > K.
-        struct CapPane { Session* s; std::string id, owner; DWORD pid; };
         std::vector<CapPane> snap;
         // The target is read from the field map, not from get(): absent is the documented "every
         // real pane", present-but-empty is a refusal (EmptyTarget), and get() answers "" for both.
@@ -11136,16 +11218,8 @@ static std::string ctlDispatch(const std::string& line) {
             }
             snap.push_back({ target, target->paneId, owner, livePid(target) });   // `pane` is the PANE id (P4)
         } else {
-            // Every real pane: each visible session (the panes the S lines restore) followed by its
-            // split shell (the pane its P line restores), in list order — tree order.
             LockG hold;
-            for (Session* s : g_sessions) {
-                if (s->hidden) continue;
-                snap.push_back({ s, s->paneId, s->id, livePid(s) });
-                if (s->splitId.empty()) continue;
-                for (Session* sh : g_sessions)
-                    if (sh->id == s->splitId) { snap.push_back({ sh, sh->paneId, s->id, livePid(sh) }); break; }
-            }
+            snapshotRealPanes(&snap);   // every real pane, in tree order
         }
         // The query, lock-free: a shell pid of 0 (a dead entry, a restore placeholder, an EXITED
         // shell — livePid) is skipped by captureForeground and reads as null below.
@@ -11153,30 +11227,11 @@ static std::string ctlDispatch(const std::string& line) {
         for (const auto& p : snap) if (p.pid) pids.push_back(p.pid);
         std::map<DWORD, std::string> found;
         if (!captureForeground(pids, &found)) return ctlErr(kCaptureQueryFailed);
-        // The write. Null is written too (an empty slot): a fresh capture replaces the previous
-        // checkpoint, including with nothing — "the shell had no non-denylisted child" is an answer,
-        // and keeping a stale command would misreport something that is no longer running. A
-        // pane closed between the snapshot and here is dropped from the reply rather than written to;
-        // the id is re-checked as well as the pointer, since a freed Session's address can be reused.
-        // The id compared is the PANE id the snapshot recorded: paneId is written once and never
-        // rewritten, while `id` moves onto a promoted survivor (closeSplitSide) and would reject the
-        // very pane this was meant to validate (revmux r1: every promoted session silently dropped).
+        // The write, and the reply array built from what landed: applyForegroundCapture says what is
+        // written, what is skipped and why.
         std::string panes;
-        int captured = 0, written = 0;   // written = slots the loop replaced (null included); captured = the non-null ones
-        {
-            LockG hold;
-            for (const auto& p : snap) {
-                if (indexOfSession(p.s) < 0 || p.s->paneId != p.id) continue;
-                auto f = p.pid ? found.find(p.pid) : found.end();
-                p.s->capturedCmd = f != found.end() ? f->second : std::string();
-                written++;
-                if (!panes.empty()) panes += ",";
-                panes += "{\"pane\":\"" + jsonEscape(p.id) + "\",\"session\":\"" + jsonEscape(p.owner) + "\",\"captured\":";
-                if (p.s->capturedCmd.empty()) panes += "null";
-                else { panes += "\"" + jsonEscape(p.s->capturedCmd) + "\""; captured++; }
-                panes += "}";
-            }
-        }
+        int captured = 0;   // the non-null slots; `written` counts every slot replaced, null included
+        int written = applyForegroundCapture(snap, found, &panes, &captured);
         // A zero-landed capture is a no-op: no save or refresh. For any replaced slots, the
         // first save from a pipe thread makes the successful reply describe a state that is ON DISK
         // (agwinterm's rule): posting the refresh, which saves on the UI thread, would answer before
