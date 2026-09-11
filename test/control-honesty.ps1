@@ -1481,7 +1481,11 @@ try {
         Check 'session rename on the split shell is refused, naming the id and why (no row, no name field)' `
             (-not $r.ok -and [string]$r.error -eq "session rename: '$splitId' is a split, scratch, overlay or quick pane; it has no sidebar row to draw a name in and no name field in the state file, so a name on it is shown nowhere, cannot be resolved by name and is gone at the next start. Rename its session, or address the pane by id. Nothing changed.") "raw: $raw"
         Check 'and the owner kept its own name' ([string](CtxNode $cid).name -eq 'ctx-renamed') "name: $([string](CtxNode $cid).name)"
-        Check 'and the refused name resolves to nothing' (-not (ConvertFrom-Json (Send-Ctl $s @('session', 'status', '--target', 'hidden-name'))).ok)
+        # `session text`, not `session status`: status takes a STATE argument and refuses without one
+        # ("session status needs a state"), so it would answer ok:false whether the name resolved or not
+        # -- a check that cannot fail. text is a read, and it resolves its target the same way.
+        $raw = Send-Ctl $s @('session', 'text', '--target', 'hidden-name')
+        Check 'and the refused name resolves to nothing' (-not (ConvertFrom-Json $raw).ok) "raw: $raw"
         Check 'and the split pane is still there (a refusal changed nothing structural)' (@(Nodes).Count -eq $before -and -not (CtxNode $splitId))
 
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
