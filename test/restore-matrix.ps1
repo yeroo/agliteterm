@@ -207,6 +207,7 @@ function Cell {
         [string]$Name,
         [scriptblock]$Setup,          # receives the instance name; creates the state to be restored
         [switch]$Kill,                # forced kill instead of a graceful close
+        [scriptblock]$Between,        # runs after the close, before the restart (receives the instance)
         [scriptblock]$Assert          # receives (before, after, instance); returns $true when the cell passes
     )
     if ($Only -and $Only -ne $Name) { return }
@@ -220,6 +221,10 @@ function Cell {
         Start-Sleep -Seconds 2
         $before = Signature $inst
         Stop-Lite $p -Kill:$Kill; $p = $null
+        # The window between the two launches: the file the close wrote is final and nothing is
+        # running. A cell whose FIRST instance needs a setting its second must not have changes it
+        # here — the restart reads the setting at startup, and no Setup or Assert runs then.
+        if ($Between) { & $Between $inst }
 
         $p2 = Start-Lite $inst
         Start-Sleep -Seconds 2
@@ -1088,6 +1093,13 @@ function Describe-NoPing([string]$what, [string[]]$ns) {
     $foreign = @($ns | ForEach-Object { Describe-ForeignPings $_ })
     if ($foreign.Count) { "$what; $($foreign -join '; ')" } else { $what }
 }
+# restore-commands, in the run's own registry namespace (never the developer's — the same isolated
+# key and value name the P10b configuration cases guard). It has to be set BEFORE a launch: the
+# quit-time capture reads it in OnDestroy, and a Cell's Setup runs after its instance is already up.
+function Set-RestoreCommands([int]$On) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath -RequireIsolation))
+    try { $key.SetValue('RestoreCommands', $On, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+}
 if ($cliHasP3) {
     # Captured over the API, saved by the verb itself, back after a graceful close — and re-written
     # by the build that loaded it (the file inspected AFTER the second run).
@@ -1155,6 +1167,51 @@ if ($cliHasP3) {
     if (-not $Only -or $Only -eq 'capture-graceful') { Skip 'capture-graceful' 'this agwintermctl predates agwinterm #233 and has no `restore capture` - set AGWINTERMCTL to a newer build' }
     if (-not $Only -or $Only -eq 'capture-killed')   { Skip 'capture-killed'   'same client' }
     if (-not $Only -or $Only -eq 'capture-split')    { Skip 'capture-split'    'same client' }
+}
+
+# The close itself as the capture (agwinterm's SaveState(captureCommands: true), which lite's
+# OnDestroy did not have): nothing here runs `restore capture`, so an empty slot after the restart
+# means the quit wrote nothing. The opt-in is set before the FIRST launch — OnDestroy reads it — and
+# cleared before the restart, because the replay it would otherwise arm types the ping back into a
+# restored shell this run has no way to prove its own, and an unprovable process can only be reported
+# and left running. What a slot DOES on a fresh restore is shell-configuration-ui-cases' subject; the
+# subject here is that the close wrote it, and that the restart read it back.
+Set-RestoreCommands 1
+Cell -Name 'capture-at-quit' -Between { Set-RestoreCommands 0 } -Setup {
+    param($i)
+    Stop-Ping '317'
+    $id = LastSessionId $i
+    & $ctl session rename cap-at-quit --target $id --pipe $i 2>&1 | Out-Null
+    Own-Shell $id $i | Out-Null
+    & $ctl session type "ping -n 317 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+    if (-not (Wait-Ping '317')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('317')) }
+    Start-Sleep -Milliseconds 500
+} -Assert {
+    param($b, $a, $i)
+    Stop-Ping '317'
+    if ($b -match 'cap-at-quit\^') { return $false }   # nothing was captured while the ping was running
+    ($a -match 'cap-at-quit\^[^|;]*-n 317 127\.0\.0\.1') -and
+        ((Get-Content (State $i) -Raw) -match "(?m)^K`t0`t[^`t]*-n 317 127\.0\.0\.1`t`r?$")
+}
+Set-RestoreCommands 0   # a Setup that threw never reached the -Between; no later cell inherits the opt-in
+
+# The gate, with the default setting: the same close captures NOTHING. A command line can carry
+# anything the user typed, and the state file is not the place to put it unasked — `restore capture`
+# is a request and stays ungated, the close is not.
+Cell -Name 'capture-at-quit-off' -Setup {
+    param($i)
+    Stop-Ping '318'
+    $id = LastSessionId $i
+    & $ctl session rename cap-no-quit --target $id --pipe $i 2>&1 | Out-Null
+    Own-Shell $id $i | Out-Null
+    & $ctl session type "ping -n 318 127.0.0.1`n" --target $id --pipe $i 2>&1 | Out-Null
+    if (-not (Wait-Ping '318')) { throw (Describe-NoPing 'the ping never started under the pane shell' @('318')) }
+    Start-Sleep -Milliseconds 500
+} -Assert {
+    param($b, $a, $i)
+    Stop-Ping '318'
+    ($a -eq $b) -and ($a -match 'cap-no-quit') -and ($a -notmatch '\^') -and
+        ((Get-Content (State $i) -Raw) -notmatch "(?m)^K`t")
 }
 
 # --- P4: the L line (a split's layout) -----------------------------------------------------------

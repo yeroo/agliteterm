@@ -134,7 +134,11 @@ native controls** — menu bar, toolbar, TreeView sidebar, status bar — in the
   exited and readonly panes skip replay. An unknown, empty or cover-pane target, or a process query
   that did not run, is refused with nothing written for anyone; a save that did not land is
   refused too, but AFTER the slots were replaced in memory (the reply says so, `tree --json` shows
-  them) — that save did not put the checkpoint on disk; a later one may. Parity batch P4 gives a split its
+  them) — that save did not put the checkpoint on disk; a later one may. **With `restore-commands` on, the
+  close captures too**: the quit fills every real pane's slot from what is running then, while the shells
+  are still alive, before its final save — so a restart replays what the panes were doing, not whatever a
+  hand-run capture froze hours earlier. With the opt-in off the close captures nothing. Parity batch P4
+  gives a split its
   full shape, in agterm's words: `vertical` = left/right panes (the default), `horizontal` =
   top/bottom — the axis names the arrangement, never the divider. `session split [on|off|toggle]
   [--axis ..] [--target ID]` **answers a pane id** (a bare string) whichever way it went — `on`
@@ -324,6 +328,8 @@ unsupported/overlong paths refuse. Live write followed by persistence failure re
 
 `config set restore-commands true` opts into captured K replay on future fresh restore; default false.
 Review captured commands first. This does not immediately execute anything in existing panes.
+The same opt-in turns on the quit-time capture: closing the window fills each real pane's slot from
+what that pane is running, so the replay has the close to work from.
 
 ### Commands and agent integration (P11)
 

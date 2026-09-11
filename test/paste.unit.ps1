@@ -7,7 +7,11 @@ $arm=[regex]::Match($source,'(?ms)^    if \(cmd == "session.paste"\).*?(?=^    i
 $normalize=[regex]::Match($source,'(?ms)^static std::string pasteNormalize\(.*?^\}')
 $clipboard=[regex]::Match($source,'(?ms)^static std::string readClipboardText\(.*?^\}')
 $capture=[regex]::Match($source,'(?ms)^    if \(cmd == "restore.capture"\).*?(?=^    if \(cmd == "session.duplicate"\))')
+$capPane=[regex]::Match($source,'(?ms)^struct CapPane \{.*?\};')
+$snapshot=[regex]::Match($source,'(?ms)^static void snapshotRealPanes\(.*?^\}')
+$applyCapture=[regex]::Match($source,'(?ms)^static int applyForegroundCapture\(.*?^\}')
 if(-not $arm.Success -or -not $normalize.Success -or -not $clipboard.Success -or -not $capture.Success){throw 'Production paste/capture functions not found'}
+if(-not $capPane.Success -or -not $snapshot.Success -or -not $applyCapture.Success){throw 'Production capture helpers not found (CapPane/snapshotRealPanes/applyForegroundCapture)'}
 $prefix=@'
 #include <string>
 #include <cstdio>
@@ -83,7 +87,10 @@ $out=Join-Path $repo 'bin/paste-unit';New-Item -ItemType Directory -Force $out|O
 $generated=Join-Path $out 'paste.generated.cpp'
 $dispatch='std::string paste(Session* target,const Request& req){ std::string cmd="session.paste",targetWhy;'+"`n"+$arm.Value+'return "unhandled";}'
 $captureDispatch='std::string capture(Session* target,const Request& req){ std::string cmd="restore.capture",targetWhy;'+"`n"+$capture.Value+'return "unhandled";}'
-[IO.File]::WriteAllText($generated,($prefix+"`n"+$normalize.Value+"`n"+$clipboard.Value+"`n"+$dispatch+"`n"+$captureDispatch+"`n"+$tests),[Text.UTF8Encoding]::new($false))
+# The helpers go before the capture dispatch that calls them, and after $prefix, which declares the
+# Session/LockG/g_sessions/livePid/indexOfSession/jsonEscape they are written against.
+[IO.File]::WriteAllText($generated,($prefix+"`n"+$normalize.Value+"`n"+$clipboard.Value+"`n"+$dispatch+"`n"+
+    $capPane.Value+"`n"+$snapshot.Value+"`n"+$applyCapture.Value+"`n"+$captureDispatch+"`n"+$tests),[Text.UTF8Encoding]::new($false))
 $testExe=Join-Path $out 'paste-unit.exe'
 & cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /EHsc /W4 /utf-8 `"$generated`" /Fe:`"$testExe`" /Fo:`"$out/paste-unit.obj`""
 if($LASTEXITCODE -ne 0){throw 'Paste unit compile failed'}
