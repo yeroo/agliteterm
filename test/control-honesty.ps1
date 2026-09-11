@@ -1470,6 +1470,37 @@ try {
         Check 'session context on the split shell is refused, naming the id and why (no row, no session line)' `
             (-not $r.ok -and [string]$r.error -eq "session context: '$splitId' is a split, scratch, overlay or quick pane; it has no sidebar row and no session line in the state file, so it has no context to set. Nothing changed.") "raw: $raw"
         Check 'and nothing appeared in the tree, and the owner kept its own context' (@(Nodes).Count -eq $before -and (CtxOf $cid) -eq 'by name')
+
+        # -- and `session rename` on that same split shell names the SESSION, and says which one ----
+        # agwinterm #287. Before this, the name was written on the hidden session, where `tree` never
+        # draws it, resolveTarget never matches it by name and the `P` line never keeps it - and the
+        # reply said "renamed" anyway. Refusing it was the other candidate and is the wrong one: a
+        # bare `session rename` sends the caller's own AGWINTERM_SESSION_ID, which inside a split IS
+        # the split shell's id, so refusing would refuse the verb's commonest call. It names the
+        # session both shells are in, and the reply says so.
+        $raw = Send-Ctl $s @('session', 'rename', 'p287-from-the-split', '--target', $splitId); $r = ConvertFrom-Json $raw
+        Start-Sleep -Milliseconds 300
+        Check 'session rename on the split shell names the session that shell belongs to, and the reply says which' `
+            ([bool]$r.ok -and [string]$r.result.session -eq $cid -and [string]$r.result.name -eq 'p287-from-the-split') "raw: $raw"
+        Check 'and the name is really on the owner: its tree node carries it, and no node appeared for the shell' `
+            ([string](CtxNode $cid).name -eq 'p287-from-the-split' -and @(Nodes).Count -eq $before -and -not (CtxNode $splitId)) `
+            "owner name: $([string](CtxNode $cid).name), nodes $(@(Nodes).Count)"
+        # The point of naming it: the name now addresses something. It never did before. A READ, so
+        # the context set above is left exactly as it is - the undo-close check below asserts it.
+        $raw = Send-Ctl $s @('session', 'text', '--target', 'p287-from-the-split'); $r = ConvertFrom-Json $raw
+        Check 'and the new name resolves as a target, which a name on a hidden shell never could' ([bool]$r.ok) "raw: $raw"
+        Check 'and the context is untouched by a rename (still the two-fields rule)' ((CtxOf $cid) -eq 'by name') "context: $(CtxOf $cid)"
+        # Two conditions, two wordings: they used to be "rename needs a name" and "session not found".
+        $raw = Send-Ctl $s @('session', 'rename', '   ', '--target', $cid); $r = ConvertFrom-Json $raw
+        Check 'a blank name is refused in agwinterm''s words, and the name stands' `
+            (-not $r.ok -and [string]$r.error -eq 'session rename: the name is blank; a name is one line of printable text. Nothing changed.' -and
+             [string](CtxNode $cid).name -eq 'p287-from-the-split') "raw: $raw"
+        $raw = Send-Ctl $s @('session', 'rename', 'p287-ghost', '--target', 'no-such-target-287'); $r = ConvertFrom-Json $raw
+        Check 'and a target that belongs to no session is refused with the shared no-session wording' `
+            (-not $r.ok -and [string]$r.error -eq 'session not found; nothing changed') "raw: $raw"
+        Send-Ctl $s @('session', 'rename', 'ctx-renamed', '--target', $cid) | Out-Null
+        Start-Sleep -Milliseconds 300
+
         Send-Ctl $s @('session', 'split', 'off') | Out-Null
         Start-Sleep -Milliseconds 300
 

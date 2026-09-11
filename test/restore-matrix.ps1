@@ -1563,13 +1563,17 @@ Seeded -Name 'oversize-fields' `
 if (-not $Only -or $Only -eq 'name-injection') {
     $inst = 'rm-name-injection'
     Reset-Cell $inst
-    $err = ''; $lines = 0; $after = ''; $renamed = ''; $count = 0; $forged = 0
+    $err = ''; $lines = 0; $after = ''; $renamed = ''; $renameSession = ''; $count = 0; $forged = 0
     $p = $null; $p2 = $null
     try {
         $p = Start-Lite $inst
         $id = LastSessionId $inst
         $evil = 'pwn' + [char]10 + 'S' + [char]9 + '0' + [char]9 + 'injected' + [char]9 + 'notepad.exe' + [char]9
         $renamed = (& $ctl session rename $evil --target $id --pipe $inst 2>&1) -join ''
+        # The reply is an object naming the session and the name in effect (agwinterm #287), not the
+        # word "renamed" it used to be. Reading the session id out of it is what says the write
+        # happened; the name itself is the payload under test and is checked through the state file.
+        try { $renameSession = [string](ConvertFrom-Json $renamed).session } catch { $renameSession = '' }
         Start-Sleep -Seconds 2
         Stop-Lite $p; $p = $null
         $lines = @(Get-Content (State $inst) | Where-Object { $_ -match "^S`t" }).Count
@@ -1583,13 +1587,13 @@ if (-not $Only -or $Only -eq 'name-injection') {
         Stop-Lite $p2; $p2 = $null
     } catch { $err = $_.Exception.Message }
     finally { Stop-Leftover $p; Stop-Leftover $p2 }
-    if (-not $err -and $renamed -match 'renamed' -and $lines -eq 1 -and $count -eq 1 -and $forged -eq 0) {
+    if (-not $err -and $renameSession -and $lines -eq 1 -and $count -eq 1 -and $forged -eq 0) {
         "  PASS  {0,-22} (a name cannot forge a session line)" -f 'name-injection'
     } else {
         $script:failed += 'name-injection'
         "  FAIL  name-injection"
         if ($err) { "        error:  $err" }
-        "        rename said: $renamed"
+        "        rename said: $renamed (session '$renameSession')"
         "        S lines in the saved file: $lines (expected 1)"
         "        sessions restored: $count (expected 1), forged 'injected' session(s): $forged"
         "        after:  [$after]"

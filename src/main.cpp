@@ -8634,6 +8634,28 @@ static const char* const kContextTextAndClear =
 // script sees one wording for one condition.
 static const char* const kContextNoSession = "session not found; nothing changed";
 
+// char.IsWhiteSpace minus the control range (a context refuses those outright; a name has them
+// folded to spaces by tsvField first), so both label verbs trim what agwinterm's string.Trim does.
+static bool isUnicodeWhitespace(wchar_t c) {
+    return c == 0x20 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+static std::wstring trimUnicodeWhitespace(const std::wstring& w) {
+    size_t b = 0, e = w.size();
+    while (b < e && isUnicodeWhitespace(w[b])) b++;
+    while (e > b && isUnicodeWhitespace(w[e - 1])) e--;
+    return w.substr(b, e - b);
+}
+
+// ---- session.rename refusals (agwinterm #287) ----
+// agwinterm's SessionNames (src/Agwinterm.Pty/SessionNames.cs), verbatim. A rename names a SESSION
+// and says which one; a blank name and a target that belongs to no session used to share one
+// sentence there and answer "rename needs a name" / "session not found" here — two conditions now
+// have two wordings, the same two in both products.
+static const char* const kRenameBlank =
+    "session rename: the name is blank; a name is one line of printable text. Nothing changed.";
+static const char* const kRenameNoSession = "session not found; nothing changed";
+
 // ---- restore.capture refusals (P3) ----
 // agwinterm's RestoreCaptureReply (src/Agwinterm.Pty/RestoreCaptureReply.cs), verbatim. Each one
 // captures nothing for anyone and saves nothing — the verb returns before the process query.
@@ -8974,14 +8996,7 @@ static std::string contextRefusal(const std::string& decoded, std::string* norma
             return b;
         }
     }
-    auto isWs = [](wchar_t c) {   // char.IsWhiteSpace, minus the control range refused above
-        return c == 0x20 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
-               c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
-    };
-    size_t b = 0, e = w.size();
-    while (b < e && isWs(w[b])) b++;
-    while (e > b && isWs(w[e - 1])) e--;
-    std::wstring t = w.substr(b, e - b);
+    std::wstring t = trimUnicodeWhitespace(w);
     if (t.empty()) return kContextBlank;
     if (t.size() > kContextMaxLength)
         return "session context: " + std::to_string(t.size()) + " characters is over the ceiling of " +
@@ -9422,8 +9437,13 @@ owner - a flag or a name on its hidden shell is one nobody can see), on a pane v
 close`, the split verbs, `restore capture`) the focused pane's **shell** as P4 says (`close` on a
 focused split pane is the unsplit the chord does) - because the overlay has no identity of its own
 (no node, no sidebar row, nothing in the state file) for either kind to act on; an EXPLICIT split
-shell's id keeps P4's meaning on every verb but two: `session select` shows the session the pane
-belongs to (the focus on slot 0) and `session context` refuses every hidden id (a split shell has
+shell's id keeps P4's meaning on every verb but three: `session select` shows the session the pane
+belongs to (the focus on slot 0), `session rename` names that session too and its reply SAYS which
+one (`{session, name}`) - a split shell has no sidebar row to draw a name in and no name field on
+its `P` line, so a name written on it used to be drawn nowhere, resolve nothing and be gone at the
+next start while the reply said `renamed` (agwinterm #287); worth knowing because a bare
+`session rename` sends your own `AGWINTERM_SESSION_ID`, so from inside a split it names the session
+BOTH shells are in - and `session context` refuses every hidden id (a split shell has
 no row and no session line to keep a context in); `--target <pane id>` reaches the shell
 **underneath** (`session text` reads the surface underneath); `--target <overlay id>` reaches the
 overlay from anywhere on the surface verbs and is refused as a cover by EVERY other verb - the
@@ -10369,9 +10389,13 @@ static std::string ctlDispatch(const std::string& line) {
     // written on it is one nobody can see), the session that shell belongs to (splitOwnerOf); the
     // PANE-class verbs (`session close`, the split verbs, `restore capture`: P4's rule — a pane id
     // reaches that shell, `close` on the focused split pane is the unsplit the chord does) keep the
-    // shell. An EXPLICIT id keeps its meaning on every verb but two (a split shell's id reaches that
+    // shell. An EXPLICIT id keeps its meaning on every verb but three (a split shell's id reaches that
     // shell — except on `session select`, below, which shows the session the pane belongs to with
-    // the focus on slot 0, and on `session context`, which refuses every hidden id; `--target
+    // the focus on slot 0, on `session rename`, which names that session too and says so in its
+    // reply (agwinterm #287: a name on a hidden shell is drawn nowhere, resolves nothing and is gone
+    // at the next start, and answering "renamed" for that was the defect — refusing it would refuse
+    // a bare `session rename` from inside a split, which sends that shell's own id), and on
+    // `session context`, which refuses every hidden id; `--target
     // <overlay id>` reaches the overlay on the surface verbs and is refused as a cover by every
     // other verb: the structural refusals and sessionIdentityCover — `session flag clear` alone
     // takes no target at all). Each cover guard re-checks the target is still listed first: a
@@ -10981,21 +11005,44 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlOkStr("seen");
     }
     if (cmd == "session.rename") {
-        if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
-        std::string nm = req.get("args.name");
-        if (nm.empty()) return ctlErr("rename needs a name");
+        // A rename names a SESSION, and the reply says WHICH one (agwinterm #287). The name is
+        // checked before the target, as session.context checks its text first, so a bad name on a
+        // bad target names the name. JSON carries \t and \n; a name is one line (tsvField), trimmed
+        // the way agwinterm's server trims it, so the two products accept and refuse the same text.
+        std::wstring wanted = trimUnicodeWhitespace(widen(tsvField(req.get("args.name"))));
+        if (wanted.empty()) return ctlErr(kRenameBlank);
+        if (!target) return ctlErr(targetWhy.empty() ? kRenameNoSession : targetWhy);
+        std::string reply;
         {   // under g_lock: `tree` and resolveTarget read the name on other threads (a std::wstring
             // reassignment frees the old buffer once the name outgrows the small-string buffer)
             LockG hold;
-            if (indexOfSession(target) < 0) return ctlErr("session not found");   // closed since the resolve (#21's class)
+            if (indexOfSession(target) < 0) return ctlErr(kRenameNoSession);   // closed since the resolve (#21's class)
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("rename", target->id, "renamed"));
+            // An explicit SPLIT SHELL's id names the session that shell belongs to — the mapping
+            // `active` already gets on a session verb (resolveTarget's own comment: "a flag or a
+            // name written on it is one nobody can see"), and the one toggleFlagLocked already makes
+            // for the chord. Not a widening the caller has to guess at: a split shell's
+            // AGWINTERM_SESSION_ID is its own id and the CLI sends it when no --target is passed, so
+            // a bare `session rename` from inside a split IS a pane-targeted rename and means the
+            // session. Writing the hidden session instead was the bug: `tree` skips hidden sessions
+            // so the name was drawn nowhere, resolveTarget refuses a hidden session BY NAME so it
+            // addressed nothing, and a split's `P` line has no name field so it was gone at the next
+            // start — while the reply said "renamed". Refusing instead would refuse the verb's
+            // commonest call; the honest fix is to name the session the name landed on. A cover has
+            // no owner at all (isCoverLocked, above) and never reaches this.
+            Session* named = splitOwnerOf(target);
+            if (!named || indexOfSession(named) < 0) return ctlErr(kRenameNoSession);
             // The name and the context (session.context, below) are two separate fields: a rename
             // writes this one and leaves `context` exactly as it was, and neither is derived from
             // the other.
-            target->name = widen(tsvField(nm));   // JSON carries \t and \n; a name is one line (see tsvField)
+            named->name = wanted;
+            // Read BACK from the session under the same hold — the name in effect, not an echo of
+            // the request (agwinterm's SessionNames.Reply is built from ses.CustomName).
+            reply = "{\"session\":\"" + jsonEscape(named->id) + "\",\"name\":\"" +
+                    jsonEscape(narrow(named->name)) + "\"}";
         }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
-        return ctlOkStr("renamed");
+        return ctlOk(reply);
     }
     if (cmd == "session.context") {   // P3: one line of "what is this pane for", per session
         // The value is read from the field map, not from get(): get() answers "" for absent AND
