@@ -2477,6 +2477,29 @@ static void syncSplitToPrimary() {
     syncPaneSizes();
 }
 
+static void remapPanesAfterClose(int closedIndex) {
+    if (g_pane[0] == closedIndex) {
+        g_pane[0] = -1;
+        for (int candidate = closedIndex - 1; candidate >= 0; candidate--) {
+            if (!g_sessions[candidate]->hidden) {
+                g_pane[0] = candidate;
+                break;
+            }
+        }
+        if (g_pane[0] < 0) {
+            for (int candidate = closedIndex; candidate < (int)g_sessions.size(); candidate++) {
+                if (!g_sessions[candidate]->hidden) {
+                    g_pane[0] = candidate;
+                    break;
+                }
+            }
+        }
+    } else if (g_pane[0] > closedIndex) {
+        g_pane[0]--;
+    }
+    resolveSplitForPrimary();
+}
+
 /// Show a session in the main pane, bringing its own split with it. A hidden session (a split shell,
 /// a cover: the popup's session, a pane overlay) is never installed here — g_pane names sessions,
 /// and a cover that lands in it is drawn twice and left stale in g_pane when its own close unlists
@@ -2941,12 +2964,7 @@ static void closeSessionAt(int idx) {
     g_mru.erase(std::remove(g_mru.begin(), g_mru.end(), g_sessions[idx]->id), g_mru.end());
     g_sessions.erase(g_sessions.begin() + idx);
     emitEvent("tree");
-    for (int p = 0; p < 2; p++) {
-        if (g_pane[p] == idx) g_pane[p] = g_sessions.empty() ? -1 : max(0, idx - 1);
-        else if (g_pane[p] > idx) g_pane[p]--;
-    }
-    if (g_sessions.empty()) g_pane[1] = -1;   // unsplit when the last pane dies
-    resolveSplitForPrimary();                // pane 1 follows whichever session pane 0 now shows
+    remapPanesAfterClose(idx);
     auto* primary = displayedOwner();
     if (primary && primary != previousPrimary) primary->notifications = 0;
     // "Emptied" means NOTHING IS LEFT ON SCREEN IN THIS WINDOW, which is neither the raw session

@@ -33,3 +33,14 @@ $statusExe=Join-Path $out 'status-ownership-unit.exe'
 if($LASTEXITCODE-ne 0){throw 'Status ownership fixture compile failed'}
 & $statusExe
 if($LASTEXITCODE-ne 0){throw 'Status ownership fixture failed'}
+$splitResolver=[regex]::Match($main,'(?ms)^static void resolveSplitForPrimary\(.*?^\}')
+$paneRemap=[regex]::Match($main,'(?ms)^static void remapPanesAfterClose\(.*?^\}')
+if(-not $splitResolver.Success -or -not $paneRemap.Success){throw 'Actual pane selection helpers missing'}
+$paneCpp=Join-Path $out 'pane-selection-unit.cpp'
+$paneSource=(Get-Content "$PSScriptRoot/pane-selection.unit.cpp" -Raw).Replace('ACTUAL_SPLIT_RESOLVER',$splitResolver.Value).Replace('ACTUAL_CLOSE_PANE_REMAP',$paneRemap.Value)
+[IO.File]::WriteAllText($paneCpp,$paneSource)
+$paneExe=Join-Path $out 'pane-selection-unit.exe'
+& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /std:c++17 /EHsc /W4 /utf-8 `"$paneCpp`" /Fe:`"$paneExe`" /Fo:`"$out/pane-selection-unit.obj`""
+if($LASTEXITCODE-ne 0){throw 'Pane selection fixture compile failed'}
+& $paneExe
+if($LASTEXITCODE-ne 0){throw 'Pane selection fixture failed'}
