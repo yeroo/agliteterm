@@ -9463,7 +9463,10 @@ refused. So `session type --stdin --target <quick session id>` types into it.
 
 `session write` does NOT reach the shell. It injects bytes into the terminal's display, so it paints
 a pane without any program having printed anything — useful for a banner or a marker, and no use at
-all for sending keys.
+all for sending keys. What it paints is NOT durable: the shell's next repaint, and the full repaint the
+pty-host does on every resize (a window resize, `session split`, a split-ratio change, `session split
+close`), paints over it, and it does not survive into scrollback. Write once the layout has settled, or
+read it back.
 
 ## A second pane, beside you or below you
 
