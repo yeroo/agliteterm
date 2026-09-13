@@ -19,3 +19,15 @@ $adoptionExe=Join-Path $out 'adoption-ticket-unit.exe'
 if($LASTEXITCODE-ne 0){throw 'Adoption fixture compile failed'}
 & $adoptionExe
 if($LASTEXITCODE-ne 0){throw 'Adoption incarnation wiring fixture failed'}
+# agliteterm #82: a reader's end-of-stream is the shell exiting only when the host says so. Compile the
+# production HostSession and hostListSaysAlive, so a renamed field or a changed rule fails here.
+$hostSession=[regex]::Match($main,'(?ms)^struct HostSession \{.*?^\};')
+$saysAlive=[regex]::Match($main,'(?ms)^static bool hostListSaysAlive\(.*?^\}')
+if(-not $hostSession.Success -or -not $saysAlive.Success){throw 'Actual stream-end helpers not found (HostSession/hostListSaysAlive)'}
+$streamSource=(Get-Content "$PSScriptRoot/stream-end.unit.cpp" -Raw).Replace('// ACTUAL_HOST_SESSION_STRUCT',$hostSession.Value).Replace('// ACTUAL_HOST_LIST_SAYS_ALIVE',$saysAlive.Value)
+$streamCpp=Join-Path $out 'stream-end-unit.cpp';[IO.File]::WriteAllText($streamCpp,$streamSource)
+$streamExe=Join-Path $out 'stream-end-unit.exe'
+& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /std:c++17 /EHsc /W4 /utf-8 `"$streamCpp`" /Fe:`"$streamExe`" /Fo:`"$out/stream-end-unit.obj`""
+if($LASTEXITCODE-ne 0){throw 'Stream end fixture compile failed'}
+& $streamExe
+if($LASTEXITCODE-ne 0){throw 'Stream end fixture failed'}

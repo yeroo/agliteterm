@@ -2216,6 +2216,8 @@ static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
     }
 }
 
+static int indexOfSession(const Session* s);      // fwd: the reader asks whether its session is still listed
+static bool streamEndIsExit(const Session* s);   // fwd: asks the host; defined after hostSessions()
 static DWORD WINAPI readerThread(void* param) {
     Session* s = (Session*)param;
     std::vector<uint8_t> buf(64 * 1024);
@@ -2259,7 +2261,30 @@ static DWORD WINAPI readerThread(void* param) {
         InvalidateRect(windowForSession(s), nullptr, FALSE);
         if (bump) PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // repaint the badge
     }
-    s->exited = true;   // EOF: child exited, host shut down, or we were superseded
+    // The stream ended. That is the shell EXITING only when the host says so (agliteterm #82). The same
+    // EOF comes from a supersede - another client attached this session and the host detached us - and
+    // from the host dropping our data pipe, and in both the shell is still running. Taking every EOF for
+    // an exit marked a live shell "(exited)" and, for a split side, had OnPaneExit collapse the split
+    // and kill a running pane along with its scrollback. agwinterm's ServerSession.OnStreamEnded asks
+    // first ("an EOF for a session the host says is still alive is a supersede/detach: not an exit"),
+    // and this is that question. A genuine exit still reads as one: the pty-host's exit watcher stores
+    // has_exited BEFORE it detaches the client, so the list already says so when this EOF arrives.
+    //
+    // Only an UNEXPECTED end is asked about. A session this window has already taken out of g_sessions -
+    // closeSessionAt, closeSplitSide's victim, a closed overlay - is one we are closing, so its EOF is the
+    // kill we sent and nothing on screen needs protecting: it keeps exactly the old path, with no host
+    // round trip (the pty-host's handle_cancel also drops a session from its list before disposing it,
+    // so the answer would be "exited" regardless). A session still LISTED that loses its stream is #82.
+    bool listed;
+    EnterCriticalSection(&g_lock);
+    listed = indexOfSession(s) >= 0;
+    LeaveCriticalSection(&g_lock);
+    if (listed && !streamEndIsExit(s)) {
+        logWarn("session '%s': output stream ended but the host reports its shell still running "
+                "(superseded or detached); kept on screen, not marked exited", s->paneId.c_str());
+        return 0;
+    }
+    s->exited = true;   // EOF, and the host confirms the child exited (or could not be asked)
     InvalidateRect(windowForSession(s), nullptr, FALSE);
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // reflect the exited marker in the tree
     // A split side that exits collapses to its survivor (P4, OnPaneExit) — judged on the UI thread
@@ -2805,7 +2830,7 @@ struct HostSession {
     std::string creationTicket;
     bool adoptable() const { return !exited && !attached; }
 };
-static std::vector<HostSession> hostSessions() {
+static std::vector<HostSession> hostSessions(const char* consequence = "restore will create fresh sessions") {
     std::vector<HostSession> out;
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -2815,9 +2840,10 @@ static std::vector<HostSession> hostSessions() {
         // Say it: an empty list here is indistinguishable from "the host holds nothing", and the
         // difference decides whether restore adopts or re-creates.
         if (oc != ReqOutcome::Ok)
-            logWarn("pty-host: could not read the live session list (%s) — restore will create fresh sessions",
+            logWarn("pty-host: could not read the live session list (%s) — %s",
                     oc == ReqOutcome::Undecodable ? "reply did not decode"
-                                                  : oc == ReqOutcome::Refused ? "host refused" : "no reply");
+                                                  : oc == ReqOutcome::Refused ? "host refused" : "no reply",
+                    consequence);
         return out;
     }
     for (pb_size_t i = 0; i < rep.body.list.sessions_count; i++) {
@@ -2826,6 +2852,34 @@ static std::vector<HostSession> hostSessions() {
         out.push_back({ si.id, si.has_exited, si.attached, si.creation_ticket });
     }
     return out;
+}
+
+// The host's answer to "is this shell still running?" (agliteterm #82), for a session identified the
+// way every host request keys it: the PANE id, and - since the creation protocol - its immutable
+// creation ticket, so a pane id the host has reused for a newer incarnation is not mistaken for ours.
+// Only a listed, matching, not-exited entry is alive. Everything else is not: listed and exited, not
+// listed, or a list that could not be read (hostSessions returns it empty). That keeps a real exit and
+// an unreachable host an exit, exactly as agwinterm's ServerSession.OnStreamEnded treats them. Pure
+// over the list, so test/stream-end.unit.cpp compiles this very function.
+static bool hostListSaysAlive(const std::vector<HostSession>& list, const std::string& paneId,
+                              const std::string& creationTicket) {
+    for (const auto& hs : list) {
+        if (hs.id != paneId) continue;
+        if (!creationTicket.empty() && hs.creationTicket != creationTicket) continue;
+        return !hs.exited;
+    }
+    return false;
+}
+
+// Whether a reader's end-of-stream is the shell exiting (agliteterm #82). A local failure surface has
+// no host id and nothing to ask, so it keeps the old answer, as killSession skips it. Runs on the
+// reader thread with g_lock released: request() serializes on control_transport's own gate, bounded by
+// its 2 s timeout, and nothing joins a reader thread, so this cannot stall a close or shutdown. paneId
+// and creationTicket are written once at creation and never again, so they are read without the lock.
+static bool streamEndIsExit(const Session* s) {
+    if (s->paneId.empty() || s->failed) return true;
+    return !hostListSaysAlive(hostSessions("the stream end is taken as the shell exiting"),
+                              s->paneId, s->creationTicket);
 }
 
 // What the host held when this lite connected, read ONCE at startup (the list is also the handshake
