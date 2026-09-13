@@ -1691,6 +1691,54 @@ if (-not $Only -or $Only -eq 'harness-selfcheck') {
     }
 }
 
+# agliteterm #79: a cold restart relaunches an EXACT empty argv exactly, and an ordinary empty one with
+# the PowerShell wrapper; the E line that says which survives the re-save. Seeded, then the restored
+# shells' command lines are READ OFF THE PROCESSES while the instance is still up: each pane answers a
+# fresh-nonce challenge with its pid and birth (owned-procs.ps1), and the birth is matched to the
+# process record before CommandLine is trusted. A Cell cannot do this: it stops the relaunch first.
+if (-not $Only -or $Only -eq 'exact-argv') {
+    $inst = 'rm-exact-argv'
+    Reset-Cell $inst
+    $err = ''; $exactLine = ''; $wrappedLine = ''; $resaved = ''; $p = $null
+    function RestoredCommandLine([string]$Instance, [string]$Session) {
+        $answer = Ask-PaneShell { param($t) & $ctl session type $t --target $Session --pipe $Instance 2>&1 | Out-Null } `
+                                { (& $ctl session text --target $Session --pipe $Instance 2>&1) -join "`n" } 20000
+        $row = Get-CimInstance Win32_Process -Filter "ProcessId=$($answer.Pid)"
+        if (-not $row) { throw "session $Session answered pid $($answer.Pid), which is not running" }
+        if ((UtcMicroTicks $row.CreationDate) -ne ($answer.BornUtcTicks - ($answer.BornUtcTicks % 10))) {
+            throw "session $Session answered pid $($answer.Pid), which is now a different process"
+        }
+        [string]$row.CommandLine
+    }
+    try {
+        Write-State (State $inst) ("V1`nW`tws-e`nS`t0`texact-empty`tpowershell.exe`t$cwd`nS`t0`twrapped`tpowershell.exe`t$cwd`nE`t0`nA`t0`n")
+        $p = Start-Lite $inst
+        Start-Sleep -Seconds 3
+        $ids = @{}
+        foreach ($s in @(SessionsOf $inst)) { $ids[[string]$s.name] = [string]$s.id }
+        foreach ($n in 'exact-empty', 'wrapped') { if (-not $ids[$n]) { throw "the restored tree has no '$n' session" } }
+        $exactLine = RestoredCommandLine $inst $ids['exact-empty']
+        $wrappedLine = RestoredCommandLine $inst $ids['wrapped']
+        Stop-Lite $p; $p = $null
+        $resaved = [IO.File]::ReadAllText((State $inst))
+    } catch { $err = $_.Exception.Message }
+    finally { Stop-Leftover $p }
+    $eLines = @($resaved -split "`n" | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -match "^E`t" })
+    $wrapper = '(^|\s)-(EncodedCommand|NoLogo|NoExit)\b'
+    if (-not $err -and $exactLine -and $exactLine -notmatch $wrapper -and $wrappedLine -match '-EncodedCommand' -and
+        $eLines.Count -eq 1 -and $eLines[0] -eq "E`t0") {
+        "  PASS  {0,-22} (exact empty argv relaunched exactly; ordinary empty wrapped; E line re-saved)" -f 'exact-argv'
+    } else {
+        $script:failed += 'exact-argv'
+        "  FAIL  exact-argv"
+        if ($err) { "        error:   $err" }
+        "        exact:   [$exactLine]"
+        "        wrapped: [$wrappedLine]"
+        "        E lines: [$($eLines -join ' | ')]"
+        "        log:     $(Restore-Verdict $inst)"
+    }
+}
+
 ""
 if ($script:failed.Count) { "restore-matrix: FAILED cells: $($script:failed -join ', ')"; exit 1 }
 if ($script:skipped -and $Strict) { "restore-matrix: $script:skipped cell(s) skipped under -Strict"; exit 1 }

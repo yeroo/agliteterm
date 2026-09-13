@@ -6,7 +6,7 @@ Assert-LiteSuiteContext
 . "$PSScriptRoot/owned-window.ps1"
 $commandArtifact=Join-Path $env:LOCALAPPDATA ('command-'+[guid]::NewGuid().ToString('N'))
 $appDir=Join-Path $commandArtifact 'agliteterm';New-Item -ItemType Directory -Path $appDir|Out-Null
-@{default='SafeCmd';profiles=@(@{name='SafeCmd';command='cmd.exe';args=@('/d','/q')})}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $appDir 'profiles.json')
+@{default='SafeCmd';profiles=@(@{name='SafeCmd';command='cmd.exe';args=@('/d','/q')},@{name='WrappedPwsh';command='powershell.exe';args=@()})}|ConvertTo-Json -Depth 5|Set-Content (Join-Path $appDir 'profiles.json')
 $commandPipe=Get-LiteTestPipe 'command';$commandCtl=$env:AGLITETERM_TEST_REAL_CTL
 $proc=$null;$failed=$false
 function CommandRpc([string]$verb,$params,[string]$target,[switch]$AllowError){
@@ -30,6 +30,7 @@ try{
     }
     if(-not $ready){throw 'Owned command window did not become ready'}
     . "$PSScriptRoot/session-command-cases.ps1"
+    . "$PSScriptRoot/session-command-exact-cases.ps1"   # lite-only: #79, argv exactness across relaunches
 }catch{$failed=$true;"Session command FAILED: $_"}
 finally{
     if($proc){

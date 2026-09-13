@@ -451,6 +451,12 @@ struct Session {
     std::string overlayResult;
     std::string app, cwd;          // launch spec, remembered so the session can be restored on next launch
     std::vector<std::string> args; // ("" app = default PowerShell; empty args = wrap/bare per app)
+    // The args are the launch argv EXACTLY, empty included: a `session new --command-mode direct` launch.
+    // Without it an empty `args` is ambiguous - "no args given, wrap PowerShell" and "run PowerShell with
+    // no args" record identically - and every relaunch read it as the first, adding -NoLogo -NoExit
+    // -EncodedCommand to a program started with none (#79). Set once, at creation, from the decision
+    // newSession made; duplicate, Reopen Closed and restore carry it.
+    bool exactArgs = false;
     shell_configuration::InputGate inputGate; // sticky PTY input history + per-pane write serialization
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     ULONGLONG childCreated = 0;    // birth identity captured at attach; agent lifecycle refuses unknown/reused PIDs
@@ -2449,7 +2455,7 @@ static std::vector<Profile> listedProfiles() {
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
                               bool repaint = false, bool hidden = false, uint64_t workspace = 0,
-                              const char* creationTicket = "");   // fwd
+                              const char* creationTicket = "", bool exactArgs = false);   // fwd
 
 // The protocol's string fields are FIXED-SIZE arrays, and MSVC's strcpy_s does not truncate on an
 // oversize source — it invokes the CRT invalid-parameter handler, whose default terminates the
@@ -2566,6 +2572,7 @@ static Session* failedCommandSession(int cols, int rows, const char* app,
     auto* s = new Session();
     s->app = app ? app : "";
     if (args) s->args = *args;
+    s->exactArgs = true;            // only an explicit command reaches here, and its args are exact (#79)
     s->cwd = cwd ? cwd : "";
     s->exited = true; s->failed = true;
     s->cols = cols; s->rows = rows;
@@ -2632,8 +2639,11 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         else logWarn("session create: cwd is %zu bytes and does not fit the protocol field (%zu) — "
                      "starting in the default directory instead", strlen(cwd), sizeof agwinterm_ptyhost_Create::cwd - 1);
     }
+    // The one decision that separates an exact argv from "wrap PowerShell". attachSession records it on
+    // the session, so a duplicate, Reopen Closed and a restore relaunch the same way (#79).
+    const bool exactArgs = pargs && (explicitCommand || !pargs->empty());
     std::string enc;
-    if (pargs && (explicitCommand || !pargs->empty())) { // explicit command args, including zero, are exact
+    if (exactArgs) { // explicit command args, including zero, are exact
         // The wire holds 16 args (proto/ptyhost.options). The old cap of 4 silently rewrote the
         // command line of any profile with more than four — saved in full, relaunched truncated.
         const int kMaxArgs = (int)(sizeof agwinterm_ptyhost_Create::args / sizeof agwinterm_ptyhost_Create::args[0]);
@@ -2707,7 +2717,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str());
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str(), exactArgs);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
@@ -2730,7 +2740,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
 /// running and can simply be picked back up, scrollback and all.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint, bool hidden, uint64_t workspace, const char* creationTicket) {
+                              bool repaint, bool hidden, uint64_t workspace, const char* creationTicket, bool exactArgs) {
     { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -2782,6 +2792,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->creationTicket = rep.body.attach.creation_ticket;
     s->app = app ? app : "";        // remember the launch spec for session restore
     if (pargs) s->args = *pargs;
+    s->exactArgs = exactArgs;       // before the push below: duplicate and save read it on other threads (#79)
     s->cwd = cwd ? cwd : "";
     s->emu = emu_new(cols, rows);
     if (!emu_set_scrollback(s->emu, g_scrollbackLines.load())) {
@@ -2949,7 +2960,7 @@ static void killSession(Session* s) {
 // What undo-close (Ctrl+Shift+T) puts back: the launch spec plus the two per-session texts, name
 // and context — a reopened session that came back with its name but not its context would have
 // lost a value the user was told was set (P3).
-struct ClosedSpec { std::wstring name; uint64_t workspace; std::string app, cwd; std::vector<std::string> args; std::wstring context; };
+struct ClosedSpec { std::wstring name; uint64_t workspace; std::string app, cwd; std::vector<std::string> args; std::wstring context; bool exactArgs = false; };
 static std::vector<ClosedSpec> g_closedStack;   // recently closed sessions, for Reopen Closed Session
 
 static bool closePaneOverlay(Session* shell);   // fwd (P5, defined with the overlay verbs' helpers)
@@ -3005,7 +3016,7 @@ static void closeSessionAt(int idx) {
     if (idx < 0) { LeaveCriticalSection(&g_lock); return; }
     if (!cs->hidden) {   // snapshot + append ordered atomically against workspace.move
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
-        g_closedStack.push_back({ cs->name, g_workspaces.token(cs->ws), cs->app, cs->cwd, cs->args, cs->context });
+        g_closedStack.push_back({ cs->name, g_workspaces.token(cs->ws), cs->app, cs->cwd, cs->args, cs->context, cs->exactArgs });
     }
     const Session* previousPrimary = displayedOwner();
     // Taken BEFORE the erase: the split pane's shell is hidden (never persisted, never in the tree)
@@ -3059,8 +3070,9 @@ static void reopenClosed() {
       if (g_closedStack.empty()) return;
       sp = g_closedStack.back(); g_closedStack.pop_back(); }
     int c, r; newSessionGrid(g_focus, &c, &r);
+    // An exact argv relaunches exactly, even when it is empty; an ordinary empty one still wraps (#79).
     Session* s = newSession(c, r, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
-                            sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, sp.workspace);
+                            (sp.exactArgs || !sp.args.empty()) ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, sp.workspace, sp.exactArgs);
     if (s) {
         { LockG hold; s->name = sp.name; s->context = sp.context; }   // `tree` reads both on pipe threads
         selectPrimary(-1, true, s); InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -3848,6 +3860,7 @@ static bool saveSessionState() {
     EnterCriticalSection(&g_lock);
     for (const auto& w : g_workspaces) out += "W\t" + tsvField(narrow(w)) + "\n";
     std::string flagLine;   // "F\t<i>..." = indices (in S-line order) of flagged sessions; old builds skip it
+    std::string exactLine;  // "E\t<i>..." = indices (in S-line order) of sessions whose EMPTY argv is exact (#79); old builds skip it
     // "D\t<id>..." = the host session ids, in S-line order — same in-order idiom as the F line, and
     // additive so a 0.17.x file (which has no D line) still restores, just without adoption.
     std::string idLine;
@@ -3866,6 +3879,7 @@ static bool saveSessionState() {
         for (const auto& a : s->args) out += "\t" + tsvField(a);
         out += "\n";
         if (s->flagged) flagLine += "\t" + std::to_string(saved);
+        if (s->exactArgs && s->args.empty()) exactLine += "\t" + std::to_string(saved);   // a non-empty argv relaunches exactly anyway
         // The D line is what a relaunch after a kill ADOPTS by, and the host knows the shell by its
         // paneId — `id` is the same string until a promotion (closeSplitSide) moves it onto the
         // survivor; written as `id`, a promoted session was never adoptable and its live shell leaked
@@ -3961,6 +3975,7 @@ static bool saveSessionState() {
     unsigned long long stamp = ++g_saveStamp;   // this buffer's place in the order of snapshots
     LeaveCriticalSection(&g_lock);
     if (!flagLine.empty()) out += "F" + flagLine + "\n";
+    if (!exactLine.empty()) out += "E" + exactLine + "\n";
     if (!idLine.empty()) out += "D" + idLine + "\n";
     out += ctxLines;                         // C lines: session contexts, with F and D, before P
     out += splitLines;                       // P lines: each session's own split shell
@@ -6210,18 +6225,19 @@ static void showTreeContextMenu() {
             if (duplicateSource) {
                 std::string app, cwd;
                 std::vector<std::string> args;
+                bool exact = false;               // an exact argv duplicates exactly, even when empty (#79)
                 {
                     LockG hold;
                     // The popup pumps messages: an index may now name a different session.
                     if (indexOfSession(duplicateSource) < 0 ||
                         (duplicateSource->hidden && !splitOwnerOf(duplicateSource))) break;
                     g_activeWs = duplicateSource->ws;
-                    app = duplicateSource->app; args = duplicateSource->args; cwd = duplicateSource->cwd;
+                    app = duplicateSource->app; args = duplicateSource->args; cwd = duplicateSource->cwd; exact = duplicateSource->exactArgs;
                 }
                 int c, r; newSessionGrid(g_focus, &c, &r);
                 // Duplicate the resolved launch, not whichever profile is the new default.
                 Session* s = newSession(c, r, app.empty() ? "powershell.exe" : app.c_str(),
-                                        &args, cwd.empty() ? nullptr : cwd.c_str());
+                                        &args, cwd.empty() ? nullptr : cwd.c_str(), false, false, 0, exact);
                 if (s) { selectPrimary((int)g_sessions.size() - 1); InvalidateRect(g_hwnd, nullptr, FALSE); }
             }
             break;
@@ -11339,8 +11355,9 @@ static std::string ctlDispatch(const std::string& line) {
         int cols, rows; newSessionGrid(0, &cols, &rows);
         g_activeWs = target->ws;
         std::string app = target->app; std::vector<std::string> targs = target->args; std::string cwd = target->cwd;
+        const bool exact = target->exactArgs;   // an exact argv duplicates exactly, even when empty (#79)
         Session* s = newSession(cols, rows, app.empty() ? "powershell.exe" : app.c_str(),
-                                targs.empty() ? nullptr : &targs, cwd.empty() ? nullptr : cwd.c_str());
+                                (exact || !targs.empty()) ? &targs : nullptr, cwd.empty() ? nullptr : cwd.c_str(), false, false, 0, exact);
         if (!s) return ctlErr("create failed");
         selectIdx((int)g_sessions.size() - 1);
         return ctlOkStr(s->id);
@@ -12021,7 +12038,7 @@ static DWORD WINAPI ctlServerThreadFor(void* arg) {
 
 // One parsed state file. `opened` separates "no file" from "a file that says nothing useful" — the
 // two used to look identical from outside, which is half of why the field report was unanswerable.
-struct RestoreSpec { int ws; std::string name, app, cwd; std::vector<std::string> args; bool flagged = false; };
+struct RestoreSpec { int ws; std::string name, app, cwd; std::vector<std::string> args; bool flagged = false; bool exactArgs = false; };
 // A split shell, and which S line owns it. It has no name and no workspace of its own - it is one
 // session's split shell, so it is restored only if that session was.
 struct SplitSpec { int owner = -1; RestoreSpec spec; };
@@ -12142,6 +12159,11 @@ static ParsedState parseStateFile(const std::wstring& path) {
             for (size_t k = 1; k < ff.size(); k++) {
                 int fi = atoi(ff[k].c_str());
                 if (fi >= 0 && fi < (int)ps.specs.size()) ps.specs[fi].flagged = true;
+            }
+        } else if (ff[0] == "E") {   // exact-argv indices, in S-line order (#79; absent in older files)
+            for (size_t k = 1; k < ff.size(); k++) {
+                int ei = atoi(ff[k].c_str());
+                if (ei >= 0 && ei < (int)ps.specs.size()) ps.specs[ei].exactArgs = true;
             }
         } else if (ff[0] == "D") {   // host session ids, in S-line order (absent in 0.17.x files)
             for (size_t k = 1; k < ff.size(); k++) ps.savedIds.push_back(ff[k]);
@@ -12398,7 +12420,7 @@ static bool restoreSessions() {
             for (const auto& hs : g_hostLive) if (hs.id == want) { expectedTicket = hs.creationTicket; break; }
             s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
-                              true, false, 0, expectedTicket.c_str());   // repaint, guarded against id reuse since the scan
+                              true, false, 0, expectedTicket.c_str(), sp.exactArgs);   // repaint, guarded against id reuse since the scan; the argv's exactness rides along (#79)
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
             // The shell itself is untouched by a failed adopt (attach may well have succeeded and
             // only the data pipe refused), so it keeps running under an id nothing points at any
@@ -12409,7 +12431,7 @@ static bool restoreSessions() {
         }
         if (!s)
             s = newSession(cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
-                           sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str());
+                           (sp.exactArgs || !sp.args.empty()) ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, 0, sp.exactArgs);
         if (s) {
             s->name = widen(sp.name); s->flagged = sp.flagged;
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;

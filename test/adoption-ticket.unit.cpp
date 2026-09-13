@@ -4,12 +4,12 @@
 #include <cstdio>
 struct Session {};
 struct HostSession { std::string id, creationTicket; };
-struct Spec { std::string app, cwd; std::vector<std::string> args; };
+struct Spec { std::string app, cwd; std::vector<std::string> args; bool exactArgs = false; };
 static std::vector<HostSession> g_hostLive;
 static std::string received, current;
 static Session live;
 static Session* attachSession(const char*, int, int, const char*, const std::vector<std::string>*,
-                              const char*, bool repaint, bool hidden, uint64_t, const char* expected = "") {
+                              const char*, bool repaint, bool hidden, uint64_t, const char* expected = "", bool = false) {
     received = expected;
     return repaint && !hidden && (received.empty() || received == current) ? &live : nullptr;
 }

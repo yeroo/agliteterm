@@ -41,7 +41,7 @@ std::atomic<int> g_activeWs{2};
 int g_focus=0,held=0,creates=0,lockErrors=0,selectedIndex=0;
 void* g_hwnd=nullptr;constexpr bool FALSE=false;
 Session made,intruder;Session* selected=nullptr;std::vector<Session*> g_sessions;
-std::function<void()> duringHost;std::string appSeen,cwdSeen;std::vector<std::string> argsSeen;
+std::function<void()> duringHost;std::string appSeen,cwdSeen;std::vector<std::string> argsSeen;bool explicitSeen=false,pargsNullSeen=false,exactSeen=false;
 struct LockG {LockG(){++held;}~LockG(){--held;}};
 void newSessionGrid(int,int*c,int*r){*c=80;*r=24;}
 void selectPrimary(int index,bool,Session* expected=nullptr){selectedIndex=index;selected=expected;}
@@ -53,10 +53,11 @@ int callerWs=-1;
 int callerWorkspace(const std::string&caller){return caller=="caller-pane"?callerWs:-1;}
 '@
 $attachFake=@'
-static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0,const char* creationTicket=""){
+static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0,const char* creationTicket="",bool exactArgs=false){
 '@ + "`n"+$attachCapture.Value+@'
 
     if(held)++lockErrors;
+    exactSeen=exactArgs;
     if(duringHost)duringHost();
     Session* s=&made;
     { LockG hold;
@@ -70,8 +71,8 @@ $createFake=@'
 static Session* newSession(int cols,int rows,const char* app=nullptr,const std::vector<std::string>*pargs=nullptr,const char*cwd=nullptr,bool quick=false,bool hidden=false,uint64_t workspace=0,bool explicitCommand=false){
 '@ + "`n"+$createCapture.Value+@'
 
-    ++creates;appSeen=app?app:"";cwdSeen=cwd?cwd:"";argsSeen=pargs?*pargs:std::vector<std::string>{};
-    const char* idbuf="private-created";std::string creationTicket="private-test-ticket";
+    ++creates;appSeen=app?app:"";cwdSeen=cwd?cwd:"";argsSeen=pargs?*pargs:std::vector<std::string>{};explicitSeen=explicitCommand;pargsNullSeen=(pargs==nullptr);
+    const char* idbuf="private-created";std::string creationTicket="private-test-ticket";const bool exactArgs=pargs&&(explicitCommand||!pargs->empty()); // production newSession's decision, for the actual attach call
 '@ + "`n"+$attachCall.Value+@'
 
     g_sessions.push_back(&intruder); // another creator wins the vector's last slot before selection
@@ -102,6 +103,16 @@ int main(){
    check(held==0&&lockErrors==0);
  }
  duringHost=nullptr;creates=0;g_closedStack.clear();reopenClosed();check(creates==0);
+ // #79: Reopen Closed relaunches an EXACT empty argv exactly, and an ordinary empty one still takes the
+ // PowerShell wrapper path. Production reopenClosed, newSession's decision and its actual attach call.
+ g_workspaces=std::vector<std::wstring>{L"first"};g_activeWs=0;duringHost=nullptr;
+ for(bool exact:{true,false}){
+   g_sessions.clear();selected=nullptr;held=creates=lockErrors=0;made=Session{};explicitSeen=pargsNullSeen=exactSeen=!exact;
+   g_closedStack={{L"powershell",g_workspaces.token(0),"powershell.exe","C:/Exact",{},L"",exact}};
+   reopenClosed();check(creates==1&&g_closedStack.empty());
+   check(explicitSeen==exact&&pargsNullSeen==!exact&&argsSeen.empty()&&exactSeen==exact);
+   check(held==0&&lockErrors==0);
+ }
  // Ordinary create also freezes its destination before the host wait.
  g_workspaces=std::vector<std::wstring>{L"first",L"second"};g_activeWs=1;
  duringHost=[&]{g_activeWs=0;};newSession(80,24);check(made.ws==1);
