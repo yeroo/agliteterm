@@ -15,6 +15,13 @@ if(-not $refresh.Success){throw 'Actual refreshTree missing'}
 if($refresh.Value -match 'saveSessionState\('){throw 'refreshTree saves inline on the UI thread again; it must call requestSessionSave'}
 if($refresh.Value -notmatch 'requestSessionSave\('){throw 'refreshTree no longer requests the worker save'}
 if($main -notmatch '(?m)^static DWORD WINAPI saveWorkerThread\('){throw 'save worker thread missing'}
+# OnDestroy joins the worker BEFORE its final save: a worker past its stop check that built after
+# killSession would publish fallback cwds over the live ones. The handle must be kept for the join.
+if($main -notmatch 'g_saveWorker = CreateThread\(nullptr, 0, saveWorkerThread'){throw 'the save worker handle is no longer kept for OnDestroy to join'}
+$destroy=[regex]::Match($main,'(?ms)^    void OnDestroy\(\) \{.*?^    \}')
+if(-not $destroy.Success){throw 'Actual OnDestroy missing'}
+$join=$destroy.Value.IndexOf('WaitForSingleObject(g_saveWorker');$final=$destroy.Value.IndexOf('saveSessionState();')
+if($join -lt 0 -or $final -lt 0 -or $join -gt $final){throw 'OnDestroy must join the save worker before its final saveSessionState'}
 $prefix=@'
 #include <string>
 #include <map>

@@ -4054,9 +4054,6 @@ static bool saveSessionState() {
             !CopyFileW(path.c_str(), bak.c_str(), FALSE))
             logWarn("save: could not keep a .bak generation of %s (err %lu) before writing in place",
                     narrow(path).c_str(), GetLastError());
-        // CREATE_ALWAYS truncates the primary the instant it opens: from here the remembered bytes
-        // describe a file that no longer holds them, so a later save with those bytes must write.
-        g_savePublishedBytes.clear();
         HANDLE g = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (g == INVALID_HANDLE_VALUE) {
             // The silent return that made "restore doesn't work" unanswerable in the field: if the
@@ -4069,6 +4066,10 @@ static bool saveSessionState() {
                     narrow(tmp).c_str(), terr, narrow(path).c_str(), GetLastError(), saved);
             return false;
         }
+        // The open succeeded, so CREATE_ALWAYS has truncated the primary: from here the remembered
+        // bytes describe a file that no longer holds them, and a later save with those bytes must
+        // write. (A failed open above truncates nothing, so the skip stays valid there.)
+        g_savePublishedBytes.clear();
         DWORD wr2 = 0;
         BOOL ok2 = WriteFile(g, out.data(), (DWORD)out.size(), &wr2, nullptr);
         DWORD werr2 = ok2 ? 0 : GetLastError();
