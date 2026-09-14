@@ -8,7 +8,9 @@ resolution — at `%LOCALAPPDATA%\agliteterm\agliteterm.log` (`agliteterm-<insta
 instances), rotating at about 1 MB into `.log.old`. It records what the client *did*, never terminal
 output, pasted text, or your command lines, so it is safe to attach to an issue. A `save ok` line
 means the state file changed: a tree change whose bytes are already on disk writes nothing and logs
-nothing, so a quiet log is a stable window, not a stopped saver.
+nothing. A save blocked inside the filesystem (a rename held by an endpoint-security filter) also
+logs nothing until it returns, so a quiet log is either a stable window or a stuck save; `--diagnose`
+prints the state file's modified time, which tells the two apart.
 
 ## Reporting a problem
 

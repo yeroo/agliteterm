@@ -4004,9 +4004,14 @@ static bool saveSessionState() {
     // Nothing to write: the file holds exactly these bytes. An empty remembered buffer is "nothing
     // published yet in this process", never a match. The existence probe is what keeps this a skip
     // and not a loss — after restore.clear or a hand deletion the same bytes are written again.
+    // The fence moves with it: this snapshot IS what the file holds, so an older buffer still
+    // waiting for g_saveLock must be dropped by it exactly as if it had been written — otherwise
+    // that buffer would publish stale bytes over a newer state (state-fence.unit pins this).
     if (!g_savePublishedBytes.empty() && out == g_savePublishedBytes &&
-        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        g_savePublished = stamp;
         return true;
+    }
 
     // Anything that rebuilds the tree while the session list is momentarily empty used to rewrite the
     // file with zero S lines — a good file replaced by a useless one, with nothing to fall back to.
@@ -4049,6 +4054,9 @@ static bool saveSessionState() {
             !CopyFileW(path.c_str(), bak.c_str(), FALSE))
             logWarn("save: could not keep a .bak generation of %s (err %lu) before writing in place",
                     narrow(path).c_str(), GetLastError());
+        // CREATE_ALWAYS truncates the primary the instant it opens: from here the remembered bytes
+        // describe a file that no longer holds them, so a later save with those bytes must write.
+        g_savePublishedBytes.clear();
         HANDLE g = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (g == INVALID_HANDLE_VALUE) {
             // The silent return that made "restore doesn't work" unanswerable in the field: if the
@@ -4146,11 +4154,15 @@ static bool saveSessionState() {
 // call saveSessionState inline, and one ReplaceFileW that an endpoint-security filter held open
 // kept the window hung for twenty minutes with every keystroke queued behind it; before that, the
 // same call stalled it for 20-50 s at a time. Tree changes now only wake this thread, which lets a
-// burst settle and saves once. The two savers that need a result stay synchronous on their own
-// threads — OnDestroy (the one save that must have landed before the shells go) and restore.capture
-// on its pipe thread — and every saver goes through g_saveLock and the stamps, so the newest
-// snapshot still wins whoever writes it.
+// burst settle and saves once. The savers whose reply or exit claims durability stay synchronous
+// where they run: OnDestroy (the one save that must have landed before the shells go, and it joins
+// this thread first), restore.capture on its pipe thread, and the verbs that save before answering
+// — session.resize, session.restore / bind, workspace.move, claude adopt / restart, and
+// restore.clear's fence — several of which the dispatcher runs ON the UI thread. So a held rename
+// can still stall the window for one of those calls, never for a click or a keystroke. Every saver
+// goes through g_saveLock and the stamps, so the newest snapshot still wins whoever writes it.
 static HANDLE g_saveWake = nullptr;              // auto-reset: "the tree changed; save when you can"
+static HANDLE g_saveWorker = nullptr;            // the thread; OnDestroy joins it before the final save
 static std::atomic<bool> g_saveWorkerStop{false};
 static DWORD WINAPI saveWorkerThread(void*) {
     for (;;) {
@@ -6176,7 +6188,7 @@ static void refreshTree(bool persist = true) {
     }   // g_lock released
     updateStatus();
     // Off the UI thread (see saveWorkerThread); a caller that must report a durable result calls
-    // saveSessionState itself, as the resize and capture verbs do.
+    // saveSessionState itself, as the resize, restore/bind, capture and workspace.move verbs do.
     if (persist && !g_restoring) requestSessionSave();
 }
 
@@ -8779,10 +8791,18 @@ public:
         // shells whose children the query reads: agwinterm's SaveState(captureCommands: true), gated
         // the same way — see captureCommandsIntoPanes.
         if (g_restoreCommands.load()) captureCommandsIntoPanes();
-        // No worker save may START after this point: killSession below takes the shells the save
-        // queries. One already running finishes first — the final save waits on g_saveLock.
+        // No worker save may run past this point: killSession below takes the shells the save
+        // queries, and a worker that built its buffer after that would put the fallback cwds on
+        // disk over the live ones. Stop it, wake it, and JOIN it. The wait is bounded because a
+        // worker stuck in ReplaceFileW behind the filter holds g_saveLock, and the final save below
+        // waits on that lock anyway; a worker that outlives the bound is logged, not ignored.
         g_saveWorkerStop = true;
         if (g_saveWake) SetEvent(g_saveWake);
+        if (g_saveWorker) {
+            if (WaitForSingleObject(g_saveWorker, 5000) != WAIT_OBJECT_0)
+                logWarn("save worker did not stop within 5 s; the final save waits on the save lock behind it");
+            CloseHandle(g_saveWorker); g_saveWorker = nullptr;
+        }
         saveSessionState();                      // final save with LIVE cwds — while the shells are
                                                  // still alive to answer the PEB query; the periodic
                                                  // saves only fire on structural changes, not on cd
@@ -12730,9 +12750,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // every build before the saver did, and the log says so once.
     g_saveWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (g_saveWake) {
-        HANDLE worker = CreateThread(nullptr, 0, saveWorkerThread, nullptr, 0, nullptr);
-        if (worker) CloseHandle(worker);
-        else {
+        g_saveWorker = CreateThread(nullptr, 0, saveWorkerThread, nullptr, 0, nullptr);   // joined by OnDestroy
+        if (!g_saveWorker) {
             DWORD err = GetLastError();
             CloseHandle(g_saveWake); g_saveWake = nullptr;
             logWarn("save worker could not start (err %lu) — state saves run on the UI thread this run", err);
