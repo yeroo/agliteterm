@@ -1,8 +1,10 @@
 # Configuration
 
 Settings live in the registry under `HKCU\Software\agliteterm`; most of them are also on
-*File ▸ Properties*. Key bindings and custom commands live in `%LOCALAPPDATA%\agliteterm\keymap.conf`
-(see [commands and agent integration](agent-integration.md)), shell profiles in
+*File ▸ Properties*. Built-in action bindings are `Key_*` registry values there too, set in the
+Keyboard dialog. `%LOCALAPPDATA%\agliteterm\keymap.conf` holds custom commands, the leader, and extra
+`map` chords for commands or built-in actions (see [commands and agent integration](agent-integration.md));
+a `map` line adds a chord and leaves the registry binding in place. Shell profiles live in
 `%LOCALAPPDATA%\agliteterm\profiles.json`.
 
 ## Settings over the control API
@@ -22,8 +24,11 @@ an unknown outcome: read back before retrying.
 | foreground, background | #RRGGBB; used when custom-colors is true |
 | sidebar-font-size | 0 for system default, or 6..24 |
 | scrollback-lines | 0..1000000; default 5000; new surfaces only, no live eviction; positive caps allow 512 rows of batched-trim slack |
-| omp-theme | a theme path for eligible new PowerShell shells, or `none` (see below) |
+| omp-theme | a theme name (from `omp list`) or path for eligible new PowerShell shells, or `none` (see below) |
 | restore-commands | true/false, default false (see below) |
+
+`config list` is the authoritative list; it also reports the cursor and quick-terminal keys this table
+leaves out.
 
 `theme list/set` uses the same four modes. `settings` requests the Properties dialog without raising
 the terminal; its reply is `settings open requested`. `keymap reload` reloads registry bindings:

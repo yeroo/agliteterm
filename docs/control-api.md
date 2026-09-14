@@ -123,7 +123,8 @@ default), `horizontal` = top/bottom. The axis names the arrangement, never the d
   `focusedPane`, `axis` — and a single one carries none of it, except that a promoted session's node
   carries `paneIds` alone (`[<its shell's id>]`, the one single session whose pane id is not its
   `id`). Every structural change emits `tree`.
-- `session resize --split-ratio R` or `--grow-left/right/top/bottom N` moves the divider.
+- `session resize --split-ratio R` or `--grow-left/right/top/bottom N` moves the active split's divider —
+  the split on screen; it does not take `--target`.
   Wrong-axis or malformed growth refuses; ratios clamp to 0.05..0.95 and persist.
 
 **The session-id rule.** A session id names the session's own shell while it exists. Whenever that
@@ -147,7 +148,8 @@ and one per pane.
   session takes `left`) and **answers the overlay's id**, a session id the program inside holds as
   its `AGWINTERM_SESSION_ID`.
 - The sibling pane keeps rendering and taking input. The overlay is the covered pane's **surface**:
-  keys and the mouse reach it, and the pane's own id reaches the shell underneath.
+  keys and the mouse reach it, and the pane's own id reaches the shell underneath. On
+  `session overlay`, the overlay's id names its slot (see [Targets](#targets)).
 - Refused with nothing opened: a word that is not `left` / `right`; `--pane right` on one pane
   (`pane not visible`); a slot already holding one (`pane overlay already open` — no silent
   replace); a `--target` naming the other side; and `--size-percent` / `resize` with `--pane` (a
@@ -178,6 +180,8 @@ only, a recorded difference. The pair together is refused.
 - On a **surface** verb (`session type` / `write` / `output` / `text` / `copy` / `paste`,
   `surface cursor`, `session overlay`, `selection all` / `copy` / `clear` / `finalize`) it is the
   overlay.
+- On `session overlay` (`close`, `result`, `copy`, `text`), `--target <overlay id>` without `--pane`
+  names the slot that overlay occupies.
 - An overlay's id reaches it on the surface verbs only, and is refused as a cover by every other verb
   (`close`, `select`, `flag`, `rename`, `duplicate`, …). `flag clear` alone takes no target and
   unflags every session.

@@ -38,7 +38,7 @@ classic Windows look.
 ## Keys
 
 Keys are fully rebindable. Ctrl+Shift+P opens the palette, Ctrl+Shift+M toggles mark mode,
-Ctrl+Shift+A selects all; other actions start unbound.
+Ctrl+Shift+A selects all, Ctrl+` toggles the quick terminal; other actions start unbound.
 
 The two pane-focus rows are by **slot**: *Focus Left / Top Pane* is slot 0 and *Focus Right / Bottom
 Pane* slot 1, whichever shell a `session swap` put there, and the same two rows serve both axes.
