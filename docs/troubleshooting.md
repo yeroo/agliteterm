@@ -6,7 +6,9 @@ agliteterm keeps a small always-on log of its own decisions — session saves an
 counts, byte totals, and the exact error when a write fails), focus handoffs, and font and pack
 resolution — at `%LOCALAPPDATA%\agliteterm\agliteterm.log` (`agliteterm-<instance>.log` for named
 instances), rotating at about 1 MB into `.log.old`. It records what the client *did*, never terminal
-output, pasted text, or your command lines, so it is safe to attach to an issue.
+output, pasted text, or your command lines, so it is safe to attach to an issue. A `save ok` line
+means the state file changed: a tree change whose bytes are already on disk writes nothing and logs
+nothing, so a quiet log is a stable window, not a stopped saver.
 
 ## Reporting a problem
 

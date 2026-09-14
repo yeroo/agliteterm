@@ -22,6 +22,8 @@ constexpr int REPLACEFILE_IGNORE_MERGE_ERRORS=1,REPLACEFILE_WRITE_THROUGH=2,MOVE
 struct BY_HANDLE_FILE_INFORMATION {DWORD dwFileAttributes=0;};
 int g_lock=0,g_saveLock=1,heldState=0,heldSave=0,lockErrors=0,ioCalls=0,nextHandle=1;
 unsigned long long g_saveStamp=0,g_savePublished=0;
+std::string g_savePublishedBytes;
+constexpr DWORD INVALID_FILE_ATTRIBUTES=0xFFFFFFFFul;
 DWORD error=0; bool flushOk=true,regular=true,markerOk=true;
 std::wstring failDelete;
 std::map<std::wstring,std::string> files; std::map<int,std::wstring> handles;
@@ -45,6 +47,7 @@ HANDLE CreateFileW(const wchar_t* p,int,int,void*,int creation,int,void*){
  int handle=nextHandle++;handles[handle]=path;return handle;
 }
 BOOL GetFileInformationByHandle(HANDLE,BY_HANDLE_FILE_INFORMATION*info){io();info->dwFileAttributes=regular?0:FILE_ATTRIBUTE_REPARSE_POINT;return 1;}
+DWORD GetFileAttributesW(const wchar_t*p){io();return files.count(p)?0:INVALID_FILE_ATTRIBUTES;}
 BOOL FlushFileBuffers(HANDLE){io();return flushOk;}
 BOOL CloseHandle(HANDLE h){io();handles.erase(h);return 1;}
 BOOL WriteFile(HANDLE h,const void*data,DWORD size,DWORD*written,void*){io();files[handles.at(h)]={static_cast<const char*>(data),size};*written=size;return 1;}
@@ -60,7 +63,7 @@ $tests=@'
 int main(){
  int checks=0,failed=0;auto check=[&](bool ok){++checks;if(!ok){++failed;std::printf("FAIL fence %d\n",checks);}};
  const auto path=stateFilePath();
- auto reset=[&]{g_saveStamp=g_savePublished=0;files={{path,"primary"},{path+L".bak","backup"},{path+L".tmp","temp"}};handles.clear();heldState=heldSave=lockErrors=ioCalls=0;beforeSaveLock=nullptr;flushOk=regular=markerOk=true;failDelete.clear();};
+ auto reset=[&]{g_saveStamp=g_savePublished=0;g_savePublishedBytes.clear();files={{path,"primary"},{path+L".bak","backup"},{path+L".tmp","temp"}};handles.clear();heldState=heldSave=lockErrors=ioCalls=0;beforeSaveLock=nullptr;flushOk=regular=markerOk=true;failDelete.clear();};
  auto snapshot=[&]{LockG hold;return ++g_saveStamp;};
  // Older snapshot is paused before the actual save lock; clear publishes its durable fence first.
  reset();auto old=snapshot();auto cleared=clearRestoreState();int clearedIo=ioCalls;
@@ -89,6 +92,15 @@ int main(){
  check(publish(path,"kept-after-empty",snapshot()));check(files[path]=="kept-after-empty");
  check(!publish(path,"",snapshot(),0,false));check(files[path]=="kept-after-empty");
  check(publish(path,"",snapshot(),0,true));check(files[path].empty()&&!files.count(path+L".bak"));
+ check(lockErrors==0&&heldState==0&&heldSave==0);
+ // Bytes already on disk are not written again: the repeat costs one existence probe and no write,
+ // and rotates nothing. A missing primary is re-created from the same bytes; different bytes rotate.
+ reset();check(publish(path,"same",snapshot()));int afterFirst=ioCalls;check(files[path]=="same"&&files[path+L".bak"]=="primary");
+ check(publish(path,"same",snapshot()));check(ioCalls==afterFirst+1);check(files[path]=="same"&&files[path+L".bak"]=="primary");
+ files.erase(path);check(publish(path,"same",snapshot()));check(files[path]=="same"&&ioCalls>afterFirst+2);
+ check(publish(path,"changed",snapshot()));check(files[path]=="changed"&&files[path+L".bak"]=="same");
+ // restore.clear forgets the bytes with the files: the same snapshot afterwards is a real write.
+ check(clearRestoreState().starts_with("ok:"));check(publish(path,"changed",snapshot()));check(files[path]=="changed");
  check(lockErrors==0&&heldState==0&&heldSave==0);
  std::printf("state fence: %d checks, %d failed\n",checks,failed);return failed?1:0;
 }

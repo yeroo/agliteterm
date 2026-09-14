@@ -476,7 +476,6 @@ struct Session {
     bool adopted = false;          // a live shell must never receive restore replay
     void* emu = nullptr;
     HANDLE data = INVALID_HANDLE_VALUE;
-    HANDLE reader = nullptr;
     int cols = 0, rows = 0;     // geometry last pushed to the host (0 = never sized yet)
     int scrollOff = 0;          // rows scrolled up into history (0 = live)
     std::atomic<bool> exited{false}; // reader EOF is observed by UI/control threads without a data race
@@ -1186,6 +1185,12 @@ static CRITICAL_SECTION g_resizeLock;
 static CRITICAL_SECTION g_saveLock;
 static unsigned long long g_saveStamp = 0;      // bumped under g_lock as a buffer is built
 static unsigned long long g_savePublished = 0;  // the stamp of the last buffer published (under g_saveLock)
+// The bytes of that buffer (under g_saveLock). A save whose buffer equals them, while the file is
+// still on disk, is not written again: refreshTree persists on every tree change — a status cue,
+// an unread badge, a focus move — and most of those change nothing the file records. The
+// 2026-09-14 hang report logged three identical 2 KB saves per second, each a write, a flush and a
+// write-through rename through the endpoint-security filter.
+static std::string g_savePublishedBytes;
 // Scoped hold of g_lock. The section is recursive, so nesting (a reconcile inside a paint that
 // already holds it) is safe.
 struct LockG {
@@ -2820,7 +2825,9 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // seeding the scrollback is a separate improvement.
     EnterCriticalSection(&g_lock);
     s->ws = g_workspaces.destination(workspace);
-    s->reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr);
+    // Nothing joins the reader — it ends with the data pipe — so its handle is closed at once rather
+    // than kept as one more zombie thread object per session.
+    if (HANDLE reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr)) CloseHandle(reader);
     s->hidden=hidden;
     g_sessions.push_back(s);
     emitEvent("session", s->id, "created");
@@ -3994,6 +4001,12 @@ static bool saveSessionState() {
         ~LockSave() { LeaveCriticalSection(&g_saveLock); }
     } saveHold;
     if (stamp < g_savePublished) return true;   // overtaken: the file already holds a newer snapshot
+    // Nothing to write: the file holds exactly these bytes. An empty remembered buffer is "nothing
+    // published yet in this process", never a match. The existence probe is what keeps this a skip
+    // and not a loss — after restore.clear or a hand deletion the same bytes are written again.
+    if (!g_savePublishedBytes.empty() && out == g_savePublishedBytes &&
+        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return true;
 
     // Anything that rebuilds the tree while the session list is momentarily empty used to rewrite the
     // file with zero S lines — a good file replaced by a useless one, with nothing to fall back to.
@@ -4062,6 +4075,7 @@ static bool saveSessionState() {
                     "(err %lu), so this save was not atomic",
                     saved, out.size(), narrow(path).c_str(), narrow(tmp).c_str(), terr);
             g_savePublished = stamp;
+            g_savePublishedBytes = out;
             return true;
         }
         logWarn("save FAILED in place to %s: wrote %lu of %zu bytes (err %lu) after %s could not "
@@ -4102,6 +4116,7 @@ static bool saveSessionState() {
                                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
         logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
         g_savePublished = stamp;
+        g_savePublishedBytes = out;
         return true;
     }
     bool rotated = rotate && MoveFileExW(path.c_str(), bak.c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -4123,7 +4138,34 @@ static bool saveSessionState() {
     }
     logInfo("save ok: %d session(s), %zu bytes -> %s", saved, out.size(), narrow(path).c_str());
     g_savePublished = stamp;
+    g_savePublishedBytes = out;
     return true;
+}
+
+// The UI thread does not write the state file on a tree change (2026-09-14). refreshTree used to
+// call saveSessionState inline, and one ReplaceFileW that an endpoint-security filter held open
+// kept the window hung for twenty minutes with every keystroke queued behind it; before that, the
+// same call stalled it for 20-50 s at a time. Tree changes now only wake this thread, which lets a
+// burst settle and saves once. The two savers that need a result stay synchronous on their own
+// threads — OnDestroy (the one save that must have landed before the shells go) and restore.capture
+// on its pipe thread — and every saver goes through g_saveLock and the stamps, so the newest
+// snapshot still wins whoever writes it.
+static HANDLE g_saveWake = nullptr;              // auto-reset: "the tree changed; save when you can"
+static std::atomic<bool> g_saveWorkerStop{false};
+static DWORD WINAPI saveWorkerThread(void*) {
+    for (;;) {
+        WaitForSingleObject(g_saveWake, INFINITE);
+        if (g_saveWorkerStop.load()) return 0;
+        Sleep(200);                              // a burst of tree changes becomes one save
+        if (g_saveWorkerStop.load()) return 0;
+        saveSessionState();
+    }
+}
+/// What refreshTree calls. Without a worker (its event or thread failed to start, which the log
+/// reports) the save runs inline as before, so persistence never silently stops.
+static void requestSessionSave() {
+    if (g_saveWake) SetEvent(g_saveWake);
+    else saveSessionState();
 }
 
 // Select a face+size, apply it, and persist the choice (used by the Properties dialog).
@@ -6133,7 +6175,9 @@ static void refreshTree(bool persist = true) {
     g_treeSyncing = false;
     }   // g_lock released
     updateStatus();
-    if (persist && !g_restoring) saveSessionState();   // callers may explicitly save once and report its result
+    // Off the UI thread (see saveWorkerThread); a caller that must report a durable result calls
+    // saveSessionState itself, as the resize and capture verbs do.
+    if (persist && !g_restoring) requestSessionSave();
 }
 
 // Remove a workspace; its sessions fall back to the first workspace (indices shift down).
@@ -8735,6 +8779,10 @@ public:
         // shells whose children the query reads: agwinterm's SaveState(captureCommands: true), gated
         // the same way — see captureCommandsIntoPanes.
         if (g_restoreCommands.load()) captureCommandsIntoPanes();
+        // No worker save may START after this point: killSession below takes the shells the save
+        // queries. One already running finishes first — the final save waits on g_saveLock.
+        g_saveWorkerStop = true;
+        if (g_saveWake) SetEvent(g_saveWake);
         saveSessionState();                      // final save with LIVE cwds — while the shells are
                                                  // still alive to answer the PEB query; the periodic
                                                  // saves only fire on structural changes, not on cd
@@ -12035,7 +12083,12 @@ static DWORD WINAPI ctlServerThreadFor(void* arg) {
             static bool warned = false;
             if (!warned) { warned = true; logInfo("ctl: a client used the legacy pipe name '%s' - alias still in use", narrow(kLegacyAppId).c_str()); }
         }
-        CreateThread(nullptr, 0, ctlClientThread, pipe, 0, nullptr);
+        // Nothing joins the client thread, so its handle is closed at once: kept, each one pinned a
+        // zombie thread object for the life of the process — 12,000 of them after two days of
+        // agwintermctl traffic (2026-09-14). The thread owns the pipe; if it cannot start, close that.
+        HANDLE client = CreateThread(nullptr, 0, ctlClientThread, pipe, 0, nullptr);
+        if (client) CloseHandle(client);
+        else CloseHandle(pipe);
     }
 }
 
@@ -12673,6 +12726,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     InitializeCriticalSection(&g_saveLock);
     InitializeCriticalSection(&g_evtLock);
     InitializeCriticalSection(&g_statusLock);
+    // The saver the tree changes wake (saveWorkerThread). Without it the UI thread saves inline, as
+    // every build before the saver did, and the log says so once.
+    g_saveWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_saveWake) {
+        HANDLE worker = CreateThread(nullptr, 0, saveWorkerThread, nullptr, 0, nullptr);
+        if (worker) CloseHandle(worker);
+        else {
+            DWORD err = GetLastError();
+            CloseHandle(g_saveWake); g_saveWake = nullptr;
+            logWarn("save worker could not start (err %lu) — state saves run on the UI thread this run", err);
+        }
+    } else logWarn("save worker event could not be created (err %lu) — state saves run on the UI thread this run", GetLastError());
     g_evtReady = true;   // from here on, anything worth reporting goes into the event log
     loadCore();
 

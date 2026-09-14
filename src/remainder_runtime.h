@@ -140,7 +140,10 @@ static std::string clearRestoreState() {
     CloseHandle(receipt);
     if (!durable) return ctlErr("restore clear: intent marker could not be flushed; no state files removed");
     // Fence older snapshots even on partial failure. Never nest the state lock inside the I/O lock.
+    // The remembered bytes go too: the file they described is being removed, so the next save with
+    // the same bytes must write, not skip.
     g_savePublished = stamp;
+    g_savePublishedBytes.clear();
     int removed = 0; std::string failures;
     for (const auto& suffix : {L".bak", L".tmp", L""}) {
         const auto file = path + suffix;
