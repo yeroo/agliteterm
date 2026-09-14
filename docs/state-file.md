@@ -1,9 +1,9 @@
 # The state file — `sessions.tsv`, line by line
 
 What agliteterm writes to restore itself from, field by field, so a file can be read, hand-edited or
-seeded by a test without reading `saveSessionState()` / `parseStateFile()` in `src/main.cpp`. The
-README's *Session restore & the state file* section is the user-facing half (where the file is, the
-`.bak` generation, how to recover by hand); this is the format.
+seeded by a test without reading `saveSessionState()` / `parseStateFile()` in `src/main.cpp`.
+[Session restore](session-restore.md) is the user-facing half (where the file is, the `.bak`
+generation, how to recover by hand); this is the format.
 
 Path: `%LOCALAPPDATA%\agliteterm\sessions.tsv` for the default instance, `sessions-<instance>.tsv`
 for a `--pipe <instance>` window. One file per window process. Tab-separated UTF-8 text, `\n`
