@@ -108,6 +108,9 @@ one named, into a per-pane slot.
 Parity batch P4 gives a split its full shape, in agterm's words: `vertical` = left/right panes (the
 default), `horizontal` = top/bottom. The axis names the arrangement, never the divider.
 
+- **To get a pane, use `session split on`.** The bare form is a toggle: on a session that is already
+  split it closes the split and answers the survivor's id — the session's own shell — so a script
+  that asks twice ends up addressing the pane it runs in. `on` answers slot 1's id every time.
 - `session split [on|off|toggle] [--axis ..] [--target ID]` **answers a pane id** (a bare string)
   whichever way it went: `on` the right/bottom pane's, also when already split; `off` the survivor's,
   also when already single. It honours its target (a session, either pane, a prefix, a name; a cover

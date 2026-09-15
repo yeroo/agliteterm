@@ -9595,6 +9595,11 @@ agwintermctl session swap [--target <id>]
 agwintermctl session focus [primary|split|left|right|top|bottom|other]
 ```
 
+TO GET A PANE, USE `session split on`. The bare form is `toggle`: on a session that is already
+split it CLOSES the split and answers the SURVIVOR's id - the session's own shell, the pane you may
+be typing in - so a launcher that calls it twice types its second command into itself (seen in the
+field). `on` answers slot 1's id every time, split or not.
+
 `session split` REPLIES WITH A PANE ID, a bare string. `on` = slot 1's pane id - ALSO when the
 session was already split (nothing changes; a caller that does not know whether it split gets
 something addressable either way - after a swap that is the session's own shell). `off` = the
