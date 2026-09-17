@@ -32,8 +32,13 @@ int main(){
     check(indexOf(custom,L"From keymap.conf")>0&&custom[indexOf(custom,L"From keymap.conf")].find(L"%LOCALAPPDATA%\\agliteterm")!=std::wstring::npos,"the data-folder line carries a real backslash, not a BEL");
     auto leaderOnly=lines(L"1",{},{},L"F12");
     check(has(leaderOnly,L"CUSTOM COMMANDS")&&indexOf(leaderOnly,L"F12")>0,"a leader without sequences still shows the section");
+    // A long command label is clipped to the card with "...", never cut mid-word by the painter.
+    auto longRow=lines(L"1",{},{{L"leader, Ctrl+Shift+Alt+F12",L"command:"+std::wstring(90,L'x')}},L"");
+    int lr=indexOf(longRow,L"leader, Ctrl+Shift+Alt+F12");
+    check(lr>0&&longRow[lr].size()==74&&longRow[lr].compare(71,3,L"...")==0,"an over-long binding row is clipped to 74 with an ellipsis");
+    check(fit(L"short")==L"short"&&fit(std::wstring(74,L'a')).size()==74&&fit(std::wstring(75,L'a')).size()==74,"fit leaves a fitting line alone");
     // Every line fits the 78-column card the host paints (an over-long line is cut with an ellipsis).
-    bool fits=true;for(const auto& l:custom)if(l.size()>74)fits=false;for(const auto& l:plain)if(l.size()>74)fits=false;
+    bool fits=true;for(const auto& l:custom)if(l.size()>74)fits=false;for(const auto& l:plain)if(l.size()>74)fits=false;for(const auto& l:longRow)if(l.size()>74)fits=false;
     check(fits,"no help line exceeds 74 characters");
     // Scroll clamps.
     check(clampScroll(5,10,4)==5&&clampScroll(99,10,4)==6&&clampScroll(-3,10,4)==0,"scroll clamps to the last page and to zero");

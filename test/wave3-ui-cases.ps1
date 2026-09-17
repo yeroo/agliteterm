@@ -241,4 +241,13 @@ Check 'a second F1 closes it' (Help-Wait {-not (Help-Visible)})
 Check 'the Help menu command opens the card' (Help-Wait {Help-Visible})
 [void][HelpUi]::PostMessageW($h,0x201,[IntPtr]1,[IntPtr]0x00010001);[void][HelpUi]::PostMessageW($h,0x202,[IntPtr]0,[IntPtr]0x00010001)   # a press at client (1,1): outside the card
 Check 'a click outside the card closes it' (Help-Wait {-not (Help-Visible)})
+# A menu command while the card is open runs in the open: View > Command Palette (IDM_PALETTE = 130)
+# closes help first, so the palette never sits under the card; Esc then closes the palette.
+Help-Key 0x70 0x3B
+Check 'F1 opens the card once more' (Help-Wait {Help-Visible})
+[void][HelpUi]::PostMessageW($h,0x111,[IntPtr]130,[IntPtr]::Zero)
+Check 'the palette command closes the card before it opens the palette' (Help-Wait {-not (Help-Visible)})
+Help-Key 0x1B 0x01 0x1B                               # closes the palette
+Start-Sleep -Milliseconds 400
+Check 'the palette round trip typed nothing into the shell either' ((([string](Wave-Rpc 'session.text' @{})).TrimEnd())-ceq $helpTextBefore)
 Check 'the shell still answers after the help round trip' ([bool](Wave-Rpc 'ping'))

@@ -5858,16 +5858,27 @@ static void updCheck(bool interactive) {
 // text itself is help::lines (help.h), so its content and order are unit-tested without a window.
 static void helpRebuild() {
     std::vector<help::Row> builtin, custom;
+    // EFFECTIVE bindings only (revmux r1): a built-in whose chord a keymap.conf line took is
+    // shadowed (customKey runs first); of two keymap.conf lines on one chord the LAST runs
+    // (Catalog::binding walks backwards); a bare F1 is help's (handleKeyDown), so a `map f1` and
+    // a `leader = f1` with everything under it never fire and are left off the card.
+    auto bareF1 = [](uint16_t k) { return LOBYTE(k) == VK_F1 && HIBYTE(k) == 0; };
     for (int a = 0; a < KB_COUNT; a++)
-        if (g_keys[a]) builtin.push_back({ palKeyName(g_keys[a]), kKbInfo[a].label });
-    for (const auto& b : g_commands.bindings)   // UI thread: g_commands is UI-thread owned
+        if (g_keys[a] && !g_commands.binding(g_keys[a], false))
+            builtin.push_back({ palKeyName(g_keys[a]), kKbInfo[a].label });
+    bool leaderUsable = g_commands.leader && !bareF1(g_commands.leader);
+    for (const auto& b : g_commands.bindings) {   // UI thread: g_commands is UI-thread owned
+        if (g_commands.binding(b.key, b.leader) != &b) continue;
+        if (b.leader ? !leaderUsable : bareF1(b.key)) continue;
         custom.push_back({ (b.leader ? L"leader, " : L"") + palKeyName((WORD)b.key), widen(b.action) });
+    }
     g_helpLines = help::lines(updVersion(), std::move(builtin), std::move(custom),
-                              g_commands.leader ? palKeyName((WORD)g_commands.leader) : L"");
+                              leaderUsable ? palKeyName((WORD)g_commands.leader) : L"");
 }
 
 static void openHelp() {
     if (g_palette) g_palette = false;   // help replaces the palette; Esc then returns to the terminal
+    g_leaderPending = false;            // a leader half-typed before F1 must not eat the key after Esc
     helpRebuild();
     g_helpOpen = true;
     g_helpScroll = 0;
@@ -5887,6 +5898,7 @@ static void helpScrollBy(int lines) {
 // Keyboard while help is open: it owns every key (modal), so nothing leaks to the shell - the
 // caller sets g_swallowChar from the true return, which drops Esc's WM_CHAR as well.
 static bool helpKey(WPARAM vk) {
+    if (altDown()) return false;   // Alt chords are the system's (Alt+F4, the menu bar): DefWindowProc gets them
     int n = (int)g_helpLines.size(), view = max(1, g_helpViewLines);
     switch (vk) {
         case VK_ESCAPE: case VK_F1: closeHelp(); return true;
@@ -5953,6 +5965,7 @@ static void paintHelp(HDC mem, RECT rc) {
 }
 
 static void togglePalette() {
+    if (!g_palette && g_helpOpen) closeHelp();   // the card and the palette never stack, in either order (revmux r1 Major)
     g_palette = !g_palette;
     g_palQuery.clear();
     palFilter();
@@ -6036,12 +6049,20 @@ static void runKbAction(int a) {
         case KB_DASHBOARD: { JsonReq r; r.fields["cmd"] = "dashboard"; if (g_dashboard) r.fields["args.close"] = "true"; remainderOnUi(r); break; }
     }
 }
-static bool handleKeyDown(WPARAM vk, bool repeat = false) {
+static bool handleKeyDown(WPARAM vk, bool repeat = false, bool popup = false) {
     if (g_dashboard) return dashboardKey(vk);
-    // Help owns the keyboard while open; plain F1 opens it from anywhere the frame has the keys -
-    // a full-screen program included, as in agwinterm - and so shadows an F1 a program would get.
-    if (g_helpOpen) return helpKey(vk);
-    if (vk == VK_F1 && !ctrlDown() && !altDown() && !shiftDown()) { openHelp(); return true; }
+    // Help is the main frame's. A popup terminal (quick, scratch, overlay: popupProc shares this
+    // handler and says so) keeps its own keyboard, so its F1 reaches its program and a card open
+    // on the frame never swallows the popup's keys (revmux r1 Major). On the frame the card owns
+    // the keyboard while open, and plain F1 opens it from anywhere the frame has the keys - a
+    // full-screen program included, as in agwinterm - and so shadows an F1 a program would get.
+    // A leader sequence still inside its window takes F1 first (`map leader f1 = ...` runs); a
+    // bare `map f1` is shadowed, and the card leaves it out.
+    if (!popup) {
+        if (g_helpOpen) return helpKey(vk);
+        bool leaderLive = g_leaderPending && GetTickCount64() - g_leaderAt <= 2000;
+        if (vk == VK_F1 && !ctrlDown() && !altDown() && !shiftDown() && !leaderLive) { openHelp(); return true; }
+    }
     endMarkModeIfMoved();
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
@@ -7356,7 +7377,7 @@ static LRESULT CALLBACK popupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             setFocusOverride(s);
-            g_swallowChar = handleKeyDown(w, (l & (1LL << 30)) != 0);
+            g_swallowChar = handleKeyDown(w, (l & (1LL << 30)) != 0, /*popup:*/ true);
             InvalidateRect(h, nullptr, FALSE);
             if (g_swallowChar) return 0;
             break;
@@ -7586,6 +7607,7 @@ static bool showPopupRaised(HWND h) {
 static void togglePopupTerminal(bool scratch) {
     if(!scratch){try{quickVisibility("toggle",true);}catch(const std::exception& ex){logWarn("quick: %s",ex.what());}return;}
     g_dashboard = false; g_dashCells.clear(); // popup terminals regain their own keyboard
+    if (g_helpOpen) closeHelp();                // and the frame does not keep a card behind them
     HWND& hw = scratch ? g_scratchHwnd : g_quickHwnd;
     Session*& sess = scratch ? g_scratchSession : g_quickSession;
     if (hw && IsWindowVisible(hw)) {
@@ -7643,7 +7665,7 @@ static void openOverlay(const std::string& command, int sizePct, const std::stri
     if (!overlayCommandFits(commandLine)) { logWarn("overlay: encoded command exceeds host argument capacity; nothing opened"); return; }
     { LockG hold; bool found=false; for(auto* s:g_sessions)if(!s->hidden&&s->id==ownerId){found=true;break;}
       if(!found){logWarn("overlay: owner closed before queued open");return;} }
-    g_dashboard = false; g_dashCells.clear();
+    g_dashboard = false; g_dashCells.clear(); if (g_helpOpen) closeHelp();
     // One at a time; WM_DESTROY kills the old session + clears state. Every popup open resets the
     // window-wide `result` (agwinterm's rule) — the VERB already did, when it answered "opened", so
     // a `result` right after the ack reads `no overlay` and not the replaced popup's exit — and the
@@ -8840,6 +8862,7 @@ public:
         // id can collide with command ids (EN_CHANGE arrived as id 1 == IDM_NEW — so renaming a
         // workspace opened the New Session dialog).
         if (lp != 0 && (HWND)lp != g_toolbar) return 0;
+        if (g_helpOpen && id != IDM_HELP) closeHelp();   // a menu or toolbar command runs in the open, never under the card
         if (HIWORD(wp) > 1) return 0;   // BN_CLICKED/menu/accel only, never EN_*/CBN_*
         switch (id) {
             case IDM_MARK: runKbAction(KB_MARK); break;

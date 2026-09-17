@@ -33,6 +33,11 @@ inline std::wstring row(const Row& r, size_t column = 20) {
     return s + r.label;
 }
 
+inline std::wstring fit(std::wstring s, size_t width = 74) {
+    if (s.size() > width) s = s.substr(0, width - 3) + L"...";
+    return s;
+}
+
 inline bool byLabel(const Row& a, const Row& b) {
     size_t n = (std::min)(a.label.size(), b.label.size());
     for (size_t i = 0; i < n; ++i) {
@@ -43,7 +48,8 @@ inline bool byLabel(const Row& a, const Row& b) {
 }
 
 // The card's text - every line at most 74 characters, so it fits the 78-column card the host
-// paints even in the 8-px raster font (a wider line would be cut with an ellipsis). `builtin` are the bound built-in actions (an unbound action has no row - the
+// paints even in the 8-px raster font: the fixed text by construction, a binding row by `fit`
+// (a long command label ends in "..." rather than being cut mid-word by the painter). `builtin` are the bound built-in actions (an unbound action has no row - the
 // dialog lists those); `custom` are keymap.conf's bindings, a leader sequence's key already
 // prefixed by the host ("leader, G"); `leader` is the leader chord's name or empty.
 inline std::vector<std::wstring> lines(const std::wstring& version, std::vector<Row> builtin,
@@ -56,23 +62,23 @@ inline std::vector<std::wstring> lines(const std::wstring& version, std::vector<
         L"",
         L"FOCUS AND NAVIGATION",
         L"F1            this help, also while a full-screen program runs",
-        L"Alt or F10    menu bar: arrows move, Enter opens, Esc leaves",
+        L"Alt           menu bar: arrows move, Enter opens, Esc leaves",
         L"Esc           closes this help, the command palette and the dashboard",
         L"Ctrl+C        copies a selection (copy-on-Ctrl+C on), else interrupts;",
-        L"              Ctrl+Shift+C always copies, Ctrl+Shift+V pastes",
+        L"              Ctrl+Shift+C always copies; Paste is a Keyboard binding",
         L"",
         L"KEY BINDINGS",
         L"File > Keyboard... assigns them; unbound actions are not listed.",
     };
     std::stable_sort(builtin.begin(), builtin.end(), byLabel);
     if (builtin.empty()) out.push_back(L"(no built-in action is bound)");
-    for (const auto& r : builtin) out.push_back(row(r));
+    for (const auto& r : builtin) out.push_back(fit(row(r)));
     if (!custom.empty() || !leader.empty()) {
         out.push_back(L"");
         out.push_back(L"CUSTOM COMMANDS");
         out.push_back(L"From keymap.conf in agliteterm's data folder (%LOCALAPPDATA%\\agliteterm).");
-        if (!leader.empty()) out.push_back(row({ leader, L"leader chord (then a second key)" }));
-        for (const auto& r : custom) out.push_back(row(r));
+        if (!leader.empty()) out.push_back(fit(row({ leader, L"leader chord (then a second key)" })));
+        for (const auto& r : custom) out.push_back(fit(row(r)));
     }
     out.push_back(L"");
     out.push_back(L"MORE");
