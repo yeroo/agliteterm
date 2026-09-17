@@ -53,6 +53,9 @@ A pane overlay over the right pane, while the left pane stays live:
 - **Session.** One running shell with a name, a working directory, an optional one-line context, and its own scrollback. It is the row you see in the sidebar.
 - **Split.** A session can hold two shells, left/right or top/bottom, sharing its one sidebar row.
 - **Popups and overlays.** Quick, scratch and overlay terminals open over the session; a pane overlay covers just one pane. None of them is persisted.
+- **Help.** `F1` (or Help ▸ Help, or the palette) opens a card with how agliteterm works and the effective key bindings, File ▸ Keyboard… and keymap.conf included; `Esc` closes it.
+
+![The F1 help card over a session](docs/img/qa-f1-help.png)
 
 ## Install
 

@@ -241,7 +241,7 @@ static std::string remainderOnUi(const JsonReq& req) {
         }
         if (ids.empty()) return ctlErr("dashboard: no sessions");
         cancelDrag(g_hwnd); g_splitDrag = false; if (GetCapture() == g_hwnd) ReleaseCapture();
-        g_rbtnForwarded = false; g_palette = false; g_leaderPending = false;
+        g_rbtnForwarded = false; g_palette = false; g_leaderPending = false; g_helpOpen = false;   // the grid never opens under the help card
         g_dashIds = std::move(ids); g_dashCells.clear(); g_dashSelected = 0; g_dashboard = true;
         InvalidateRect(g_hwnd, nullptr, FALSE); return ctlOkStr("dashboard");
     }

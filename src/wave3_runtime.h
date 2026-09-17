@@ -92,7 +92,7 @@ static std::string waveOnUi(const JsonReq& request){
             auto spec=wave3::pick(args);
             if(!g_pendingPick.empty())throw std::invalid_argument("pick already pending");
             if(waveBusy())throw std::invalid_argument("another UI operation owns the window");
-            if(g_palette)togglePalette();g_leaderPending=false;
+            if(g_helpOpen)closeHelp();if(g_palette)togglePalette();g_leaderPending=false;
             GUID guid{};if(FAILED(CoCreateGuid(&guid)))throw std::runtime_error("picker id creation failed");wchar_t id[40]{};StringFromGUID2(guid,id,40);
             const auto created=wave3::utf8(id);g_pendingPick=created;g_pickPublished=false;
             try{
@@ -161,7 +161,7 @@ static void quickVisibility(const std::string& op,bool human){
             {LockG hold;g_quickSession=session;session->name=L"quick";}
         }catch(...){DestroyWindow(g_quickHwnd);g_quickHwnd=nullptr;throw;}
     }else repositionQuick();
-    g_quickPinned=!human;darkTitleBar(g_quickHwnd,g_th.dark);ShowWindow(g_quickHwnd,SW_SHOWNOACTIVATE);
+    if(g_helpOpen)closeHelp();g_quickPinned=!human;darkTitleBar(g_quickHwnd,g_th.dark);ShowWindow(g_quickHwnd,SW_SHOWNOACTIVATE);
     if(human)SetForegroundWindow(g_quickHwnd);
     InvalidateRect(g_quickHwnd,nullptr,FALSE);
 }
