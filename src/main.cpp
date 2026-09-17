@@ -5043,7 +5043,7 @@ static void paint(HDC dc, RECT rc) {
         }
     }
 
-    if (g_helpOpen) paintHelp(mem, rc);   // above the palette: opening help closes the palette, never the reverse
+    if (g_helpOpen) paintHelp(mem, rc);   // above the palette; the two never stack (each closes the other when it opens)
     paintAttention(mem, rc);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
@@ -5858,18 +5858,22 @@ static void updCheck(bool interactive) {
 // text itself is help::lines (help.h), so its content and order are unit-tested without a window.
 static void helpRebuild() {
     std::vector<help::Row> builtin, custom;
-    // EFFECTIVE bindings only (revmux r1): a built-in whose chord a keymap.conf line took is
-    // shadowed (customKey runs first); of two keymap.conf lines on one chord the LAST runs
-    // (Catalog::binding walks backwards); a bare F1 is help's (handleKeyDown), so a `map f1` and
-    // a `leader = f1` with everything under it never fire and are left off the card.
-    auto bareF1 = [](uint16_t k) { return LOBYTE(k) == VK_F1 && HIBYTE(k) == 0; };
+    // EFFECTIVE bindings only, on the FRAME (revmux r1, r2): the leader chord arms before any
+    // lookup (customKey), so it shadows a built-in or a map line on the same chord; a keymap.conf
+    // line shadows a built-in (customKey runs before the g_keys walk); of two lines on one chord
+    // the LAST runs (Catalog::binding walks backwards); a bare F1 is help's (handleKeyDown), so a
+    // `map f1` and a `leader = f1` with everything under it never fire; and a pending leader's
+    // Esc cancels the sequence before any lookup, so `map leader escape` never fires. A popup
+    // terminal has no help branch and its own view of some of this; the card describes the frame.
+    auto bare = [](uint16_t k, BYTE vk) { return LOBYTE(k) == vk && HIBYTE(k) == 0; };
+    bool leaderUsable = g_commands.leader && !bare(g_commands.leader, VK_F1);
+    auto leaderTakes = [&](uint16_t k) { return leaderUsable && k == g_commands.leader; };
     for (int a = 0; a < KB_COUNT; a++)
-        if (g_keys[a] && !g_commands.binding(g_keys[a], false))
+        if (g_keys[a] && !leaderTakes(g_keys[a]) && !g_commands.binding(g_keys[a], false))
             builtin.push_back({ palKeyName(g_keys[a]), kKbInfo[a].label });
-    bool leaderUsable = g_commands.leader && !bareF1(g_commands.leader);
     for (const auto& b : g_commands.bindings) {   // UI thread: g_commands is UI-thread owned
         if (g_commands.binding(b.key, b.leader) != &b) continue;
-        if (b.leader ? !leaderUsable : bareF1(b.key)) continue;
+        if (b.leader ? (!leaderUsable || bare(b.key, VK_ESCAPE)) : (bare(b.key, VK_F1) || leaderTakes(b.key))) continue;
         custom.push_back({ (b.leader ? L"leader, " : L"") + palKeyName((WORD)b.key), widen(b.action) });
     }
     g_helpLines = help::lines(updVersion(), std::move(builtin), std::move(custom),
@@ -5895,8 +5899,10 @@ static void helpScrollBy(int lines) {
     if (next != g_helpScroll) { g_helpScroll = next; InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 
-// Keyboard while help is open: it owns every key (modal), so nothing leaks to the shell - the
-// caller sets g_swallowChar from the true return, which drops Esc's WM_CHAR as well.
+// Keyboard while help is open: it owns every key but the Alt chords (modal), so nothing leaks to
+// the shell - the caller sets g_swallowChar from the true return, which drops Esc's WM_CHAR as
+// well. An Alt chord goes to DefWindowProc (Alt+F4, the menu bar); the WM_CHAR an AltGr chord
+// then produces is dropped by OnChar's own g_helpOpen return, which is the guard for that case.
 static bool helpKey(WPARAM vk) {
     if (altDown()) return false;   // Alt chords are the system's (Alt+F4, the menu bar): DefWindowProc gets them
     int n = (int)g_helpLines.size(), view = max(1, g_helpViewLines);
@@ -8230,7 +8236,7 @@ public:
     // ---- keyboard ----
     void OnChar(TCHAR chr, UINT, UINT) {
         if (g_dashboard) return;
-        if (g_helpOpen) return;   // every keydown was swallowed above; this catches what arrives without one (IME)
+        if (g_helpOpen) return;   // the WM_CHAR of an Alt/AltGr chord helpKey let through, and IME input: never the shell's while the card is up
         if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)chr); return; }
         if (g_swallowChar) { g_swallowChar = false; return; }   // belongs to a keydown a binding consumed
         if (chr == L'\r') { sendBytes("\r", 1); return; }
