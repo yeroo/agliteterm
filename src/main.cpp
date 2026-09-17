@@ -81,6 +81,7 @@ CAppModule _Module;
 #include "shell_configuration.h"
 #include "commands.h"
 #include "wave3.h"
+#include "help.h"
 #include "native_picker.h"
 #pragma comment(lib, "normaliz.lib")
 
@@ -1110,7 +1111,7 @@ enum { IDM_NEW = 1, IDM_CLOSE = 2, IDM_SPLIT = 3, IDM_NEXT = 4, IDM_COPY = 5, ID
        IDM_QUICK = 120, IDM_SCRATCH = 121, IDM_REOPEN = 122,
        IDM_TG_SIDEBAR = 123, IDM_TG_TOOLBAR = 124, IDM_TG_STATUS = 125,
        IDM_FLAG = 126, IDM_FLAGVIEW = 127, IDM_ATTENTION = 128, IDM_FOCUSWS = 129, IDM_PALETTE = 130,
-       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132, IDM_READONLY = 135 };
+       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132, IDM_HELP = 133, IDM_READONLY = 135 };
 #define IDM_MOVE_BASE 300   // "Move to workspace <w>" = IDM_MOVE_BASE + w
 enum { ID_TREE = 200, ID_TRAY = 201, ID_TOOLBAR = 202, ID_STATUS = 203 };
 
@@ -1333,6 +1334,7 @@ static const PalAction kPalActions[] = {
     { L"Check for Updates",        IDM_UPDATE,     -1,           -1 },
     { L"Install Agent Skill",      IDM_INSTALLSKILL, -1,         -1 },
     { L"Restart Everything",       IDM_RESTART,    -1,           -1 },
+    { L"Help",                     IDM_HELP,       -1,           -1 },
     { L"About agliteterm",         IDM_ABOUT,      -1,           -1 },
     { L"Exit",                     IDM_EXIT,       -1,           -1 },
 };
@@ -1344,6 +1346,14 @@ static std::vector<std::wstring> g_palCustom; // UI snapshot of configured comma
 static int g_paletteSel = 0;                   // selection: index into g_palHits
 static int g_palTop = 0;                       // first visible row of the viewport
 static RECT g_palBox{}, g_palList{};           // last painted geometry (mouse hit-testing)
+
+// F1 Help overlay (agwinterm parity: Help.cs): a card over the terminal listing how lite works and
+// the EFFECTIVE bindings. Modal to the keyboard while open (help::lines in help.h builds the text).
+static bool g_helpOpen = false;
+static int g_helpScroll = 0;                   // first visible line
+static int g_helpViewLines = 1;                // lines the last paint could show (page size)
+static std::vector<std::wstring> g_helpLines;
+static RECT g_helpCard{};                      // last painted card (a click outside closes)
 
 // Fuzzy match: every query char must appear in order; starts of words score higher, consecutive
 // runs higher still. Returns <0 for no match. Case-insensitive.
@@ -4898,6 +4908,8 @@ afterGridPaint:;
     }
 }
 
+static void paintHelp(HDC mem, RECT rc);   // F1 help card (defined with the palette, after updVersion)
+
 static void paint(HDC dc, RECT rc) {
     HDC mem = CreateCompatibleDC(dc);
     HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
@@ -5031,6 +5043,7 @@ static void paint(HDC dc, RECT rc) {
         }
     }
 
+    if (g_helpOpen) paintHelp(mem, rc);   // above the palette: opening help closes the palette, never the reverse
     paintAttention(mem, rc);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
@@ -5840,6 +5853,105 @@ static void updCheck(bool interactive) {
     else g_updBusy = false;
 }
 
+// ---- F1 help ---------------------------------------------------------------------------------
+// The host-side half: gather what the card needs, own the open/close/scroll state, paint it. The
+// text itself is help::lines (help.h), so its content and order are unit-tested without a window.
+static void helpRebuild() {
+    std::vector<help::Row> builtin, custom;
+    for (int a = 0; a < KB_COUNT; a++)
+        if (g_keys[a]) builtin.push_back({ palKeyName(g_keys[a]), kKbInfo[a].label });
+    for (const auto& b : g_commands.bindings)   // UI thread: g_commands is UI-thread owned
+        custom.push_back({ (b.leader ? L"leader, " : L"") + palKeyName((WORD)b.key), widen(b.action) });
+    g_helpLines = help::lines(updVersion(), std::move(builtin), std::move(custom),
+                              g_commands.leader ? palKeyName((WORD)g_commands.leader) : L"");
+}
+
+static void openHelp() {
+    if (g_palette) g_palette = false;   // help replaces the palette; Esc then returns to the terminal
+    helpRebuild();
+    g_helpOpen = true;
+    g_helpScroll = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void closeHelp() {
+    g_helpOpen = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void helpScrollBy(int lines) {
+    int next = help::clampScroll(g_helpScroll + lines, (int)g_helpLines.size(), g_helpViewLines);
+    if (next != g_helpScroll) { g_helpScroll = next; InvalidateRect(g_hwnd, nullptr, FALSE); }
+}
+
+// Keyboard while help is open: it owns every key (modal), so nothing leaks to the shell - the
+// caller sets g_swallowChar from the true return, which drops Esc's WM_CHAR as well.
+static bool helpKey(WPARAM vk) {
+    int n = (int)g_helpLines.size(), view = max(1, g_helpViewLines);
+    switch (vk) {
+        case VK_ESCAPE: case VK_F1: closeHelp(); return true;
+        case VK_DOWN:   helpScrollBy(+1); return true;
+        case VK_UP:     helpScrollBy(-1); return true;
+        case VK_NEXT:   helpScrollBy(+view); return true;
+        case VK_PRIOR:  helpScrollBy(-view); return true;
+        case VK_HOME:   helpScrollBy(-n); return true;
+        case VK_END:    helpScrollBy(+n); return true;
+    }
+    return true;
+}
+
+static void paintHelp(HDC mem, RECT rc) {
+    // Over the terminal area only: the sidebar, toolbar and status bar stay as they are, the way
+    // the palette does it, so the card never hides the row a status cue is landing on.
+    int left = sidebarSpan(), top0 = toolbarTop(), bottom0 = rc.bottom - (g_showStatus ? g_statusH : 0);
+    int aw = max(1, (int)rc.right - left), ah = max(1, bottom0 - top0);
+    int rowH = g_ch + 4;
+    // 78 columns of the terminal font (the lines are kept under 74), so nothing is cut in the
+    // 8-px raster font either; capped by the area. ASCII only in the chrome: the raster fonts
+    // have no glyph for a middle dot or an arrow and paint a stray letter instead.
+    int cardW = min(max(640, g_cw * 78 + 40), aw - 40); if (cardW < 240) cardW = max(240, aw - 8);
+    int cardH = min(680, ah - 40); if (cardH < 6 * rowH) cardH = max(6 * rowH, ah - 8);
+    int cx = left + (aw - cardW) / 2, cy = top0 + (ah - cardH) / 2;
+    g_helpCard = { cx, cy, cx + cardW, cy + cardH };
+    HBRUSH bb = CreateSolidBrush(g_th.bar);
+    FillRect(mem, &g_helpCard, bb); DeleteObject(bb);
+    HBRUSH fr = CreateSolidBrush(g_th.accent);
+    FrameRect(mem, &g_helpCard, fr); DeleteObject(fr);
+    SelectObject(mem, g_fonts[0]);
+    SetBkMode(mem, TRANSPARENT);
+
+    std::wstring title = L"Help - agliteterm " + updVersion();
+    RECT hdr{ cx + 16, cy + 8, cx + cardW - 16, cy + 8 + rowH };
+    SetTextColor(mem, g_th.text);
+    DrawTextW(mem, title.c_str(), -1, &hdr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SetTextColor(mem, g_th.dim);
+    DrawTextW(mem, L"Esc closes   Up/Down PgUp PgDn scroll", -1, &hdr, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+    int top = hdr.bottom + 6, bottom = cy + cardH - 8;
+    g_helpViewLines = max(1, (bottom - top) / rowH);
+    int n = (int)g_helpLines.size();
+    g_helpScroll = help::clampScroll(g_helpScroll, n, g_helpViewLines);   // a resize can shrink the page
+    HRGN clip = CreateRectRgn(cx + 1, top, cx + cardW - 1, bottom);
+    SelectClipRgn(mem, clip);
+    int y = top;
+    for (int i = g_helpScroll; i < n && y + rowH <= bottom; i++, y += rowH) {
+        const std::wstring& line = g_helpLines[i];
+        SetTextColor(mem, help::isSection(line) ? g_th.accent : g_th.text);
+        RECT lr{ cx + 16, y, cx + cardW - 20, y + rowH };
+        DrawTextW(mem, line.c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clip);
+    if (n > g_helpViewLines) {   // thumb, as the palette draws it
+        int trackH = bottom - top;
+        int th = max(rowH, trackH * g_helpViewLines / n);
+        int ty = top + (trackH - th) * g_helpScroll / max(1, n - g_helpViewLines);
+        RECT tr{ cx + cardW - 7, ty, cx + cardW - 4, ty + th };
+        HBRUSH tb = CreateSolidBrush(g_th.dim);
+        FillRect(mem, &tr, tb); DeleteObject(tb);
+    }
+}
+
 static void togglePalette() {
     g_palette = !g_palette;
     g_palQuery.clear();
@@ -5926,6 +6038,10 @@ static void runKbAction(int a) {
 }
 static bool handleKeyDown(WPARAM vk, bool repeat = false) {
     if (g_dashboard) return dashboardKey(vk);
+    // Help owns the keyboard while open; plain F1 opens it from anywhere the frame has the keys -
+    // a full-screen program included, as in agwinterm - and so shadows an F1 a program would get.
+    if (g_helpOpen) return helpKey(vk);
+    if (vk == VK_F1 && !ctrlDown() && !altDown() && !shiftDown()) { openHelp(); return true; }
     endMarkModeIfMoved();
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
@@ -6383,6 +6499,7 @@ static HMENU buildMenuBar() {
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_INSTALLSKILL, L"Install Agent &Skill…");
     AppendMenuW(help, MF_STRING, IDM_UPDATE, L"Check for &Updates…");
+    AppendMenuW(help, MF_STRING, IDM_HELP, L"&Help\tF1");
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About agliteterm");
     HMENU bar = CreateMenu();
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -8091,6 +8208,7 @@ public:
     // ---- keyboard ----
     void OnChar(TCHAR chr, UINT, UINT) {
         if (g_dashboard) return;
+        if (g_helpOpen) return;   // every keydown was swallowed above; this catches what arrives without one (IME)
         if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)chr); return; }
         if (g_swallowChar) { g_swallowChar = false; return; }   // belongs to a keydown a binding consumed
         if (chr == L'\r') { sendBytes("\r", 1); return; }
@@ -8108,6 +8226,7 @@ public:
     // ---- mouse ----
     BOOL OnMouseWheel(UINT nFlags, short zDelta, CPoint pt) {
         if (g_dashboard) return TRUE;
+        if (g_helpOpen) { helpScrollBy(zDelta > 0 ? -3 : 3); return TRUE; }
         if (g_palette) {   // scroll the palette list
             int n = (int)g_palHits.size(), rows = min(n, kPalMaxRows);
             if (n > rows) {
@@ -8128,6 +8247,10 @@ public:
     void OnLButtonDown(UINT, CPoint pt) {
         if (noticeClick(pt)) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); return; }
         if (g_dashboard) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); dashboardClick(pt); return; }
+        if (g_helpOpen) {   // a click outside the card closes it; inside it is the card's own
+            if (!PtInRect(&g_helpCard, POINT{ pt.x, pt.y })) { closeHelp(); SetFocus(); }
+            return;
+        }
         if (inSplitter(pt.x, pt.y)) { g_splitDrag = true; SetCapture(); return; }   // grab the sidebar splitter
         if (g_palette) {   // click an item to run it; click anywhere else to dismiss
             if (PtInRect(&g_palList, POINT{ pt.x, pt.y })) {
@@ -8201,6 +8324,7 @@ public:
     }
     void OnRButtonDown(UINT, CPoint pt) {
         if (g_dashboard) return;
+        if (g_helpOpen) return;                                  // no paste under the help card
         if (pt.x < sidebarSpan()) return;                        // sidebar/splitter: no paste
         // Everything a LEFT click does about focus, a right click must do too. It did neither, and
         // both omissions bite:
@@ -8763,6 +8887,7 @@ public:
                 ::MessageBoxW(g_hwnd, widen(r).c_str(), L"agliteterm", MB_OK | MB_ICONINFORMATION);
                 break;
             }
+            case IDM_HELP: openHelp(); break;
             case IDM_ABOUT: {
                 std::wstring about = L"agliteterm " + updVersion() +
                                      L"\nA lightweight native terminal over the Rust pty-host.";
@@ -12056,6 +12181,8 @@ static std::string ctlDispatch(const std::string& line) {
                          ",\"fullscreen\":false"
                          ",\"maximized\":" + (IsZoomed(w->hwnd) ? "true" : "false") +
                          ",\"quickTerminalVisible\":" + ((g_quickHwnd && IsWindowVisible(g_quickHwnd)) ? "true" : "false") +
+                         // Beyond the contract: the F1 help card, so a script (and the UI suite) can see it.
+                         ",\"helpVisible\":" + (g_helpOpen ? "true" : "false") +
                          ",\"activeWorkspace\":\"" + jsonEscape(aws) + "\"" +
                          ",\"activeSession\":\"" + jsonEscape(activeName) + "\"" +
                          // Beyond the contract, and kept: the geometry is what a tiling script wants,

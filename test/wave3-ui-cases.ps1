@@ -204,3 +204,41 @@ if($env:CI -eq 'true'){
     Check 'quick after EOF starts a fresh shell without old display marker' ((Wave-Rpc 'session.text' @{} '' 'quick') -notmatch 'P17-QUICK-RETAIN')
     $null=Wave-Rpc 'quick' @{op='off'}
 }
+# ---- F1 help overlay (agwinterm parity) ----------------------------------------------------------
+# Plain keys posted to the owned frame: F1 opens the card, every key is swallowed while it is open
+# (the letter below, and Esc together with the WM_CHAR TranslateMessage would queue for it), Esc
+# and F1 close it, the Help menu command opens it, a click outside the card closes it. `window
+# state` reports the card (helpVisible, beyond the contract), which is how the checks see it.
+'-- F1 help overlay --'
+if(-not ('HelpUi' -as [type])){Add-Type -TypeDefinition @'
+using System;using System.Runtime.InteropServices;
+public static class HelpUi {
+ [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+}
+'@}
+function Help-Visible { [bool](Wave-Rpc 'window.state').helpVisible }
+function Help-Wait([scriptblock]$condition){for($i=0;$i-lt 50;$i++){if(& $condition){return $true};Start-Sleep -Milliseconds 100};return $false}
+function Help-Key([int]$vk,[int]$scan,[int]$char=-1){
+    [void][HelpUi]::PostMessageW($h,0x100,[IntPtr]$vk,[IntPtr](($scan -shl 16) -bor 1))
+    if($char-ge 0){[void][HelpUi]::PostMessageW($h,0x102,[IntPtr]$char,[IntPtr](($scan -shl 16) -bor 1))}
+    [void][HelpUi]::PostMessageW($h,0x101,[IntPtr]$vk,[IntPtr]((0xC000 -shl 16) -bor ($scan -shl 16) -bor 1))
+}
+$helpTextBefore=([string](Wave-Rpc 'session.text' @{})).TrimEnd()
+Check 'help starts closed' (-not (Help-Visible))
+Help-Key 0x70 0x3B                                   # F1
+Check 'F1 opens the help card (window state reports helpVisible)' (Help-Wait {Help-Visible})
+Help-Key 0x58 0x2D ([int][char]'x')                   # a letter while open: swallowed, never typed
+Help-Key 0x1B 0x01 0x1B                               # Esc, with its WM_CHAR
+Check 'Esc closes the help card' (Help-Wait {-not (Help-Visible)})
+Start-Sleep -Milliseconds 400
+$helpTextAfter=([string](Wave-Rpc 'session.text' @{})).TrimEnd()
+Check 'F1, the swallowed letter and Esc never reached the shell' ($helpTextAfter-ceq $helpTextBefore) "before=[$helpTextBefore] after=[$helpTextAfter]"
+Help-Key 0x70 0x3B
+Check 'F1 opens it again' (Help-Wait {Help-Visible})
+Help-Key 0x70 0x3B
+Check 'a second F1 closes it' (Help-Wait {-not (Help-Visible)})
+[void][HelpUi]::PostMessageW($h,0x111,[IntPtr]133,[IntPtr]::Zero)   # WM_COMMAND IDM_HELP: Help > Help, and the palette row
+Check 'the Help menu command opens the card' (Help-Wait {Help-Visible})
+[void][HelpUi]::PostMessageW($h,0x201,[IntPtr]1,[IntPtr]0x00010001);[void][HelpUi]::PostMessageW($h,0x202,[IntPtr]0,[IntPtr]0x00010001)   # a press at client (1,1): outside the card
+Check 'a click outside the card closes it' (Help-Wait {-not (Help-Visible)})
+Check 'the shell still answers after the help round trip' ([bool](Wave-Rpc 'ping'))
