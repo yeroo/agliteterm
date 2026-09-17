@@ -55,6 +55,8 @@ A pane overlay over the right pane, while the left pane stays live:
 - **Popups and overlays.** Quick, scratch and overlay terminals open over the session; a pane overlay covers just one pane. None of them is persisted.
 - **Help.** `F1` (or Help ▸ Help, or the palette) opens a card with how agliteterm works and the effective key bindings, File ▸ Keyboard… and keymap.conf included; `Esc` closes it.
 
+![The F1 help card over a session](docs/img/qa-f1-help.png)
+
 ## Install
 
 Pre-built releases are for **Windows x64**. The installer is per-user and needs no admin rights.
