@@ -17,14 +17,25 @@ function Read-InstallText([string]$Path){
     $reader=New-Object IO.StreamReader($Path,$utf8,$true)
     try{$reader.ReadToEnd()}finally{$reader.Dispose()}
 }
+function Get-InstallReparsePoint([string]$Path){
+    $full=[IO.Path]::GetFullPath($Path)
+    for($part=[IO.Path]::GetDirectoryName($full);$part;$part=[IO.Path]::GetDirectoryName($part)){
+        try{if([IO.File]::GetAttributes($part)-band [IO.FileAttributes]::ReparsePoint){return $part}}
+        catch [IO.FileNotFoundException]{} catch [IO.DirectoryNotFoundException]{}
+    }
+    try{if([IO.File]::GetAttributes($full)-band [IO.FileAttributes]::ReparsePoint){return $full}}
+    catch [IO.FileNotFoundException]{} catch [IO.DirectoryNotFoundException]{}
+    return $null
+}
+function Test-InstallDestination([string]$Path){
+    $reparse=Get-InstallReparsePoint $Path
+    if($reparse){throw "Refusing reparse-point destination: $reparse"}
+}
 function Set-InstallText([string]$Path,[string]$Text,[string]$Expected){
     $full=[IO.Path]::GetFullPath($Path)
     if([IO.File]::Exists($full) -and (Read-InstallText $full) -ceq $Text){return}
     $parent=[IO.Path]::GetDirectoryName($full)
-    for($part=$parent;$part;$part=[IO.Path]::GetDirectoryName($part)){
-        if([IO.Directory]::Exists($part) -and ([IO.File]::GetAttributes($part)-band [IO.FileAttributes]::ReparsePoint)){throw "Refusing reparse-point destination: $part"}
-    }
-    if([IO.File]::Exists($full) -and ([IO.File]::GetAttributes($full)-band [IO.FileAttributes]::ReparsePoint)){throw "Refusing reparse-point destination: $full"}
+    Test-InstallDestination $full
     if((Read-InstallText $full) -cne $Expected){throw "File changed during install: $full"}
     [IO.Directory]::CreateDirectory($parent)|Out-Null
     $tmp=$full+'.agliteterm-'+[guid]::NewGuid().ToString('N')+'.tmp'
@@ -75,16 +86,17 @@ function Test-InstallJsonShape([string]$Text,[string]$Label='Claude settings'){
             $frame=$stack.Peek()
             if($part -eq ','){$frame.Key=$frame.Object}
             elseif($frame.Object -and $frame.Key -and $part.StartsWith('"')){
-                $key=$part|ConvertFrom-Json -ErrorAction Stop
+                try{$key=$part|ConvertFrom-Json -ErrorAction Stop}
+                catch{throw "$Label has an invalid JSON key; unchanged"}
                 if(-not $frame.Names.Add($key)){throw "Duplicate/case-colliding $Label key '$key'; unchanged"}
                 $frame.Key=$false
             }
         }
     }
 }
-function Test-InstallHookTree($Root,[string]$Label,[string[]]$Events,[string[]]$HandlerFields,[bool]$Claude){
+function Test-InstallHookTree($Root,[string]$Label,[string[]]$Events,[string[]]$HandlerFields,[bool]$Claude,[string[]]$RootKeys=@('hooks')){
     if($Root -isnot [pscustomobject]){throw "$Label root is not an object; unchanged"}
-    Test-InstallKeyCase $Root @('hooks') $Label
+    Test-InstallKeyCase $Root $RootKeys $Label
     if(-not $Root.PSObject.Properties['hooks']){$Root|Add-Member hooks ([pscustomobject]@{})}
     if($Root.hooks -isnot [pscustomobject]){throw "$Label hooks is not an object; unchanged"}
     Test-InstallKeyCase $Root.hooks $Events $Label
@@ -202,6 +214,8 @@ try {
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
         $codexDir=Join-Path $UserRoot '.codex';$codexPath=Join-Path $codexDir 'hooks.json';$codex='';$codexMerged=''
         $codexPresent=[IO.Directory]::Exists($codexDir)
+        $codexReparse=if($codexPresent){Get-InstallReparsePoint $codexPath}else{$null}
+        if($codexReparse){$codexPresent=$false}
         if($Operation -eq 'hooks'){
             $settings=Read-InstallText $settingsPath
             Test-InstallJsonShape $settings
@@ -211,17 +225,22 @@ try {
             Merge-InstallHooks $root @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt')) $wrapper $false
             $merged=$root|ConvertTo-Json -Depth 100
             if($codexPresent){
-                try{$codex=Read-InstallText $codexPath;Test-InstallJsonShape $codex 'Codex hooks'}
-                catch{throw "Codex hooks could not be read or validated: $($_.Exception.Message); unchanged"}
+                try{$codex=Read-InstallText $codexPath}
+                catch{throw "Codex hooks could not be read: $($_.Exception.Message); unchanged"}
+                Test-InstallJsonShape $codex 'Codex hooks'
                 try{$codexRoot=if($codex.Trim()){$codex|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}}
                 catch{throw "Codex hooks JSON is invalid: $($_.Exception.Message); unchanged"}
-                Test-InstallHookTree $codexRoot 'Codex hooks' $codexEvents $codexFields $false
+                Test-InstallHookTree $codexRoot 'Codex hooks' $codexEvents $codexFields $false @('hooks','description')
                 $codexWrapper=Join-Path $DataRoot 'agliteterm-codex-hook.ps1'
                 Merge-InstallHooks $codexRoot @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('PermissionRequest','blocked',''),@('Stop','stop','')) $codexWrapper $true
                 $codexMerged=$codexRoot|ConvertTo-Json -Depth 100
             }
         }
         # Validate all inputs above before touching the first destination. Report partial failures.
+        foreach($script in $scripts){Test-InstallDestination (Join-Path $DataRoot $script)}
+        if($Operation -eq 'hooks'){Test-InstallDestination $settingsPath}
+        if($Operation -eq 'hooks' -and $codexPresent){Test-InstallDestination $codexPath}
+        Test-InstallDestination $ProfilePath
         foreach($script in $scripts){$path=Join-Path $DataRoot $script;Set-InstallText $path $sources[$script] (Read-InstallText $path)}
         if($Operation -eq 'hooks'){Set-InstallText $settingsPath $merged $settings}
         if($Operation -eq 'hooks' -and $codexPresent){Set-InstallText $codexPath $codexMerged $codex}
@@ -229,6 +248,7 @@ try {
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
         if($Operation -eq 'hooks'){
             if($codexPresent){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
+            elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink; agliteterm does not write through reparse points."}
             else{$result+="`nCodex hooks skipped because $codexDir does not exist."}
         }
         @{ok=$true;result=$result}|ConvertTo-Json -Compress -Depth 4
