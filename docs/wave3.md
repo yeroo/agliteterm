@@ -2,7 +2,8 @@
 
 P17 mirrors full agwinterm P13–P16 using native GDI and standard Windows controls.
 Use a shared CLI built from full commit `7af9b0751aa73dc9e79b7e3de593e50bea76b331`
-or newer. CI builds that pinned CLI after staging native dependencies. This change
+or newer. CI builds the shared CLI at the tag pinned in `.github/workflows/ci.yml`,
+after staging native dependencies. This change
 does not update the native ABI pin or install/release a binary.
 
 ## Session HUD
