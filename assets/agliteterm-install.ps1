@@ -17,19 +17,70 @@ function Read-InstallText([string]$Path){
     $reader=New-Object IO.StreamReader($Path,$utf8,$true)
     try{$reader.ReadToEnd()}finally{$reader.Dispose()}
 }
-function Get-InstallReparsePoint([string]$Path){
+# Only link-type reparse points (junctions, symlinks) redirect a path, so only they are refused.
+# Cloud-files placeholders (OneDrive Known Folder Move), dedup, WOF and similar tags are written through.
+function Test-InstallLinkTag([uint32]$Tag){
+    # Name-surrogate bit (0x20000000): junction, symlink, LX symlink, WCI link, ...
+    # APPEXECLINK (0x8000001B) lacks the bit but is a link too; tag 0 means it was not read.
+    return [bool]($Tag -eq 0 -or ($Tag -band 0x20000000) -or $Tag -eq [uint32]2147483675)
+}
+function Get-InstallReparseTag([string]$Path){
+    # The tag from the directory entry, or $null when it cannot be read. FindFirstFile does not open
+    # the file, so a cloud placeholder is not hydrated. FILETIMEs are uint pairs: a long would be
+    # 8-aligned, shift dwReserved0 and read every tag as 0.
+    try{
+        if(-not ('AgLiteInstallFind' -as [type])){
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class AgLiteInstallFind {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct FindData {
+        public uint Attributes;
+        public uint CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh;
+        public uint SizeHigh, SizeLow, Reserved0, Reserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string FileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=14)] public string AlternateFileName;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr FindFirstFileW(string path, out FindData data);
+    [DllImport("kernel32.dll")]
+    static extern bool FindClose(IntPtr handle);
+    // The reparse tag, or -1 when the entry cannot be read or is not a reparse point.
+    public static long Tag(string path) {
+        FindData data;
+        IntPtr handle = FindFirstFileW(path, out data);
+        if (handle == new IntPtr(-1)) return -1;
+        FindClose(handle);
+        if ((data.Attributes & 0x400) == 0) return -1;
+        return data.Reserved0;
+    }
+}
+'@
+        }
+        $tag=[AgLiteInstallFind]::Tag($Path)
+        if($tag -lt 0){return $null}
+        return [uint32]$tag
+    }catch{return $null}
+}
+function Test-InstallLinkPart([string]$Path){
+    try{if(-not([IO.File]::GetAttributes($Path)-band [IO.FileAttributes]::ReparsePoint)){return $false}}
+    catch [IO.FileNotFoundException]{return $false} catch [IO.DirectoryNotFoundException]{return $false}
+    # Fail closed: a reparse point whose tag cannot be read counts as a link.
+    $tag=Get-InstallReparseTag $Path
+    return ($null -eq $tag) -or (Test-InstallLinkTag $tag)
+}
+function Get-InstallLinkPoint([string]$Path){
     $full=[IO.Path]::GetFullPath($Path)
     for($part=[IO.Path]::GetDirectoryName($full);$part;$part=[IO.Path]::GetDirectoryName($part)){
-        try{if([IO.File]::GetAttributes($part)-band [IO.FileAttributes]::ReparsePoint){return $part}}
-        catch [IO.FileNotFoundException]{} catch [IO.DirectoryNotFoundException]{}
+        if(Test-InstallLinkPart $part){return $part}
     }
-    try{if([IO.File]::GetAttributes($full)-band [IO.FileAttributes]::ReparsePoint){return $full}}
-    catch [IO.FileNotFoundException]{} catch [IO.DirectoryNotFoundException]{}
+    if(Test-InstallLinkPart $full){return $full}
     return $null
 }
 function Test-InstallDestination([string]$Path){
-    $reparse=Get-InstallReparsePoint $Path
-    if($reparse){throw "Refusing reparse-point destination: $reparse"}
+    $link=Get-InstallLinkPoint $Path
+    if($link){throw "Refusing junction/symlink destination: $link"}
 }
 function Set-InstallText([string]$Path,[string]$Text,[string]$Expected){
     $full=[IO.Path]::GetFullPath($Path)
@@ -210,13 +261,13 @@ try {
         $loads=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
         $body="if (`$env:TERM_PROGRAM -eq 'agliteterm') {`r`n"
         foreach($script in $loads){$body+="    . '"+(Join-Path $DataRoot $script).Replace("'","''")+"'`r`n"};$body+='}'
-        # A profile behind a reparse point (OneDrive Known Folder Move) is skipped, not fatal.
-        $profileReparse=Get-InstallReparsePoint $ProfilePath
+        # A profile behind a junction/symlink is skipped, not fatal.
+        $profileReparse=Get-InstallLinkPoint $ProfilePath
         try{$next=Add-InstallBlock $profile $Operation $body}catch{if(-not $profileReparse){throw};$next=$null}
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
         $codexDir=Join-Path $UserRoot '.codex';$codexPath=Join-Path $codexDir 'hooks.json';$codex='';$codexMerged=''
         $codexPresent=[IO.Directory]::Exists($codexDir)
-        $codexReparse=if($codexPresent){Get-InstallReparsePoint $codexPath}else{$null}
+        $codexReparse=if($codexPresent){Get-InstallLinkPoint $codexPath}else{$null}
         if($codexReparse){$codexPresent=$false}
         if($Operation -eq 'hooks'){
             $settings=Read-InstallText $settingsPath
@@ -249,23 +300,23 @@ try {
         $writes=@()
         foreach($destination in $destinations){
             if([IO.File]::Exists($destination.Path) -and (Read-InstallText $destination.Path) -ceq $destination.Text){continue}
-            $reparse=Get-InstallReparsePoint $destination.Path
+            $reparse=Get-InstallLinkPoint $destination.Path
             if(-not $reparse){$writes+=$destination;continue}
             switch($destination.Kind){
                 'codex' {$codexReparse=$reparse;$codexPresent=$false}
                 'profile' {$profileReparse=$reparse;$next=$null}
-                default {throw "Refusing reparse-point destination: $reparse"}
+                default {throw "Refusing junction/symlink destination: $reparse"}
             }
         }
         foreach($destination in $writes){Set-InstallText $destination.Path $destination.Text $destination.Expected}
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
         if($null -eq $next){
             $dotSources=($loads|ForEach-Object {Join-Path $DataRoot $_}) -join ' and '
-            $result+="`nPowerShell profile block skipped: $ProfilePath is under a reparse point ($profileReparse, e.g. OneDrive); agliteterm does not write through reparse points. Dot-source $dotSources yourself if you want them."
+            $result+="`nPowerShell profile block skipped: $ProfilePath is under a junction/symlink ($profileReparse); agliteterm does not write through junctions/symlinks. Dot-source $dotSources yourself if you want them."
         }
         if($Operation -eq 'hooks'){
             if($codexPresent){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
-            elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink; agliteterm does not write through reparse points."}
+            elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink; agliteterm does not write through junctions/symlinks."}
             else{$result+="`nCodex hooks skipped because $codexDir does not exist."}
         }
         @{ok=$true;result=$result}|ConvertTo-Json -Compress -Depth 4
