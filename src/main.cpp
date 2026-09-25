@@ -124,8 +124,9 @@ static void (*core_free_buf)(uint8_t*, uint32_t);
 // v16 added agwcore_emu_set_scrollback. v18 (agwinterm 0.17.10; there was no 17) inserted
 // mouseSgrPixels into FfiEmuInfo above and added or changed NO export - a bump can be a struct
 // alone. The core handshake is an EXACT match and the structs are shared, so the pin moves with
-// the core it is built against. Re-check FfiEmuInfo here AND FfiCell in styled_text.h against
-// lib.rs on each bump: emu_copy_grid writes both layouts through this ABI.
+// the core it is built against. Re-check every struct above (FfiEmuInfo, FfiMark) AND FfiCell in
+// styled_text.h against lib.rs on each bump: emu_info, emu_marks and emu_copy_grid /
+// emu_copy_history_row respectively write those layouts into caller memory.
 static constexpr uint32_t kRequiredAbi = 18;
 static constexpr uint32_t kProtocolVersion = 2;
 static constexpr int kSidebarW = 180;
@@ -9546,11 +9547,28 @@ static bool readSurfaceText(Session* s, const TextArgs& a, std::string* text) {
 }
 static bool readSurfaceStyled(Session* s, const TextArgs& a, std::string* reply) {
     struct StyledRow { int64_t abs; bool empty; std::string runs; };
-    std::vector<StyledRow> rows;
+    std::deque<StyledRow> rows, pending;
     FfiEmuInfo info{};
+    auto keepTail = [&](StyledRow row) {
+        rows.push_back(std::move(row));
+        while (rows.size() > (uint64_t)a.lines) rows.pop_front();
+    };
     bool screenOk = visitBufferRows(s, -1, -1, a.lines, &info,
         [&](int64_t abs, const FfiCell* cells, uint32_t cols) {
-            rows.push_back({abs, styled_text::rowText(cells, cols).empty(), styled_text::rowRunsJson(cells, cols)});
+            std::string runs = styled_text::rowRunsJson(cells, cols);
+            // The run builder trims the same ASCII spaces as rowText: [] is exactly a blank row.
+            StyledRow row{abs, runs == "[]", std::move(runs)};
+            if (a.lines <= 0) { rows.push_back(std::move(row)); return; }
+            if (row.empty) {
+                // Trailing blank rows will be squashed. If a later nonblank row arrives, at most
+                // N-1 immediately preceding blanks can survive in its N-row tail.
+                pending.push_back(std::move(row));
+                while (pending.size() >= (uint64_t)a.lines) pending.pop_front();
+            } else {
+                for (auto& blank : pending) keepTail(std::move(blank));
+                pending.clear();
+                keepTail(std::move(row));
+            }
         });
     if (!screenOk) {
         *reply = overlayReadFailedRefusal("the emulator did not copy its screen (session " + s->id + ")");
@@ -9559,8 +9577,6 @@ static bool readSurfaceStyled(Session* s, const TextArgs& a, std::string* reply)
     // Mirror dumpBufferLines' squash and tail, preserving absolute row labels. Change both together.
     // The plain reader retains one newline on an all-empty buffer; the structured form omits it.
     while (!rows.empty() && rows.back().empty) rows.pop_back();
-    if (a.lines > 0 && (uint64_t)a.lines < rows.size())
-        rows.erase(rows.begin(), rows.end() - (size_t)a.lines);
     *reply = "{\"cols\":" + std::to_string(info.cols) + ",\"rows\":[";
     for (const auto& row : rows) {
         if (reply->back() != '[') *reply += ',';

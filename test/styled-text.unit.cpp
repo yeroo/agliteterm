@@ -24,6 +24,8 @@ static std::string joinedEscapedTexts(const std::string& json) {
 static void invariant(const std::vector<FfiCell>& row) {
     check(joinedEscapedTexts(runs(row)) == jsonEscape(styled_text::rowText(row.data(), (uint32_t)row.size())),
           "joined run text equals plain row text");
+    check((runs(row) == "[]") == styled_text::rowText(row.data(), (uint32_t)row.size()).empty(),
+          "empty runs exactly matches an empty plain row");
 }
 int main() {
     std::vector<FfiCell> row{cell('a'), cell('b', kAttrDim), cell('c', kAttrDim | kAttrBold |
