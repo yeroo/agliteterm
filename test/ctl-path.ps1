@@ -7,7 +7,7 @@
 # external dependency like the core dll, so it is resolved rather than assumed:
 #
 #   1. $env:AGWINTERMCTL           — an explicit override, and what CI sets
-#   2. bin\agwintermctl.exe        — fetched next to the client by tools\fetch-native.ps1
+#   2. bin\agwintermctl.exe        — tools\fetch-native.ps1 stages it from native\pinned.json's cliTag
 #   3. the installed agwinterm     — a developer machine that has the full app, i.e. the old path
 #
 # Returns $null when none is present, so a caller can skip with a clear message instead of failing

@@ -53,12 +53,14 @@ Rules the suite obeys, each learned from a real incident:
 `restore-matrix.ps1` is the big one: cells covering kill vs. graceful close, two windows at once,
 interrupted writes, `.bak` fallback, bogus apps, and old and future file formats.
 
-The checks that drive the control pipe need `agwintermctl` — from an installed agwinterm, from `bin/`
-(the fetch pulls it when the pinned release publishes it), or `$env:AGWINTERMCTL`. The supervisor
-requires the real CLI before starting any suite and refuses if it is absent.
+The checks that drive the control pipe need `agwintermctl` — from `$env:AGWINTERMCTL`, from `bin/`,
+or from an installed agwinterm, in that order. The fetch stages `bin/agwintermctl.exe` from the
+release named by `cliTag` in [`native/pinned.json`](native/pinned.json), pinned apart from the core,
+and refuses a staged copy that does not report that version. CI tests with that same binary. The
+supervisor requires the real CLI before starting any suite and refuses if it is absent.
 
-A check that needs a client newer than the fetched release probes the client first and SKIPs on an
-older one; `-Strict` turns that into a failure, which is the release gate. The probed features:
+A check that needs a client newer than the pinned CLI (`cliTag`) probes the client first and SKIPs on
+an older one; `-Strict` turns that into a failure, which is the release gate. The probed features:
 
 - `--stdin`, a strict `--size-percent`, `sidebar width N`, the `caller` field — agwinterm #226
 - `session context` and `restore capture` — agwinterm #233 (`agwintermctl restore` answers a usage
@@ -70,5 +72,5 @@ older one; `-Strict` turns that into a failure, which is the release gate. The p
 - `session text --styles` — agwinterm #320 (`session overlay text --styles` is refused before any
   pipe is opened)
 
-To run them all, point `$env:AGWINTERMCTL` at an agwinterm dev build:
+To try a CLI feature that no release carries yet, point `$env:AGWINTERMCTL` at an agwinterm dev build:
 `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
