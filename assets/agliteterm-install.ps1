@@ -17,8 +17,9 @@ function Read-InstallText([string]$Path){
     $reader=New-Object IO.StreamReader($Path,$utf8,$true)
     try{$reader.ReadToEnd()}finally{$reader.Dispose()}
 }
-# Only link-type reparse points (junctions, symlinks) redirect a path, so only they are refused.
-# Cloud-files placeholders (OneDrive Known Folder Move), dedup, WOF and similar tags are written through.
+# Only link-type reparse points (junctions, symlinks, app-exec aliases) redirect a path, so only they are
+# refused, plus any reparse point whose tag cannot be read (fail closed). Cloud-files placeholders
+# (OneDrive Known Folder Move), dedup, WOF and similar tags are written through.
 function Test-InstallLinkTag([uint32]$Tag){
     # Name-surrogate bit (0x20000000): junction, symlink, LX symlink, WCI link, ...
     # APPEXECLINK (0x8000001B) lacks the bit but is a link too; tag 0 means it was not read.
@@ -80,7 +81,7 @@ function Get-InstallLinkPoint([string]$Path){
 }
 function Test-InstallDestination([string]$Path){
     $link=Get-InstallLinkPoint $Path
-    if($link){throw "Refusing junction/symlink destination: $link"}
+    if($link){throw "Refusing destination under a junction/symlink or a reparse point whose type could not be read: $link"}
 }
 function Set-InstallText([string]$Path,[string]$Text,[string]$Expected){
     $full=[IO.Path]::GetFullPath($Path)
@@ -261,7 +262,7 @@ try {
         $loads=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
         $body="if (`$env:TERM_PROGRAM -eq 'agliteterm') {`r`n"
         foreach($script in $loads){$body+="    . '"+(Join-Path $DataRoot $script).Replace("'","''")+"'`r`n"};$body+='}'
-        # A profile behind a junction/symlink is skipped, not fatal.
+        # A profile behind a link is skipped, not fatal.
         $profileReparse=Get-InstallLinkPoint $ProfilePath
         try{$next=Add-InstallBlock $profile $Operation $body}catch{if(-not $profileReparse){throw};$next=$null}
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
@@ -305,18 +306,18 @@ try {
             switch($destination.Kind){
                 'codex' {$codexReparse=$reparse;$codexPresent=$false}
                 'profile' {$profileReparse=$reparse;$next=$null}
-                default {throw "Refusing junction/symlink destination: $reparse"}
+                default {throw "Refusing destination under a junction/symlink or a reparse point whose type could not be read: $reparse"}
             }
         }
         foreach($destination in $writes){Set-InstallText $destination.Path $destination.Text $destination.Expected}
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
         if($null -eq $next){
             $dotSources=($loads|ForEach-Object {Join-Path $DataRoot $_}) -join ' and '
-            $result+="`nPowerShell profile block skipped: $ProfilePath is under a junction/symlink ($profileReparse); agliteterm does not write through junctions/symlinks. Dot-source $dotSources yourself if you want them."
+            $result+="`nPowerShell profile block skipped: $ProfilePath is under a junction/symlink or a reparse point whose type could not be read ($profileReparse); agliteterm does not write through links. Dot-source $dotSources yourself if you want them."
         }
         if($Operation -eq 'hooks'){
             if($codexPresent){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
-            elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink; agliteterm does not write through junctions/symlinks."}
+            elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink or a reparse point whose type could not be read; agliteterm does not write through links."}
             else{$result+="`nCodex hooks skipped because $codexDir does not exist."}
         }
         @{ok=$true;result=$result}|ConvertTo-Json -Compress -Depth 4

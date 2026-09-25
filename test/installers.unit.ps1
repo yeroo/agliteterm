@@ -217,7 +217,7 @@ try {
     $profileJunction=Join-Path $iso 'documents-junction';New-Item -ItemType Junction -Path $profileJunction -Target $profileTarget|Out-Null
     $profile=Join-Path $profileJunction 'profile.ps1'
     $before=Get-TreeHash $profileTarget;$r=Install hooks;$after=Get-TreeHash $profileTarget
-    Check 'junctioned profile is skipped while helpers, Claude and Codex hooks install' ($r.ok -and $installExit-eq 0 -and $r.result-match'PowerShell profile block skipped' -and $r.result.Contains($profileJunction) -and $r.result-match'agliteterm-claude\.ps1' -and $before-ceq$after -and [IO.File]::Exists((Join-Path $data 'agliteterm-agent-status.ps1')) -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and (Get-Content -Raw (Join-Path $user '.codex/hooks.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1)
+    Check 'junctioned profile is skipped while helpers, Claude and Codex hooks install' ($r.ok -and $installExit-eq 0 -and $r.result-match'PowerShell profile block skipped' -and $r.result.Contains('or a reparse point whose type could not be read') -and $r.result.Contains($profileJunction) -and $r.result-match'agliteterm-claude\.ps1' -and $before-ceq$after -and [IO.File]::Exists((Join-Path $data 'agliteterm-agent-status.ps1')) -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and (Get-Content -Raw (Join-Path $user '.codex/hooks.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1)
     [IO.Directory]::Delete($profileJunction)
 
     # hooks.json itself a file symlink under a plain ~/.codex skips Codex.
