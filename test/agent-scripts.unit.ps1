@@ -30,11 +30,11 @@ foreach($asset in Get-ChildItem (Join-Path $repo 'assets') -Filter 'agliteterm-*
     & $shell -NoProfile -NonInteractive -Command $parse
     Check "PS5.1 parser: $($asset.Name)" ($LASTEXITCODE-eq 0)
 }
-function Invoke-AgentFixture([string]$Body,[int]$Requests){
+function Invoke-AgentFixture([string]$Body,[int]$Requests,[string]$InputJson=''){
     $pipe='p11-agent-unit-'+[guid]::NewGuid().ToString('N')
     $server=[IO.Pipes.NamedPipeServerStream]::new($pipe,[IO.Pipes.PipeDirection]::InOut,1,[IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]::Asynchronous)
     $start=[Diagnostics.ProcessStartInfo]::new($shell);$start.UseShellExecute=$false;$start.CreateNoWindow=$true
-    $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true;$start.RedirectStandardInput=$true
     $prefix="`$env:TERM_PROGRAM='agliteterm';`$env:AGWINTERM_SESSION_ID='private-test-pane';`$env:AGWINTERM_PIPE='$pipe';`$env:PATH='"+$root.Replace("'","''")+";'+`$env:PATH;"
     $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prefix+$Body))
     $start.Arguments='-NoProfile -NonInteractive -EncodedCommand '+$encoded
@@ -42,6 +42,8 @@ function Invoke-AgentFixture([string]$Body,[int]$Requests){
     $cancel=[Threading.CancellationTokenSource]::new()
     try {
         $accept=$server.WaitForConnectionAsync($cancel.Token);$client=[Diagnostics.Process]::Start($start);[void]$client.SafeHandle
+        $inputBytes=[Text.UTF8Encoding]::new($false).GetBytes($InputJson)
+        $client.StandardInput.BaseStream.Write($inputBytes,0,$inputBytes.Length);$client.StandardInput.Close()
         $stdout=$client.StandardOutput.ReadToEndAsync();$stderr=$client.StandardError.ReadToEndAsync()
         for($i=0;$i-lt$Requests;$i++){
             if(-not$accept.Wait(30000)){throw 'Fixture pipe connection timed out'}
@@ -56,6 +58,7 @@ function Invoke-AgentFixture([string]$Body,[int]$Requests){
             if($i+1-lt$Requests){$accept=$server.WaitForConnectionAsync($cancel.Token)}
         }
         if(-not$client.WaitForExit(30000)){throw 'Fixture subprocess did not exit'}
+        $script:fixtureStdout=$stdout.Result
         if($client.ExitCode-ne0){throw "Fixture failed: $($stderr.Result)"}
         $script:unexpectedConnection=$Requests-eq 0 -and $accept.IsCompleted -and -not$accept.IsFaulted -and -not$accept.IsCanceled
         return $answers
@@ -84,8 +87,46 @@ Check 'wrapper leaves opaque arguments and new subcommands unchanged' ($log[-2]-
 $notify=(Join-Path $assets 'agliteterm-codex-notify.ps1').Replace("'","''")
 $request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`"}'" 1)
 Check 'Codex completion notify uses exact event and pane' ($request[0].cmd-eq'session.status' -and $request[0].args.status-eq'completed' -and $request[0].target-eq'private-test-pane')
+$request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`",`"last-assistant-message`":`"Shall I push it?  `"}'" 1)
+Check 'legacy Codex notify maps a final question to blocked' ($request[0].args.status-eq'blocked' -and $script:fixtureStdout-eq'')
 $null=Invoke-AgentFixture "& '$notify' '{`"type`":`"other`"}'" 0
 Check 'unknown Codex event is inert (no pipe connection)' (-not$script:unexpectedConnection)
+$codexHook=(Join-Path $assets 'agliteterm-codex-hook.ps1').Replace("'","''")
+foreach($state in 'active','blocked'){
+    $request=@(Invoke-AgentFixture "& '$codexHook' $state" 1 '{}')
+    Check "Codex hook $state reports pane status with empty stdout" ($request.Count-eq 1 -and $request[0].cmd-eq'session.status' -and $request[0].args.status-eq$state -and $request[0].target-eq'private-test-pane' -and $script:fixtureStdout-eq'')
+}
+foreach($case in @(@('Done.','completed'),@('Shall I push it?  ','blocked'),@(('caf'+[char]0x00e9+'?'),'blocked'))){
+    $json=@{last_assistant_message=$case[0]}|ConvertTo-Json -Compress
+    $request=@(Invoke-AgentFixture "& '$codexHook' stop" 1 $json)
+    Check 'Codex Stop maps final message with UTF-8 stdin and empty stdout' ($request.Count-eq 1 -and $request[0].args.status-eq$case[1] -and $script:fixtureStdout-eq'')
+}
+$execTranscript=Join-Path $root 'exec-rollout.jsonl';$cliTranscript=Join-Path $root 'cli-rollout.jsonl'
+[IO.File]::WriteAllText($execTranscript,'{"payload":{"source":"exec"}}'+"`n",[Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($cliTranscript,'{"payload":{"source":"cli"}}'+"`n",[Text.UTF8Encoding]::new($false))
+$held=[IO.FileStream]::new($execTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$null=Invoke-AgentFixture "& '$codexHook' active" 0 (@{transcript_path=$execTranscript}|ConvertTo-Json -Compress)}finally{$held.Dispose()}
+Check 'nested Codex exec hook sends no status and no stdout' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$utf8Dir=Join-Path $root ('rollout-'+[char]0x00e9);[IO.Directory]::CreateDirectory($utf8Dir)|Out-Null
+$utf8Transcript=Join-Path $utf8Dir 'exec.jsonl'
+[IO.File]::WriteAllText($utf8Transcript,'{"payload":{"source":"exec"}}'+"`n",[Text.UTF8Encoding]::new($false))
+$utf8Json=@{transcript_path=$utf8Transcript}|ConvertTo-Json -Compress
+Check 'UTF-8 fixture sends raw non-ASCII transcript path' ($utf8Json.Contains([char]0x00e9))
+$held=[IO.FileStream]::new($utf8Transcript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$null=Invoke-AgentFixture "& '$codexHook' active" 0 $utf8Json}finally{$held.Dispose()}
+Check 'UTF-8 stdin preserves non-ASCII rollout path and suppresses nested exec' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$held=[IO.FileStream]::new($cliTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$cliTranscript}|ConvertTo-Json -Compress))}finally{$held.Dispose()}
+Check 'interactive Codex hook reads a live rollout and reports status' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=(Join-Path $root 'missing-rollout.jsonl')}|ConvertTo-Json -Compress))
+Check 'missing Codex transcript fails open to status report' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$badTranscript=Join-Path $root 'bad-rollout.jsonl';[IO.File]::WriteAllText($badTranscript,'{broken')
+$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$badTranscript}|ConvertTo-Json -Compress))
+Check 'invalid Codex transcript fails open to status report' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$null=Invoke-AgentFixture "& '$codexHook' active" 0 '{broken'
+Check 'malformed Codex stdin is silent and inert' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$null=Invoke-AgentFixture "`$env:TERM_PROGRAM='other'; & '$codexHook' active" 0 '{}'
+Check 'Codex hook is inert outside lite' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
 $prompt=(Join-Path $assets 'agliteterm-prompt.ps1').Replace("'","''")
 $protocol=@'
 $global:p11Claims=0;$global:p11Acks=0;$global:p11Receipts=0
