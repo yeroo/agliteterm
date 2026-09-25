@@ -46,6 +46,19 @@ public:
         transfer();
         return true;
     }
+    // session type/paste: an untokened editing write with a BOUNDED wait for the gate. Other writers
+    // queue behind it exactly as behind write(). transfer() returns true when it left a write
+    // unresolved; the pane then stays reserved under a token taken before the mutex is released,
+    // until release(retained). A refusal (busy or reserved) writes nothing and leaves `written`
+    // alone. No editable check: read-only is not a ban on session.type (P9 contract).
+    template<class Write> bool writeRetaining(unsigned lockWaitMs, Write transfer, unsigned long long& retained) {
+        retained = 0;
+        std::unique_lock<std::timed_mutex> hold(mutex,std::defer_lock);
+        if (!hold.try_lock_for(std::chrono::milliseconds(lockWaitMs)) || reservation) return false;
+        written = true; // even a failed/partial write makes emptiness unproven
+        if (transfer()) retained = reservation = ++sequence;
+        return true;
+    }
 };
 inline bool powershell(const std::string& path) {
     const auto separator = path.find_last_of("/\\");

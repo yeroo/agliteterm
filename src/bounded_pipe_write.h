@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <vector>
+#include "bounded_input.h" // kCancelWaitMs: its budget counts this wait
 
 namespace bounded_pipe_write {
 struct Pending {
@@ -16,8 +17,11 @@ inline bool complete(Pending*& pending, DWORD& written) {
 }
 // An unresolved cancellation transfers ownership to the caller. It must retain its input lease
 // and this allocation until complete() observes actual success/cancellation/failure.
-inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, Pending*& deferred) {
+// timedOut (optional) tells a cancelled-at-deadline write apart from one that failed.
+inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, Pending*& deferred,
+                   bool* timedOut = nullptr) {
     deferred=nullptr;
+    if (timedOut) *timedOut=false;
     auto* pending = new Pending;
     if (!DuplicateHandle(GetCurrentProcess(),pipe,GetCurrentProcess(),&pending->pipe,0,FALSE,DUPLICATE_SAME_ACCESS)) { delete pending; return 0; }
     pending->bytes.assign(static_cast<const char*>(bytes),static_cast<const char*>(bytes)+length);
@@ -29,12 +33,20 @@ inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, 
     if (WaitForSingleObject(pending->ov.hEvent,timeout) == WAIT_OBJECT_0) {
         complete(pending,written); return written;
     }
+    if (timedOut) *timedOut=true;
     CancelIoEx(pending->pipe,&pending->ov);
     // Cancellation is asynchronous. Never free the OVERLAPPED/buffer until completion, and
     // never turn its cleanup into another unbounded wait on the control/lease worker.
-    WaitForSingleObject(pending->ov.hEvent,1000);
+    WaitForSingleObject(pending->ov.hEvent,bounded_input::kCancelWaitMs);
     if (complete(pending,written)) return written; // cancellation may have lost to normal delivery
     deferred=pending;
     return 0;
+}
+// The body of the worker that owns an unresolved write: wait (unbounded, off the control thread)
+// until it resolves, free it, and only then release the lease that kept the pane reserved.
+template<class Gate> void resolveThenRelease(Gate& gate, unsigned long long lease, Pending* pending) {
+    WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
+    if (complete(pending,ignored)) gate.release(lease);
+    // A wait failure cannot authorize new input or free possibly active I/O.
 }
 }

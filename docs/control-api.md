@@ -43,6 +43,35 @@ Three probes answer what an agent otherwise has to guess:
 - There is no `quick type`: the quick terminal is a hidden session, typed into as
   `session type --window quick` while visible or `session type --target <its id>` (the id arrives as
   a `session`/`created` event after `quick on`).
+- `session type` and `session paste` always answer well inside `agwintermctl`'s 30 s reply
+  deadline (#110). They wait at most 5 s for the pane's input. If another type/paste still holds it,
+  or a write whose cancellation has not resolved keeps it reserved, the call refuses with
+  `input to this pane is busy or reserved; nothing typed` (or `nothing pasted`), and no byte is
+  written. The text then goes out in chunks of at most 4096 bytes, never split inside a UTF-8
+  character, under one 15 s deadline for the whole text. `typed` / `pasted` mean every byte was
+  written, as before. A write that stops early refuses with `N of M bytes written`, then the K-byte
+  chunk at offset N, which was cancelled or failed and **may have been partly delivered**, then the
+  remaining bytes, which were not written. So a caller that retries the whole text repeats N bytes,
+  plus up to K. Only `session type` can resume from offset N: its counts are over the text as sent,
+  where the only change is `\n` becoming `\r`, byte for byte, and a resume may still repeat up to K
+  bytes. For `session paste`, the counts include `ESC[200~` and are over the normalized text, where
+  CRLF becomes CR, and a clipboard paste's text is never seen by the caller. So those counts say how
+  far the paste got, but they are not an offset into the caller's text. If a chunk's cancellation
+  has not resolved within 1 s, the reply says it is still in flight and may still arrive. The pane's
+  input then stays reserved, so human keys and other API input are refused, until that write
+  resolves. An `input` event is emitted when that happens.
+- A bracketed `session paste` writes `ESC[200~` and `ESC[201~` as chunks of their own. If the
+  paste stops after the opening marker, lite sends a separate `ESC[201~` (bounded to 500 ms) so the
+  application is not left inside a paste, and the reply says whether that worked. That separate
+  close is reported on its own and is not counted among the remaining bytes. If only the closing
+  marker was left when the deadline passed and the separate close then succeeds, every byte went,
+  and the reply is `pasted`. Lite does not send a separate close:
+  - when the opening marker itself was stopped (whether the paste was opened is unknown);
+  - when a body chunk is still in flight (the reply says the paste is left open);
+  - when too little of the time budget is left to attempt the 500 ms close (the reply says the
+    paste is left open: no time left to send `ESC[201~`);
+  - when the stopped chunk was the closing marker itself. If that chunk is still in flight, the reply
+    says so. Do not close the paste yourself: that marker may still arrive.
 - `session write` is display-only. What it paints is not durable: the shell's next repaint, and the
   full repaint the pty-host does on every resize (a window resize, `session split`, a split-ratio
   change, `session split close`), paints over it, and it does not survive into scrollback.
@@ -221,8 +250,8 @@ ASCII spaces on each row. Blank rows at the end are omitted; an entirely blank b
 - `session paste` refuses an observed exited or readonly target before clipboard access.
   Unterminated or odd-sized UTF-16 clipboard blocks, and blocks larger than 16 MiB, are unavailable.
   Empty or unavailable text returns `nothing to paste`; `pasted` means input was handed off without a
-  synchronous error, not proof of application execution. Partial or failed writes refuse; do not
-  retry blindly.
+  synchronous error, not proof of application execution. Partial or failed writes refuse and say how
+  far they got (see Typing text); do not retry blindly.
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.
   `session bind <agent-command>|none --target PANE` supplies a binding instead (default `claude`).
   Both save before success. Replay waits 2500 ms, uses current values, and skips adopted shells; the
