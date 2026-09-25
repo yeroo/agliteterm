@@ -147,7 +147,7 @@ Check 'Codex match-all merge remains byte-idempotent' ($r.ok -and [Convert]::ToB
 $scopedCodex=@{hooks=@{PostToolUse=@(@{matcher='Bash';hooks=@(@{type='command';command=$codexCommand+'active'})})}}|ConvertTo-Json -Depth 20
 [IO.File]::WriteAllText($codexPath,$scopedCodex);$r=Install hooks;$codexTree=Get-Content -Raw $codexPath|ConvertFrom-Json
 Check 'scoped Codex command does not suppress match-all status hook' ($r.ok -and $codexTree.hooks.PostToolUse.Count-eq 2)
-$codexBad=@('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"bad"}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"hooks":false}]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[false]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":false}]}]}}','{"a":1,"a":2}','{"a":1,"A":2}','{"key":1,"\u006bey":2}','{"hooks":{"stop":[]}}','{"Hooks":{}}','{"hooks":{"Stop":[{"Hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[{"Type":"command"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","CommandWindows":"alias"}]}]}}')
+$codexBad=@('{broken','[]','{"\q":1}','{"hooks":false}','{"hooks":{"Stop":"bad"}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"hooks":false}]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[false]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":false}]}]}}','{"a":1,"a":2}','{"a":1,"A":2}','{"key":1,"\u006bey":2}','{"hooks":{"stop":[]}}','{"Hooks":{}}','{"hooks":{"Stop":[{"Hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[{"Type":"command"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","CommandWindows":"alias"}]}]}}')
 foreach($bad in $codexBad){
     [IO.File]::WriteAllText($codexPath,$bad)
     [IO.File]::WriteAllText((Join-Path $data 'agliteterm-codex-hook.ps1'),'# deliberately stale private helper')
@@ -157,6 +157,12 @@ foreach($bad in $codexBad){
     $after=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
     Check 'malformed Codex hooks refuse every destination write' (-not $r.ok -and $installExit-ne 0 -and $r.error-match'Codex' -and $before-ceq$after -and $r.error.EndsWith('completed writes: '))
 }
+[IO.File]::WriteAllBytes($codexPath,[byte[]](0x7B,0x22,0xFF,0x22,0x3A,0x31,0x7D))
+[IO.File]::WriteAllText((Join-Path $data 'agliteterm-codex-hook.ps1'),'# deliberately stale private helper')
+$before=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+$r=Install hooks
+$after=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+Check 'invalid UTF-8 Codex hooks names file and preserves every destination' (-not $r.ok -and $installExit-ne 0 -and $r.error-match'Codex' -and $before-ceq$after -and $r.error.EndsWith('completed writes: '))
 [IO.File]::WriteAllText($codexPath,$seed);$r=Install hooks
 Check 'valid Codex install refreshes helpers after refusals' ($r.ok -and [IO.File]::ReadAllText((Join-Path $data 'agliteterm-codex-hook.ps1'))-cne'# deliberately stale private helper')
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"

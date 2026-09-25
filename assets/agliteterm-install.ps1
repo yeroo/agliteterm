@@ -135,6 +135,7 @@ $hookKinds=@{
     agent=@{prompt='requiredText';model='text'}
 }
 $hookFields=@($hookCommon.Keys)+@($hookKinds.Values|ForEach-Object {$_.Keys})|Select-Object -Unique
+# Catalog snapshot 2026-09-25, https://learn.chatgpt.com/docs/hooks
 $codexEvents=@('SessionStart','SessionEnd','SubagentStart','PreToolUse','PermissionRequest','PostToolUse','PreCompact','PostCompact','UserPromptSubmit','SubagentStop','Stop','Interrupt')
 $codexFields=@('type','command','commandWindows','timeout','statusMessage','additionalContextLimit','async','server','tool','input')
 function Test-InstallHandler($Hook,[string]$Event){
@@ -200,6 +201,7 @@ try {
         $next=Add-InstallBlock $profile $Operation $body
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
         $codexDir=Join-Path $UserRoot '.codex';$codexPath=Join-Path $codexDir 'hooks.json';$codex='';$codexMerged=''
+        $codexPresent=[IO.Directory]::Exists($codexDir)
         if($Operation -eq 'hooks'){
             $settings=Read-InstallText $settingsPath
             Test-InstallJsonShape $settings
@@ -208,9 +210,9 @@ try {
             $wrapper=Join-Path $DataRoot 'agliteterm-agent-status.ps1'
             Merge-InstallHooks $root @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt')) $wrapper $false
             $merged=$root|ConvertTo-Json -Depth 100
-            if([IO.Directory]::Exists($codexDir)){
-                $codex=Read-InstallText $codexPath
-                Test-InstallJsonShape $codex 'Codex hooks'
+            if($codexPresent){
+                try{$codex=Read-InstallText $codexPath;Test-InstallJsonShape $codex 'Codex hooks'}
+                catch{throw "Codex hooks could not be read or validated: $($_.Exception.Message); unchanged"}
                 try{$codexRoot=if($codex.Trim()){$codex|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}}
                 catch{throw "Codex hooks JSON is invalid: $($_.Exception.Message); unchanged"}
                 Test-InstallHookTree $codexRoot 'Codex hooks' $codexEvents $codexFields $false
@@ -222,11 +224,11 @@ try {
         # Validate all inputs above before touching the first destination. Report partial failures.
         foreach($script in $scripts){$path=Join-Path $DataRoot $script;Set-InstallText $path $sources[$script] (Read-InstallText $path)}
         if($Operation -eq 'hooks'){Set-InstallText $settingsPath $merged $settings}
-        if($Operation -eq 'hooks' -and [IO.Directory]::Exists($codexDir)){Set-InstallText $codexPath $codexMerged $codex}
+        if($Operation -eq 'hooks' -and $codexPresent){Set-InstallText $codexPath $codexMerged $codex}
         Set-InstallText $ProfilePath $next $profile
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
         if($Operation -eq 'hooks'){
-            if([IO.Directory]::Exists($codexDir)){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
+            if($codexPresent){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
             else{$result+="`nCodex hooks skipped because $codexDir does not exist."}
         }
         @{ok=$true;result=$result}|ConvertTo-Json -Compress -Depth 4

@@ -87,7 +87,7 @@ Check 'wrapper leaves opaque arguments and new subcommands unchanged' ($log[-2]-
 $notify=(Join-Path $assets 'agliteterm-codex-notify.ps1').Replace("'","''")
 $request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`"}'" 1)
 Check 'Codex completion notify uses exact event and pane' ($request[0].cmd-eq'session.status' -and $request[0].args.status-eq'completed' -and $request[0].target-eq'private-test-pane')
-$request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`",`"last-agent-message`":`"Shall I push it?  `"}'" 1)
+$request=@(Invoke-AgentFixture "& '$notify' '{`"type`":`"agent-turn-complete`",`"last-assistant-message`":`"Shall I push it?  `"}'" 1)
 Check 'legacy Codex notify maps a final question to blocked' ($request[0].args.status-eq'blocked' -and $script:fixtureStdout-eq'')
 $null=Invoke-AgentFixture "& '$notify' '{`"type`":`"other`"}'" 0
 Check 'unknown Codex event is inert (no pipe connection)' (-not$script:unexpectedConnection)
@@ -107,6 +107,14 @@ $execTranscript=Join-Path $root 'exec-rollout.jsonl';$cliTranscript=Join-Path $r
 $held=[IO.FileStream]::new($execTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
 try{$null=Invoke-AgentFixture "& '$codexHook' active" 0 (@{transcript_path=$execTranscript}|ConvertTo-Json -Compress)}finally{$held.Dispose()}
 Check 'nested Codex exec hook sends no status and no stdout' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$utf8Dir=Join-Path $root ('rollout-'+[char]0x00e9);[IO.Directory]::CreateDirectory($utf8Dir)|Out-Null
+$utf8Transcript=Join-Path $utf8Dir 'exec.jsonl'
+[IO.File]::WriteAllText($utf8Transcript,'{"payload":{"source":"exec"}}'+"`n",[Text.UTF8Encoding]::new($false))
+$utf8Json=@{transcript_path=$utf8Transcript}|ConvertTo-Json -Compress
+Check 'UTF-8 fixture sends raw non-ASCII transcript path' ($utf8Json.Contains([char]0x00e9))
+$held=[IO.FileStream]::new($utf8Transcript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$null=Invoke-AgentFixture "& '$codexHook' active" 0 $utf8Json}finally{$held.Dispose()}
+Check 'UTF-8 stdin preserves non-ASCII rollout path and suppresses nested exec' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
 $held=[IO.FileStream]::new($cliTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
 try{$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$cliTranscript}|ConvertTo-Json -Compress))}finally{$held.Dispose()}
 Check 'interactive Codex hook reads a live rollout and reports status' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')

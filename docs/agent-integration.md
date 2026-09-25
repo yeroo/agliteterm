@@ -44,8 +44,8 @@ The native host's 2048-byte argument limit is checked before launch; oversized c
 ## Installation and updates
 
 `install.hooks` copies product-scoped status/Claude/Codex/generic-agent scripts to lite app data,
-merges four Claude hook events and four Codex events into `~/.codex/hooks.json` when `~/.codex`
-exists, and adds a named block to the current user's Windows PowerShell profile.
+merges four Claude hook events into `~/.claude/settings.json` and, when `~/.codex` exists,
+four Codex events into `~/.codex/hooks.json`. It adds a named block to the current user's Windows PowerShell profile.
 It preserves unrelated settings/hooks/profile text and custom PSReadLine Enter handlers. Notification
 hooks only mark permission prompts blocked. Codex hooks report active work, approval prompts,
 and completion; a final assistant question reports blocked. Trust new hooks once in Codex `/hooks`.
