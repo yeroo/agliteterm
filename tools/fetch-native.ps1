@@ -14,8 +14,9 @@
 #
 # It also stages agwintermctl.exe, the control client the checks drive lite with. That has its own
 # pin, cliTag in native/pinned.json, cached under .native/cli-<cliTag>/, and the staged copy must
-# report that version on every run ('latest' has no version to check, so it is refetched every run
-# instead). -Tag overrides the core tag only; it no longer moves the CLI.
+# report that version on every run. 'latest' has no version to check, so it is refetched every run
+# instead, falling back to the cached copy with a warning when offline. -Tag overrides the core tag
+# only; it no longer moves the CLI.
 #
 # -NativeDir (or AGLITETERM_NATIVE_DIR) takes a local agwinterm checkout's target\release instead,
 # which is how you work on the core and the client together — and the only way to build against a
@@ -112,45 +113,28 @@ $cliCache = Join-Path $root ".native\cli-$cliTag"
 if ($Force -and (Test-Path $cliCache)) { Remove-Item -Recurse -Force $cliCache }
 New-Item -ItemType Directory -Force $cliCache | Out-Null
 $ctlCached = Join-Path $cliCache 'agwintermctl.exe'
-# latest has no version to check the cache against, so a cached copy would freeze at the first
-# fetch unnoticed. Always take it afresh.
-if ($cliTag -eq 'latest') { Remove-Item $ctlCached -Force -ErrorAction SilentlyContinue }
 # Whatever an earlier run staged is unchecked until this step passes, so a failure anywhere below
 # leaves no CLI in bin rather than one test\ctl-path.ps1 would still pick up.
 $ctlStaged = Join-Path $bin 'agwintermctl.exe'
 Remove-Item $ctlStaged -Force -ErrorAction SilentlyContinue
-Get-Asset $cliBase $cliTag 'agwintermctl.exe' $ctlCached ("  native\pinned.json's cliTag must name an agwinterm release that publishes agwintermctl.exe.`n" +
-                                                         "  to test with an unreleased CLI, set AGWINTERMCTL to a dev build")
-Copy-Item $ctlCached $ctlStaged -Force
-
-# A pipe nothing answers on, and none of the pane variables that would point the CLI at the app
-# this script may be running inside: the probe must never talk to a live instance.
-$paneVars = 'AGWINTERM_PIPE', 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID'
-$savedVars = @{}
-$ctlVersion = $null
-try {
-    foreach ($v in $paneVars) { $savedVars[$v] = [Environment]::GetEnvironmentVariable($v); [Environment]::SetEnvironmentVariable($v, $null) }
+$cliHint = ("  native\pinned.json's cliTag must name an agwinterm release that publishes agwintermctl.exe.`n" +
+            "  to test with an unreleased CLI, set AGWINTERMCTL to a dev build")
+if ($cliTag -eq 'latest') {
+    # latest has no version to check the cache against, so a cached copy would freeze at the first
+    # fetch unnoticed: take it afresh each run. Into a side file, so a failed download (offline, rate
+    # limited) keeps the cached copy to build with rather than failing the build.
+    $ctlFresh = "$ctlCached.download"
+    Remove-Item $ctlFresh -Force -ErrorAction SilentlyContinue
     try {
-        # Only the cli line identifies the client; the exit code is about the app, and none answers
-        # here. Continue, so stderr under 2>&1 is output to check rather than a PS 5.1 terminating error.
-        $ErrorActionPreference = 'Continue'
-        $ctlVersion = (& $ctlStaged version --pipe "agliteterm-fetch-probe-$([guid]::NewGuid().ToString('N'))" 2>&1 | Out-String)
-        $global:LASTEXITCODE = 0
+        Get-Asset $cliBase $cliTag 'agwintermctl.exe' $ctlFresh $cliHint
+        Move-Item $ctlFresh $ctlCached -Force
     }
-    finally {
-        $ErrorActionPreference = 'Stop'
-        foreach ($v in $paneVars) { [Environment]::SetEnvironmentVariable($v, $savedVars[$v]) }
+    catch {
+        if (-not (Test-Path $ctlCached)) { throw }
+        Write-Warning "could not refresh the latest agwintermctl.exe, so the cached copy is used and may be stale: $($_.Exception.Message)"
     }
-    Assert-CliVersion $ctlVersion $cliTag
 }
-catch {
-    # A refused client must not stay in bin, where test\ctl-path.ps1 would still pick it up.
-    Remove-Item $ctlStaged -Force -ErrorAction SilentlyContinue
-    if ($null -ne $ctlVersion) { throw }   # it ran and Assert-CliVersion refused it, saying why
-    # It never ran: a truncated download, or something blocking the exe. The cache is what every
-    # later run would copy, so it goes too and the next run downloads afresh.
-    Remove-Item $ctlCached -Force -ErrorAction SilentlyContinue
-    throw (Get-CliLaunchFailure $cliTag $_.Exception.Message)
-}
+else { Get-Asset $cliBase $cliTag 'agwintermctl.exe' $ctlCached $cliHint }
+Install-CheckedCli -Cached $ctlCached -Staged $ctlStaged -CliTag $cliTag
 
 "native: $repo@$($pin.tag) abi $requiredAbi (cached in .native\$($pin.tag)); cli $cliTag (cached in .native\cli-$cliTag)"

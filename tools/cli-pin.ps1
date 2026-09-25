@@ -1,5 +1,6 @@
-# The pure half of fetch-native's CLI step: which agwintermctl the checks drive, and whether the one
-# staged in bin is that one. Dot-sourced by tools\fetch-native.ps1 and test\fetch-native.unit.ps1.
+# The offline half of fetch-native's CLI step: which agwintermctl the checks drive, and admitting
+# the one staged in bin only when it is that one. Dot-sourced by tools\fetch-native.ps1 and
+# test\fetch-native.unit.ps1.
 #
 # The CLI has its own pin (cliTag in native\pinned.json) because it answers to a different clock
 # than the core: the core must match kRequiredAbi exactly, while the checks want a client new
@@ -34,5 +35,40 @@ function Assert-CliVersion([string]$VersionOutput, [string]$CliTag) {
     $want = $CliTag -replace '^v', ''
     if ($m.Groups[1].Value -ne $want) {
         throw ("the staged agwintermctl.exe is cli $($m.Groups[1].Value), but native\pinned.json pins cliTag $CliTag.`n$fix")
+    }
+}
+
+# Copies the cached CLI to bin and admits it only if it runs and reports $CliTag. A refused client
+# must not stay in bin, where test\ctl-path.ps1 would still pick it up. One that never ran (a
+# truncated download, AV or app control blocking it) is dropped from the cache too, since every
+# later run would copy it; one that ran but is the wrong version keeps its cache, the message says why.
+function Install-CheckedCli([string]$Cached, [string]$Staged, [string]$CliTag) {
+    Copy-Item $Cached $Staged -Force
+    # A pipe nothing answers on, and none of the pane variables that would point the CLI at the app
+    # this may be running inside: the probe must never talk to a live instance.
+    $paneVars = 'AGWINTERM_PIPE', 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID'
+    $saved = @{}
+    $output = $null
+    try {
+        foreach ($v in $paneVars) { $saved[$v] = [Environment]::GetEnvironmentVariable($v); [Environment]::SetEnvironmentVariable($v, $null) }
+        $eap = $ErrorActionPreference
+        try {
+            # Only the cli line identifies the client; the exit code is about the app, and none answers
+            # here. Continue, so stderr under 2>&1 is output to check, not a PS 5.1 terminating error.
+            $ErrorActionPreference = 'Continue'
+            $output = (& $Staged version --pipe "agliteterm-fetch-probe-$([guid]::NewGuid().ToString('N'))" 2>&1 | Out-String)
+            $global:LASTEXITCODE = 0
+        }
+        finally {
+            $ErrorActionPreference = $eap
+            foreach ($v in $paneVars) { [Environment]::SetEnvironmentVariable($v, $saved[$v]) }
+        }
+        Assert-CliVersion $output $CliTag
+    }
+    catch {
+        Remove-Item $Staged -Force -ErrorAction SilentlyContinue
+        if ($null -ne $output) { throw }
+        Remove-Item $Cached -Force -ErrorAction SilentlyContinue
+        throw (Get-CliLaunchFailure $CliTag $_.Exception.Message)
     }
 }
