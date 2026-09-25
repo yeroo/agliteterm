@@ -175,6 +175,14 @@ and one per pane.
 instead of dropped) and `--all`. `--all` is lite's bare form; the full app's bare form is the screen
 only, a recorded difference. The pair together is refused.
 
+`session text --styles` returns `{cols,rows,cursor}` instead of a string. Each row has its
+screen-relative `row` (negative for scrollback) and `runs` with grid-cell `col`/`width`, `text`,
+six flags (`faint`, `bold`, `italic`, `underline`, `inverse`, `strike`) and `fg`/`bg` specs
+(`default`, `idx:N`, or `#rrggbb`). A wide glyph occupies two cells but contributes one character.
+It selects the same rows as lite's plain text, including `--all` and `--lines`, and trims trailing
+ASCII spaces on each row. Blank rows at the end are omitted; an entirely blank buffer has `rows:[]`.
+`session overlay text --styles` is refused; use `session text --styles --target <overlay-id>`.
+
 ## Targets
 
 - `--target active` on a **session** verb (`select`, `flag`, `rename`, `duplicate`, …) is the session

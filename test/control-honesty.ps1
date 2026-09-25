@@ -2589,6 +2589,54 @@ try {
         Check 'a raw all:true alone is the whole buffer, ok' ([bool]$r.ok -and [string]$r.result -eq $full) "raw: $raw"
         $raw = RawText $sp9 '"all":false,"lines":2'; $r = ConvertFrom-Json $raw
         Check 'a raw all:false beside lines is the flag NOT asked for: the tail, ok' ([bool]$r.ok -and [string]$r.result -eq (TailOf $full 2)) "raw: $raw"
+        # Styled text uses the same rows and one emulator snapshot. Inject into the alternate
+        # screen so the shell cannot race the fixture or wrap a long prompt into its row.
+        $esc = [string][char]27
+        $styledFixture = $esc + '[?1049h' + $esc + '[2J' + $esc + '[H' +
+            'A' + $esc + '[2mfaintword' + $esc + '[0m' +
+            $esc + '[38;5;196mI' + $esc + '[0m' +
+            $esc + '[38;2;1;2;255mR' + $esc + '[0m' +
+            [char]0x4e2d + $esc + '[1mZ' + $esc + '[0m' + $esc + '[7m   ' + $esc + '[0m'
+        $raw = Send-Raw (@{cmd='session.write';target=$sp9;args=@{text=$styledFixture}} | ConvertTo-Json -Compress -Depth 5)
+        $r = ConvertFrom-Json $raw
+        Check 'setup: exact SGR fixture entered the alternate screen' ([bool]$r.ok) "raw: $raw"
+        $styledBase = $null
+        foreach ($argJson in @('', '"all":true', '"lines":0', '"lines":3')) {
+            $argsJson = if ($argJson) { '"styles":true,' + $argJson } else { '"styles":true' }
+            $raw = RawText $sp9 $argsJson; $r = ConvertFrom-Json $raw
+            $plainRaw = RawText $sp9 $argJson; $plain = ConvertFrom-Json $plainRaw
+            $joined = @($r.result.rows | ForEach-Object { @($_.runs | ForEach-Object { [string]$_.text }) -join '' }) -join "`n"
+            $plainJoined = if ($plain.ok) { ([string]$plain.result) -replace "`n$", '' } else { '' }
+            Check "styled $argsJson has the structured shape and the plain selected text" ([bool]$r.ok -and $r.result.cols -is [long] -and $r.result.rows -is [array] -and $r.result.cursor.row -is [long] -and $r.result.cursor.col -is [long] -and $joined -ceq $plainJoined) "styled: $raw`nplain: $plainRaw"
+            if (-not $argJson) { $styledBase = $r.result }
+        }
+        $styledRuns = if ($styledBase -and $styledBase.rows.Count -gt 0) { @($styledBase.rows[0].runs) } else { @() }
+        $faintRun = @($styledRuns | Where-Object { $_.text -eq 'faintword' })
+        $idxRun = @($styledRuns | Where-Object { $_.text -eq 'I' })
+        $rgbRun = @($styledRuns | Where-Object { $_.text -eq 'R' })
+        $wideRun = @($styledRuns | Where-Object { $_.text -eq [string][char]0x4e2d })
+        $afterWide = @($styledRuns | Where-Object { $_.text -eq 'Z' })
+        Check 'SGR 2 marks only faintword faint' ($faintRun.Count -eq 1 -and $faintRun[0].faint -eq $true -and $styledRuns.Count -gt 0 -and $styledRuns[0].text -eq 'A' -and $styledRuns[0].faint -eq $false)
+        Check 'indexed and RGB color specs survive the FFI snapshot' ($idxRun.Count -eq 1 -and $idxRun[0].fg -eq 'idx:196' -and $rgbRun.Count -eq 1 -and $rgbRun[0].fg -eq '#0102ff')
+        Check 'wide glyph occupies two cells and following run starts after it' ($wideRun.Count -eq 1 -and $afterWide.Count -eq 1 -and $wideRun[0].width -eq 2 -and $afterWide[0].col -eq ($wideRun[0].col + 2))
+        Check 'inverse trailing spaces are trimmed from all runs' ($styledRuns.Count -gt 0 -and (@($styledRuns | Where-Object { $_.inverse }).Count -eq 0) -and ($styledRuns[-1].text -eq 'Z'))
+        $cursorRaw = Send-Raw (@{cmd='surface.cursor';target=$sp9;args=@{}} | ConvertTo-Json -Compress)
+        $cursorReply = ConvertFrom-Json $cursorRaw
+        Check 'styled cursor is the same column as surface.cursor and row zero is the screen top' ($cursorReply.ok -and $styledBase.cursor.col -eq $cursorReply.result -and $styledBase.rows[0].row -eq 0)
+        $raw = RawText $sp9 '"styles":false'; $r = ConvertFrom-Json $raw
+        $plainRaw = RawText $sp9 ''; $plain = ConvertFrom-Json $plainRaw
+        Check 'styles false and absent both return the plain string' ($r.ok -and $r.result -is [string] -and $r.result -ceq $plain.result)
+        $raw = RawText 'no-such-session-9999' '"styles":true,"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'styled all with lines refuses before target resolution' (-not $r.ok -and $r.error -eq $allWithLines)
+        $raw = RawText 'no-such-session-9999' '"styles":true,"lines":"5O"'; $r = ConvertFrom-Json $raw
+        Check 'styled bad lines refuses before target resolution' (-not $r.ok -and $r.error -eq (LinesRefusal '5O'))
+        $stylesRefusal = 'session overlay text: --styles is not supported here; use `session text --styles --target <overlay-id>`. Nothing read.'
+        $raw = RawOvText 'no-such-session-9999' '"styles":true,"all":true,"lines":3'; $r = ConvertFrom-Json $raw
+        Check 'overlay text styles refuses before its other text args and target resolution' (-not $r.ok -and $r.error -eq $stylesRefusal) "raw: $raw"
+        $raw = Send-Raw (@{cmd='session.overlay';target=$sp9;args=@{action='copy';styles=$true}} | ConvertTo-Json -Compress)
+        $r = ConvertFrom-Json $raw
+        Check 'overlay copy is unaffected by styles' ($r.error -ne $stylesRefusal) "raw: $raw"
+        Send-Raw (@{cmd='session.write';target=$sp9;args=@{text=($esc + '[?1049l')}} | ConvertTo-Json -Compress -Depth 5) | Out-Null
         # The same three on `overlay text`, on a pane slot and on the popup — the same reader.
         # Three echo lines, so the overlay's buffer has a tail to cut (its command sleeps, so no prompt
         # follows them); Wait-Shell5 finds the shell by the first `echo <marker>;` on its command line.

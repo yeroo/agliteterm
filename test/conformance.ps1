@@ -93,6 +93,9 @@ $cliHasP4 = $probe -match 'Nothing sent'
 # uses this probe).
 $probe = (& $ctl session overlay resize --pane left --pipe 'conform-probe' --json 2>&1) -join ''
 $cliHasP5 = $probe -match 'Nothing sent'
+# A post-#320 client refuses this unsupported overlay combination before opening the pipe.
+$probe = (& $ctl session overlay text --styles --pipe 'conform-probe' --json 2>&1) -join ''
+$cliHasStyledText = $probe -match '--styles is not supported here'
 
 # Sidebar width is a real SET. Restore it between fixtures even in the supervisor's private
 # registry namespace, so subsequent geometry cases do not inherit this contract step's width.
@@ -103,6 +106,9 @@ $savedSidebar = if (Test-Path $regKey) { (Get-ItemProperty -Path $regKey -ErrorA
 # client's shortfall, not the step's, so the fix (set AGWINTERMCTL) is in the message.
 function Needs-NewClient($argv) {
     $a = [string[]]@($argv)
+    if ($a -contains '--styles' -and -not $cliHasStyledText) {
+        return 'this agwintermctl predates agwinterm #320 and drops --styles - set AGWINTERMCTL to a newer build'
+    }
     if ($a.Count -eq 3 -and $a[0] -eq 'sidebar' -and $a[1] -eq 'width' -and $a[2] -match '^\d+$' -and -not $cliHasSidebarWidth) {
         return 'this agwintermctl predates agwinterm #226 and sends `sidebar width N` as a read - set AGWINTERMCTL to a newer build'
     }

@@ -67,6 +67,8 @@ older one; `-Strict` turns that into a failure, which is the release gate. The p
   refused with "Nothing sent" by a post-#238 client)
 - `session overlay --pane`, `overlay copy` / `text` and `session text --all` / `--lines` — agwinterm
   #250 (`session overlay resize --pane left` is refused before any pipe is opened)
+- `session text --styles` — agwinterm #320 (`session overlay text --styles` is refused before any
+  pipe is opened)
 
 To run them all, point `$env:AGWINTERMCTL` at an agwinterm dev build:
 `<agwinterm>\src\Agwinterm.Ctl\bin\Release\net10.0-windows\agwintermctl.exe`.
