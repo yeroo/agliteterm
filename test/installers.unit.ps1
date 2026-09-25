@@ -209,7 +209,7 @@ try {
     Check 'already-current Claude settings behind a junction install nothing and succeed' ($r.ok -and $installExit-eq 0 -and $r.result-match'Changed: \r?\n' -and $before-ceq$after)
     [IO.Directory]::Delete($claudeJunction)
 
-    # A profile under a junction (OneDrive Known Folder Move) is skipped; everything else installs.
+    # A profile under a junction is skipped; everything else installs.
     $iso=Use-IsolatedRoot 'reparse-profile'
     [IO.Directory]::CreateDirectory((Join-Path $user '.claude'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $user '.codex'))|Out-Null
     $profileTarget=Join-Path $iso 'onedrive-documents';[IO.Directory]::CreateDirectory($profileTarget)|Out-Null
@@ -217,7 +217,7 @@ try {
     $profileJunction=Join-Path $iso 'documents-junction';New-Item -ItemType Junction -Path $profileJunction -Target $profileTarget|Out-Null
     $profile=Join-Path $profileJunction 'profile.ps1'
     $before=Get-TreeHash $profileTarget;$r=Install hooks;$after=Get-TreeHash $profileTarget
-    Check 'junctioned profile is skipped while helpers, Claude and Codex hooks install' ($r.ok -and $installExit-eq 0 -and $r.result-match'PowerShell profile block skipped' -and $r.result.Contains($profileJunction) -and $r.result-match'agliteterm-claude\.ps1' -and $before-ceq$after -and [IO.File]::Exists((Join-Path $data 'agliteterm-agent-status.ps1')) -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and (Get-Content -Raw (Join-Path $user '.codex/hooks.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1)
+    Check 'junctioned profile is skipped while helpers, Claude and Codex hooks install' ($r.ok -and $installExit-eq 0 -and $r.result-match'PowerShell profile block skipped' -and $r.result.Contains('or a reparse point whose type could not be read') -and $r.result.Contains($profileJunction) -and $r.result-match'agliteterm-claude\.ps1' -and $before-ceq$after -and [IO.File]::Exists((Join-Path $data 'agliteterm-agent-status.ps1')) -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and (Get-Content -Raw (Join-Path $user '.codex/hooks.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1)
     [IO.Directory]::Delete($profileJunction)
 
     # hooks.json itself a file symlink under a plain ~/.codex skips Codex.
@@ -234,6 +234,57 @@ try {
         [IO.File]::Delete($codexLink)
     }
 }finally{$data=$savedData;$user=$savedUser;$profile=$savedProfile}
+# The link classifier and walker, extracted from the installer (it runs work at top level, so it cannot be dot-sourced).
+$ast=[Management.Automation.Language.Parser]::ParseFile($helper,[ref]$null,[ref]$null)
+$linkFunctions=@('Test-InstallLinkTag','Get-InstallReparseTag','Test-InstallLinkPart','Get-InstallLinkPoint')
+foreach($definition in $ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $linkFunctions -contains $n.Name},$true)){. ([scriptblock]::Create($definition.Extent.Text))}
+$links=@('A0000003','A000000C','8000001B','A000001D','A0000027','00000000')
+$notLinks=@('9000001A','9000601A','9000701A','80000013','80000017','9000001C')
+Check 'junction, symlink, LX/WCI links, app-exec alias and an unread tag classify as links' (@($links|Where-Object {-not(Test-InstallLinkTag ([Convert]::ToUInt32($_,16)))}).Count-eq 0)
+Check 'cloud-files, dedup, WOF and ProjFS tags do not classify as links' (@($notLinks|Where-Object {Test-InstallLinkTag ([Convert]::ToUInt32($_,16))}).Count-eq 0)
+# Real reparse points: any user may set a third-party tag on an empty directory they own.
+if(-not('AgLiteInstallTestReparse' -as [type])){
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class AgLiteInstallTestReparse {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool DeviceIoControl(SafeFileHandle handle, uint code, byte[] input, int inputSize, IntPtr output, int outputSize, out int returned, IntPtr overlapped);
+    // FSCTL_SET_REPARSE_POINT with a REPARSE_GUID_DATA_BUFFER; returns 0 or the Win32 error.
+    public static int Set(string directory, uint tag) {
+        using (SafeFileHandle handle = CreateFileW(directory, 0x40000000, 7, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) return Marshal.GetLastWin32Error();
+            byte[] buffer = new byte[28];
+            BitConverter.GetBytes(tag).CopyTo(buffer, 0);
+            BitConverter.GetBytes((ushort)4).CopyTo(buffer, 4);
+            Guid.NewGuid().ToByteArray().CopyTo(buffer, 8);
+            int returned;
+            return DeviceIoControl(handle, 0x000900A4, buffer, buffer.Length, IntPtr.Zero, 0, out returned, IntPtr.Zero) ? 0 : Marshal.GetLastWin32Error();
+        }
+    }
+}
+'@
+}
+$walk=Join-Path $root 'walker';[IO.Directory]::CreateDirectory($walk)|Out-Null
+$plainTagged=Join-Path $walk 'cloud-like';$surrogateTagged=Join-Path $walk 'link-like'
+[IO.Directory]::CreateDirectory($plainTagged)|Out-Null;[IO.Directory]::CreateDirectory($surrogateTagged)|Out-Null
+$plainError=[AgLiteInstallTestReparse]::Set($plainTagged,[uint32]0x123);$surrogateError=[AgLiteInstallTestReparse]::Set($surrogateTagged,[uint32]0x20000123)
+if($plainError -or $surrogateError){"SKIP tagged-directory walker checks: cannot set a reparse tag here (Win32 errors $plainError/$surrogateError)"}
+else{
+    Check 'a non-link reparse point on the path is written through' (([IO.File]::GetAttributes($plainTagged)-band [IO.FileAttributes]::ReparsePoint) -and $null -eq (Get-InstallLinkPoint $plainTagged))
+    Check 'a name-surrogate reparse point read from disk is refused' ((Get-InstallLinkPoint $surrogateTagged)-ceq$surrogateTagged)
+}
+[IO.Directory]::Delete($plainTagged);[IO.Directory]::Delete($surrogateTagged)
+$walkTarget=Join-Path $walk 'target';[IO.Directory]::CreateDirectory($walkTarget)|Out-Null
+$walkJunction=Join-Path $walk 'junction';New-Item -ItemType Junction -Path $walkJunction -Target $walkTarget|Out-Null
+# Proves the P/Invoke reads dwReserved0: a misaligned struct reads tag 0 (which fails closed) or garbage.
+Check 'the junction tag is read from disk as a mount point' ((Get-InstallReparseTag $walkJunction)-eq [Convert]::ToUInt32('A0000003',16))
+Check 'a junction itself and a path beneath it are refused' ((Get-InstallLinkPoint $walkJunction)-ceq$walkJunction -and (Get-InstallLinkPoint (Join-Path $walkJunction 'child.ps1'))-ceq$walkJunction)
+Check 'a plain path has no link point' ($null -eq (Get-InstallLinkPoint (Join-Path $walkTarget 'child.ps1')))
+[IO.Directory]::Delete($walkJunction)
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"
 if($failures){throw 'installer unit checks failed'}
 exit 0 # Negative helper cases intentionally returned nonzero; do not leak their exit into run-all.
