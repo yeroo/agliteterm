@@ -12,6 +12,10 @@
 #   3. download that release's manifest and refuse if its abiVersion is not the one we require
 #   4. cache under .native/<tag>/, so a rebuild is offline and reproducible
 #
+# It also stages agwintermctl.exe, the control client the checks drive lite with. That has its own
+# pin, cliTag in native/pinned.json, cached under .native/cli-<cliTag>/, and the staged copy must
+# report that version on every run. -Tag overrides the core tag only; it no longer moves the CLI.
+#
 # -NativeDir (or AGLITETERM_NATIVE_DIR) takes a local agwinterm checkout's target\release instead,
 # which is how you work on the core and the client together — and the only way to build against a
 # core that has not been released yet.
@@ -63,21 +67,23 @@ $cache = Join-Path $root ".native\$($pin.tag)"
 if ($Force -and (Test-Path $cache)) { Remove-Item -Recurse -Force $cache }
 New-Item -ItemType Directory -Force $cache | Out-Null
 
-function Get-Asset([string]$name, [string]$dest) {
+# The likeliest cause of a failed core download by far, and the one worth naming: that release
+# predates the ABI-stamped assets, or the tag is wrong.
+$coreHint = ("  the release must carry ABI-stamped core assets (added in agwinterm 0.17.4).`n" +
+             "  to build against an unreleased core, pass -NativeDir <agwinterm>\native\target\release")
+
+function Get-Asset([string]$from, [string]$tag, [string]$name, [string]$dest, [string]$hint) {
     if (Test-Path $dest) { return }
-    $url = "$base/$name"
-    try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
+    try { Invoke-WebRequest -Uri "$from/$name" -OutFile $dest -UseBasicParsing }
     catch {
-        # The likeliest cause by far, and the one worth naming: that release predates the
-        # ABI-stamped assets, or the tag is wrong.
-        throw ("could not download $name from $repo@$($pin.tag): $($_.Exception.Message)`n" +
-               "  the release must carry ABI-stamped core assets (added in agwinterm 0.17.4).`n" +
-               "  to build against an unreleased core, pass -NativeDir <agwinterm>\native\target\release")
+        # A failed request can leave a partial file, which the next run would take as cached.
+        Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        throw "could not download $name from $repo@${tag}: $($_.Exception.Message)`n$hint"
     }
 }
 
 $manifestPath = Join-Path $cache 'agwinterm-core-abi.json'
-Get-Asset 'agwinterm-core-abi.json' $manifestPath
+Get-Asset $base $pin.tag 'agwinterm-core-abi.json' $manifestPath $coreHint
 $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 if ([int]$manifest.abiVersion -ne $requiredAbi) {
     throw ("ABI mismatch: src\main.cpp requires abi $requiredAbi but $repo@$($pin.tag) publishes abi $($manifest.abiVersion).`n" +
@@ -90,18 +96,39 @@ foreach ($f in $wanted) {
     # renamed back to the plain names the client loads by filename.
     $stamped = $f -replace '(\.[^.]+)$', "-abi$requiredAbi`$1"
     $dest = Join-Path $cache $stamped
-    Get-Asset $stamped $dest
+    Get-Asset $base $pin.tag $stamped $dest $coreHint
     Copy-Item $dest (Join-Path $bin $f) -Force
 }
 
-# The control client the checks drive agliteterm with. Not ABI-stamped and not needed to BUILD,
-# so a release that predates it is not an error here — test\ctl-path.ps1 falls back to an installed
-# agwinterm, and the checks that need it skip with a message rather than failing obscurely.
-$ctlDest = Join-Path $cache 'agwintermctl.exe'
-if (-not (Test-Path $ctlDest)) {
-    try { Invoke-WebRequest -Uri "$base/agwintermctl.exe" -OutFile $ctlDest -UseBasicParsing }
-    catch { Write-Warning "agwintermctl.exe not published by $repo@$($pin.tag) - control-pipe checks will skip" }
-}
-if (Test-Path $ctlDest) { Copy-Item $ctlDest (Join-Path $bin 'agwintermctl.exe') -Force }
+# The control client the checks drive agliteterm with. Not needed to BUILD and never shipped, but
+# pinned on its own (cliTag) so a local run and CI drive lite with the same client, and checked
+# on every run so a stale cache or a hand-dropped exe cannot stand in for it.
+. (Join-Path $PSScriptRoot 'cli-pin.ps1')
+$cliTag = Get-CliPin $pin
+$cliBase = if ($cliTag -eq 'latest') { "https://github.com/$repo/releases/latest/download" }
+           else { "https://github.com/$repo/releases/download/$cliTag" }
+$cliCache = Join-Path $root ".native\cli-$cliTag"
+if ($Force -and (Test-Path $cliCache)) { Remove-Item -Recurse -Force $cliCache }
+New-Item -ItemType Directory -Force $cliCache | Out-Null
+$ctlCached = Join-Path $cliCache 'agwintermctl.exe'
+Get-Asset $cliBase $cliTag 'agwintermctl.exe' $ctlCached ("  native\pinned.json's cliTag must name an agwinterm release that publishes agwintermctl.exe.`n" +
+                                                         "  to test with an unreleased CLI, set AGWINTERMCTL to a dev build")
+$ctlStaged = Join-Path $bin 'agwintermctl.exe'
+Copy-Item $ctlCached $ctlStaged -Force
 
-"native: $repo@$($pin.tag) abi $requiredAbi (cached in .native\$($pin.tag))"
+# A pipe nothing answers on, and none of the pane variables that would point the CLI at the app
+# this script may be running inside: the probe must never talk to a live instance.
+$paneVars = 'AGWINTERM_PIPE', 'AGWINTERM_SESSION_ID', 'AGWINTERM_PANE_ID'
+$savedVars = @{}
+foreach ($v in $paneVars) { $savedVars[$v] = [Environment]::GetEnvironmentVariable($v); [Environment]::SetEnvironmentVariable($v, $null) }
+try {
+    # Only the cli line identifies the client; the exit code is about the app, and none answers here.
+    $ctlVersion = (& $ctlStaged version --pipe "agliteterm-fetch-probe-$([guid]::NewGuid().ToString('N'))" 2>&1 | Out-String)
+    $global:LASTEXITCODE = 0
+}
+finally { foreach ($v in $paneVars) { [Environment]::SetEnvironmentVariable($v, $savedVars[$v]) } }
+# A refused client must not stay in bin, where test\ctl-path.ps1 would still pick it up.
+try { Assert-CliVersion $ctlVersion $cliTag }
+catch { Remove-Item $ctlStaged -Force -ErrorAction SilentlyContinue; throw }
+
+"native: $repo@$($pin.tag) abi $requiredAbi (cached in .native\$($pin.tag)); cli $cliTag (cached in .native\cli-$cliTag)"
