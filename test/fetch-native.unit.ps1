@@ -26,6 +26,8 @@ foreach($case in @(
     $m=Refusal {Assert-CliVersion $case.Out 'v0.20.11'}
     Check "Assert-CliVersion refuses $($case.Why), naming the tag and the fix" ($m -and $m.Contains('v0.20.11') -and $m.Contains('-Force') -and $m.Contains('AGWINTERMCTL'))
 }
+$m=Get-CliLaunchFailure 'v0.20.11' 'The specified executable is not a valid application for this OS platform.'
+Check 'a CLI that cannot be run is reported with the tag, the cause and the fix' ($m.Contains('v0.20.11') -and $m.Contains('not a valid application') -and $m.Contains('-Force') -and $m.Contains('AGWINTERMCTL'))
 Check 'latest skips the comparison' ($null -eq (Refusal {Assert-CliVersion "cli 0.19.0 C:\x`r`n" 'latest'}))
 
 # CI drives lite with the CLI fetch-native staged from cliTag, not a second, CI-only build of it.

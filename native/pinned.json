@@ -3,5 +3,5 @@
   "tag": "v0.19.0",
   "note": "The agwinterm release whose agwinterm_core.dll + agwinterm-ptyhost.exe this client is built against. tools/fetch-native.ps1 refuses a release whose published abiVersion is not the one src/main.cpp requires. Pin an explicit tag (e.g. v0.17.4) to make a build reproducible; 'latest' tracks the newest release.",
   "cliTag": "v0.20.11",
-  "cliNote": "The agwinterm release whose agwintermctl.exe the checks drive agliteterm with, locally and in CI. Pinned independently of the core/ABI tag above, because the checks need a client new enough for every contract feature lite answers while the core must match kRequiredAbi exactly. The CLI is never shipped with agliteterm. tools/fetch-native.ps1 refuses a staged CLI whose version is not this tag; 'latest' skips that comparison."
+  "cliNote": "The agwinterm release whose agwintermctl.exe the checks drive agliteterm with, locally and in CI. Pinned independently of the core/ABI tag above, because the checks need a client new enough for every contract feature lite answers while the core must match kRequiredAbi exactly. The CLI is never shipped with agliteterm. tools/fetch-native.ps1 refuses a staged CLI whose version is not this tag; 'latest' skips that comparison and is downloaded afresh on every fetch, since nothing else would notice a stale copy."
 }

@@ -15,10 +15,17 @@ function Get-CliPin($Pin) {
     return $tag
 }
 
+$script:CliFix = "  run tools\fetch-native.ps1 -Force to refetch it, or set AGWINTERMCTL to test with a dev build"
+
+# The staged exe could not be run at all (a truncated download, AV or app control blocking it).
+function Get-CliLaunchFailure([string]$CliTag, [string]$Reason) {
+    "the agwintermctl.exe fetched for cliTag $CliTag could not be run, so it was removed from bin and the cache: $Reason`n$script:CliFix"
+}
+
 # $VersionOutput is what `agwintermctl version` printed; its first line is `cli <version> <path>`.
 function Assert-CliVersion([string]$VersionOutput, [string]$CliTag) {
     if ($CliTag -eq 'latest') { return }   # latest has no fixed number to compare against
-    $fix = "  run tools\fetch-native.ps1 -Force to refetch it, or set AGWINTERMCTL to test with a dev build"
+    $fix = $script:CliFix
     $m = [regex]::Match($VersionOutput, '(?m)^cli (\S+)')
     if (-not $m.Success) {
         throw ("the staged agwintermctl.exe printed no 'cli <version>' line, so it cannot be checked against cliTag $CliTag.`n" +
