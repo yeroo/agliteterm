@@ -43,6 +43,24 @@ Three probes answer what an agent otherwise has to guess:
 - There is no `quick type`: the quick terminal is a hidden session, typed into as
   `session type --window quick` while visible or `session type --target <its id>` (the id arrives as
   a `session`/`created` event after `quick on`).
+- `session type` and `session paste` always answer well inside `agwintermctl`'s 30 s reply
+  deadline (#110). They wait at most 5 s for the pane's input. If another type/paste still holds it,
+  or a write whose cancellation has not resolved keeps it reserved, the call refuses with
+  `input to this pane is busy or reserved; nothing typed` (or `nothing pasted`), and no byte is
+  written. The text then goes out in chunks of at most 4096 bytes, never split inside a UTF-8
+  character, under one 15 s deadline for the whole text. `typed` / `pasted` mean every byte was
+  written, as before. A write that stops early refuses with `N of M bytes written`, then the K-byte
+  chunk at offset N, which was cancelled or failed and **may have been partly delivered**, then the
+  remaining bytes, which were not written. So a caller that resumes from offset N may repeat up to K
+  bytes, and one that retries the whole text repeats N. If a chunk's cancellation has not resolved
+  within 1 s, the reply says it is still in flight and may still arrive. The pane's input then stays
+  reserved, so human keys and other API input are refused, until that write resolves. An `input`
+  event is emitted when that happens.
+- A bracketed `session paste` writes `ESC[200~` and `ESC[201~` as chunks of their own. If the
+  paste stops after the opening marker, lite sends a separate `ESC[201~` (bounded to 500 ms) so the
+  application is not left inside a paste, and the reply says whether that worked. It does not send
+  one when the opening marker itself was stopped (whether the paste was opened is unknown), when a
+  chunk is still in flight, or when the stopped chunk was the closing marker itself.
 - `session write` is display-only. What it paints is not durable: the shell's next repaint, and the
   full repaint the pty-host does on every resize (a window resize, `session split`, a split-ratio
   change, `session split close`), paints over it, and it does not survive into scrollback.
@@ -221,8 +239,8 @@ ASCII spaces on each row. Blank rows at the end are omitted; an entirely blank b
 - `session paste` refuses an observed exited or readonly target before clipboard access.
   Unterminated or odd-sized UTF-16 clipboard blocks, and blocks larger than 16 MiB, are unavailable.
   Empty or unavailable text returns `nothing to paste`; `pasted` means input was handed off without a
-  synchronous error, not proof of application execution. Partial or failed writes refuse; do not
-  retry blindly.
+  synchronous error, not proof of application execution. Partial or failed writes refuse and say how
+  far they got (see Typing text); do not retry blindly.
 - `session restore <command>|none --target PANE` pins a command for a fresh restored shell.
   `session bind <agent-command>|none --target PANE` supplies a binding instead (default `claude`).
   Both save before success. Replay waits 2500 ms, uses current values, and skips adopted shells; the

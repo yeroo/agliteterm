@@ -1578,6 +1578,7 @@ static bool cancelCreation(const char* id, const char* ticket) {
 }
 
 #include "bounded_pipe_write.h"
+#include "bounded_input.h"
 static DWORD ovIo(HANDLE h, bool write, const void* wbuf, void* rbuf, DWORD len,
                   bool paneInput = true, bool requireUntouched = false, bool* guardRefused = nullptr,
                   unsigned long long reservation = 0, DWORD timeout = INFINITE,
@@ -5238,6 +5239,44 @@ static bool sendHumanBytes(Session* s, const char* bytes, DWORD len) {
         }).detach(); } catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
     } else s->inputGate.release(lease);
     return written == len && !pending;
+}
+// session type / session paste (#110): a bounded wait for the pane's input gate, then one deadline
+// across a chunked write, so the reply always comes inside agwintermctl's 30 s. Other editing
+// writers queue behind it as before; only an unresolved chunk leaves the pane reserved, until a
+// worker sees that write resolve (as sendHumanBytes). The caller checks read-only where it applies.
+static bounded_input::Result<bounded_pipe_write::Pending> boundedPaneInput(Session* s, const std::string& bytes,
+                                                                          size_t openLen = 0, size_t closeLen = 0) {
+    bounded_input::Result<bounded_pipe_write::Pending> r;
+    r.total = (DWORD)bytes.size();
+    HANDLE data = INVALID_HANDLE_VALUE;
+    { LockG hold;
+      if (std::find(g_sessions.begin(),g_sessions.end(),s) == g_sessions.end() || s->exited || s->data == INVALID_HANDLE_VALUE ||
+          !DuplicateHandle(GetCurrentProcess(),s->data,GetCurrentProcess(),&data,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+          r.stop = bounded_input::Stop::NoInput; return r;
+      }
+    }
+    if (bytes.empty()) { CloseHandle(data); return r; } // as before: an empty write is not editing input
+    unsigned long long retained = 0;
+    const bool entered = s->inputGate.writeRetaining(bounded_input::kGateWaitMs, [&] {
+        r = bounded_input::send<bounded_pipe_write::Pending>(bytes, openLen, closeLen, bounded_input::Limits{},
+            [&](const char* p, DWORD n, DWORD timeout, bounded_pipe_write::Pending*& deferred, bool& timedOut) {
+                return bounded_pipe_write::write(data, p, n, timeout, deferred, &timedOut);
+            }, [] { return GetTickCount64(); });
+        return r.pending != nullptr;
+    }, retained);
+    CloseHandle(data);
+    if (!entered) { r = {}; r.total = (DWORD)bytes.size(); r.stop = bounded_input::Stop::Refused; return r; }
+    if (auto* pending = r.pending) {
+        emitEvent("input", s->paneId, "type/paste write cancellation pending; input remains reserved until completion");
+        logWarn("pane %s: type/paste stopped with %lu of %lu bytes written; a %lu-byte write is unresolved, input reserved until it completes",
+                s->paneId.c_str(), r.written, r.total, r.bracket == bounded_input::Bracket::ClosePending ? (DWORD)closeLen : r.chunk);
+        try { std::thread([s,retained,pending]() mutable {
+            WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
+            if (bounded_pipe_write::complete(pending,ignored)) s->inputGate.release(retained);
+            // A wait failure cannot authorize new input or free possibly active I/O.
+        }).detach(); } catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
+    }
+    return r;
 }
 static void sendBytes(const char* bytes, int len) {
     // THE GATE: human keys only. API type/write and emulator protocol replies bypass this.
@@ -10965,15 +11004,13 @@ static std::string ctlDispatch(const std::string& line) {
                 return ctlErr(emsg);
             }
         }
-        HANDLE data;
         { LockG hold;
           if(indexOfSession(target)<0)return ctlErr("session not found");
           if (target->data == INVALID_HANDLE_VALUE || target->exited) return ctlErr("session type: pane has no live input");
-          data=target->data;
         }
-        if (ovIo(data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
-            return ctlErr("session type: input reserved or write failed/partial; shell outcome unknown");
-        return ctlOkStr("typed");
+        // Bounded (#110): refuses a busy pane, or reports exactly how far a stopped write got.
+        const auto typed = bounded_input::outcome("type", boundedPaneInput(target, text));
+        return typed.first ? ctlOkStr(typed.second) : ctlErr(typed.second);
     }
     if (cmd == "session.write") {
         // Feed bytes into the EMULATOR only - display injection, never the shell. Same meaning as
@@ -11935,10 +11972,11 @@ static std::string ctlDispatch(const std::string& line) {
             if (data == INVALID_HANDLE_VALUE) return ctlErr("session paste: pane has no live input");
             if (!emu_info(target->emu, &pinfo)) return ctlErr("session paste: pane state unavailable; nothing pasted");
         }
+        const size_t marker = pinfo.bracketedPaste ? 6 : 0;   // ESC[200~ / ESC[201~, each its own chunk
         if (pinfo.bracketedPaste) text = "\x1b[200~" + text + "\x1b[201~";
-        if (ovIo(data, true, text.data(), nullptr, (DWORD)text.size()) != text.size())
-            return ctlErr("session paste: input reserved or write failed/partial; shell outcome unknown");
-        return ctlOkStr("pasted");
+        // Bounded (#110): refuses a busy pane, or reports exactly how far a stopped write got.
+        const auto pasted = bounded_input::outcome("paste", boundedPaneInput(target, text, marker, marker));
+        return pasted.first ? ctlOkStr(pasted.second) : ctlErr(pasted.second);
     }
     if (cmd == "session.go") {   // dir: next|prev|first|last|next-attention|prev-attention
         std::string dir = req.get("args.dir");

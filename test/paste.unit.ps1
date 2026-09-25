@@ -4,13 +4,14 @@ $ErrorActionPreference='Stop'
 $repo=Split-Path $PSScriptRoot -Parent
 $source=Get-Content (Join-Path $repo 'src/main.cpp') -Raw
 $arm=[regex]::Match($source,'(?ms)^    if \(cmd == "session.paste"\).*?(?=^    if \(cmd == "session.go"\))')
+$typeArm=[regex]::Match($source,'(?ms)^    if \(cmd == "session.type"\).*?(?=^    if \(cmd == "session.write"\))')
 $normalize=[regex]::Match($source,'(?ms)^static std::string pasteNormalize\(.*?^\}')
 $clipboard=[regex]::Match($source,'(?ms)^static std::string readClipboardText\(.*?^\}')
 $capture=[regex]::Match($source,'(?ms)^    if \(cmd == "restore.capture"\).*?(?=^    if \(cmd == "session.duplicate"\))')
 $capPane=[regex]::Match($source,'(?ms)^struct CapPane \{.*?\};')
 $snapshot=[regex]::Match($source,'(?ms)^static void snapshotRealPanes\(.*?^\}')
 $applyCapture=[regex]::Match($source,'(?ms)^static int applyForegroundCapture\(.*?^\}')
-if(-not $arm.Success -or -not $normalize.Success -or -not $clipboard.Success -or -not $capture.Success){throw 'Production paste/capture functions not found'}
+if(-not $arm.Success -or -not $typeArm.Success -or -not $normalize.Success -or -not $clipboard.Success -or -not $capture.Success){throw 'Production paste/capture functions not found'}
 if(-not $capPane.Success -or -not $snapshot.Success -or -not $applyCapture.Success){throw 'Production capture helpers not found (CapPane/snapshotRealPanes/applyForegroundCapture)'}
 $prefix=@'
 #include <string>
@@ -20,6 +21,8 @@ $prefix=@'
 #include <map>
 #include <vector>
 #include <atomic>
+namespace bounded_pipe_write { struct Pending {}; }
+#include "bounded_input.h"
 using DWORD=unsigned long; using HANDLE=uintptr_t; using HWND=void*;
 constexpr HANDLE INVALID_HANDLE_VALUE=0; constexpr int CF_UNICODETEXT=13;
 struct Session { bool readOnly=false,exited=false,listed=true,hidden=false; std::string paneId="pane",id="session",splitId,capturedCmd; HANDLE data=1; int emu=1; };
@@ -38,7 +41,20 @@ size_t GlobalSize(HANDLE){return clipMode==4?5*sizeof(wchar_t):clipMode==5?3*siz
 void GlobalUnlock(HANDLE){++unlocks;} void CloseClipboard(){++closes;}
 std::string narrow(const std::wstring&s){return std::string(s.begin(),s.end());}
 bool emu_info(int,FfiEmuInfo*info){info->bracketedPaste=bracketed;return infoOk;}
-DWORD ovIo(HANDLE,bool,const void*bytes,void*,DWORD size){++writes;if(held)return 0;sent.assign((const char*)bytes,size);return writeMode==1?0:writeMode==2?size-1:size;}
+// The bounded writer (#110) is faked; its Result -> reply mapping (bounded_input::outcome) is real.
+// writeMode: 0 all written, 1 gate refused, 2 deadline after N-1 bytes with the last byte cancelled,
+// 3 pending, 4 bracket closed after a stop. Any call under the global lock is a failure.
+size_t openSeen=0,closeSeen=0; bool lockedWrite=false;
+bounded_input::Result<bounded_pipe_write::Pending> boundedPaneInput(Session*,const std::string& bytes,size_t open=0,size_t close=0){
+ ++writes;if(held)lockedWrite=true;sent=bytes;openSeen=open;closeSeen=close;
+ static bounded_pipe_write::Pending pending;bounded_input::Result<bounded_pipe_write::Pending> r;r.total=(unsigned long)bytes.size();
+ using bounded_input::Stop;using bounded_input::Bracket;
+ if(writeMode==0){r.stop=Stop::Done;r.written=r.total;}
+ else if(writeMode==1)r.stop=Stop::Refused;
+ else if(writeMode==2){r.stop=Stop::TimedOut;r.written=r.total-1;r.chunk=1;}
+ else if(writeMode==3){r.stop=Stop::Pending;r.written=0;r.chunk=r.total;r.pending=&pending;r.bracket=open?Bracket::Unknown:Bracket::None;}
+ else {r.stop=Stop::TimedOut;r.written=(unsigned long)open;r.chunk=1;r.bracket=Bracket::Closed;}
+ return r;}
 std::vector<Session*> g_sessions; std::atomic<bool> g_restoreCommands{false};
 int saves=0,refreshes=0; bool disappear=false,queryOk=true,saveOk=true; HWND g_hwnd=nullptr; constexpr int WM_APP_REFRESHTREE=1;
 std::string stateFile="prior-state",backupFile="prior-backup";
@@ -66,8 +82,23 @@ int main(){
  for(int mode=5;mode<=8;++mode){reset();clipMode=mode;check(paste(&s,{})=="ok:nothing to paste");check(reads==1&&writes==0&&closes==1);check(unlocks==(mode==5?1:0));}
  reset();check(paste(&s,{"one\r\ntwo\n"})=="ok:pasted");check(reads==0&&writes==1&&sent=="one\rtwo\r");
  reset();clipMode=4;bracketed=true;check(paste(&s,{})=="ok:pasted");check(sent=="\x1b[200~text\x1b[201~"&&reads==1);
- reset();writeMode=1;check(paste(&s,{"text"}).find("error:")==0);check(writes==1);
- reset();writeMode=2;check(paste(&s,{"text"}).find("partial")!=std::string::npos);check(writes==1);
+ reset();writeMode=1;check(paste(&s,{"text"})=="error:session paste: input to this pane is busy or reserved; nothing pasted");check(writes==1);
+ reset();writeMode=2;check(paste(&s,{"text"})=="error:session paste: 3 of 4 bytes written; the 1-byte chunk at offset 3 was cancelled at the 15 s input deadline and may have been partly delivered; the remaining 0 bytes were not written");check(writes==1);
+ reset();writeMode=3;check(paste(&s,{"text"}).find("still in flight and may still arrive; the remaining 0 bytes were not written; this pane's input stays reserved")!=std::string::npos);
+ reset();bracketed=true;check(paste(&s,{"text"})=="ok:pasted");check(openSeen==6&&closeSeen==6&&sent=="\x1b[200~text\x1b[201~");
+ reset();check(paste(&s,{"text"})=="ok:pasted");check(openSeen==0&&closeSeen==0);
+ reset();bracketed=true;writeMode=4;check(paste(&s,{"text"}).find("then closed (ESC[201~ written)")!=std::string::npos);
+ reset();bracketed=true;writeMode=3;check(paste(&s,{"text"}).find("whether the bracketed paste was opened is unknown")!=std::string::npos);
+ // session type: same bounded writer; read-only does NOT refuse it (P9), control bytes still do.
+ reset();check(type(&s,{"one\ntwo"})=="ok:typed");check(writes==1&&sent=="one\rtwo"&&openSeen==0&&closeSeen==0);
+ reset();s.readOnly=true;check(type(&s,{"x"})=="ok:typed");check(writes==1);
+ reset();writeMode=1;check(type(&s,{"x"})=="error:session type: input to this pane is busy or reserved; nothing typed");
+ reset();writeMode=2;check(type(&s,{"abcd"}).find("error:session type: 3 of 4 bytes written; the 1-byte chunk at offset 3 was cancelled")==0);
+ reset();writeMode=3;check(type(&s,{"abcd"}).find("stays reserved until that write resolves")!=std::string::npos);
+ reset();check(type(&s,{std::string("a\x01")}).find("refuses control byte 0x01")!=std::string::npos);check(writes==0);
+ reset();s.exited=true;check(type(&s,{"x"}).find("no live input")!=std::string::npos);check(writes==0);
+ reset();s.listed=false;check(type(&s,{"x"})=="error:session not found");check(writes==0);
+ check(!lockedWrite);
  reset();s.data=0;check(paste(&s,{"text"}).find("no live input")!=std::string::npos);check(writes==0);
  reset();infoOk=false;check(paste(&s,{"text"}).find("state unavailable")!=std::string::npos);check(writes==0);
  reset();clipMode=4;duringClipboard=&s;check(paste(&s,{}).find("exited")!=std::string::npos);check(reads==1&&writes==0);
@@ -86,13 +117,14 @@ if(-not $vs){throw 'MSVC required'}
 $out=Join-Path $repo 'bin/paste-unit';New-Item -ItemType Directory -Force $out|Out-Null
 $generated=Join-Path $out 'paste.generated.cpp'
 $dispatch='std::string paste(Session* target,const Request& req){ std::string cmd="session.paste",targetWhy;'+"`n"+$arm.Value+'return "unhandled";}'
+$typeDispatch='std::string type(Session* target,const Request& req){ std::string cmd="session.type",targetWhy;'+"`n"+$typeArm.Value+'return "unhandled";}'
 $captureDispatch='std::string capture(Session* target,const Request& req){ std::string cmd="restore.capture",targetWhy;'+"`n"+$capture.Value+'return "unhandled";}'
 # The helpers go before the capture dispatch that calls them, and after $prefix, which declares the
 # Session/LockG/g_sessions/livePid/indexOfSession/jsonEscape they are written against.
-[IO.File]::WriteAllText($generated,($prefix+"`n"+$normalize.Value+"`n"+$clipboard.Value+"`n"+$dispatch+"`n"+
+[IO.File]::WriteAllText($generated,($prefix+"`n"+$normalize.Value+"`n"+$clipboard.Value+"`n"+$dispatch+"`n"+$typeDispatch+"`n"+
     $capPane.Value+"`n"+$snapshot.Value+"`n"+$applyCapture.Value+"`n"+$captureDispatch+"`n"+$tests),[Text.UTF8Encoding]::new($false))
 $testExe=Join-Path $out 'paste-unit.exe'
-& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /EHsc /W4 /utf-8 `"$generated`" /Fe:`"$testExe`" /Fo:`"$out/paste-unit.obj`""
+& cmd /c "`"$vs/VC/Auxiliary/Build/vcvars64.bat`" && cl /nologo /std:c++17 /EHsc /W4 /utf-8 /I `"$repo/src`" `"$generated`" /Fe:`"$testExe`" /Fo:`"$out/paste-unit.obj`""
 if($LASTEXITCODE -ne 0){throw 'Paste unit compile failed'}
 & $testExe
 if($LASTEXITCODE -ne 0){throw 'Paste unit tests failed'}
