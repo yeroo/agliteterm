@@ -68,6 +68,8 @@ Three probes answer what an agent otherwise has to guess:
   and the reply is `pasted`. Lite does not send a separate close:
   - when the opening marker itself was stopped (whether the paste was opened is unknown);
   - when a body chunk is still in flight (the reply says the paste is left open);
+  - when too little of the time budget is left to attempt the 500 ms close (the reply says the
+    paste is left open: no time left to send `ESC[201~`);
   - when the stopped chunk was the closing marker itself. If that chunk is still in flight, the reply
     says so. Do not close the paste yourself: that marker may still arrive.
 - `session write` is display-only. What it paints is not durable: the shell's next repaint, and the
