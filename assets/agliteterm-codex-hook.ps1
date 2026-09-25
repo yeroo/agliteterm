@@ -6,9 +6,15 @@ try {
     $reader=New-Object IO.StreamReader([Console]::OpenStandardInput(),[Text.Encoding]::UTF8)
     try{$event=$reader.ReadToEnd()|ConvertFrom-Json -ErrorAction Stop}finally{$reader.Dispose()}
     if($event.transcript_path -is [string] -and $event.transcript_path){
-        $first=[IO.File]::ReadLines($event.transcript_path,[Text.Encoding]::UTF8)|Select-Object -First 1
-        $meta=$first|ConvertFrom-Json -ErrorAction Stop
-        if($meta.payload.source -and $meta.payload.source -cne 'cli'){exit 0}
+        # Codex keeps the rollout open while hooks run. Only a positive nested-run signal suppresses status.
+        $source=$null;$transcript=$null;$lines=$null
+        try {
+            $transcript=[IO.FileStream]::new($event.transcript_path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]'ReadWrite, Delete')
+            $lines=New-Object IO.StreamReader($transcript,[Text.Encoding]::UTF8)
+            $meta=$lines.ReadLine()|ConvertFrom-Json -ErrorAction Stop
+            $source=$meta.payload.source
+        }catch{}finally{if($lines){$lines.Dispose()}elseif($transcript){$transcript.Dispose()}}
+        if($source -and $source -cne 'cli'){exit 0}
     }
     if($State -ceq 'stop'){
         $message=[string]$event.last_assistant_message

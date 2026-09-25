@@ -11,8 +11,7 @@ foreach($mode in 'noop','fail','new','downgrade'){
     [IO.File]::WriteAllText((Join-Path $root 'version.txt'),'1.0.0')
     [IO.File]::WriteAllText((Join-Path $root 'update-mode.txt'),$mode)
     $receipt=Join-Path $root "$mode.json"
-    try {$ErrorActionPreference='Continue';$output=& $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -Executable $fake -Receipt $receipt -Nonce $mode 2>&1}
-    finally {$ErrorActionPreference='Stop'}
+    $output=& $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -Executable $fake -Receipt $receipt -Nonce $mode 2>&1
     $code=$LASTEXITCODE
     if($mode-eq'fail'){Check 'failed update produces no restart receipt' ($code-ne 0 -and -not(Test-Path $receipt))}
     else{
@@ -21,8 +20,7 @@ foreach($mode in 'noop','fail','new','downgrade'){
     }
 }
 $receipt=Join-Path $root 'existing.json';[IO.File]::WriteAllText($receipt,'KEEP')
-try {$ErrorActionPreference='Continue';$null=& $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -Executable $fake -Receipt $receipt -Nonce refuse 2>&1}
-finally {$ErrorActionPreference='Stop'}
+$null=& $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -Executable $fake -Receipt $receipt -Nonce refuse 2>&1
 Check 'updater never overwrites an existing receipt' ($LASTEXITCODE-ne 0 -and [IO.File]::ReadAllText($receipt)-ceq'KEEP')
 # Parse every shipped integration asset with both supported PowerShell parsers; no script runs.
 foreach($asset in Get-ChildItem (Join-Path $repo 'assets') -Filter 'agliteterm-*.ps1'){
@@ -106,10 +104,17 @@ foreach($case in @(@('Done.','completed'),@('Shall I push it?  ','blocked'),@(('
 $execTranscript=Join-Path $root 'exec-rollout.jsonl';$cliTranscript=Join-Path $root 'cli-rollout.jsonl'
 [IO.File]::WriteAllText($execTranscript,'{"payload":{"source":"exec"}}'+"`n",[Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText($cliTranscript,'{"payload":{"source":"cli"}}'+"`n",[Text.UTF8Encoding]::new($false))
-$null=Invoke-AgentFixture "& '$codexHook' active" 0 (@{transcript_path=$execTranscript}|ConvertTo-Json -Compress)
+$held=[IO.FileStream]::new($execTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$null=Invoke-AgentFixture "& '$codexHook' active" 0 (@{transcript_path=$execTranscript}|ConvertTo-Json -Compress)}finally{$held.Dispose()}
 Check 'nested Codex exec hook sends no status and no stdout' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
-$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$cliTranscript}|ConvertTo-Json -Compress))
-Check 'interactive Codex hook reports status' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$held=[IO.FileStream]::new($cliTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$cliTranscript}|ConvertTo-Json -Compress))}finally{$held.Dispose()}
+Check 'interactive Codex hook reads a live rollout and reports status' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=(Join-Path $root 'missing-rollout.jsonl')}|ConvertTo-Json -Compress))
+Check 'missing Codex transcript fails open to status report' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
+$badTranscript=Join-Path $root 'bad-rollout.jsonl';[IO.File]::WriteAllText($badTranscript,'{broken')
+$request=@(Invoke-AgentFixture "& '$codexHook' active" 1 (@{transcript_path=$badTranscript}|ConvertTo-Json -Compress))
+Check 'invalid Codex transcript fails open to status report' ($request[0].args.status-eq'active' -and $script:fixtureStdout-eq'')
 $null=Invoke-AgentFixture "& '$codexHook' active" 0 '{broken'
 Check 'malformed Codex stdin is silent and inert' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
 $null=Invoke-AgentFixture "`$env:TERM_PROGRAM='other'; & '$codexHook' active" 0 '{}'
