@@ -75,6 +75,7 @@ CAppModule _Module;
 #include "proto/pb_encode.h"
 #include "proto/pb_decode.h"
 #include "control.h"
+#include "styled_text.h"
 #include "driving.h"
 #include "configuration.h"
 #include "profiles.h"
@@ -86,12 +87,6 @@ CAppModule _Module;
 #pragma comment(lib, "normaliz.lib")
 
 // ---- agwinterm-core C ABI (ABI v18) ----
-struct FfiCell {
-    int32_t rune;
-    uint32_t fg, bg, attrs, width;
-    uint32_t fgKind, fgIndex, fgRgb;
-    uint32_t bgKind, bgIndex, bgRgb;
-};
 struct FfiEmuInfo {
     uint32_t cols, rows, cursorRow, cursorCol, cursorVisible, isAltScreen, historyCount;
     int64_t scrollGeneration;
@@ -129,10 +124,10 @@ static void (*core_free_buf)(uint8_t*, uint32_t);
 // v16 added agwcore_emu_set_scrollback. v18 (agwinterm 0.17.10; there was no 17) inserted
 // mouseSgrPixels into FfiEmuInfo above and added or changed NO export - a bump can be a struct
 // alone. The core handshake is an EXACT match and the structs are shared, so the pin moves with
-// the core it is built against and every struct above is re-checked against lib.rs on each bump.
+// the core it is built against. Re-check every struct above (FfiEmuInfo, FfiMark) AND FfiCell in
+// styled_text.h against lib.rs on each bump: emu_info, emu_marks and emu_copy_grid /
+// emu_copy_history_row respectively write those layouts into caller memory.
 static constexpr uint32_t kRequiredAbi = 18;
-static constexpr uint32_t kAttrBold = 1, kAttrItalic = 2, kAttrUnderline = 4,
-                          kAttrInverse = 8, kAttrDim = 16, kAttrStrike = 32;
 static constexpr uint32_t kProtocolVersion = 2;
 static constexpr int kSidebarW = 180;
 static constexpr int kSplitterW = 5;   // draggable divider between the sidebar and the terminal
@@ -9226,6 +9221,12 @@ static std::string overlayLinesRefusal(const std::string& raw) {
 // `text`'s `--all` and `--lines` are exclusive, on both verbs alike (one reader, two verbs).
 static const char* const kOverlayAllWithLines =
     "--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.";
+static const char* const kOverlayStylesRefusal =
+    "session overlay text: --styles is not supported here; use `session text --styles --target <overlay-id>`. Nothing read.";
+static bool textArgFlag(const JsonReq& req, const char* key) {
+    const std::string& value = req.get(key);
+    return value == "true" || value == "1";
+}
 // What `text` reads, on `session text` and `session overlay text` alike (agwinterm's
 // OverlayTextArgs; the words above are its two refusals). Lite's DEFAULT is the whole buffer (gate 2
 // of the P5-lite plan — agwinterm's and agterm's is the screen, recorded in lite-parity.md), so
@@ -9238,12 +9239,13 @@ static const char* const kOverlayAllWithLines =
 // here is (true, "true" or "1"; anything else is the flag not asked for).
 struct TextArgs {
     bool all = false;      // the whole buffer (lite's bare form too)
+    bool styles = false;   // structured runs from the same selected rows
     int64_t lines = -1;    // -1 = not asked (the whole buffer); 0 = the screen; N = the last N lines
 };
 static bool parseTextArgs(const JsonReq& req, TextArgs* out, std::string* refusal) {
     *out = TextArgs{};
-    const std::string& all = req.get("args.all");
-    out->all = all == "true" || all == "1";
+    out->all = textArgFlag(req, "args.all");
+    out->styles = textArgFlag(req, "args.styles");
     auto it = req.fields.find("args.lines");
     if (it == req.fields.end()) return true;
     if (out->all) { *refusal = kOverlayAllWithLines; return false; }
@@ -9467,48 +9469,23 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
     return hit->ws;
 }
 
-// Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
-// scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
-// mark's outputLine..endLine can be handed straight in.
-// `tail` (P5): -1 = the range as given; 0 = the visible screen (the range becomes the screen rows,
-// read under the same hold as the count, so a line the shell prints meanwhile cannot shift it);
-// N >= 1 = the last N lines of the whole buffer AS dumpBufferText RETURNS IT — after the trailing
-// blank rows below the prompt are squashed, so `--lines 3` on a pane whose prompt sits at row 3 of
-// 30 is the prompt and the two lines above it, not three blanks (agwinterm counts screen rows from
-// the bottom; lite's default is the whole buffer, and this is the tail of that — gate 2's reader).
-// One walk; the row logic is not copied.
-static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail, bool* screenOk = nullptr) {
+// Visit selected scrollback and screen cells under one lock. Absolute row numbers and cursor
+// come from the same emu_info snapshot. `tail == 0` selects the screen here; positive tails are
+// applied after trailing blank rows are removed by the two renderers below.
+template<class Visit>
+static bool visitBufferRows(Session* s, int64_t from, int64_t to, int64_t tail,
+                            FfiEmuInfo* infoOut, Visit visit) {
     FfiEmuInfo info{};
-    if (screenOk) *screenOk = true;
-    std::string out;
+    bool screenOk = true;
     int64_t abs = 0;
-    EnterCriticalSection(&g_lock);
+    LockG hold;
     emu_info(s->emu, &info);
     if (tail == 0) { from = info.historyCount; to = INT64_MAX; }
     std::vector<FfiCell> row(info.cols);
-    auto appendRow = [&](const FfiCell* cells) {
-        std::string line;
-        for (uint32_t c = 0; c < info.cols; c++) {
-            const FfiCell& cell = cells[c];
-            if (cell.width == 0) continue;
-            int cp = cell.rune ? cell.rune : ' ';
-            wchar_t wbuf[2];
-            int wn = 0;
-            if (cp > 0xFFFF) {
-                wbuf[wn++] = (wchar_t)(0xD800 + ((cp - 0x10000) >> 10));
-                wbuf[wn++] = (wchar_t)(0xDC00 + ((cp - 0x10000) & 0x3FF));
-            } else wbuf[wn++] = (wchar_t)cp;
-            char u8[8];
-            int n8 = WideCharToMultiByte(CP_UTF8, 0, wbuf, wn, u8, sizeof u8, nullptr, nullptr);
-            line.append(u8, n8);
-        }
-        while (!line.empty() && line.back() == ' ') line.pop_back();
-        out += line;
-        out += '\n';
-    };
     auto wanted = [&](int64_t line) { return from < 0 || (line >= from && line <= to); };
     for (uint32_t h = 0; h < info.historyCount; h++, abs++)
-        if (wanted(abs) && emu_copy_history_row(s->emu, h, row.data(), info.cols)) appendRow(row.data());
+        if (wanted(abs) && emu_copy_history_row(s->emu, h, row.data(), info.cols))
+            visit(abs, row.data(), info.cols);
     // The live screen straight from the emulator, never from `s->grid` — that is paintPane's
     // snapshot, refreshed only when THIS session is painted, and a session that is not painted has
     // a stale or empty one: a shell under a pane overlay (its box paints the overlay — P5's rule is
@@ -9522,9 +9499,24 @@ static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t
     std::vector<FfiCell> live((size_t)info.cols * info.rows);
     if (!live.empty() && emu_copy_grid(s->emu, live.data(), (uint32_t)live.size())) {
         for (uint32_t r = 0; r < info.rows; r++, abs++)
-            if (wanted(abs)) appendRow(&live[r * info.cols]);
-    } else if (!live.empty() && screenOk) *screenOk = false;
-    LeaveCriticalSection(&g_lock);
+            if (wanted(abs)) visit(abs, &live[(size_t)r * info.cols], info.cols);
+    } else if (!live.empty()) screenOk = false;
+    if (infoOut) *infoOut = info;
+    return screenOk;
+}
+// Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
+// scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
+// mark's outputLine..endLine can be handed straight in.
+// `tail` (P5): -1 = the range as given; 0 = the visible screen (selected in visitBufferRows under
+// the same hold as its count); N >= 1 = the last N lines AFTER trailing blank rows are squashed.
+// Keep this squash and cut in sync with readSurfaceStyled below.
+static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail, bool* screenOk = nullptr) {
+    std::string out;
+    bool ok = visitBufferRows(s, from, to, tail, nullptr, [&](int64_t, const FfiCell* cells, uint32_t cols) {
+        out += styled_text::rowText(cells, cols);
+        out += '\n';
+    });
+    if (screenOk) *screenOk = ok;
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
     if (tail > 0) {
         // The last `tail` lines of the trimmed text: each line ends in '\n', so the cut is after the
@@ -9552,6 +9544,48 @@ static bool readSurfaceText(Session* s, const TextArgs& a, std::string* text) {
     *text = dumpBufferLines(s, -1, -1, a.lines < 0 ? -1 : a.lines, &screenOk);
     if (!screenOk) *text = overlayReadFailedRefusal("the emulator did not copy its screen (session " + s->id + ")");
     return screenOk;
+}
+static bool readSurfaceStyled(Session* s, const TextArgs& a, std::string* reply) {
+    struct StyledRow { int64_t abs; bool empty; std::string runs; };
+    std::deque<StyledRow> rows, pending;
+    FfiEmuInfo info{};
+    auto keepTail = [&](StyledRow row) {
+        rows.push_back(std::move(row));
+        while (rows.size() > (uint64_t)a.lines) rows.pop_front();
+    };
+    bool screenOk = visitBufferRows(s, -1, -1, a.lines, &info,
+        [&](int64_t abs, const FfiCell* cells, uint32_t cols) {
+            std::string runs = styled_text::rowRunsJson(cells, cols);
+            // The run builder trims the same ASCII spaces as rowText: [] is exactly a blank row.
+            StyledRow row{abs, runs == "[]", std::move(runs)};
+            if (a.lines <= 0) { rows.push_back(std::move(row)); return; }
+            if (row.empty) {
+                // Trailing blank rows will be squashed. If a later nonblank row arrives, at most
+                // N-1 immediately preceding blanks can survive in its N-row tail.
+                pending.push_back(std::move(row));
+                while (pending.size() >= (uint64_t)a.lines) pending.pop_front();
+            } else {
+                for (auto& blank : pending) keepTail(std::move(blank));
+                pending.clear();
+                keepTail(std::move(row));
+            }
+        });
+    if (!screenOk) {
+        *reply = overlayReadFailedRefusal("the emulator did not copy its screen (session " + s->id + ")");
+        return false;
+    }
+    // Mirror dumpBufferLines' squash and tail, preserving absolute row labels. Change both together.
+    // The plain reader retains one newline on an all-empty buffer; the structured form omits it.
+    while (!rows.empty() && rows.back().empty) rows.pop_back();
+    *reply = "{\"cols\":" + std::to_string(info.cols) + ",\"rows\":[";
+    for (const auto& row : rows) {
+        if (reply->back() != '[') *reply += ',';
+        *reply += "{\"row\":" + std::to_string(row.abs - info.historyCount) +
+                  ",\"runs\":" + row.runs + "}";
+    }
+    *reply += "],\"cursor\":{\"row\":" + std::to_string(info.cursorRow) +
+              ",\"col\":" + std::to_string(info.cursorCol) + "}}";
+    return true;
 }
 
 // The output of the last COMPLETED command, delimited by the shell's FTCS (OSC 133) marks.
@@ -9944,6 +9978,12 @@ and said ok); `--all` beside `--lines` is refused naming both. Both refusals com
 target is resolved. `session text --target <pane id>` under an overlay reads the SHELL; `--target
 <overlay id>` or `overlay text --pane X` the overlay.
 
+`session text --styles` reads the same selected rows as structured runs with faint/bold/italic/
+underline/inverse/strike flags and `default`, `idx:N` or `#rrggbb` colour specs. Row numbers are
+negative for scrollback, and run columns/widths count cells. Trailing ASCII spaces are trimmed;
+an all-blank buffer has no rows. `session overlay text --styles` is refused; use `session text
+--styles --target <overlay-id>`.
+
 ```
 ov=$(agwintermctl session overlay open "npm test" --pane right)   # the overlay's id
 agwintermctl session type "git status`n" --target $AGWINTERM_PANE_ID    # your own pane keeps working
@@ -10024,6 +10064,7 @@ agwintermctl events --since <cursor>            # what changed; the reply carrie
 agwintermctl session output --target build      # the last COMPLETED command's output
 agwintermctl session text --target build        # the whole buffer (scrollback + screen), when you need context
 agwintermctl session text --lines 30 --target build   # its last 30 lines; --lines 0 = the screen; --all = the bare form
+agwintermctl session text --styles --target build     # attributed runs, row positions and cursor
 ```
 
 `events` is cursor-polled: start with `agwintermctl events` to get a cursor, then pass it as
@@ -10985,6 +11026,7 @@ static std::string ctlDispatch(const std::string& line) {
         if (!parseTextArgs(req, &ta, &taWhy)) return ctlErr(taWhy);
         if (!target) return ctlErr(targetWhy.empty() ? "session not found" : targetWhy);
         std::string text;
+        if (ta.styles) return readSurfaceStyled(target, ta, &text) ? ctlOk(text) : ctlErr(text);
         return readSurfaceText(target, ta, &text) ? ctlOkStr(text) : ctlErr(text);
     }
     if (cmd == "surface.cursor") {
@@ -11101,6 +11143,7 @@ static std::string ctlDispatch(const std::string& line) {
         // refusals here, before any resolve (agwinterm's order: after the size and pane words).
         TextArgs textArgs;
         if (action == "text") {
+            if (textArgFlag(req, "args.styles")) return ctlErr(kOverlayStylesRefusal);
             std::string textWhy;
             if (!parseTextArgs(req, &textArgs, &textWhy)) return ctlErr(textWhy);
         }
