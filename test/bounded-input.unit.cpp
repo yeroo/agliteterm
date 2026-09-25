@@ -100,17 +100,34 @@ static void brackets() {
       check(r.bracket == Bracket::Closed && s.chunks.size() == 3 && s.chunks[2] == close && s.timeoutsSeen[2] == kBracketCloseMs, "body stopped: close sent with its own bound");
       check(r.written == 6 && r.chunk == 4096, "counts exclude the separate close");
       auto m = outcome("paste", r);
-      check(has(m.second, ("6 of " + std::to_string(M) + " bytes written").c_str()) && has(m.second, "then closed (ESC[201~ written)"), "closed wording"); }
+      check(has(m.second, ("6 of " + std::to_string(M) + " bytes written").c_str()) && has(m.second, "then closed with a separate ESC[201~"), "closed wording");
+      check(r.closed == 6 && has(m.second, "the remaining 904 bytes were not written"), "remaining excludes the separate close (5012-6-4096-6)"); }
     { Script s; s.steps = {-1, -1, -2}; auto r = s.run(text, 6, 6);
       check(r.bracket == Bracket::LeftOpen && r.pending && s.chunks.size() == 3, "body pending: left open, no close attempted");
       check(has(outcome("paste", r).second, "left open (no ESC[201~ sent)"), "left open wording"); }
     { Script s; s.steps = {-1, 0, 0}; auto r = s.run(text, 6, 6);
       check(r.bracket == Bracket::CloseFailed && !r.pending, "close cancelled");
-      check(has(outcome("paste", r).second, "ESC[201~ may have been partly delivered"), "close failed wording"); }
+      auto m = outcome("paste", r).second;
+      check(has(m, "separate ESC[201~ to close the bracketed paste failed and may have been partly delivered") &&
+            has(m, "the remaining 904 bytes were not written"), "close failed wording and count"); }
     { Script s; s.steps = {-1, 0, -2}; auto r = s.run(text, 6, 6);
       check(r.bracket == Bracket::ClosePending && r.pending && r.stop == Stop::TimedOut, "close pending keeps the reservation");
       auto m = outcome("paste", r).second;
-      check(has(m, "closing ESC[201~ is still in flight") && has(m, "stays reserved"), "close pending wording"); }
+      check(has(m, "separate ESC[201~ to close the bracketed paste is still in flight") && has(m, "stays reserved") &&
+            has(m, "the remaining 904 bytes were not written"), "close pending wording and count"); }
+    { Script s; s.steps = {-1, -1, -1, -2}; auto r = s.run(text, 6, 6); // the body is done, its own ESC[201~ chunk is deferred
+      check(r.bracket == Bracket::ClosePending && r.pending && r.written == 5006 && r.chunk == 6 && r.closed == 0 && s.chunks.size() == 4,
+            "the closing marker chunk in flight is ClosePending, not left open");
+      auto m = outcome("paste", r).second;
+      check(has(m, "the 6-byte chunk at offset 5006 is still in flight") && has(m, "that chunk is the closing ESC[201~") &&
+            !has(m, "no ESC[201~ sent") && has(m, "the remaining 0 bytes"), "closing marker in flight wording"); }
+    { Script s; s.tick = 5000; auto r = s.run(text, 6, 6); // chunks at 0, 5, 10 s; the deadline passes exactly at the close marker
+      check(r.stop == Stop::Done && r.written == M && r.closed == 0 && r.bracket == Bracket::None && s.chunks.size() == 4 && s.chunks[3] == close,
+            "deadline at the close marker, then the bounded close succeeds: every byte went, so pasted");
+      check(outcome("paste", r) == std::make_pair(true, std::string("pasted")), "that answers pasted"); }
+    { Script s; s.tick = 5000; s.steps = {-1, -1, -1, 0}; auto r = s.run(text, 6, 6);
+      check(r.stop == Stop::TimedOut && r.written == 5006 && r.chunk == 0 && r.closed == 6 && r.bracket == Bracket::CloseFailed, "deadline at the close marker, close fails");
+      check(has(outcome("paste", r).second, "the remaining 0 bytes were not written"), "and counts it once"); }
     { Script s; s.steps = {-1, -1, -1, 0}; auto r = s.run(text, 6, 6);
       check(r.bracket == Bracket::CloseStopped && s.chunks.size() == 4 && r.written == 5006, "stopped IN the close marker: not retried"); }
     { Script s; s.steps = {-1, 0}; s.tick = 9000; auto r = s.run(text, 6, 6); // 18 s elapsed: 18+0.5+1 > 17.5
@@ -154,13 +171,19 @@ static void gate() {
       check(entered && r.pending && retained != 0, "unresolved chunk retains a reservation");
       check(g.reserve(0) == 0, "human keys fail closed while it is unresolved");
       int ran = 0; check(!g.write(true, false, [&] { ++ran; }) && ran == 0, "untokened writers refused while unresolved");
-      Pending* p = r.pending; s.made.clear();
-      p->ov.hEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr); // the write resolves
-      DWORD ignored = 0; const auto token = retained;
       unsigned long long again = 0; check(!g.writeRetaining(10, [] { return false; }, again), "a second type is refused meanwhile");
-      if (bounded_pipe_write::complete(p, ignored)) g.release(token);
-      check(!p, "complete() took the Pending");
-      check(g.reserve(0) != 0, "released after completion"); }
+      // Production's worker body, on its own thread, as main.cpp's retainUntilResolved runs it.
+      Pending* p = r.pending; s.made.clear();
+      HANDLE resolved = CreateEventW(nullptr, TRUE, FALSE, nullptr); p->ov.hEvent = resolved;
+      std::thread worker([&g, token = retained, p] { bounded_pipe_write::resolveThenRelease(g, token, p); });
+      Sleep(100); check(g.reserve(0) == 0, "the worker keeps the pane reserved while the write is unresolved");
+      SetEvent(resolved); worker.join(); // the write resolves; resolveThenRelease frees the Pending (and its event)
+      check(g.reserve(0) != 0, "the worker releases the reservation once the write resolved"); }
+    // A stale lease never releases a newer reservation.
+    { InputGate g; auto* p = new Pending; p->ov.hEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+      const auto current = g.reserve(0);
+      bounded_pipe_write::resolveThenRelease(g, current + 1, p);
+      check(g.reserve(0) == 0, "a worker with another token leaves the current reservation alone"); g.release(current); }
 }
 
 // The real bounded_pipe_write, through send(), against a real named pipe.

@@ -53,7 +53,7 @@ bounded_input::Result<bounded_pipe_write::Pending> boundedPaneInput(Session*,con
  else if(writeMode==1)r.stop=Stop::Refused;
  else if(writeMode==2){r.stop=Stop::TimedOut;r.written=r.total-1;r.chunk=1;}
  else if(writeMode==3){r.stop=Stop::Pending;r.written=0;r.chunk=r.total;r.pending=&pending;r.bracket=open?Bracket::Unknown:Bracket::None;}
- else {r.stop=Stop::TimedOut;r.written=(unsigned long)open;r.chunk=1;r.bracket=Bracket::Closed;}
+ else {r.stop=Stop::TimedOut;r.written=(unsigned long)open;r.chunk=1;r.closed=(unsigned long)close;r.bracket=Bracket::Closed;}
  return r;}
 std::vector<Session*> g_sessions; std::atomic<bool> g_restoreCommands{false};
 int saves=0,refreshes=0; bool disappear=false,queryOk=true,saveOk=true; HWND g_hwnd=nullptr; constexpr int WM_APP_REFRESHTREE=1;
@@ -87,7 +87,7 @@ int main(){
  reset();writeMode=3;check(paste(&s,{"text"}).find("still in flight and may still arrive; the remaining 0 bytes were not written; this pane's input stays reserved")!=std::string::npos);
  reset();bracketed=true;check(paste(&s,{"text"})=="ok:pasted");check(openSeen==6&&closeSeen==6&&sent=="\x1b[200~text\x1b[201~");
  reset();check(paste(&s,{"text"})=="ok:pasted");check(openSeen==0&&closeSeen==0);
- reset();bracketed=true;writeMode=4;check(paste(&s,{"text"}).find("then closed (ESC[201~ written)")!=std::string::npos);
+ reset();bracketed=true;writeMode=4;check(paste(&s,{"text"}).find("then closed with a separate ESC[201~")!=std::string::npos);
  reset();bracketed=true;writeMode=3;check(paste(&s,{"text"}).find("whether the bracketed paste was opened is unknown")!=std::string::npos);
  // session type: same bounded writer; read-only does NOT refuse it (P9), control bytes still do.
  reset();check(type(&s,{"one\ntwo"})=="ok:typed");check(writes==1&&sent=="one\rtwo"&&openSeen==0&&closeSeen==0);

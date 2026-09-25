@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <vector>
+#include "bounded_input.h" // kCancelWaitMs: its budget counts this wait
 
 namespace bounded_pipe_write {
 struct Pending {
@@ -36,9 +37,16 @@ inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, 
     CancelIoEx(pending->pipe,&pending->ov);
     // Cancellation is asynchronous. Never free the OVERLAPPED/buffer until completion, and
     // never turn its cleanup into another unbounded wait on the control/lease worker.
-    WaitForSingleObject(pending->ov.hEvent,1000);
+    WaitForSingleObject(pending->ov.hEvent,bounded_input::kCancelWaitMs);
     if (complete(pending,written)) return written; // cancellation may have lost to normal delivery
     deferred=pending;
     return 0;
+}
+// The body of the worker that owns an unresolved write: wait (unbounded, off the control thread)
+// until it resolves, free it, and only then release the lease that kept the pane reserved.
+template<class Gate> void resolveThenRelease(Gate& gate, unsigned long long lease, Pending* pending) {
+    WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
+    if (complete(pending,ignored)) gate.release(lease);
+    // A wait failure cannot authorize new input or free possibly active I/O.
 }
 }

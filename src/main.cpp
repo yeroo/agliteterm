@@ -5218,6 +5218,11 @@ static const char* selectAllOf(Session* target) {
 }
 
 // ---- input ----
+// An unresolved write keeps the pane reserved: a worker owns it until it resolves, then releases.
+static void retainUntilResolved(Session* s, unsigned long long lease, bounded_pipe_write::Pending* pending) {
+    try { std::thread([s,lease,pending] { bounded_pipe_write::resolveThenRelease(s->inputGate,lease,pending); }).detach(); }
+    catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
+}
 static bool sendHumanBytes(Session* s, const char* bytes, DWORD len) {
     HANDLE data = INVALID_HANDLE_VALUE;
     { LockG hold;
@@ -5232,11 +5237,7 @@ static bool sendHumanBytes(Session* s, const char* bytes, DWORD len) {
     CloseHandle(data);
     if (pending) {
         emitEvent("input",s->paneId,"write cancellation pending; input remains reserved until completion");
-        try { std::thread([s,lease,pending]() mutable {
-            WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
-            if (bounded_pipe_write::complete(pending,ignored)) s->inputGate.release(lease);
-            // A wait failure cannot authorize new input or free possibly active I/O.
-        }).detach(); } catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
+        retainUntilResolved(s,lease,pending);
     } else s->inputGate.release(lease);
     return written == len && !pending;
 }
@@ -5269,12 +5270,8 @@ static bounded_input::Result<bounded_pipe_write::Pending> boundedPaneInput(Sessi
     if (auto* pending = r.pending) {
         emitEvent("input", s->paneId, "type/paste write cancellation pending; input remains reserved until completion");
         logWarn("pane %s: type/paste stopped with %lu of %lu bytes written; a %lu-byte write is unresolved, input reserved until it completes",
-                s->paneId.c_str(), r.written, r.total, r.bracket == bounded_input::Bracket::ClosePending ? (DWORD)closeLen : r.chunk);
-        try { std::thread([s,retained,pending]() mutable {
-            WaitForSingleObject(pending->ov.hEvent,INFINITE); DWORD ignored=0;
-            if (bounded_pipe_write::complete(pending,ignored)) s->inputGate.release(retained);
-            // A wait failure cannot authorize new input or free possibly active I/O.
-        }).detach(); } catch (...) { logWarn("input completion worker failed; lease retained until app exit"); }
+                s->paneId.c_str(), r.written, r.total, r.closed ? r.closed : r.chunk);
+        retainUntilResolved(s,retained,pending);
     }
     return r;
 }

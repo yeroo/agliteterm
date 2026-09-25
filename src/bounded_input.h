@@ -9,7 +9,7 @@ namespace bounded_input {
 constexpr unsigned long kGateWaitMs = 5000;      // wait for the pane's input gate
 constexpr unsigned long kDeadlineMs = 15000;     // one deadline across the whole text
 constexpr unsigned long kBracketCloseMs = 500;   // closing ESC[201~ after a stopped paste
-constexpr unsigned long kCancelWaitMs = 1000;    // bounded_pipe_write's fixed cancellation wait
+constexpr unsigned long kCancelWaitMs = 1000;    // bounded_pipe_write::write's cancellation wait
 constexpr unsigned long kChunkBytes = 4096;
 static_assert(kGateWaitMs + kDeadlineMs + kCancelWaitMs + kBracketCloseMs + kCancelWaitMs < 25000,
               "type/paste must answer well inside agwintermctl's 30 s reply deadline");
@@ -28,13 +28,14 @@ enum class Bracket {
     Closed,        // opened; a separate ESC[201~ was written after the stop
     CloseStopped,  // the stopped chunk WAS the closing marker: it may have been partly delivered
     CloseFailed,   // the separate ESC[201~ was cancelled/failed and may have been partly delivered
-    ClosePending,  // the separate ESC[201~ is still in flight
+    ClosePending,  // the closing ESC[201~ (its own chunk, or the separate close) is still in flight
 };
 
 template<class Pending> struct Result {
     unsigned long total = 0;    // M: bytes asked for (paste: markers included)
     unsigned long written = 0;  // N: confirmed written, from offset 0
     unsigned long chunk = 0;    // K: the stopped chunk at offset N (cancelled/failed/in flight)
+    unsigned long closed = 0;   // the separately attempted ESC[201~: in neither N nor K; `bracket` reports it
     Stop stop = Stop::Done;
     Bracket bracket = Bracket::None;
     Pending* pending = nullptr; // unresolved write: the caller owns it and keeps the pane reserved
@@ -82,7 +83,7 @@ Result<Pending> send(const std::string& bytes, size_t openLen, size_t closeLen, 
     r.written = static_cast<unsigned long>(off);
     if (!openLen || r.stop == Stop::Done) return r;
     if (off < openLen) { r.bracket = off == 0 && r.chunk == 0 ? Bracket::None : Bracket::Unknown; return r; }
-    if (r.stop == Stop::Pending) { r.bracket = Bracket::LeftOpen; return r; }
+    if (r.stop == Stop::Pending) { r.bracket = off >= bodyEnd ? Bracket::ClosePending : Bracket::LeftOpen; return r; }
     if (off >= bodyEnd && r.chunk) { r.bracket = Bracket::CloseStopped; return r; }
     if (static_cast<unsigned long>(now() - start) + limits.closeMs + limits.cancelWaitMs > limits.capMs()) {
         r.bracket = Bracket::NoTime; return r;
@@ -91,8 +92,11 @@ Result<Pending> send(const std::string& bytes, size_t openLen, size_t closeLen, 
     Pending* deferred = nullptr;
     timedOut = false;
     const unsigned long w = write(bytes.data() + bodyEnd, n, limits.closeMs, deferred, timedOut);
+    r.closed = n;
     if (deferred) { r.pending = deferred; r.bracket = Bracket::ClosePending; }
-    else r.bracket = w >= n ? Bracket::Closed : Bracket::CloseFailed;
+    else if (w < n) r.bracket = Bracket::CloseFailed;
+    else if (off == bodyEnd) { r.stop = Stop::Done; r.written = r.total; r.closed = 0; r.bracket = Bracket::None; } // every byte went
+    else r.bracket = Bracket::Closed;
     return r;
 }
 
@@ -107,7 +111,7 @@ template<class Pending> std::pair<bool, std::string> outcome(const char* verb, c
     default: break;
     }
     const auto num = [](unsigned long x) { return std::to_string(x); };
-    const unsigned long rest = r.total - r.written - r.chunk;
+    const unsigned long rest = r.total - r.written - r.chunk - r.closed;
     std::string m = head + num(r.written) + " of " + num(r.total) + " bytes written";
     if (r.stop == Stop::TimedOut && !r.chunk)
         m += " before the " + num(kDeadlineMs / 1000) + " s input deadline";
@@ -123,10 +127,11 @@ template<class Pending> std::pair<bool, std::string> outcome(const char* verb, c
     case Bracket::Unknown: m += "; whether the bracketed paste was opened is unknown, so no ESC[201~ was sent"; break;
     case Bracket::LeftOpen: m += "; the bracketed paste is left open (no ESC[201~ sent)"; break;
     case Bracket::NoTime: m += "; the bracketed paste is left open: no time left to send ESC[201~"; break;
-    case Bracket::Closed: m += "; the bracketed paste was then closed (ESC[201~ written)"; break;
+    case Bracket::Closed: m += "; the bracketed paste was then closed with a separate ESC[201~"; break;
     case Bracket::CloseStopped: m += "; that chunk was the closing ESC[201~, so the bracketed paste may be left open"; break;
-    case Bracket::CloseFailed: m += "; closing the bracketed paste failed (ESC[201~ may have been partly delivered)"; break;
-    case Bracket::ClosePending: m += "; the closing ESC[201~ is still in flight and may still arrive"; break;
+    case Bracket::CloseFailed: m += "; a separate ESC[201~ to close the bracketed paste failed and may have been partly delivered"; break;
+    case Bracket::ClosePending: m += r.closed ? "; a separate ESC[201~ to close the bracketed paste is still in flight and may still arrive"
+                                              : "; that chunk is the closing ESC[201~"; break;
     }
     if (r.pending) m += "; this pane's input stays reserved until that write resolves";
     return {false, m};

@@ -51,16 +51,25 @@ Three probes answer what an agent otherwise has to guess:
   character, under one 15 s deadline for the whole text. `typed` / `pasted` mean every byte was
   written, as before. A write that stops early refuses with `N of M bytes written`, then the K-byte
   chunk at offset N, which was cancelled or failed and **may have been partly delivered**, then the
-  remaining bytes, which were not written. So a caller that resumes from offset N may repeat up to K
-  bytes, and one that retries the whole text repeats N. If a chunk's cancellation has not resolved
-  within 1 s, the reply says it is still in flight and may still arrive. The pane's input then stays
-  reserved, so human keys and other API input are refused, until that write resolves. An `input`
-  event is emitted when that happens.
+  remaining bytes, which were not written. So a caller that retries the whole text repeats N bytes,
+  plus up to K. Only `session type` can resume from offset N: its counts are over the text as sent,
+  where the only change is `\n` becoming `\r`, byte for byte, and a resume may still repeat up to K
+  bytes. For `session paste`, the counts include `ESC[200~` and are over the normalized text, where
+  CRLF becomes CR, and a clipboard paste's text is never seen by the caller. So those counts say how
+  far the paste got, but they are not an offset into the caller's text. If a chunk's cancellation
+  has not resolved within 1 s, the reply says it is still in flight and may still arrive. The pane's
+  input then stays reserved, so human keys and other API input are refused, until that write
+  resolves. An `input` event is emitted when that happens.
 - A bracketed `session paste` writes `ESC[200~` and `ESC[201~` as chunks of their own. If the
   paste stops after the opening marker, lite sends a separate `ESC[201~` (bounded to 500 ms) so the
-  application is not left inside a paste, and the reply says whether that worked. It does not send
-  one when the opening marker itself was stopped (whether the paste was opened is unknown), when a
-  chunk is still in flight, or when the stopped chunk was the closing marker itself.
+  application is not left inside a paste, and the reply says whether that worked. That separate
+  close is reported on its own and is not counted among the remaining bytes. If only the closing
+  marker was left when the deadline passed and the separate close then succeeds, every byte went,
+  and the reply is `pasted`. Lite does not send a separate close:
+  - when the opening marker itself was stopped (whether the paste was opened is unknown);
+  - when a body chunk is still in flight (the reply says the paste is left open);
+  - when the stopped chunk was the closing marker itself. If that chunk is still in flight, the reply
+    says so. Do not close the paste yourself: that marker may still arrive.
 - `session write` is display-only. What it paints is not durable: the shell's next repaint, and the
   full repaint the pty-host does on every resize (a window resize, `session split`, a split-ratio
   change, `session split close`), paints over it, and it does not survive into scrollback.
