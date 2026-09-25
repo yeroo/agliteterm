@@ -7,7 +7,8 @@
 #include <utility>
 #include "control.h"
 
-// The core ABI cell layout. Keep this one definition shared by the reader and its unit tests.
+// Core ABI v18 cell layout; pinned by kRequiredAbi in main.cpp. Re-check against lib.rs on every
+// ABI bump: emu_copy_grid and emu_copy_history_row write this exact layout.
 struct FfiCell {
     int32_t rune;
     uint32_t fg, bg, attrs, width;

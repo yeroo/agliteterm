@@ -124,7 +124,8 @@ static void (*core_free_buf)(uint8_t*, uint32_t);
 // v16 added agwcore_emu_set_scrollback. v18 (agwinterm 0.17.10; there was no 17) inserted
 // mouseSgrPixels into FfiEmuInfo above and added or changed NO export - a bump can be a struct
 // alone. The core handshake is an EXACT match and the structs are shared, so the pin moves with
-// the core it is built against and every struct above is re-checked against lib.rs on each bump.
+// the core it is built against. Re-check FfiEmuInfo here AND FfiCell in styled_text.h against
+// lib.rs on each bump: emu_copy_grid writes both layouts through this ABI.
 static constexpr uint32_t kRequiredAbi = 18;
 static constexpr uint32_t kProtocolVersion = 2;
 static constexpr int kSidebarW = 180;
@@ -9221,6 +9222,10 @@ static const char* const kOverlayAllWithLines =
     "--all and --lines cannot be combined: --all reads the whole buffer (screen + scrollback), --lines N the last N lines; pass one. Nothing read.";
 static const char* const kOverlayStylesRefusal =
     "session overlay text: --styles is not supported here; use `session text --styles --target <overlay-id>`. Nothing read.";
+static bool textArgFlag(const JsonReq& req, const char* key) {
+    const std::string& value = req.get(key);
+    return value == "true" || value == "1";
+}
 // What `text` reads, on `session text` and `session overlay text` alike (agwinterm's
 // OverlayTextArgs; the words above are its two refusals). Lite's DEFAULT is the whole buffer (gate 2
 // of the P5-lite plan — agwinterm's and agterm's is the screen, recorded in lite-parity.md), so
@@ -9238,14 +9243,10 @@ struct TextArgs {
 };
 static bool parseTextArgs(const JsonReq& req, TextArgs* out, std::string* refusal) {
     *out = TextArgs{};
-    const std::string& all = req.get("args.all");
-    out->all = all == "true" || all == "1";
+    out->all = textArgFlag(req, "args.all");
+    out->styles = textArgFlag(req, "args.styles");
     auto it = req.fields.find("args.lines");
-    if (it == req.fields.end()) {
-        const std::string& styles = req.get("args.styles");
-        out->styles = styles == "true" || styles == "1";
-        return true;
-    }
+    if (it == req.fields.end()) return true;
     if (out->all) { *refusal = kOverlayAllWithLines; return false; }
     // Digits only (no sign, no fraction, no exponent). The parser keeps a number as its raw text
     // and a string as its content, so a quoted "3" arrives as 3 and is accepted — lite cannot see
@@ -9265,8 +9266,6 @@ static bool parseTextArgs(const JsonReq& req, TextArgs* out, std::string* refusa
         v = v * 10 + d;
     }
     out->lines = v;
-    const std::string& styles = req.get("args.styles");
-    out->styles = styles == "true" || styles == "1";
     return true;
 }
 // The popup's own refusals (P2-lite), moved here unchanged. An unknown action names every action.
@@ -9469,34 +9468,23 @@ static int callerWorkspace(const std::string& caller, std::wstring* nameOut = nu
     return hit->ws;
 }
 
-// Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
-// scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
-// mark's outputLine..endLine can be handed straight in.
-// `tail` (P5): -1 = the range as given; 0 = the visible screen (the range becomes the screen rows,
-// read under the same hold as the count, so a line the shell prints meanwhile cannot shift it);
-// N >= 1 = the last N lines of the whole buffer AS dumpBufferText RETURNS IT — after the trailing
-// blank rows below the prompt are squashed, so `--lines 3` on a pane whose prompt sits at row 3 of
-// 30 is the prompt and the two lines above it, not three blanks (agwinterm counts screen rows from
-// the bottom; lite's default is the whole buffer, and this is the tail of that — gate 2's reader).
-// One walk; the row logic is not copied.
-struct BufferRow { int64_t abs; std::vector<FfiCell> cells; };
-struct BufferSnapshot {
+// Visit selected scrollback and screen cells under one lock. Absolute row numbers and cursor
+// come from the same emu_info snapshot. `tail == 0` selects the screen here; positive tails are
+// applied after trailing blank rows are removed by the two renderers below.
+template<class Visit>
+static bool visitBufferRows(Session* s, int64_t from, int64_t to, int64_t tail,
+                            FfiEmuInfo* infoOut, Visit visit) {
     FfiEmuInfo info{};
-    std::vector<BufferRow> rows;
     bool screenOk = true;
-};
-static BufferSnapshot snapshotBufferRows(Session* s, int64_t from, int64_t to, int64_t tail) {
-    BufferSnapshot snap;
-    FfiEmuInfo& info = snap.info;
     int64_t abs = 0;
-    EnterCriticalSection(&g_lock);
+    LockG hold;
     emu_info(s->emu, &info);
     if (tail == 0) { from = info.historyCount; to = INT64_MAX; }
     std::vector<FfiCell> row(info.cols);
     auto wanted = [&](int64_t line) { return from < 0 || (line >= from && line <= to); };
     for (uint32_t h = 0; h < info.historyCount; h++, abs++)
         if (wanted(abs) && emu_copy_history_row(s->emu, h, row.data(), info.cols))
-            snap.rows.push_back({abs, row});
+            visit(abs, row.data(), info.cols);
     // The live screen straight from the emulator, never from `s->grid` — that is paintPane's
     // snapshot, refreshed only when THIS session is painted, and a session that is not painted has
     // a stale or empty one: a shell under a pane overlay (its box paints the overlay — P5's rule is
@@ -9510,20 +9498,24 @@ static BufferSnapshot snapshotBufferRows(Session* s, int64_t from, int64_t to, i
     std::vector<FfiCell> live((size_t)info.cols * info.rows);
     if (!live.empty() && emu_copy_grid(s->emu, live.data(), (uint32_t)live.size())) {
         for (uint32_t r = 0; r < info.rows; r++, abs++)
-            if (wanted(abs)) snap.rows.push_back({abs, std::vector<FfiCell>(live.begin() + (size_t)r * info.cols,
-                                                                               live.begin() + (size_t)(r + 1) * info.cols)});
-    } else if (!live.empty()) snap.screenOk = false;
-    LeaveCriticalSection(&g_lock);
-    return snap;
+            if (wanted(abs)) visit(abs, &live[(size_t)r * info.cols], info.cols);
+    } else if (!live.empty()) screenOk = false;
+    if (infoOut) *infoOut = info;
+    return screenOk;
 }
+// Buffer text, optionally limited to an absolute line range [from, to]. "Absolute" numbers the
+// scrollback and the screen as one sequence, which is the numbering FfiMark already speaks, so a
+// mark's outputLine..endLine can be handed straight in.
+// `tail` (P5): -1 = the range as given; 0 = the visible screen (selected in visitBufferRows under
+// the same hold as its count); N >= 1 = the last N lines AFTER trailing blank rows are squashed.
+// Keep this squash and cut in sync with readSurfaceStyled below.
 static std::string dumpBufferLines(Session* s, int64_t from, int64_t to, int64_t tail, bool* screenOk = nullptr) {
-    BufferSnapshot snap = snapshotBufferRows(s, from, to, tail);
-    if (screenOk) *screenOk = snap.screenOk;
     std::string out;
-    for (const auto& row : snap.rows) {
-        out += styled_text::rowText(row.cells.data(), snap.info.cols);
+    bool ok = visitBufferRows(s, from, to, tail, nullptr, [&](int64_t, const FfiCell* cells, uint32_t cols) {
+        out += styled_text::rowText(cells, cols);
         out += '\n';
-    }
+    });
+    if (screenOk) *screenOk = ok;
     while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') out.pop_back();
     if (tail > 0) {
         // The last `tail` lines of the trimmed text: each line ends in '\n', so the cut is after the
@@ -9553,25 +9545,30 @@ static bool readSurfaceText(Session* s, const TextArgs& a, std::string* text) {
     return screenOk;
 }
 static bool readSurfaceStyled(Session* s, const TextArgs& a, std::string* reply) {
-    BufferSnapshot snap = snapshotBufferRows(s, -1, -1, a.lines);
-    if (!snap.screenOk) {
+    struct StyledRow { int64_t abs; bool empty; std::string runs; };
+    std::vector<StyledRow> rows;
+    FfiEmuInfo info{};
+    bool screenOk = visitBufferRows(s, -1, -1, a.lines, &info,
+        [&](int64_t abs, const FfiCell* cells, uint32_t cols) {
+            rows.push_back({abs, styled_text::rowText(cells, cols).empty(), styled_text::rowRunsJson(cells, cols)});
+        });
+    if (!screenOk) {
         *reply = overlayReadFailedRefusal("the emulator did not copy its screen (session " + s->id + ")");
         return false;
     }
-    // Match dumpBufferLines' trailing blank-row squash and tail, preserving absolute row labels.
+    // Mirror dumpBufferLines' squash and tail, preserving absolute row labels. Change both together.
     // The plain reader retains one newline on an all-empty buffer; the structured form omits it.
-    while (!snap.rows.empty() && styled_text::rowText(snap.rows.back().cells.data(), snap.info.cols).empty())
-        snap.rows.pop_back();
-    if (a.lines > 0 && (uint64_t)a.lines < snap.rows.size())
-        snap.rows.erase(snap.rows.begin(), snap.rows.end() - (size_t)a.lines);
-    *reply = "{\"cols\":" + std::to_string(snap.info.cols) + ",\"rows\":[";
-    for (const auto& row : snap.rows) {
+    while (!rows.empty() && rows.back().empty) rows.pop_back();
+    if (a.lines > 0 && (uint64_t)a.lines < rows.size())
+        rows.erase(rows.begin(), rows.end() - (size_t)a.lines);
+    *reply = "{\"cols\":" + std::to_string(info.cols) + ",\"rows\":[";
+    for (const auto& row : rows) {
         if (reply->back() != '[') *reply += ',';
-        *reply += "{\"row\":" + std::to_string(row.abs - snap.info.historyCount) +
-                  ",\"runs\":" + styled_text::rowRunsJson(row.cells.data(), snap.info.cols) + "}";
+        *reply += "{\"row\":" + std::to_string(row.abs - info.historyCount) +
+                  ",\"runs\":" + row.runs + "}";
     }
-    *reply += "],\"cursor\":{\"row\":" + std::to_string(snap.info.cursorRow) +
-              ",\"col\":" + std::to_string(snap.info.cursorCol) + "}}";
+    *reply += "],\"cursor\":{\"row\":" + std::to_string(info.cursorRow) +
+              ",\"col\":" + std::to_string(info.cursorCol) + "}}";
     return true;
 }
 
@@ -11130,8 +11127,7 @@ static std::string ctlDispatch(const std::string& line) {
         // refusals here, before any resolve (agwinterm's order: after the size and pane words).
         TextArgs textArgs;
         if (action == "text") {
-            const std::string& styles = req.get("args.styles");
-            if (styles == "true" || styles == "1") return ctlErr(kOverlayStylesRefusal);
+            if (textArgFlag(req, "args.styles")) return ctlErr(kOverlayStylesRefusal);
             std::string textWhy;
             if (!parseTextArgs(req, &textArgs, &textWhy)) return ctlErr(textWhy);
         }

@@ -2637,6 +2637,35 @@ try {
         $r = ConvertFrom-Json $raw
         Check 'overlay copy is unaffected by styles' ($r.error -ne $stylesRefusal) "raw: $raw"
         Send-Raw (@{cmd='session.write';target=$sp9;args=@{text=($esc + '[?1049l')}} | ConvertTo-Json -Compress -Depth 5) | Out-Null
+        # A long main-screen fixture forces real scrollback. The alt-screen's single row above
+        # cannot expose an ignored --lines tail or an unadjusted absolute row number.
+        $historyFixture = "`r`n"
+        for ($i = 0; $i -lt 100; $i++) { $historyFixture += ('STYLED-HIST-{0:d3}' -f $i) + $(if ($i -lt 99) { "`r`n" } else { '' }) }
+        $raw = Send-Raw (@{cmd='session.write';target=$sp9;args=@{text=$historyFixture}} | ConvertTo-Json -Compress -Depth 5)
+        $r = ConvertFrom-Json $raw
+        Check 'setup: 100 numbered rows entered the main screen' ([bool]$r.ok) "raw: $raw"
+        function JoinedStyled($value) { @($value.rows | ForEach-Object { @($_.runs | ForEach-Object { [string]$_.text }) -join '' }) -join "`n" }
+        $raw = RawText $sp9 '"styles":true'; $styledFull = ConvertFrom-Json $raw
+        $raw = RawText $sp9 '"styles":true,"all":true'; $styledAll = ConvertFrom-Json $raw
+        $raw = RawText $sp9 '"styles":true,"lines":0'; $styledScreen = ConvertFrom-Json $raw
+        $raw = RawText $sp9 '"styles":true,"lines":3'; $styledTail = ConvertFrom-Json $raw
+        $plainFull = ConvertFrom-Json (RawText $sp9 '')
+        $plainScreen = ConvertFrom-Json (RawText $sp9 '"lines":0')
+        $plainTail = ConvertFrom-Json (RawText $sp9 '"lines":3')
+        $fullRows = @($styledFull.result.rows); $screenRows = @($styledScreen.result.rows); $tailRows = @($styledTail.result.rows)
+        Check 'styled bare/all include scrollback and match plain text' ($styledFull.ok -and $styledAll.ok -and $fullRows.Count -gt $screenRows.Count -and
+            (JoinedStyled $styledFull.result) -ceq (([string]$plainFull.result) -replace "`n$", '') -and
+            (JoinedStyled $styledAll.result) -ceq (JoinedStyled $styledFull.result))
+        Check 'styled --lines 0 selects only visible rows and matches plain text' ($styledScreen.ok -and $screenRows.Count -gt 0 -and
+            $screenRows[0].row -eq 0 -and (JoinedStyled $styledScreen.result) -ceq (([string]$plainScreen.result) -replace "`n$", ''))
+        Check 'styled --lines 3 is exactly the last three numbered rows with their labels' ($styledTail.ok -and $tailRows.Count -eq 3 -and
+            (JoinedStyled $styledTail.result) -ceq (([string]$plainTail.result) -replace "`n$", '') -and
+            $tailRows[0].row -eq $fullRows[-3].row -and $tailRows[2].row -eq $fullRows[-1].row -and
+            (JoinedStyled $styledTail.result) -match 'STYLED-HIST-099')
+        $historyCount = $fullRows.Count - $screenRows.Count
+        $labelsCorrect = $historyCount -gt 0
+        for ($i = 0; $i -lt $fullRows.Count; $i++) { if ($fullRows[$i].row -ne ($i - $historyCount)) { $labelsCorrect = $false; break } }
+        Check 'every styled row label is relative to the visible screen top, with negative scrollback' ($labelsCorrect -and $fullRows[0].row -lt 0)
         # The same three on `overlay text`, on a pane slot and on the popup — the same reader.
         # Three echo lines, so the overlay's buffer has a tail to cut (its command sleeps, so no prompt
         # follows them); Wait-Shell5 finds the shell by the first `echo <marker>;` on its command line.
