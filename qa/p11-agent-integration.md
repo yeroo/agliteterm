@@ -9,7 +9,7 @@ Implementation base: 174b3b1. No real Claude CLI or release installation is used
   idempotence, fake updater version/receipt handling, script syntax and private-pipe wrapper/notify.
 - Guarded: `test/selection-ui.ps1 -Strict -AgentIntegrationOnly -TokenOwner ACTUAL_OWNER`.
   Redirected app data, private compiled fake claude.exe and UUID registry subtree. The real user
-  profile, Claude settings, Codex TOML and Environment Path are never installed or rewritten by tests.
+  profile, Claude settings, Codex hooks/TOML and Environment Path are never installed or rewritten by tests.
 - Combined: omit the filter to run P7/P9/P10a/P10b/P11 through the same ownership/restoration boundary.
 - Full `test/run-all.ps1 -Strict` is a disposable Windows CI gate, not a shared-desktop command (#51).
 - Cleanup retains process handles from proven live-parent/birth relationships, waits for exit after

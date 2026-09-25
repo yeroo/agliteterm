@@ -29,9 +29,8 @@ Check 'hooks installer succeeds' ($r.ok -and $installExit-eq 0)
 $json=Get-Content -Raw $settings|ConvertFrom-Json
 Check 'hooks preserve settings and unrelated command' ($json.theme-eq'dark' -and $json.permissionMode-eq'default' -and $json.hooks.Stop[0].hooks[0].command-eq'keep-me')
 Check 'all four status events installed' (@($json.hooks.PSObject.Properties).Count-eq 4 -and $json.hooks.Notification[0].matcher-eq'permission_prompt')
-Check 'Codex config only suggested, never created' ($r.result.Contains('notify = [') -and -not(Test-Path (Join-Path $user '.codex/config.toml')))
-$line=($r.result -split 'notify = ',2)[1];$argv=$line|ConvertFrom-Json
-Check 'suggested notify command has complete argv' ($argv.Count-eq6 -and $argv[0]-eq'powershell.exe' -and $argv[5]-eq(Join-Path $data 'agliteterm-codex-notify.ps1'))
+Check 'Codex skipped without existing directory' ($r.result.Contains('Codex hooks skipped') -and -not(Test-Path (Join-Path $user '.codex/hooks.json')) -and -not $r.result.Contains('notify = ['))
+Check 'legacy Codex notify script still copied' (Test-Path (Join-Path $data 'agliteterm-codex-notify.ps1'))
 $saved=[IO.File]::ReadAllText($settings);$profileSaved=[IO.File]::ReadAllText($profile)
 $r=Install hooks
 Check 'hooks install idempotent' ($r.ok -and [IO.File]::ReadAllText($settings)-ceq$saved -and [IO.File]::ReadAllText($profile)-ceq$profileSaved)
@@ -123,6 +122,43 @@ foreach($example in @("`$example = '# >>> agliteterm hooks >>>'; `$other = '# <<
     $preserved=[IO.File]::ReadAllText($profile);$r=Install hooks
     Check 'real sentinel refresh preserves marker examples and is idempotent' ($r.ok -and [IO.File]::ReadAllText($profile)-ceq$preserved)
 }
+$codexDir=Join-Path $user '.codex';New-Item -ItemType Directory $codexDir|Out-Null
+$codexPath=Join-Path $codexDir 'hooks.json'
+$codexWrapper=Join-Path $data 'agliteterm-codex-hook.ps1'
+$codexCommand='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'+$codexWrapper+'" '
+$seed='{"custom":{"keep":true},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-me"},{"type":"mcp_tool","server":"local","tool":"check","input":{"x":1}}]}],"Interrupt":[{"hooks":[{"type":"command","commandWindows":"keep-win","futureField":42}]}],"FutureEvent":[{"hooks":[{"type":"future","extension":true}]}]}}'
+[IO.File]::WriteAllText($codexPath,$seed)
+$r=Install hooks;$codexTree=Get-Content -Raw $codexPath|ConvertFrom-Json
+Check 'Codex hooks install in existing directory and summary explains trust' ($r.ok -and $r.result.Contains($codexPath) -and $r.result.Contains('/hooks') -and -not $r.result.Contains('notify = [') -and -not(Test-Path (Join-Path $codexDir 'config.toml')))
+$expected=@{UserPromptSubmit='active';PostToolUse='active';PermissionRequest='blocked';Stop='stop'}
+foreach($event in $expected.Keys){
+    $matches=@($codexTree.hooks.$event|Where-Object {-not $_.PSObject.Properties['matcher']}|ForEach-Object {$_.hooks}|Where-Object {$_.type-ceq'command' -and $_.command -ceq ($codexCommand+$expected[$event])})
+    Check "Codex $event installs exact matcher-less command" ($matches.Count-eq 1)
+}
+Check 'Codex root, user handlers, other events and extensions preserved' ($codexTree.custom.keep -and $codexTree.hooks.Stop[0].hooks[0].command-eq'keep-me' -and $codexTree.hooks.Stop[0].hooks[1].input.x-eq 1 -and $codexTree.hooks.Interrupt[0].hooks[0].commandWindows-eq'keep-win' -and $codexTree.hooks.FutureEvent[0].hooks[0].extension)
+$codexBytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($codexPath));$codexBackups=@(Get-ChildItem $codexDir -Filter '*.bak').Count
+$r=Install hooks
+Check 'Codex hooks install is byte-idempotent without backup' ($r.ok -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($codexPath))-ceq$codexBytes -and @(Get-ChildItem $codexDir -Filter '*.bak').Count-eq$codexBackups)
+$matcherSeed=@{hooks=@{Stop=@(@{matcher='';hooks=@(@{type='command';command=$codexCommand+'stop'})});PostToolUse=@(@{matcher='*';hooks=@(@{type='command';command=$codexCommand+'active'})})}}|ConvertTo-Json -Depth 20
+[IO.File]::WriteAllText($codexPath,$matcherSeed);$r=Install hooks;$codexTree=Get-Content -Raw $codexPath|ConvertFrom-Json
+Check 'Codex empty and star match-all groups do not duplicate status hooks' ($r.ok -and $codexTree.hooks.Stop.Count-eq 1 -and $codexTree.hooks.PostToolUse.Count-eq 1)
+$codexBytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($codexPath));$r=Install hooks
+Check 'Codex match-all merge remains byte-idempotent' ($r.ok -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($codexPath))-ceq$codexBytes)
+$scopedCodex=@{hooks=@{PostToolUse=@(@{matcher='Bash';hooks=@(@{type='command';command=$codexCommand+'active'})})}}|ConvertTo-Json -Depth 20
+[IO.File]::WriteAllText($codexPath,$scopedCodex);$r=Install hooks;$codexTree=Get-Content -Raw $codexPath|ConvertFrom-Json
+Check 'scoped Codex command does not suppress match-all status hook' ($r.ok -and $codexTree.hooks.PostToolUse.Count-eq 2)
+$codexBad=@('{broken','[]','{"hooks":false}','{"hooks":{"Stop":"bad"}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"hooks":false}]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[false]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":false}]}]}}','{"a":1,"a":2}','{"a":1,"A":2}','{"key":1,"\u006bey":2}','{"hooks":{"stop":[]}}','{"Hooks":{}}','{"hooks":{"Stop":[{"Hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[{"Type":"command"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","CommandWindows":"alias"}]}]}}')
+foreach($bad in $codexBad){
+    [IO.File]::WriteAllText($codexPath,$bad)
+    [IO.File]::WriteAllText((Join-Path $data 'agliteterm-codex-hook.ps1'),'# deliberately stale private helper')
+    [IO.File]::WriteAllText((Join-Path $data 'agliteterm-agent-status.ps1'),'# deliberately stale private helper')
+    $before=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+    $r=Install hooks
+    $after=@(Get-ChildItem $root -File -Recurse|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'
+    Check 'malformed Codex hooks refuse every destination write' (-not $r.ok -and $installExit-ne 0 -and $r.error-match'Codex' -and $before-ceq$after -and $r.error.EndsWith('completed writes: '))
+}
+[IO.File]::WriteAllText($codexPath,$seed);$r=Install hooks
+Check 'valid Codex install refreshes helpers after refusals' ($r.ok -and [IO.File]::ReadAllText((Join-Path $data 'agliteterm-codex-hook.ps1'))-cne'# deliberately stale private helper')
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"
 if($failures){throw 'installer unit checks failed'}
 exit 0 # Negative helper cases intentionally returned nonzero; do not leak their exit into run-all.

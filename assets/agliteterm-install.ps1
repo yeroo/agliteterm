@@ -52,23 +52,23 @@ function Add-InstallBlock([string]$Existing,[string]$Label,[string]$Body){
     if($starts.Count-ne 1 -or $ends.Count-ne 1 -or $last-lt$first){throw "Corrupt or duplicate $Label profile block; file unchanged"}
     return $Existing.Substring(0,$first)+$block+$Existing.Substring($last+$end.Length)
 }
-function Test-InstallKeyCase($Object,[string[]]$Known){
+function Test-InstallKeyCase($Object,[string[]]$Known,[string]$Label='Claude hook'){
     # PowerShell lookup folds case; JSON consumers do not. Reject aliases before using dot lookup.
     foreach($property in $Object.PSObject.Properties){
         if($Known -contains $property.Name -and $Known -cnotcontains $property.Name){
-            throw "Wrong-case Claude hook field '$($property.Name)'; unchanged"
+            throw "Wrong-case $Label field '$($property.Name)'; unchanged"
         }
     }
 }
-function Test-InstallJsonShape([string]$Text){
-    if($Text.Length -gt 1048576){throw 'Claude settings exceeds 1 MiB; unchanged'}
+function Test-InstallJsonShape([string]$Text,[string]$Label='Claude settings'){
+    if($Text.Length -gt 1048576){throw "$Label exceeds 1 MiB; unchanged"}
     # ConvertFrom-Json collapses duplicate keys (including case-only collisions in PS 5.1).
     # Detect them before conversion and cap nesting below ConvertTo-Json's output depth.
     $stack=New-Object Collections.Generic.Stack[object]
     foreach($match in [regex]::Matches($Text,'"(?:\\.|[^"\\])*"|[{}\[\],]')){
         $part=$match.Value
         if($part -eq '{' -or $part -eq '['){
-            if($stack.Count -ge 64){throw 'Claude settings nesting exceeds 64; unchanged'}
+            if($stack.Count -ge 64){throw "$Label nesting exceeds 64; unchanged"}
             $stack.Push(@{Object=($part-eq'{');Key=($part-eq'{');Names=(New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))})
         }elseif($part -eq '}' -or $part -eq ']'){if($stack.Count){$null=$stack.Pop()}}
         elseif($stack.Count){
@@ -76,10 +76,48 @@ function Test-InstallJsonShape([string]$Text){
             if($part -eq ','){$frame.Key=$frame.Object}
             elseif($frame.Object -and $frame.Key -and $part.StartsWith('"')){
                 $key=$part|ConvertFrom-Json -ErrorAction Stop
-                if(-not $frame.Names.Add($key)){throw "Duplicate/case-colliding Claude settings key '$key'; unchanged"}
+                if(-not $frame.Names.Add($key)){throw "Duplicate/case-colliding $Label key '$key'; unchanged"}
                 $frame.Key=$false
             }
         }
+    }
+}
+function Test-InstallHookTree($Root,[string]$Label,[string[]]$Events,[string[]]$HandlerFields,[bool]$Claude){
+    if($Root -isnot [pscustomobject]){throw "$Label root is not an object; unchanged"}
+    Test-InstallKeyCase $Root @('hooks') $Label
+    if(-not $Root.PSObject.Properties['hooks']){$Root|Add-Member hooks ([pscustomobject]@{})}
+    if($Root.hooks -isnot [pscustomobject]){throw "$Label hooks is not an object; unchanged"}
+    Test-InstallKeyCase $Root.hooks $Events $Label
+    foreach($eventProperty in $Root.hooks.PSObject.Properties){
+        if($eventProperty.Value -isnot [Array]){throw "$Label hook event is not an array; unchanged"}
+        foreach($entry in $eventProperty.Value){
+            if($entry -isnot [pscustomobject]){throw "$Label hook entry/hooks has invalid shape; unchanged"}
+            Test-InstallKeyCase $entry @('hooks','matcher') $Label
+            if($entry.hooks -isnot [Array]){throw "$Label hook entry/hooks has invalid shape; unchanged"}
+            if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw "$Label hook matcher is not text; unchanged"}
+            foreach($hook in $entry.hooks){
+                if($Claude){Test-InstallHandler $hook $eventProperty.Name}
+                else{
+                    if($hook -isnot [pscustomobject]){throw "$Label hook handler is not an object; unchanged"}
+                    Test-InstallKeyCase $hook $HandlerFields $Label
+                    if($hook.type -isnot [string]){throw "$Label hook handler type is not text; unchanged"}
+                }
+            }
+        }
+    }
+}
+function Merge-InstallHooks($Root,$Items,[string]$Wrapper,[bool]$Codex){
+    foreach($item in $Items){
+        $event=$item[0];$command='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'+$Wrapper+'" '+$item[1]
+        if(-not $Root.hooks.PSObject.Properties[$event]){$Root.hooks|Add-Member $event @()}
+        $exists=$false
+        foreach($entry in $Root.hooks.$event){
+            $matcher=[string]$entry.matcher
+            if($Codex -and -not $item[2]){if($matcher -cnotin @('','*')){continue}}
+            elseif($matcher -cne $item[2]){continue}
+            foreach($hook in $entry.hooks){if($hook.type-ceq'command' -and $hook.command -ceq $command){$exists=$true}}
+        }
+        if(-not $exists){$entry=@{hooks=@(@{type='command';command=$command})};if($item[2]){$entry.matcher=$item[2]};$Root.hooks.$event=@($Root.hooks.$event)+@([pscustomobject]$entry)}
     }
 }
 # Catalog snapshot 2026-09-10, https://code.claude.com/docs/en/hooks
@@ -97,6 +135,8 @@ $hookKinds=@{
     agent=@{prompt='requiredText';model='text'}
 }
 $hookFields=@($hookCommon.Keys)+@($hookKinds.Values|ForEach-Object {$_.Keys})|Select-Object -Unique
+$codexEvents=@('SessionStart','SessionEnd','SubagentStart','PreToolUse','PermissionRequest','PostToolUse','PreCompact','PostCompact','UserPromptSubmit','SubagentStop','Stop','Interrupt')
+$codexFields=@('type','command','commandWindows','timeout','statusMessage','additionalContextLimit','async','server','tool','input')
 function Test-InstallHandler($Hook,[string]$Event){
     if($Hook -isnot [pscustomobject]){throw 'Claude hook is not an object; unchanged'}
     Test-InstallKeyCase $Hook $hookFields
@@ -151,7 +191,7 @@ try {
     }else{
         if($Remove){throw 'Removal is supported only for install.cli'}
         $profile=Read-InstallText $ProfilePath;$next=$profile
-        $scripts=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-agent-status.ps1','agliteterm-codex-notify.ps1','agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
+        $scripts=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-agent-status.ps1','agliteterm-codex-notify.ps1','agliteterm-codex-hook.ps1','agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
         $sources=@{}
         foreach($script in $scripts){$sources[$script]=Read-InstallText (Join-Path $PSScriptRoot $script);if(-not $sources[$script]){throw "Missing bundled helper $script"}}
         $loads=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
@@ -159,49 +199,35 @@ try {
         foreach($script in $loads){$body+="    . '"+(Join-Path $DataRoot $script).Replace("'","''")+"'`r`n"};$body+='}'
         $next=Add-InstallBlock $profile $Operation $body
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
+        $codexDir=Join-Path $UserRoot '.codex';$codexPath=Join-Path $codexDir 'hooks.json';$codex='';$codexMerged=''
         if($Operation -eq 'hooks'){
             $settings=Read-InstallText $settingsPath
             Test-InstallJsonShape $settings
             $root=if($settings.Trim()){$settings|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}
-            if($root -isnot [pscustomobject]){throw 'Claude settings root is not an object; unchanged'}
-            Test-InstallKeyCase $root @('hooks')
-            if(-not $root.PSObject.Properties['hooks']){$root|Add-Member hooks ([pscustomobject]@{})}
-            if($root.hooks -isnot [pscustomobject]){throw 'Claude hooks is not an object; unchanged'}
-            Test-InstallKeyCase $root.hooks $hookEvents
-            foreach($eventProperty in $root.hooks.PSObject.Properties){
-                if($eventProperty.Value -isnot [Array]){throw 'Claude hook event is not an array; unchanged'}
-                foreach($entry in $eventProperty.Value){
-                    Test-InstallKeyCase $entry @('hooks','matcher')
-                    if($entry -isnot [pscustomobject] -or $entry.hooks -isnot [Array]){throw 'Claude hook entry/hooks has invalid shape; unchanged'}
-                    if($entry.PSObject.Properties['matcher'] -and $entry.matcher -isnot [string]){throw 'Claude hook matcher is not text; unchanged'}
-                    foreach($hook in $entry.hooks){
-                        Test-InstallHandler $hook $eventProperty.Name
-                    }
-                }
-            }
+            Test-InstallHookTree $root 'Claude settings' $hookEvents $hookFields $true
             $wrapper=Join-Path $DataRoot 'agliteterm-agent-status.ps1'
-            foreach($item in @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt'))){
-                $event=$item[0];$command='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'+$wrapper+'" '+$item[1]
-                if(-not $root.hooks.PSObject.Properties[$event]){$root.hooks|Add-Member $event @()}
-                if($root.hooks.$event -isnot [Array]){throw "Claude hook $event is not an array; unchanged"}
-                $exists=$false
-                foreach($entry in $root.hooks.$event){
-                    if([string]$entry.matcher -cne $item[2]){continue}
-                    foreach($hook in $entry.hooks){if($hook.type-ceq'command' -and $hook.command -ceq $command){$exists=$true}}
-                }
-                if(-not $exists){$entry=@{hooks=@(@{type='command';command=$command})};if($item[2]){$entry.matcher=$item[2]};$root.hooks.$event=@($root.hooks.$event)+@([pscustomobject]$entry)}
-            }
+            Merge-InstallHooks $root @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt')) $wrapper $false
             $merged=$root|ConvertTo-Json -Depth 100
+            if([IO.Directory]::Exists($codexDir)){
+                $codex=Read-InstallText $codexPath
+                Test-InstallJsonShape $codex 'Codex hooks'
+                try{$codexRoot=if($codex.Trim()){$codex|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}}
+                catch{throw "Codex hooks JSON is invalid: $($_.Exception.Message); unchanged"}
+                Test-InstallHookTree $codexRoot 'Codex hooks' $codexEvents $codexFields $false
+                $codexWrapper=Join-Path $DataRoot 'agliteterm-codex-hook.ps1'
+                Merge-InstallHooks $codexRoot @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('PermissionRequest','blocked',''),@('Stop','stop','')) $codexWrapper $true
+                $codexMerged=$codexRoot|ConvertTo-Json -Depth 100
+            }
         }
         # Validate all inputs above before touching the first destination. Report partial failures.
         foreach($script in $scripts){$path=Join-Path $DataRoot $script;Set-InstallText $path $sources[$script] (Read-InstallText $path)}
         if($Operation -eq 'hooks'){Set-InstallText $settingsPath $merged $settings}
+        if($Operation -eq 'hooks' -and [IO.Directory]::Exists($codexDir)){Set-InstallText $codexPath $codexMerged $codex}
         Set-InstallText $ProfilePath $next $profile
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
         if($Operation -eq 'hooks'){
-            $notify=Join-Path $DataRoot 'agliteterm-codex-notify.ps1'
-            $result+="`nCodex config is unchanged. Add to your user config.toml: notify = ["+((@('powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',$notify)|ForEach-Object{$_|ConvertTo-Json -Compress}) -join ',')
-            $result+=']'
+            if([IO.Directory]::Exists($codexDir)){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
+            else{$result+="`nCodex hooks skipped because $codexDir does not exist."}
         }
         @{ok=$true;result=$result}|ConvertTo-Json -Compress -Depth 4
     }

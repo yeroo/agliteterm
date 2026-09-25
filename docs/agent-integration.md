@@ -43,12 +43,13 @@ The native host's 2048-byte argument limit is checked before launch; oversized c
 
 ## Installation and updates
 
-`install.hooks` copies product-scoped status/notify/Claude/generic-agent scripts to lite app data,
-merges four Claude hook events, and adds a named block to the current user's Windows PowerShell profile.
+`install.hooks` copies product-scoped status/Claude/Codex/generic-agent scripts to lite app data,
+merges four Claude hook events and four Codex events into `~/.codex/hooks.json` when `~/.codex`
+exists, and adds a named block to the current user's Windows PowerShell profile.
 It preserves unrelated settings/hooks/profile text and custom PSReadLine Enter handlers. Notification
-hooks only mark permission prompts blocked. The Codex notify script marks `agent-turn-complete`
-completed; installation prints a user-level TOML line but never edits Codex configuration.
-This follows the [Codex notify contract](https://learn.chatgpt.com/docs/config-file/config-advanced).
+hooks only mark permission prompts blocked. Codex hooks report active work, approval prompts,
+and completion; a final assistant question reports blocked. Trust new hooks once in Codex `/hooks`.
+The legacy Codex notify script remains installed for existing `config.toml` entries.
 
 `install.shell` adds a product-scoped OSC-7 prompt wrapper to that profile. It does not rewrite the
 PowerShell 7 profile. Installed scripts are inert outside `TERM_PROGRAM=agliteterm`.
