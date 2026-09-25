@@ -10243,7 +10243,7 @@ processes; send submits one line, requires writable input, and cannot confirm sh
 
 `install hooks|shell` is explicit opt-in, preserves unrelated configuration and keeps backups.
 Codex hooks are merged into ~/.codex/hooks.json when ~/.codex exists and is not a junction/symlink; trust them once in Codex /hooks.
-A profile behind a junction/symlink is skipped with a reason; OneDrive-redirected Documents are written normally.
+A profile behind a junction/symlink is skipped with a reason; OneDrive-redirected Documents are normally written.
 Codex TOML is not edited. `install.cli` adds/removes
 the bundled CLI directory; some shared CLI builds handle this locally, so use the lite pipe verb
 or bundled agliteterm-install.ps1 -Operation cli for an unambiguous lite installation.

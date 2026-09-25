@@ -60,11 +60,11 @@ Installers are opt-in, serialized and idempotent. Malformed/duplicate-key/deep J
 profile sentinels refuse before destination writes. Changed existing files get uniquely named `.bak`
 backups via atomic replacement; output identifies completed writes and backups on a partial failure.
 This is not a multi-file transaction. Updated text is UTF-8; original bytes remain in backups.
-agliteterm never writes through a junction/symlink (a link-type reparse point), and checks every destination it will
+agliteterm never writes through a junction/symlink (a link-type reparse point, or any reparse point whose type cannot be read), and checks every destination it will
 change before the first write: helpers or Claude settings behind one refuse the whole install, while
 Codex `hooks.json` and the profile block are skipped with a reason in the summary. Other reparse points,
 such as OneDrive cloud-files placeholders (Known Folder Move Documents), do not redirect a path and are
-written normally. Destinations that already hold the installed text are left alone. Direct helper path overrides exist for isolated fixture tests, not the control API.
+written normally when their type can be read. Destinations that already hold the installed text are left alone. Direct helper path overrides exist for isolated fixture tests, not the control API.
 
 `app.update` queues the existing verified release updater only from its installed update channel.
 Developer/portable copies and concurrent update requests refuse. A queued response does not mean
