@@ -44,8 +44,8 @@ The native host's 2048-byte argument limit is checked before launch; oversized c
 ## Installation and updates
 
 `install.hooks` copies product-scoped status/Claude/Codex/generic-agent scripts to lite app data,
-merges four Claude hook events into `~/.claude/settings.json` and, when `~/.codex` exists,
-four Codex events into `~/.codex/hooks.json`. It adds a named block to the current user's Windows PowerShell profile.
+merges four Claude hook events into `~/.claude/settings.json` and, when `~/.codex` exists and is
+not behind a junction/symlink, four Codex events into `~/.codex/hooks.json`. It adds a named block to the current user's Windows PowerShell profile.
 It preserves unrelated settings/hooks/profile text and custom PSReadLine Enter handlers. Notification
 hooks only mark permission prompts blocked. Codex hooks report active work, approval prompts,
 and completion; a final assistant question reports blocked. Trust new hooks once in Codex `/hooks`.
@@ -59,8 +59,11 @@ entries while preserving unrelated entries and the registry string kind. Open a 
 Installers are opt-in, serialized and idempotent. Malformed/duplicate-key/deep JSON and corrupted
 profile sentinels refuse before destination writes. Changed existing files get uniquely named `.bak`
 backups via atomic replacement; output identifies completed writes and backups on a partial failure.
-This is not a multi-file transaction. Updated text is UTF-8; original bytes remain in backups. Reparse
-destinations refuse. Direct helper path overrides exist for isolated fixture tests, not the control API.
+This is not a multi-file transaction. Updated text is UTF-8; original bytes remain in backups.
+agliteterm never writes through a reparse point (junction/symlink), and checks every destination it will
+change before the first write: helpers or Claude settings behind one refuse the whole install, while
+Codex `hooks.json` and the profile block (for example a OneDrive-redirected Documents folder) are
+skipped with a reason in the summary. Destinations that already hold the installed text are left alone. Direct helper path overrides exist for isolated fixture tests, not the control API.
 
 `app.update` queues the existing verified release updater only from its installed update channel.
 Developer/portable copies and concurrent update requests refuse. A queued response does not mean

@@ -210,7 +210,9 @@ try {
         $loads=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
         $body="if (`$env:TERM_PROGRAM -eq 'agliteterm') {`r`n"
         foreach($script in $loads){$body+="    . '"+(Join-Path $DataRoot $script).Replace("'","''")+"'`r`n"};$body+='}'
-        $next=Add-InstallBlock $profile $Operation $body
+        # A profile behind a reparse point (OneDrive Known Folder Move) is skipped, not fatal.
+        $profileReparse=Get-InstallReparsePoint $ProfilePath
+        try{$next=Add-InstallBlock $profile $Operation $body}catch{if(-not $profileReparse){throw};$next=$null}
         $settingsPath=Join-Path $UserRoot '.claude/settings.json';$settings='';$merged=''
         $codexDir=Join-Path $UserRoot '.codex';$codexPath=Join-Path $codexDir 'hooks.json';$codex='';$codexMerged=''
         $codexPresent=[IO.Directory]::Exists($codexDir)
@@ -231,21 +233,36 @@ try {
                 try{$codexRoot=if($codex.Trim()){$codex|ConvertFrom-Json -ErrorAction Stop}else{[pscustomobject]@{}}}
                 catch{throw "Codex hooks JSON is invalid: $($_.Exception.Message); unchanged"}
                 Test-InstallHookTree $codexRoot 'Codex hooks' $codexEvents $codexFields $false @('hooks','description')
+                if($null -ne $codexRoot.description -and $codexRoot.description -isnot [string]){throw 'Codex hooks description is not text; unchanged'}
                 $codexWrapper=Join-Path $DataRoot 'agliteterm-codex-hook.ps1'
                 Merge-InstallHooks $codexRoot @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('PermissionRequest','blocked',''),@('Stop','stop','')) $codexWrapper $true
                 $codexMerged=$codexRoot|ConvertTo-Json -Depth 100
             }
         }
-        # Validate all inputs above before touching the first destination. Report partial failures.
-        foreach($script in $scripts){Test-InstallDestination (Join-Path $DataRoot $script)}
-        if($Operation -eq 'hooks'){Test-InstallDestination $settingsPath}
-        if($Operation -eq 'hooks' -and $codexPresent){Test-InstallDestination $codexPath}
-        Test-InstallDestination $ProfilePath
-        foreach($script in $scripts){$path=Join-Path $DataRoot $script;Set-InstallText $path $sources[$script] (Read-InstallText $path)}
-        if($Operation -eq 'hooks'){Set-InstallText $settingsPath $merged $settings}
-        if($Operation -eq 'hooks' -and $codexPresent){Set-InstallText $codexPath $codexMerged $codex}
-        Set-InstallText $ProfilePath $next $profile
+        # Validate all inputs above, then preflight every destination that will really be written
+        # before the first write. Already-current files are left alone wherever they live.
+        $destinations=@()
+        foreach($script in $scripts){$path=Join-Path $DataRoot $script;$destinations+=@{Kind='helper';Path=$path;Text=$sources[$script];Expected=(Read-InstallText $path)}}
+        if($Operation -eq 'hooks'){$destinations+=@{Kind='claude';Path=$settingsPath;Text=$merged;Expected=$settings}}
+        if($Operation -eq 'hooks' -and $codexPresent){$destinations+=@{Kind='codex';Path=$codexPath;Text=$codexMerged;Expected=$codex}}
+        if($null -ne $next){$destinations+=@{Kind='profile';Path=$ProfilePath;Text=$next;Expected=$profile}}
+        $writes=@()
+        foreach($destination in $destinations){
+            if([IO.File]::Exists($destination.Path) -and (Read-InstallText $destination.Path) -ceq $destination.Text){continue}
+            $reparse=Get-InstallReparsePoint $destination.Path
+            if(-not $reparse){$writes+=$destination;continue}
+            switch($destination.Kind){
+                'codex' {$codexReparse=$reparse;$codexPresent=$false}
+                'profile' {$profileReparse=$reparse;$next=$null}
+                default {throw "Refusing reparse-point destination: $reparse"}
+            }
+        }
+        foreach($destination in $writes){Set-InstallText $destination.Path $destination.Text $destination.Expected}
         $result="Installed $Operation; existing text/settings preserved; restart shells. Changed: $($changed -join ', ')"
+        if($null -eq $next){
+            $dotSources=($loads|ForEach-Object {Join-Path $DataRoot $_}) -join ' and '
+            $result+="`nPowerShell profile block skipped: $ProfilePath is under a reparse point ($profileReparse, e.g. OneDrive); agliteterm does not write through reparse points. Dot-source $dotSources yourself if you want them."
+        }
         if($Operation -eq 'hooks'){
             if($codexPresent){$result+="`nCodex hooks installed in $codexPath. Trust new hooks once in Codex /hooks before they run."}
             elseif($codexReparse){$result+="`nCodex hooks skipped: $codexReparse is a junction/symlink; agliteterm does not write through reparse points."}

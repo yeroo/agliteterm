@@ -147,7 +147,7 @@ Check 'Codex match-all merge remains byte-idempotent' ($r.ok -and [Convert]::ToB
 $scopedCodex=@{hooks=@{PostToolUse=@(@{matcher='Bash';hooks=@(@{type='command';command=$codexCommand+'active'})})}}|ConvertTo-Json -Depth 20
 [IO.File]::WriteAllText($codexPath,$scopedCodex);$r=Install hooks;$codexTree=Get-Content -Raw $codexPath|ConvertFrom-Json
 Check 'scoped Codex command does not suppress match-all status hook' ($r.ok -and $codexTree.hooks.PostToolUse.Count-eq 2)
-$codexBad=@('{broken','[]','{"\q":1}','{"hooks":false}','{"hooks":{"Stop":"bad"}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"hooks":false}]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[false]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":false}]}]}}','{"a":1,"a":2}','{"a":1,"A":2}','{"key":1,"\u006bey":2}','{"hooks":{"stop":[]}}','{"Hooks":{}}','{"Description":"alias"}','{"hooks":{"Stop":[{"Hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[{"Type":"command"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","CommandWindows":"alias"}]}]}}')
+$codexBad=@('{broken','[]','{"\q":1}','{"hooks":false}','{"hooks":{"Stop":"bad"}}','{"hooks":{"Stop":[false]}}','{"hooks":{"Stop":[{"hooks":false}]}}','{"hooks":{"Stop":[{"matcher":false,"hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[false]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":false}]}]}}','{"a":1,"a":2}','{"a":1,"A":2}','{"key":1,"\u006bey":2}','{"hooks":{"stop":[]}}','{"Hooks":{}}','{"Description":"alias"}','{"hooks":{"Stop":[{"Hooks":[]}]}}','{"hooks":{"Stop":[{"hooks":[{"Type":"command"}]}]}}','{"hooks":{"Stop":[{"hooks":[{"type":"command","CommandWindows":"alias"}]}]}}','{"description":false,"hooks":{}}')
 foreach($bad in $codexBad){
     [IO.File]::WriteAllText($codexPath,$bad)
     [IO.File]::WriteAllText((Join-Path $data 'agliteterm-codex-hook.ps1'),'# deliberately stale private helper')
@@ -179,6 +179,61 @@ try {
     $junctionSettings=Join-Path $user '.claude/settings.json'
     Check 'junctioned Codex directory skips hooks while Claude and profile install' ($r.ok -and $r.result-match'Codex hooks skipped' -and $r.result-match'junction/symlink' -and -not(Test-Path (Join-Path $junctionTarget 'hooks.json')) -and (Get-Content -Raw $junctionSettings|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and [IO.File]::ReadAllText($profile).Contains('# >>> agliteterm hooks >>>'))
 }finally{[IO.Directory]::Delete($junction);$user=$savedUser;$profile=$savedProfile}
+function Get-TreeHash([string]$Path){@(Get-ChildItem $Path -File -Recurse -Force|Sort-Object FullName|ForEach-Object {$_.FullName+':'+(Get-FileHash $_.FullName).Hash})-join ';'}
+function Use-IsolatedRoot([string]$Name){
+    $iso=Join-Path $root $Name
+    $script:data=Join-Path $iso 'data';$script:user=Join-Path $iso 'user';$script:profile=Join-Path $iso 'documents/profile.ps1'
+    [IO.Directory]::CreateDirectory($script:data)|Out-Null;[IO.Directory]::CreateDirectory((Split-Path $script:profile))|Out-Null;[IO.Directory]::CreateDirectory($script:user)|Out-Null
+    return $iso
+}
+$savedData=$data;$savedUser=$user;$savedProfile=$profile
+try {
+    # A junctioned ~/.claude whose settings must change refuses before any write.
+    $iso=Use-IsolatedRoot 'reparse-claude'
+    $claudeTarget=Join-Path $iso 'claude-target';[IO.Directory]::CreateDirectory($claudeTarget)|Out-Null
+    [IO.File]::WriteAllText((Join-Path $claudeTarget 'settings.json'),'{"theme":"dark"}')
+    $claudeJunction=Join-Path $user '.claude';New-Item -ItemType Junction -Path $claudeJunction -Target $claudeTarget|Out-Null
+    [IO.File]::WriteAllText((Join-Path $data 'agliteterm-agent-status.ps1'),'# deliberately stale private helper')
+    $before=Get-TreeHash $iso;$r=Install hooks;$after=Get-TreeHash $iso
+    Check 'junctioned Claude settings refuse before any write' (-not $r.ok -and $installExit-ne 0 -and $r.error.Contains($claudeJunction) -and $r.error.EndsWith('completed writes: ') -and $before-ceq$after)
+    [IO.Directory]::Delete($claudeJunction)
+
+    # Already-current Claude settings behind a junction are left alone, not refused.
+    $iso=Use-IsolatedRoot 'reparse-claude-current'
+    [IO.Directory]::CreateDirectory((Join-Path $user '.claude'))|Out-Null
+    $r=Install hooks
+    $claudeTarget=Join-Path $iso 'claude-target'
+    [IO.Directory]::Move((Join-Path $user '.claude'),$claudeTarget)
+    $claudeJunction=Join-Path $user '.claude';New-Item -ItemType Junction -Path $claudeJunction -Target $claudeTarget|Out-Null
+    $before=Get-TreeHash $iso;$r=Install hooks;$after=Get-TreeHash $iso
+    Check 'already-current Claude settings behind a junction install nothing and succeed' ($r.ok -and $installExit-eq 0 -and $r.result-match'Changed: \r?\n' -and $before-ceq$after)
+    [IO.Directory]::Delete($claudeJunction)
+
+    # A profile under a junction (OneDrive Known Folder Move) is skipped; everything else installs.
+    $iso=Use-IsolatedRoot 'reparse-profile'
+    [IO.Directory]::CreateDirectory((Join-Path $user '.claude'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $user '.codex'))|Out-Null
+    $profileTarget=Join-Path $iso 'onedrive-documents';[IO.Directory]::CreateDirectory($profileTarget)|Out-Null
+    [IO.File]::WriteAllText((Join-Path $profileTarget 'profile.ps1'),"# user profile`r`n")
+    $profileJunction=Join-Path $iso 'documents-junction';New-Item -ItemType Junction -Path $profileJunction -Target $profileTarget|Out-Null
+    $profile=Join-Path $profileJunction 'profile.ps1'
+    $before=Get-TreeHash $profileTarget;$r=Install hooks;$after=Get-TreeHash $profileTarget
+    Check 'junctioned profile is skipped while helpers, Claude and Codex hooks install' ($r.ok -and $installExit-eq 0 -and $r.result-match'PowerShell profile block skipped' -and $r.result.Contains($profileJunction) -and $r.result-match'agliteterm-claude\.ps1' -and $before-ceq$after -and [IO.File]::Exists((Join-Path $data 'agliteterm-agent-status.ps1')) -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and (Get-Content -Raw (Join-Path $user '.codex/hooks.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1)
+    [IO.Directory]::Delete($profileJunction)
+
+    # hooks.json itself a file symlink under a plain ~/.codex skips Codex.
+    $iso=Use-IsolatedRoot 'reparse-codex-file'
+    [IO.Directory]::CreateDirectory((Join-Path $user '.claude'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $user '.codex'))|Out-Null
+    $codexTarget=Join-Path $iso 'codex-target.json';[IO.File]::WriteAllText($codexTarget,'{"hooks":{}}')
+    $codexLink=Join-Path $user '.codex/hooks.json'
+    $linked=$true
+    try{New-Item -ItemType SymbolicLink -Path $codexLink -Target $codexTarget -ErrorAction Stop|Out-Null}
+    catch{$linked=$false;"SKIP symlinked Codex hooks.json: cannot create a file symlink here (needs Developer Mode or admin): $($_.Exception.Message)"}
+    if($linked){
+        $before=Get-TreeHash $codexTarget;$r=Install hooks;$after=Get-TreeHash $codexTarget
+        Check 'symlinked Codex hooks.json skips Codex while Claude and profile install' ($r.ok -and $r.result-match'Codex hooks skipped' -and $r.result.Contains($codexLink) -and $before-ceq$after -and (Get-Content -Raw (Join-Path $user '.claude/settings.json')|ConvertFrom-Json).hooks.Stop.Count-eq 1 -and [IO.File]::ReadAllText($profile).Contains('# >>> agliteterm hooks >>>'))
+        [IO.File]::Delete($codexLink)
+    }
+}finally{$data=$savedData;$user=$savedUser;$profile=$savedProfile}
 "installers-unit: $checks checks, $failures failed; isolated files retained at $root; no shared profile/registry changes"
 if($failures){throw 'installer unit checks failed'}
 exit 0 # Negative helper cases intentionally returned nonzero; do not leak their exit into run-all.

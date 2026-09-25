@@ -10201,7 +10201,8 @@ also appear in the palette. AGW context tokens expand text and become environmen
 processes; send submits one line, requires writable input, and cannot confirm shell success.
 
 `install hooks|shell` is explicit opt-in, preserves unrelated configuration and keeps backups.
-Codex hooks are merged into ~/.codex/hooks.json when ~/.codex exists; trust them once in Codex /hooks.
+Codex hooks are merged into ~/.codex/hooks.json when ~/.codex exists and is not a junction/symlink; trust them once in Codex /hooks.
+A profile behind a reparse point (e.g. OneDrive) is skipped with a reason.
 Codex TOML is not edited. `install.cli` adds/removes
 the bundled CLI directory; some shared CLI builds handle this locally, so use the lite pipe verb
 or bundled agliteterm-install.ps1 -Operation cli for an unambiguous lite installation.
