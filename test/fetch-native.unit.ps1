@@ -37,11 +37,21 @@ New-Item -ItemType Directory $tmp|Out-Null
 $outer=[Environment]::GetEnvironmentVariable('AGWINTERM_PIPE')
 [Environment]::SetEnvironmentVariable('AGWINTERM_PIPE','outer-pipe')
 function Case([string]$Name,[string]$File){$d=Join-Path $tmp $Name;New-Item -ItemType Directory $d,(Join-Path $d 'bin')|Out-Null;@{Cached=Join-Path $d $File;Staged=Join-Path $d "bin/$File";Seen=Join-Path $d 'seen.txt'}}
-function FakeCli($c,[string]$Version){[IO.File]::WriteAllText($c.Cached,"@echo [%AGWINTERM_PIPE%]>`"$($c.Seen)`"`r`n@echo cli $Version %~f0`r`n")}
+function FakeCli($c,[string]$Version){[IO.File]::WriteAllText($c.Cached,"@echo [%AGWINTERM_PIPE%]>`"$($c.Seen)`"`r`n@echo cli $Version %~f0`r`n@echo app unavailable 1>&2`r`n@exit /b 1`r`n")}
 try{
     $c=Case 'ok' 'agwintermctl.cmd';FakeCli $c '0.20.11'
     $m=Refusal {Install-CheckedCli -Cached $c.Cached -Staged $c.Staged -CliTag 'v0.20.11'}
-    Check 'a CLI reporting the pinned version is admitted and stays staged' ($null -eq $m -and (Test-Path $c.Staged))
+    $probeExit=$LASTEXITCODE
+    Check 'a CLI reporting the pinned version is admitted and stays staged, despite stderr and exit 1' ($null -eq $m -and (Test-Path $c.Staged))
+    Check 'the probe''s exit code does not leak into the caller''s LASTEXITCODE' ($probeExit -eq 0)
+    # The Continue guard exists for Windows PowerShell 5.1, which makes native stderr under 2>&1 a
+    # terminating error when the caller runs with Stop, so the same admission is driven under 5.1 too.
+    $c=Case 'ps51' 'agwintermctl.cmd';FakeCli $c '0.20.11'
+    $driver=Join-Path $tmp 'ps51.ps1'
+    [IO.File]::WriteAllText($driver,"`$ErrorActionPreference='Stop'`r`n. '$(Join-Path $root 'tools/cli-pin.ps1')'`r`ntry{Install-CheckedCli -Cached '$($c.Cached)' -Staged '$($c.Staged)' -CliTag 'v0.20.11';'admitted'}catch{'refused: '+`$_.Exception.Message}`r`n")
+    $ps51=(& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $driver 2>&1|Out-String).Trim()
+    Check 'Windows PowerShell 5.1 with Stop admits a CLI that writes stderr' ($ps51-ceq'admitted')
+    if($ps51-cne'admitted'){"  5.1 said: $ps51"}
     Check 'the probe ran without the caller''s AGWINTERM_PIPE' ((Get-Content -Raw $c.Seen).Trim()-ceq'[]') # a batch file expands an unset variable to nothing
     Check 'AGWINTERM_PIPE is restored after the probe' ($env:AGWINTERM_PIPE-ceq'outer-pipe')
 
