@@ -16,8 +16,11 @@ inline bool complete(Pending*& pending, DWORD& written) {
 }
 // An unresolved cancellation transfers ownership to the caller. It must retain its input lease
 // and this allocation until complete() observes actual success/cancellation/failure.
-inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, Pending*& deferred) {
+// timedOut (optional) tells a cancelled-at-deadline write apart from one that failed.
+inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, Pending*& deferred,
+                   bool* timedOut = nullptr) {
     deferred=nullptr;
+    if (timedOut) *timedOut=false;
     auto* pending = new Pending;
     if (!DuplicateHandle(GetCurrentProcess(),pipe,GetCurrentProcess(),&pending->pipe,0,FALSE,DUPLICATE_SAME_ACCESS)) { delete pending; return 0; }
     pending->bytes.assign(static_cast<const char*>(bytes),static_cast<const char*>(bytes)+length);
@@ -29,6 +32,7 @@ inline DWORD write(HANDLE pipe, const void* bytes, DWORD length, DWORD timeout, 
     if (WaitForSingleObject(pending->ov.hEvent,timeout) == WAIT_OBJECT_0) {
         complete(pending,written); return written;
     }
+    if (timedOut) *timedOut=true;
     CancelIoEx(pending->pipe,&pending->ov);
     // Cancellation is asynchronous. Never free the OVERLAPPED/buffer until completion, and
     // never turn its cleanup into another unbounded wait on the control/lease worker.
