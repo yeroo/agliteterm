@@ -2770,8 +2770,9 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str(), exactArgs,
-                               !quick && !hidden && profileShellSpec(exactArgs, app, pargs));
+    // Decided here and handed over on ONE line: reopen.unit lifts the attach call below as a line.
+    const bool profileShell = !quick && !hidden && profileShellSpec(exactArgs, app, pargs);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str(), exactArgs, profileShell);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the

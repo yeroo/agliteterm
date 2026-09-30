@@ -41,7 +41,7 @@ std::atomic<int> g_activeWs{2};
 int g_focus=0,held=0,creates=0,lockErrors=0,selectedIndex=0;
 void* g_hwnd=nullptr;constexpr bool FALSE=false;
 Session made,intruder;Session* selected=nullptr;std::vector<Session*> g_sessions;
-std::function<void()> duringHost;std::string appSeen,cwdSeen;std::vector<std::string> argsSeen;bool explicitSeen=false,pargsNullSeen=false,exactSeen=false;
+std::function<void()> duringHost;std::string appSeen,cwdSeen;std::vector<std::string> argsSeen;bool explicitSeen=false,pargsNullSeen=false,exactSeen=false,profileSeen=false;
 struct LockG {LockG(){++held;}~LockG(){--held;}};
 void newSessionGrid(int,int*c,int*r){*c=80;*r=24;}
 void selectPrimary(int index,bool,Session* expected=nullptr){selectedIndex=index;selected=expected;}
@@ -53,11 +53,11 @@ int callerWs=-1;
 int callerWorkspace(const std::string&caller){return caller=="caller-pane"?callerWs:-1;}
 '@
 $attachFake=@'
-static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0,const char* creationTicket="",bool exactArgs=false){
+static Session* attachSession(const char*,int,int,const char*,const std::vector<std::string>*,const char*,bool,bool,uint64_t workspace=0,const char* creationTicket="",bool exactArgs=false,bool profileShell=false){
 '@ + "`n"+$attachCapture.Value+@'
 
     if(held)++lockErrors;
-    exactSeen=exactArgs;
+    exactSeen=exactArgs;profileSeen=profileShell;
     if(duringHost)duringHost();
     Session* s=&made;
     { LockG hold;
@@ -73,6 +73,7 @@ static Session* newSession(int cols,int rows,const char* app=nullptr,const std::
 
     ++creates;appSeen=app?app:"";cwdSeen=cwd?cwd:"";argsSeen=pargs?*pargs:std::vector<std::string>{};explicitSeen=explicitCommand;pargsNullSeen=(pargs==nullptr);
     const char* idbuf="private-created";std::string creationTicket="private-test-ticket";const bool exactArgs=pargs&&(explicitCommand||!pargs->empty()); // production newSession's decision, for the actual attach call
+    const bool profileShell=!quick&&!hidden&&!exactArgs; // stands in for profileShellSpec's catalog lookup (lite #116)
 '@ + "`n"+$attachCall.Value+@'
 
     g_sessions.push_back(&intruder); // another creator wins the vector's last slot before selection
