@@ -9996,7 +9996,8 @@ exist on the session's axis (`top` on a vertical split), naming the axis.
 Every structural change - split, unsplit, close of either side, swap, re-orient - emits a `tree`
 event. A promotion is NOT a session close: `tree` fires, `session` / `closed` does not, and undo
 does not resurrect anything. A split side whose shell exits collapses to the survivor on its own;
-a one-pane session's exit stays on screen as "(exited)" as before. The two focus keys, Focus Left /
+a one-pane session's exit stays on screen - a profile shell held (see the shell-exit paragraph),
+anything else reading "(exit N)" or "(exited)". The two focus keys, Focus Left /
 Top Pane and Focus Right / Bottom Pane, are slot 0 and slot 1, whichever shell a swap put there.
 
 ```
@@ -12888,13 +12889,18 @@ static bool restoreSessions() {
         g_activeWs = (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) ? sp.ws : 0;
         std::string want = si < savedIds.size() ? savedIds[si] : std::string();
         Session* s = nullptr;
+        // The exactness newSession computes for this spec (the fallback below): the E line is saved
+        // only for an EMPTY exact argv, so sp.exactArgs alone reads false for every spec that has
+        // arguments, and an adopted command would be held as a profile shell (revmux r2).
+        const bool exact = sp.exactArgs || !sp.args.empty();
+        const char* const specApp = sp.app.empty() ? "powershell.exe" : sp.app.c_str();
         if (isAdoptable(want)) {
             std::string expectedTicket;
             for (const auto& hs : g_hostLive) if (hs.id == want) { expectedTicket = hs.creationTicket; break; }
-            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
+            s = attachSession(want.c_str(), cols, rows, specApp,
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
-                              true, false, 0, expectedTicket.c_str(), sp.exactArgs,
-                              profileShellSpec(sp.exactArgs, sp.app.empty() ? nullptr : sp.app.c_str(), &sp.args));   // repaint, guarded against id reuse since the scan; the argv's exactness rides along (#79)
+                              true, false, 0, expectedTicket.c_str(), exact,
+                              profileShellSpec(exact, specApp, exact ? &sp.args : nullptr));   // repaint, guarded against id reuse since the scan; the argv's exactness rides along (#79)
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
             // The shell itself is untouched by a failed adopt (attach may well have succeeded and
             // only the data pipe refused), so it keeps running under an id nothing points at any
@@ -12904,8 +12910,8 @@ static bool restoreSessions() {
                          "host may still be running the old shell under that id", want.c_str());
         }
         if (!s)
-            s = newSession(cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
-                           (sp.exactArgs || !sp.args.empty()) ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, 0, sp.exactArgs);
+            s = newSession(cols, rows, specApp,
+                           exact ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, 0, sp.exactArgs);
         if (s) {
             s->name = widen(sp.name); s->flagged = sp.flagged;
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;

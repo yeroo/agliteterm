@@ -458,6 +458,55 @@ if (-not $Only -or $Only -eq 'killed-repaint') {
     }
 }
 
+# An adopted COMMAND stays a command (lite #116, revmux r2). The state file's E line is written only
+# for an empty exact argv, so a saved `session new --command` spec reads back "not exact" - and the
+# adoption path, which took that at face value, called it a profile shell: held with the two exit
+# lines and notified, where first creation and a fresh restore leave its buffer alone. Kill, adopt,
+# let the command exit, and demand its code without the hold lines.
+if (-not $Only -or $Only -eq 'killed-command') {
+    $inst = 'rm-killed-command'
+    Reset-Cell $inst
+    $err = ''; $seenBefore = $false; $adopted = $false; $exitedAfter = $false; $textAfter = ''; $nodeAfter = $null
+    $p = $null; $p2 = $null
+    try {
+        $p = Start-Lite $inst
+        & $ctl session new --name adopt-command --command 'echo ADOPT-COMMAND-UP' --pipe $inst 2>&1 | Out-Null
+        $id = @(SessionsOf $inst | Where-Object { $_.name -eq 'adopt-command' })[0].id
+        if (-not $id) { throw 'the command session was not created' }
+        $before = Wait-ScreenMarker $inst $id 'ADOPT-COMMAND-UP'
+        $seenBefore = $before.Seen
+        if (-not $seenBefore) { throw "Pre-kill readiness failed; no adoption trial performed. Last read: $($before.Text)" }
+        Stop-Lite $p -Kill; $p = $null
+
+        $p2 = Start-Lite $inst
+        $adopted = Log-Has $inst "adopted live session '$([regex]::Escape($id))'"
+        & $ctl session type "exit 7`n" --target $id --pipe $inst 2>&1 | Out-Null
+        for ($i = 0; $i -lt 75; $i++) {
+            $nodeAfter = @(SessionsOf $inst | Where-Object { $_.name -eq 'adopt-command' })[0]
+            if ($nodeAfter -and $nodeAfter.exited) { $exitedAfter = $true; break }
+            Start-Sleep -Milliseconds 200
+        }
+        $textAfter = (& $ctl session text --target $id --pipe $inst 2>&1) -join "`n"
+        Stop-Lite $p2; $p2 = $null
+    } catch { $err = $_.Exception.Message }
+    finally { Stop-Leftover $p; Stop-Leftover $p2 }
+    $silent = $textAfter -notmatch 'Press Enter to close the session'
+    if (-not $err -and $seenBefore -and $adopted -and $exitedAfter -and $nodeAfter.exitCode -eq 7 -and $nodeAfter.unread -eq 0 -and $silent) {
+        "  PASS  {0,-22} (an adopted command exits with its code, not held and not notified)" -f 'killed-command'
+    } else {
+        $script:failed += 'killed-command'
+        "  FAIL  killed-command"
+        if ($err) { "        error:  $err" }
+        "        marker on screen before the kill: $seenBefore"
+        "        session was adopted:              $adopted"
+        "        exited after `exit 7`:            $exitedAfter"
+        "        node:   $($nodeAfter | ConvertTo-Json -Compress -Depth 4)"
+        "        buffer left without hold lines:   $silent"
+        "        after: [$(($textAfter -replace '\s+', ' ').Trim())]"
+        "        log:   $(Restore-Verdict $inst)"
+    }
+}
+
 # A session whose shell has already exited: its spec must still be saved and relaunched, otherwise
 # a day's worth of sessions quietly evaporates the moment their shells end.
 Cell -Name 'shell-exited' -Setup {
