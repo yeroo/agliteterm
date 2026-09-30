@@ -66,12 +66,15 @@ if (-not (Test-Path $conptyPackage)) {
         throw "could not download $($conpty.Package) $($conpty.Version) from ${conptyUrl}: $($_.Exception.Message)"
     }
 }
-try { Install-ConptyPackage -Package $conptyPackage -Conpty $conpty -Bin $bin }
+try { Assert-ConptyPackage $conptyPackage $conpty }
 catch {
-    # A package that fails its check is not worth keeping: the next run downloads it again.
+    # A cached file with another hash is a bad download: drop it, so the next run fetches it again.
     Remove-Item $conptyPackage -Force -ErrorAction SilentlyContinue
     throw
 }
+# Checks the hash again itself (nothing is staged without it). A destination it cannot replace - a
+# pty-host running from bin - is reported as that, and the verified package stays cached.
+Install-ConptyPackage -Package $conptyPackage -Conpty $conpty -Bin $bin
 
 # --- a local core beats a downloaded one --------------------------------------------------------
 if ($NativeDir) {

@@ -750,10 +750,11 @@ static uint32_t themeFg() { return g_customColors ? g_defFg : g_th.termFg; }
 static uint32_t themeBg() { return g_customColors ? g_defBg : g_th.termBg; }
 // Tell an emulator the colours above, which is what it answers OSC 10 / OSC 11 with ("what are
 // your foreground and background?" - Codex shades the user's messages from the reply). An emulator
-// never told answers no colour rather than a made-up one. The caller holds g_lock, or owns an
-// emulator no other thread can reach yet. applyEmulatorColors re-tells every live one when
-// Properties or `config set` changes the pair; the four themes share one terminal pair, so a theme
-// switch alone changes nothing here.
+// never told answers no colour rather than a made-up one. The caller holds g_lock.
+// applyEmulatorColors re-tells every listed one when Properties or `config set` changes the pair,
+// so a new session is told inside the g_lock hold that lists it: told earlier, a change landing
+// between the two would miss it (not listed yet) and leave it answering the old pair. The four
+// themes share one terminal pair, so a theme switch alone changes nothing here.
 static void emuThemeColors(void* emu) { if (emu) emu_set_default_colors(emu, themeFg(), themeBg()); }
 static void applyEmulatorColors();   // fwd: needs the session list
 
@@ -1754,14 +1755,15 @@ static void connectControl() {
                 fatal(L"could not start agwinterm-ptyhost.exe");
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            // The host falls back to the inbox conhost when either file is missing and says so only
-            // on a stderr nobody reads, so the log names the ConPTY this launch can get.
+            // The host falls back to the inbox conhost when either file is missing, or when the dll
+            // does not load, and says so only on a stderr nobody reads. lite cannot see which it
+            // chose: the log records the argument and whether the two files are there, no more.
             const bool haveBundled = GetFileAttributesW((exeDir() + L"\\conpty.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
                 (GetFileAttributesW((exeDir() + L"\\x64\\OpenConsole.exe").c_str()) != INVALID_FILE_ATTRIBUTES ||
                  GetFileAttributesW((exeDir() + L"\\OpenConsole.exe").c_str()) != INVALID_FILE_ATTRIBUTES);
-            if (g_conptyInbox) logInfo("pty-host: started with the inbox conhost (conpty = inbox)");
-            else if (haveBundled) logInfo("pty-host: started with the bundled ConPTY (conpty.dll + OpenConsole.exe)");
-            else logWarn("pty-host: conpty.dll or OpenConsole.exe is missing beside the exe - shells run on the inbox conhost, which answers no terminal query");
+            if (g_conptyInbox) logInfo("pty-host: started with --conpty inbox (conpty = inbox)");
+            else if (haveBundled) logInfo("pty-host: started with --conpty bundled (conpty.dll and OpenConsole.exe are beside the exe)");
+            else logWarn("pty-host: started with --conpty bundled, but conpty.dll or OpenConsole.exe is missing beside the exe - shells run on the inbox conhost, which drops the color queries (OSC 10/11)");
             g_control = openPipe(control, 5000, true);
         }
         HostHealth health = g_control != INVALID_HANDLE_VALUE ? controlHandshake() : HostHealth::Dead;
@@ -2646,7 +2648,6 @@ static Session* failedCommandSession(int cols, int rows, const char* app,
         if (s->emu) emu_free(s->emu);
         delete s; return nullptr;
     }
-    emuThemeColors(s->emu);
     std::string message = "\r\n  [agliteterm] could not start the session:\r\n  " +
         std::string(reason && *reason ? reason : "command creation failed") + "\r\n  app: " + s->app + "\r\n";
     if (!s->cwd.empty()) message += "  cwd: " + s->cwd + "\r\n";
@@ -2656,6 +2657,7 @@ static Session* failedCommandSession(int cols, int rows, const char* app,
         s->id = g_idPrefix + "-failed-" + std::to_string(g_seq++);
         s->paneId = s->id;
         s->ws = g_workspaces.destination(workspace);
+        emuThemeColors(s->emu);
         emu_feed(s->emu, (const uint8_t*)message.data(), (uint32_t)message.size());
         g_sessions.push_back(s); g_userEmptied = false;
         emitEvent("session", s->id, "created"); emitEvent("tree");
@@ -2770,6 +2772,9 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         strcpy_s(req.cmd.create.env[i].key, k);
         strcpy_s(req.cmd.create.env[i].value, v);
     };
+    // The header is generated in agwinterm from proto/ptyhost.options (Create.env max_count). A
+    // regeneration from a smaller limit would make the setEnv calls below write past the array.
+    static_assert(sizeof req.cmd.create.env / sizeof req.cmd.create.env[0] >= 9, "Create.env holds fewer entries than newSession sets - raise max_count in agwinterm's proto/ptyhost.options and regenerate");
     req.cmd.create.env_count = 9;
     setEnv(0, "AGWINTERM", "1");
     setEnv(1, "AGWINTERM_ENABLED", "1");
@@ -2894,7 +2899,6 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
         if (s->emu) emu_free(s->emu);
         delete s; return nullptr;
     }
-    emuThemeColors(s->emu);   // before the reader thread exists: the first bytes may already ask
     // A CREATED session's host and emulator are both at this grid, so the latch says so: the first
     // syncPaneSizes at the same geometry is then the no-op it should be (it used to forward a
     // 0 -> N "change" the host reflowed on), and a session created while the window is minimised
@@ -2916,6 +2920,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // seeding the scrollback is a separate improvement.
     EnterCriticalSection(&g_lock);
     s->ws = g_workspaces.destination(workspace);
+    emuThemeColors(s->emu);   // before the reader thread exists: the first bytes may already ask
     // Nothing joins the reader — it ends with the data pipe — so its handle is closed at once rather
     // than kept as one more zombie thread object per session.
     if (HANDLE reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr)) CloseHandle(reader);
@@ -12834,7 +12839,6 @@ static Session* failedSpecSession(const RestoreSpec& sp, int cols, int rows) {
     s->cols = cols; s->rows = rows;
     s->emu = emu_new(cols, rows);
     if (s->emu) emu_set_scrollback(s->emu, g_scrollbackLines.load());
-    emuThemeColors(s->emu);
     // Say it in the pane as well as the tree: the terminal is where the user looks first, and "why
     // is this session dead?" has to be answerable without opening the log.
     std::string msg = "\r\n  [agliteterm] this session could not be restored on this machine.\r\n"
@@ -12842,6 +12846,7 @@ static Session* failedSpecSession(const RestoreSpec& sp, int cols, int rows) {
     if (!sp.cwd.empty()) msg += "  cwd: " + sp.cwd + "\r\n";
     msg += "  The entry is kept so its name and settings are not lost.\r\n";
     EnterCriticalSection(&g_lock);
+    emuThemeColors(s->emu);
     if (s->emu) emu_feed(s->emu, (const uint8_t*)msg.data(), (uint32_t)msg.size());
     g_sessions.push_back(s);
     g_userEmptied = false;   // see attachSession: the deliberate-empty flag is per-empty, not per-process

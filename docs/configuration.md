@@ -57,8 +57,9 @@ drops the color queries.
 
 The pty-host reads the key once, when it starts, and it outlives the window: every window that
 connects to a running host gets the ConPTY that host started with. The new value applies after the
-last window and shell of that host are gone. If either file is missing the host falls back to the
-inbox conhost; `agliteterm.log` names the ConPTY each host was started with.
+last window and shell of that host are gone. If either file is missing, or the dll does not load,
+the host falls back to the inbox conhost without telling agliteterm; `agliteterm.log` records the
+argument each host was started with and whether the two files were there.
 
 Panes start with `COLORTERM=truecolor`, and with `AGWINTERM_THEME_COLORS=rrggbb;rrggbb`
 (foreground;background), which the pty-host answers color queries with while no window is attached.

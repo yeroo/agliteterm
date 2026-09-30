@@ -110,6 +110,22 @@ try{
     Check 'a package without the x64 OpenConsole.exe stages neither file' ($m -and $m.Contains('build/native/runtimes/x64/OpenConsole.exe') -and -not (Test-Path (Join-Path $bin 'conpty.dll')))
     $m=Refusal {Install-ConptyPackage -Package (Join-Path $tmp 'absent.nupkg') -Conpty (PinFor $good) -Bin $bin}
     Check 'a missing package is refused' ($m -and $m.Contains('was not staged'))
+    $m=Refusal {Assert-ConptyPackage $good $wrong}
+    Check 'Assert-ConptyPackage alone refuses another hash (what fetch-native drops a cached download on)' ($m -and $m.Contains('0'*64))
+    # A pty-host running from bin keeps conpty.dll open. Same bytes: nothing to replace, the build goes on.
+    $bin=Join-Path $tmp 'bin-held';New-Item -ItemType Directory $bin|Out-Null
+    Install-ConptyPackage -Package $good -Conpty (PinFor $good) -Bin $bin
+    $held=[IO.File]::Open((Join-Path $bin 'conpty.dll'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try{
+        $m=Refusal {Install-ConptyPackage -Package $good -Conpty (PinFor $good) -Bin $bin}
+        Check 'a held conpty.dll with the same bytes is left alone and staging succeeds' ($null-eq $m)
+        # Other bytes (the pin moved): it cannot be replaced, and the message names the cause, not the pin.
+        $next=FakePackage 'next' @{'runtimes/win-x64/native/conpty.dll'='DLL2';'build/native/runtimes/x64/OpenConsole.exe'='EXE2'}
+        $m=Refusal {Install-ConptyPackage -Package $next -Conpty (PinFor $next) -Bin $bin}
+        Check 'a held conpty.dll that must change is reported as in use, not as a bad pin' ($m -and $m.Contains('could not be replaced') -and $m.Contains('agwinterm-ptyhost.exe') -and -not $m.Contains('-Force'))
+        Check 'and the pair already in bin is still there' ((Test-Path (Join-Path $bin 'conpty.dll')) -and (Get-Content -Raw (Join-Path $bin 'x64/OpenConsole.exe'))-ceq'EXE')
+        Check 'and no staging file is left behind' (@(Get-ChildItem $bin -Recurse -Filter '*.staging').Count-eq 0)
+    }finally{$held.Dispose()}
 }finally{Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue}
 $fetch=Get-Content -Raw (Join-Path $root 'tools/fetch-native.ps1')
 Check 'fetch-native stages the ConPTY before it branches on -NativeDir' ($fetch.IndexOf('Install-ConptyPackage')-gt 0 -and $fetch.IndexOf('Install-ConptyPackage')-lt $fetch.IndexOf('if ($NativeDir) {'))

@@ -6,7 +6,7 @@
 # the OpenConsole.exe beside it or in x64\. Unlike the conhost built into Windows it hands a
 # program's questions to the terminal (colours, device attributes, cursor position) instead of
 # swallowing them, and passes output through unchanged. With either file missing the host falls back
-# to the inbox conhost, silently, so both are staged as a pair or not at all.
+# to the inbox conhost, silently, so both are staged as a pair.
 #
 # They are not agwinterm release assets: agwinterm takes them from NuGet at build time, and so does
 # this. native\pinned.json names the package version and the SHA-256 of its .nupkg; nothing is
@@ -33,38 +33,71 @@ function Get-ConptyPackageUrl($Conpty) {
     "https://api.nuget.org/v3-flatcontainer/$id/$($Conpty.Version)/$id.$($Conpty.Version).nupkg"
 }
 
+# The .nupkg on disk is the pinned one. A caller that caches the package deletes it when this
+# throws: a file with another hash is a bad download, and the next run fetches it again.
+function Assert-ConptyPackage([string]$Package, $Conpty) {
+    if (-not (Test-Path -LiteralPath $Package)) { throw "$($Conpty.Package) $($Conpty.Version) was not staged: the package is not at $Package`n$script:ConptyFix" }
+    $actual = (Get-FileHash -LiteralPath $Package -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -cne $Conpty.Sha256) {
+        throw "$($Conpty.Package) $($Conpty.Version) was not staged: its SHA-256 is $actual, native\pinned.json pins $($Conpty.Sha256)`n$script:ConptyFix"
+    }
+}
+
 # Stage the pair from a .nupkg on disk: bin\conpty.dll and bin\x64\OpenConsole.exe, the layout
-# agwinterm ships. A package with another hash, or without either file, stages nothing and removes
-# what an earlier run staged, so a bin never holds half a ConPTY or one nobody checked.
+# agwinterm ships. Three outcomes:
+#   - the package is not the pinned one, or lacks either file: nothing is staged and what an
+#     earlier run staged is removed, so a bin never holds a ConPTY nobody checked;
+#   - a destination cannot be replaced (a pty-host started from this bin keeps conpty.dll loaded
+#     for its whole life, and the host outlives the window): the pair already in bin is left as it
+#     is and the message says to close that host - the package and the pin are fine;
+#   - otherwise both files are in place. A destination that already holds the same bytes is not
+#     rewritten, so a rebuild beside a running host succeeds when the pin has not moved.
+# Both entries are extracted beside their destinations first and moved in only once both exist.
 function Install-ConptyPackage([string]$Package, $Conpty, [string]$Bin) {
     $dll = Join-Path $Bin 'conpty.dll'
     $console = Join-Path $Bin 'x64\OpenConsole.exe'
     $wanted = [ordered]@{ 'runtimes/win-x64/native/conpty.dll' = $dll; 'build/native/runtimes/x64/OpenConsole.exe' = $console }
+    $fresh = @{}
     try {
-        if (-not (Test-Path -LiteralPath $Package)) { throw "the package is not at $Package" }
-        $actual = (Get-FileHash -LiteralPath $Package -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -cne $Conpty.Sha256) {
-            throw "its SHA-256 is $actual, native\pinned.json pins $($Conpty.Sha256)"
-        }
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $zip = [IO.Compression.ZipFile]::OpenRead($Package)
         try {
-            $found = @{}
-            foreach ($name in $wanted.Keys) {
-                $entry = $zip.Entries | Where-Object { $_.FullName -ceq $name } | Select-Object -First 1
-                if (-not $entry -or $entry.Length -le 0) { throw "it has no $name" }
-                $found[$name] = $entry
+            Assert-ConptyPackage $Package $Conpty
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [IO.Compression.ZipFile]::OpenRead($Package)
+            try {
+                $found = @{}
+                foreach ($name in $wanted.Keys) {
+                    $entry = $zip.Entries | Where-Object { $_.FullName -ceq $name } | Select-Object -First 1
+                    if (-not $entry -or $entry.Length -le 0) {
+                        throw "$($Conpty.Package) $($Conpty.Version) was not staged: it has no $name`n$script:ConptyFix"
+                    }
+                    $found[$name] = $entry
+                }
+                foreach ($name in $wanted.Keys) {
+                    $dest = $wanted[$name]
+                    New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
+                    $fresh[$name] = "$dest.staging"
+                    [IO.Compression.ZipFileExtensions]::ExtractToFile($found[$name], $fresh[$name], $true)
+                }
             }
-            foreach ($name in $wanted.Keys) {
-                $dest = $wanted[$name]
-                New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
-                [IO.Compression.ZipFileExtensions]::ExtractToFile($found[$name], $dest, $true)
+            finally { $zip.Dispose() }
+        }
+        catch {
+            Remove-Item -LiteralPath $dll, $console -Force -ErrorAction SilentlyContinue
+            throw
+        }
+        foreach ($name in $wanted.Keys) {
+            $dest = $wanted[$name]
+            if ((Test-Path -LiteralPath $dest) -and
+                (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $fresh[$name] -Algorithm SHA256).Hash) { continue }
+            try { Move-Item -LiteralPath $fresh[$name] -Destination $dest -Force }
+            catch {
+                throw ("$dest could not be replaced: $($_.Exception.Message)`n" +
+                       "  a pty-host started from this bin keeps conpty.dll loaded while it runs - close every agliteterm using this bin (and its agwinterm-ptyhost.exe), then build again.`n" +
+                       "  The package and native\pinned.json are fine; the ConPTY already in bin was left as it is.")
             }
         }
-        finally { $zip.Dispose() }
     }
-    catch {
-        Remove-Item -LiteralPath $dll, $console -Force -ErrorAction SilentlyContinue
-        throw "$($Conpty.Package) $($Conpty.Version) was not staged: $($_.Exception.Message)`n$script:ConptyFix"
+    finally {
+        foreach ($temp in $fresh.Values) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
 }

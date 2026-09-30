@@ -115,17 +115,27 @@ try{
 }catch{$failures++;"Terminal queries FAILED: $_"}
 finally{
     # The run's registry namespace is shared by the suites after this one: put the colours back.
-    if($colorsTouched -and $proc -and -not $proc.HasExited){
-        foreach($pair in @(@('custom-colors','false'),@('foreground','#C0C0C0'),@('background','#000000'))){
-            try{$null=QueryRpc 'config.set' @{key=$pair[0];value=$pair[1]} ''}catch{$failures++;"colour restore failed for $($pair[0]): $_"}
-        }
-    }
+    # Through the window while it lives (its emulators follow); a window that died, or a refused
+    # set, leaves the three values in the namespace, and they are then written there directly - a
+    # crash here must not hand every later suite a window with custom colours.
     if($colorsTouched){
-        $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath -RequireIsolation))
+        $restored=$proc -and -not $proc.HasExited
+        if($restored){
+            foreach($pair in @(@('custom-colors','false'),@('foreground','#C0C0C0'),@('background','#000000'))){
+                try{$null=QueryRpc 'config.set' @{key=$pair[0];value=$pair[1]} ''}catch{$restored=$false;$failures++;"colour restore failed for $($pair[0]): $_"}
+            }
+        }
+        $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath -RequireIsolation))
         try{
-            $custom=if($key){$key.GetValue('CustomColors')}else{$null}
+            if(-not $restored){
+                $failures++;'the window was gone or refused the colour restore: the run''s registry values are reset directly'
+                $key.SetValue('CustomColors',0,[Microsoft.Win32.RegistryValueKind]::DWord)
+                $key.SetValue('DefFg',0xC0C0C0,[Microsoft.Win32.RegistryValueKind]::DWord)
+                $key.SetValue('DefBg',0,[Microsoft.Win32.RegistryValueKind]::DWord)
+            }
+            $custom=$key.GetValue('CustomColors')
             if($null-ne $custom -and [int]$custom-ne 0){$failures++;"the run's CustomColors is still $custom after the restore"}
-        }finally{if($key){$key.Dispose()}}
+        }finally{$key.Dispose()}
     }
     if($proc){
         if(-not $proc.HasExited){[void]$proc.CloseMainWindow()}
