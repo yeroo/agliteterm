@@ -49,7 +49,8 @@ function P12-Ready([string]$Id){if(-not(P12-Wait {(P12-Input $Id)-ne'NOT-READY'}
 $catalogPath=Join-Path $profile 'agliteterm/profiles.json'
 $sinkRoot=$script:selectionArtifact.Replace("'","''")
 $setup="Add-Type 'using System; using System.Runtime.InteropServices; public static class RawInput { [DllImport(`"kernel32.dll`")] static extern IntPtr GetStdHandle(int n); [DllImport(`"kernel32.dll`")] static extern bool GetConsoleMode(IntPtr h,out uint m); [DllImport(`"kernel32.dll`")] static extern bool SetConsoleMode(IntPtr h,uint m); public static void Enable() { uint m; var h=GetStdHandle(-10); if(!GetConsoleMode(h,out m)||!SetConsoleMode(h,(m & ~7u)|0x200u))throw new Exception(`"raw console input unavailable`"); } }'; [RawInput]::Enable(); `$f=Join-Path '$sinkRoot' ('input-'+`$env:AGWINTERM_SESSION_ID+'.txt'); [IO.File]::WriteAllText(`$f,''); [Console]::Write('P12-SINK-READY'); `$inputBytes=[Console]::OpenStandardInput(); while (`$true) { `$k=`$inputBytes.ReadByte(); if(`$k-lt0){break}; [IO.File]::AppendAllText(`$f,`$k.ToString()+',') }"
-@{default='P12';profiles=@(@{name='P12';command='powershell.exe';args=@('-NoLogo','-NoProfile','-Command',$setup);cwd=$script:selectionArtifact})}|ConvertTo-Json -Depth 8|Set-Content $catalogPath -Encoding utf8
+@{default='P12';profiles=@(@{name='P12';command='powershell.exe';args=@('-NoLogo','-NoProfile','-Command',$setup);cwd=$script:selectionArtifact},
+    @{name='P12-exit';command='cmd.exe';args=@('/d','/q');cwd=$script:selectionArtifact})}|ConvertTo-Json -Depth 8|Set-Content $catalogPath -Encoding utf8   # P12-exit: a plain shell that can be told to exit with a code
 Start-SelectionSandbox $Exe $profile;$h=$script:selectionHwnd;$g=Selection-Geometry
 $a=[string](P12-Nodes|Select-Object -First 1).id;P12-Ready $a
 $null=Selection-Rpc 'session.rename' @{name='P12-A'} $a
@@ -299,4 +300,55 @@ $null=Selection-Rpc 'session.select' @{} $a
 $null=Selection-Rpc 'notify' @{body='Survive pane promotion'} $reopened.id
 $null=Selection-Rpc 'session.split.close' @{} $reopened.id
 Check 'split promotion retains the logical session notification' ((P12-Node $reopened.id).unread-ge1)
+
+# ---- Shell exit (agwinterm #336, #337) -------------------------------------------------------
+# A one-pane profile shell that exits stays on screen with its exit code (the row label and the
+# tree's `exitCode`), its pane holds two lines, a plain Enter in that pane closes the session, and
+# an exit out of view raises a notice - attention for a non-zero code, ok for zero. A session
+# started with an explicit command gets none of it. Sessions of their own on the plain P12-exit
+# profile; the selection goes back to where it was.
+function P12-Enter { [void][LiteUi]::PostMessageW($h,0x100,[IntPtr]0x0D,[IntPtr]0x001C0001);[void][LiteUi]::PostMessageW($h,0x102,[IntPtr]13,[IntPtr]0x001C0001);[void][LiteUi]::PostMessageW($h,0x101,[IntPtr]0x0D,[IntPtr]([int64]0xC01C0001)) }
+function P12-Text([string]$Id){[string](Selection-Rpc 'session.text' @{} $Id)}
+$exitBase=[string](P12-Nodes|Where-Object active|Select-Object -First 1).id
+$exitBg=[string](Selection-Rpc 'session.new' @{name='P12-exit-bg';profile='P12-exit'});Capture-P12Children
+$exitOk=[string](Selection-Rpc 'session.new' @{name='P12-exit-ok';profile='P12-exit'});Capture-P12Children
+$exitFg=[string](Selection-Rpc 'session.new' @{name='P12-exit-fg';profile='P12-exit'});Capture-P12Children   # displayed: the two before it are out of view
+Check 'the three exit shells reach a prompt' ((P12-Wait {(P12-Text $exitBg)-match'>'}) -and (P12-Wait {(P12-Text $exitOk)-match'>'}) -and (P12-Wait {(P12-Text $exitFg)-match'>'}))
+$exitCursor=(Selection-Rpc 'events').cursor
+$null=Selection-Rpc 'session.type' @{text="exit 42`r"} $exitBg
+Check 'a background profile shell exit keeps its session and reports the code' ((P12-Wait {(P12-Node $exitBg).exited}) -and (P12-Node $exitBg).exitCode-eq42) "node=$((P12-Node $exitBg)|ConvertTo-Json -Compress -Depth 4)"
+Check 'a non-zero exit out of view raises exactly one attention notice' ((P12-Wait {(P12-Node $exitBg).unread-eq1}) -and (P12-Node $exitBg).unreadCategory-ceq'attention') "unread=$((P12-Node $exitBg).unread) category=$((P12-Node $exitBg).unreadCategory)"
+$exitNotices=@((Selection-Rpc 'events' @{since=$exitCursor}).events|Where-Object{$_.type-eq'notification' -and $_.session-ceq$exitBg})
+Check 'the notice names the session and its code' ($exitNotices.Count-eq1 -and $exitNotices[0].info-ceq'Session ended: P12-exit-bg exited with code 42.') "events=$($exitNotices|ConvertTo-Json -Compress -Depth 4)"
+Check 'the exited pane holds the two lines with the code' ((P12-Text $exitBg)-match'The session has ended \(exit 42\)\.' -and (P12-Text $exitBg)-match'Press Enter to close the session\.')
+$null=Selection-Rpc 'session.type' @{text="exit 0`r"} $exitOk
+Check 'a zero exit out of view raises an ok notice' ((P12-Wait {(P12-Node $exitOk).exited -and (P12-Node $exitOk).unread-eq1}) -and (P12-Node $exitOk).exitCode-eq0 -and (P12-Node $exitOk).unreadCategory-ceq'ok') "node=$((P12-Node $exitOk)|ConvertTo-Json -Compress -Depth 4)"
+# An explicit command keeps its buffer and its row exactly as before: a script may be reading them.
+$exitDirect=[string](Selection-Rpc 'session.new' @{name='P12-exit-direct';command='cmd.exe /d /c exit 3';'command-mode'='direct'})
+Check 'an explicit command exits with its code' ((P12-Wait {(P12-Node $exitDirect).exited}) -and (P12-Node $exitDirect).exitCode-eq3) "node=$((P12-Node $exitDirect)|ConvertTo-Json -Compress -Depth 4)"
+Start-Sleep -Milliseconds 500
+Check 'an explicit command gets no hold lines and no notice' ((P12-Text $exitDirect)-notmatch'Press Enter to close the session' -and (P12-Node $exitDirect).unread-eq0)
+P12-Enter;Start-Sleep -Milliseconds 600
+Check 'Enter does not close an exited explicit command' ($null-ne(P12-Node $exitDirect))
+$null=Selection-Rpc 'session.close' @{} $exitDirect
+# A configured command run in a new session is a command too, on first creation as after a restore.
+$exitRun=[string](Selection-Rpc 'command.run' @{command='exit 5';mode='new'})
+$exitRunId=if($exitRun-match'command session created (\S+);'){$Matches[1]}else{''}
+Check 'a command run in a new session exits with its code' ($exitRunId -and (P12-Wait {(P12-Node $exitRunId).exited}) -and (P12-Node $exitRunId).exitCode-eq5) "reply=$exitRun node=$((P12-Node $exitRunId)|ConvertTo-Json -Compress -Depth 4)"
+Start-Sleep -Milliseconds 500
+Check 'a command run in a new session gets no hold lines and no notice' ($exitRunId -and (P12-Text $exitRunId)-notmatch'Press Enter to close the session' -and (P12-Node $exitRunId).unread-eq0)
+P12-Enter;Start-Sleep -Milliseconds 600
+Check 'Enter does not close an exited command session' ($exitRunId -and $null-ne(P12-Node $exitRunId))
+if($exitRunId){$null=Selection-Rpc 'session.close' @{} $exitRunId}
+# The session on screen: held, then closed by a plain Enter - that session and no other.
+$null=Selection-Rpc 'session.select' @{} $exitFg
+$null=Selection-Rpc 'session.type' @{text="exit 7`r"} $exitFg
+Check 'the displayed profile shell exit is held with its code' ((P12-Wait {(P12-Node $exitFg).exited}) -and (P12-Node $exitFg).exitCode-eq7 -and (P12-Wait {(P12-Text $exitFg)-match'Press Enter to close the session\.'}))
+$heldCount=@(P12-Nodes).Count
+P12-Enter
+Check 'Enter closes the held session on screen' (P12-Wait {$null-eq(P12-Node $exitFg)})
+Check 'and only that one' (@(P12-Nodes).Count-eq($heldCount-1) -and $null-ne(P12-Node $exitBg) -and $null-ne(P12-Node $exitOk)) "before=$heldCount after=$(@(P12-Nodes).Count)"
+$null=Selection-Rpc 'session.close' @{} $exitBg
+$null=Selection-Rpc 'session.close' @{} $exitOk
+if($exitBase -and (P12-Node $exitBase)){$null=Selection-Rpc 'session.select' @{} $exitBase}
 Capture-P12Children

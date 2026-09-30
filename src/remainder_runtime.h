@@ -12,6 +12,30 @@ static void pruneDashboard() {
     if (g_dashIds != previous) { g_dashCells.clear(); InvalidateRect(g_hwnd,nullptr,FALSE); }
     if (g_dashIds.empty()) g_dashboard = false;
 }
+// Deliver one notice to the tree session `id`: the count and its category, the banner, the event
+// and the tray balloon. UI thread. -1 = no such tree session (nothing delivered), 0 = delivered in
+// app only, 1 = the balloon was accepted too. One implementation for the `notify` verb and for a
+// shell's exit (agwinterm #336), so the two cannot drift.
+static int raiseNotice(const std::string& id, const std::string& title, const std::string& body,
+                       lite_remainder::Category category) {
+    {
+        LockG hold;
+        const int at = indexOfSessionId(id);
+        if (at < 0 || g_sessions[at]->hidden) return -1;
+        Session* s = g_sessions[at];
+        s->noticeCategory = s->notifications > 0 ? lite_remainder::highest(s->noticeCategory, category) : category;
+        s->notifications = min(999, s->notifications + 1);
+    }
+    g_noticeId = id; g_noticeText = (title.empty() ? L"agliteterm" : widen(title)) + L": " + widen(body);
+    g_noticeUntil = GetTickCount64() + 8000;
+    emitEvent("notification", id, title + ": " + body);
+    g_nid.uFlags |= NIF_INFO;
+    wcsncpy_s(g_nid.szInfoTitle, title.empty() ? L"agliteterm" : widen(title).c_str(), _TRUNCATE);
+    wcsncpy_s(g_nid.szInfo, widen(body).c_str(), _TRUNCATE); g_nid.dwInfoFlags = NIIF_INFO;
+    const bool balloon = Shell_NotifyIconW(NIM_MODIFY, &g_nid) != FALSE; g_nid.uFlags &= ~NIF_INFO;
+    refreshTree(); InvalidateRect(g_hwnd, nullptr, FALSE);
+    return balloon ? 1 : 0;
+}
 static void selectRemainderSession(const std::string& id) {
     { LockG hold; const int at = indexOfSessionId(id);
       if (at < 0 || g_sessions[at]->hidden) return;
@@ -205,18 +229,10 @@ static std::string remainderOnUi(const JsonReq& req) {
           if (s->hidden) s = splitOwnerOf(s);
           if (!s) return ctlErr("notify: popup/cover is not a tree session");
           id = s->id;
-          s->noticeCategory = s->notifications > 0 ? lite_remainder::highest(s->noticeCategory, category) : category;
-          s->notifications = min(999, s->notifications + 1);
         }
-        g_noticeId = id; g_noticeText = (title.empty() ? L"agliteterm" : widen(title)) + L": " + widen(body);
-        g_noticeUntil = GetTickCount64() + 8000;
-        emitEvent("notification", id, title + ": " + body);
-        g_nid.uFlags |= NIF_INFO;
-        wcsncpy_s(g_nid.szInfoTitle, title.empty() ? L"agliteterm" : widen(title).c_str(), _TRUNCATE);
-        wcsncpy_s(g_nid.szInfo, widen(body).c_str(), _TRUNCATE); g_nid.dwInfoFlags = NIIF_INFO;
-        const bool balloon = Shell_NotifyIconW(NIM_MODIFY, &g_nid) != FALSE; g_nid.uFlags &= ~NIF_INFO;
-        refreshTree(); InvalidateRect(g_hwnd, nullptr, FALSE);
-        return ctlOkStr(balloon ? "notified; desktop display depends on Windows notification policy" : "notified in app; desktop notification unavailable");
+        const int delivered = raiseNotice(id, title, body, category);
+        if (delivered < 0) return ctlErr("session not found");   // closed between the resolve and the delivery
+        return ctlOkStr(delivered ? "notified; desktop display depends on Windows notification policy" : "notified in app; desktop notification unavailable");
     }
     if (cmd == "dashboard") {
         if (req.get("args.op") == "state") {

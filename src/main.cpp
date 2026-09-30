@@ -460,6 +460,15 @@ struct Session {
     // -EncodedCommand to a program started with none (#79). Set once, at creation, from the decision
     // newSession made; duplicate, Reopen Closed and restore carry it.
     bool exactArgs = false;
+    // Shell exit (agwinterm #336, #337). profileShell: a profile (login) shell rather than an
+    // explicit command - set once, at attach, before the reader thread can report an exit (see
+    // profileShellSpec). exitKnown/exitCode: the host's exit code, written under g_lock with
+    // `exited`; unknown when the host could not be asked. exitHeld: the hold lines are in the pane
+    // and a plain Enter there closes the session; set on the UI thread under g_lock.
+    bool profileShell = false;
+    bool exitKnown = false;
+    int exitCode = 0;
+    bool exitHeld = false;
     shell_configuration::InputGate inputGate; // sticky PTY input history + per-pane write serialization
     DWORD childPid = 0;            // shell pid from the attach reply (live-cwd query for restore)
     ULONGLONG childCreated = 0;    // birth identity captured at attach; agent lifecycle refuses unknown/reused PIDs
@@ -1225,6 +1234,8 @@ static bool dashboardKey(WPARAM key);
 static void dashboardClick(POINT pt);
 static bool noticeClick(POINT pt);
 static std::string remainderOnUi(const JsonReq& req);
+static int raiseNotice(const std::string& id, const std::string& title, const std::string& body,
+                       lite_remainder::Category category);
 static std::atomic<int> g_activeWs{0}; // workspace new sessions are created into
 static int g_pane[2] = { 0, -1 };   // session index per pane; pane[1] = -1 → no split
 static int g_focus = 0;             // focused pane (0/1)
@@ -2241,7 +2252,7 @@ static void runHostActions(Session* s, const uint8_t* buf, uint32_t len) {
 }
 
 static int indexOfSession(const Session* s);      // fwd: the reader asks whether its session is still listed
-static bool streamEndIsExit(const Session* s);   // fwd: asks the host; defined after hostSessions()
+static bool streamEndIsExit(const Session* s, bool& known, int& code);   // fwd: asks the host; defined after hostSessions()
 static DWORD WINAPI readerThread(void* param) {
     Session* s = (Session*)param;
     std::vector<uint8_t> buf(64 * 1024);
@@ -2303,12 +2314,16 @@ static DWORD WINAPI readerThread(void* param) {
     EnterCriticalSection(&g_lock);
     listed = indexOfSession(s) >= 0;
     LeaveCriticalSection(&g_lock);
-    if (listed && !streamEndIsExit(s)) {
+    bool exitKnown = false; int exitCode = 0;   // the host's word on how the shell ended (agwinterm #336)
+    if (listed && !streamEndIsExit(s, exitKnown, exitCode)) {
         logWarn("session '%s': output stream ended but the host reports its shell still running "
                 "(superseded or detached); kept on screen, not marked exited", s->paneId.c_str());
         return 0;
     }
+    EnterCriticalSection(&g_lock);
+    s->exitKnown = exitKnown; s->exitCode = exitCode;   // with `exited`, so whoever sees the flag sees the code
     s->exited = true;   // EOF, and the host confirms the child exited (or could not be asked)
+    LeaveCriticalSection(&g_lock);
     InvalidateRect(windowForSession(s), nullptr, FALSE);
     PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);   // reflect the exited marker in the tree
     // A split side that exits collapses to its survivor (P4, OnPaneExit) — judged on the UI thread
@@ -2473,7 +2488,7 @@ static std::vector<Profile> listedProfiles() {
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
                               bool repaint = false, bool hidden = false, uint64_t workspace = 0,
-                              const char* creationTicket = "", bool exactArgs = false);   // fwd
+                              const char* creationTicket = "", bool exactArgs = false, bool profileShell = false);   // fwd
 
 // The protocol's string fields are FIXED-SIZE arrays, and MSVC's strcpy_s does not truncate on an
 // oversize source — it invokes the CRT invalid-parameter handler, whose default terminates the
@@ -2616,6 +2631,26 @@ static Session* failedCommandSession(int cols, int rows, const char* app,
     return s;
 }
 
+// Whether a launch spec is a PROFILE shell rather than a command (agwinterm #336's ProfileShell):
+// only a profile shell gets the exit hold and the exit notice; a command keeps its buffer untouched
+// so a script can still read what it printed. `exact` is newSession's own exactArgs - "this argv is
+// the launch argv exactly" - which is true for `session new --command`, for a configured command
+// run in a new session (commands_runtime.h), for an overlay's wrapper, AND for every carrier of a
+// saved spec with arguments (restore, duplicate, Reopen Closed). Keying on it rather than on the
+// explicit-command parameter is what makes the answer the same on first creation and after a
+// restart (revmux r1: a configured command was held when created and silent once restored). An
+// exact argv cannot tell a profile that has arguments from a direct command, so a spec that IS one
+// of the catalog's profiles counts as a profile shell whatever carried it. THE ONE EXCEPTION that
+// follows: a direct command spelled exactly like a profile (`--command cmd.exe --command-mode
+// direct` with a bare cmd.exe profile in the catalog) is a profile shell too.
+static bool profileShellSpec(bool exact, const char* app, const std::vector<std::string>* pargs) {
+    if (!exact || !app) return true;
+    const auto catalog = profileSnapshot();
+    for (const auto& entry : catalog.entries)
+        if (entry.command == app && (pargs ? *pargs == entry.args : entry.args.empty())) return true;
+    return false;
+}
+
 static Session* newSession(int cols, int rows, const char* app = nullptr,
                            const std::vector<std::string>* pargs = nullptr, const char* cwd = nullptr, bool quick = false, bool hidden = false,
                            uint64_t workspace = 0, bool explicitCommand = false) {
@@ -2735,7 +2770,9 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         rep = agwinterm_ptyhost_Reply_init_default;
         logWarn("session create refused (id in use) — retrying as '%s'", idbuf);
     }
-    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str(), exactArgs);
+    // Decided here and handed over on ONE line: reopen.unit lifts the attach call below as a line.
+    const bool profileShell = !quick && !hidden && profileShellSpec(exactArgs, app, pargs);
+    Session* s = attachSession(idbuf, cols, rows, app, pargs, cwd, false, quick || hidden, workspace, creationTicket.c_str(), exactArgs, profileShell);
     if (!s) {
         // The create SUCCEEDED and only the attach failed, so the host is now holding a shell
         // nothing drives. Leaving it there leaks a process per attempt — and restore retries the
@@ -2758,7 +2795,7 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
 /// running and can simply be picked back up, scrollback and all.
 static Session* attachSession(const char* id, int cols, int rows, const char* app,
                               const std::vector<std::string>* pargs, const char* cwd,
-                              bool repaint, bool hidden, uint64_t workspace, const char* creationTicket, bool exactArgs) {
+                              bool repaint, bool hidden, uint64_t workspace, const char* creationTicket, bool exactArgs, bool profileShell) {
     { LockG hold; if (!workspace) { workspace = g_workspaces.token(g_activeWs); if (!workspace) workspace = g_workspaces.token(0); } }
     agwinterm_ptyhost_Request req = agwinterm_ptyhost_Request_init_default;
     agwinterm_ptyhost_Reply rep = agwinterm_ptyhost_Reply_init_default;
@@ -2811,6 +2848,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     s->app = app ? app : "";        // remember the launch spec for session restore
     if (pargs) s->args = *pargs;
     s->exactArgs = exactArgs;       // before the push below: duplicate and save read it on other threads (#79)
+    s->profileShell = profileShell; // likewise before the push: the reader thread may report an exit at once
     s->cwd = cwd ? cwd : "";
     s->emu = emu_new(cols, rows);
     if (!emu_set_scrollback(s->emu, g_scrollbackLines.load())) {
@@ -2859,6 +2897,7 @@ struct HostSession {
     bool exited = false;     // the shell behind it is gone: the host keeps the entry, attaching gets an EOF
     bool attached = false;   // another window is driving it right now — attaching would STEAL it
     std::string creationTicket;
+    int exitCode = 0;        // the shell's exit code; meaningful only while `exited`
     bool adoptable() const { return !exited && !attached; }
 };
 static std::vector<HostSession> hostSessions(const char* consequence = "restore will create fresh sessions") {
@@ -2880,7 +2919,7 @@ static std::vector<HostSession> hostSessions(const char* consequence = "restore 
     for (pb_size_t i = 0; i < rep.body.list.sessions_count; i++) {
         const auto& si = rep.body.list.sessions[i];
         if (g_creationRevision >= 1 && !validCreationTicket(si.creation_ticket)) continue;
-        out.push_back({ si.id, si.has_exited, si.attached, si.creation_ticket });
+        out.push_back({ si.id, si.has_exited, si.attached, si.creation_ticket, si.exit_code });
     }
     return out;
 }
@@ -2902,15 +2941,34 @@ static bool hostListSaysAlive(const std::vector<HostSession>& list, const std::s
     return false;
 }
 
+// The exit code the host recorded for an exited shell (agwinterm #336). False when the list has
+// no exited entry for it - the host could not be asked, or dropped the session already - and the
+// code is then unknown, not zero.
+static bool hostListExitCode(const std::vector<HostSession>& list, const std::string& paneId,
+                             const std::string& creationTicket, int* code) {
+    for (const auto& hs : list) {
+        if (hs.id != paneId) continue;
+        if (!creationTicket.empty() && hs.creationTicket != creationTicket) continue;
+        if (!hs.exited) return false;
+        *code = hs.exitCode;
+        return true;
+    }
+    return false;
+}
+
 // Whether a reader's end-of-stream is the shell exiting (agliteterm #82). A local failure surface has
 // no host id and nothing to ask, so it keeps the old answer, as killSession skips it. Runs on the
 // reader thread with g_lock released: request() serializes on control_transport's own gate, bounded by
 // its 2 s timeout, and nothing joins a reader thread, so this cannot stall a close or shutdown. paneId
 // and creationTicket are written once at creation and never again, so they are read without the lock.
-static bool streamEndIsExit(const Session* s) {
+// When it IS an exit, `known` and `code` carry the host's exit code from the same list (one round
+// trip); `known` stays false when the host had no exited entry to read it from.
+static bool streamEndIsExit(const Session* s, bool& known, int& code) {
     if (s->paneId.empty() || s->failed) return true;
-    return !hostListSaysAlive(hostSessions("the stream end is taken as the shell exiting"),
-                              s->paneId, s->creationTicket);
+    const auto list = hostSessions("the stream end is taken as the shell exiting");
+    if (hostListSaysAlive(list, s->paneId, s->creationTicket)) return false;
+    known = hostListExitCode(list, s->paneId, s->creationTicket, &code);
+    return true;
 }
 
 // What the host held when this lite connected, read ONCE at startup (the list is also the handshake
@@ -3100,6 +3158,48 @@ static void reopenClosed() {
 }
 static Session* closeSplitSide(Session* owner, bool closeOwner);   // fwd
 static Session* splitOwnerOf(Session* s);                             // fwd (with the split verbs' refusals)
+// A one-pane PROFILE shell has exited (agwinterm #336, #337): it stays on screen, its pane says so
+// and how to dismiss it, and when nobody is looking at it the exit is a notice - ok for code 0,
+// attention otherwise. UI thread, from OnPaneExit AFTER the split collapse: a session that still
+// has a split, a split shell, a popup or cover (hidden), a spec that never started (failed) and a
+// command (see profileShellSpec, including its one exception) are all left exactly as they were.
+// Once per session: exitHeld guards it.
+static void holdExitedShell(Session* s) {
+    std::string id, name;
+    bool known = false, outOfView = false; int code = 0;
+    {
+        LockG hold;
+        if (indexOfSession(s) < 0 || s->hidden || s->failed || !s->exited || !s->profileShell || s->exitHeld) return;
+        if (!s->splitId.empty() && indexOfSessionId(s->splitId) >= 0) return;
+        s->exitHeld = true;
+        known = s->exitKnown; code = s->exitCode; id = s->id;
+        name = s->name.empty() ? std::string("The session") : narrow(s->name);
+        const std::string text = lite_remainder::exitHoldText(known, code);
+        if (s->emu) emu_feed(s->emu, (const uint8_t*)text.data(), (uint32_t)text.size());
+        outOfView = displayedOwner() != s || GetForegroundWindow() != g_hwnd;
+    }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    emitEvent("tree");
+    if (outOfView)
+        raiseNotice(id, "Session ended", lite_remainder::exitNoticeBody(name, known, code), lite_remainder::exitCategory(known, code));
+}
+
+// Plain Enter in a held pane closes its session (agwinterm #337). Only the session on screen with
+// no split and no cover over it: the key must be going to the held pane itself.
+static bool closeExitHold() {
+    int idx = -1;
+    {
+        LockG hold;
+        if (g_pane[1] >= 0) return false;
+        idx = g_pane[0];
+        if (idx < 0 || idx >= (int)g_sessions.size()) return false;
+        const Session* s = g_sessions[idx];
+        if (s->hidden || !s->exitHeld || s->overlay) return false;
+    }
+    closeSessionAt(idx);
+    return true;
+}
+
 // The close chord / menu close: the focused PANE, either side (P4). With the split shell focused
 // this is the unsplit it always was; with the session's own shell focused on a split session it
 // is a PROMOTION (the survivor becomes the session) — before P4 it closed the whole session, the
@@ -6158,6 +6258,12 @@ static bool handleKeyDown(WPARAM vk, bool repeat = false, bool popup = false) {
             return true;
         }
     }
+    // Exit hold (agwinterm #337): plain Enter in a held pane closes its session. The frame's keys only -
+    // a popup has its own session - and AFTER everything that owns Enter before the shell does: the
+    // palette and mark mode above, and the bindings block just now, where a pending leader takes its
+    // second key and a bare `map enter` runs (revmux r1: the hold used to take Enter from both and
+    // leave the leader armed for the next key).
+    if (!popup && vk == VK_RETURN && !ctrlDown() && !altDown() && !shiftDown() && closeExitHold()) return true;
 
     // Ctrl+C with a selection COPIES; with nothing selected it falls straight through and the shell
     // still gets its ^C. That ordering is the whole point - the interrupt is never taken away, you
@@ -6349,7 +6455,7 @@ static void refreshTree(bool persist = true) {
             int cls = s->exited ? AGST_NONE : statusClass(statusOf(s).status);
             std::wstring label = s->name.empty() ? (L"session " + std::to_wstring(vis)) : s->name;
             if (s->failed) label += L"  (failed to start)";   // restored spec whose app won't run here
-            else if (s->exited) label += L"  (exited)";
+            else if (s->exited) label += s->exitKnown ? L"  (exit " + std::to_wstring(s->exitCode) + L")" : std::wstring(L"  (exited)");
             else if (cls == AGST_WORKING) label += L"  (working…)";
             TVINSERTSTRUCTW tis{};
             tis.hParent = wh;
@@ -8597,8 +8703,10 @@ public:
         // A split side whose shell exits collapses to the survivor (agwinterm OnPaneProcessExited,
         // agterm #121): the session's own shell exiting is a promotion, the split shell's an
         // unsplit — a side that stayed on screen as "(exited)" was a pane nothing could type into
-        // and no verb could close. A one-pane session stays on screen as "(exited)", as it always
-        // has. The pointer is judged under g_lock against the list: a shell closeSplitSide or
+        // and no verb could close. A one-pane session stays on screen, as it always has: a profile
+        // shell is held (holdExitedShell - the two lines, Enter closes it, a notice when out of
+        // view), anything else just reads "(exit N)", or "(exited)" when the host had no code.
+        // The pointer is judged under g_lock against the list: a shell closeSplitSide or
         // closeSessionAt already dropped is not there, and a hidden shell no session names (a
         // cover) has no split to collapse.
         Session* s = (Session*)lp;
@@ -8610,7 +8718,8 @@ public:
             if (!s->hidden) { if (indexOfSessionId(s->splitId) >= 0) { owner = s; closeOwner = true; } }
             else owner = splitOwnerOf(s);
         }
-        if (owner) closeSplitSide(owner, closeOwner);
+        if (owner) { closeSplitSide(owner, closeOwner); return 0; }
+        holdExitedShell(s);   // a one-pane profile shell: the hold lines, and a notice when out of view
         return 0;
     }
     LRESULT OnHostAction(UINT, WPARAM wp, LPARAM lp, BOOL&) {
@@ -9888,7 +9997,8 @@ exist on the session's axis (`top` on a vertical split), naming the axis.
 Every structural change - split, unsplit, close of either side, swap, re-orient - emits a `tree`
 event. A promotion is NOT a session close: `tree` fires, `session` / `closed` does not, and undo
 does not resurrect anything. A split side whose shell exits collapses to the survivor on its own;
-a one-pane session's exit stays on screen as "(exited)" as before. The two focus keys, Focus Left /
+a one-pane session's exit stays on screen - a profile shell held (see the shell-exit paragraph),
+anything else reading "(exit N)" or "(exited)". The two focus keys, Focus Left /
 Top Pane and Focus Right / Bottom Pane, are slot 0 and slot 1, whichever shell a swap put there.
 
 ```
@@ -10356,6 +10466,13 @@ no notice is unread. `tree --json` carries the highest unread category as `unrea
 Config keys notification-color-ok, notification-color-normal and notification-color-attention
 (#RRGGBB) change the three colours.
 `session seen` or selecting the session clears its notice badge. Popup/cover targets refuse.
+A one-pane session whose profile shell exits stays on screen: its row says `(exit N)`, `tree --json`
+carries `exitCode` beside `exited`, the pane prints `The session has ended (exit N).` and
+`Press Enter to close the session.`, and a plain Enter there closes it. An exit nobody was looking
+at raises a notice, ok for code 0 and attention otherwise. A session started with a command
+(`session new --command`, a configured command run in a new session) keeps its buffer untouched -
+except a direct-mode command spelled exactly like one of the profiles (executable and arguments),
+which counts as that profile. A split side still collapses to its survivor.
 `dashboard [ID ...] [--close]` shows up to nine live fixed-strike previews, defaulting to recent
 sessions. Arrows/Home/End navigate; Enter/Space/click select, Escape closes. No shell input leaks
 through the grid. It never resizes shells or zooms fonts; nonzero `--font-size` refuses. The palette
@@ -10556,6 +10673,8 @@ static std::string ctlDispatch(const std::string& line) {
                         ",\"statusChangedAt\":" + std::to_string(st.changedAt) +
                         ",\"flagged\":" + (s->flagged ? "true" : "false") +
                         ",\"exited\":" + (s->exited ? "true" : "false") +
+                        // Beyond the contract: the host's exit code, present only once it is known.
+                        (s->exited && s->exitKnown ? ",\"exitCode\":" + std::to_string(s->exitCode) : std::string()) +
                         // a spec that could not be relaunched on this machine: kept, not dropped
                         ",\"failed\":" + (s->failed ? "true" : "false") +
                         ",\"unread\":" + std::to_string(s->unread + s->notifications) +
@@ -12784,12 +12903,18 @@ static bool restoreSessions() {
         g_activeWs = (sp.ws >= 0 && sp.ws < (int)g_workspaces.size()) ? sp.ws : 0;
         std::string want = si < savedIds.size() ? savedIds[si] : std::string();
         Session* s = nullptr;
+        // The exactness newSession computes for this spec (the fallback below): the E line is saved
+        // only for an EMPTY exact argv, so sp.exactArgs alone reads false for every spec that has
+        // arguments, and an adopted command would be held as a profile shell (revmux r2).
+        const bool exact = sp.exactArgs || !sp.args.empty();
+        const char* const specApp = sp.app.empty() ? "powershell.exe" : sp.app.c_str();
         if (isAdoptable(want)) {
             std::string expectedTicket;
             for (const auto& hs : g_hostLive) if (hs.id == want) { expectedTicket = hs.creationTicket; break; }
-            s = attachSession(want.c_str(), cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
+            s = attachSession(want.c_str(), cols, rows, specApp,
                               sp.args.empty() ? nullptr : &sp.args, sp.cwd.empty() ? nullptr : sp.cwd.c_str(),
-                              true, false, 0, expectedTicket.c_str(), sp.exactArgs);   // repaint, guarded against id reuse since the scan; the argv's exactness rides along (#79)
+                              true, false, 0, expectedTicket.c_str(), exact,
+                              profileShellSpec(exact, specApp, exact ? &sp.args : nullptr));   // repaint, guarded against id reuse since the scan; the argv's exactness rides along (#79)
             if (s) { s->adopted = true; adopted++; taken.push_back(want); logInfo("restore: adopted live session '%s' (%s)", want.c_str(), sp.name.c_str()); }
             // The shell itself is untouched by a failed adopt (attach may well have succeeded and
             // only the data pipe refused), so it keeps running under an id nothing points at any
@@ -12799,8 +12924,8 @@ static bool restoreSessions() {
                          "host may still be running the old shell under that id", want.c_str());
         }
         if (!s)
-            s = newSession(cols, rows, sp.app.empty() ? "powershell.exe" : sp.app.c_str(),
-                           (sp.exactArgs || !sp.args.empty()) ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, 0, sp.exactArgs);
+            s = newSession(cols, rows, specApp,
+                           exact ? &sp.args : nullptr, sp.cwd.empty() ? nullptr : sp.cwd.c_str(), false, false, 0, sp.exactArgs);
         if (s) {
             s->name = widen(sp.name); s->flagged = sp.flagged;
             if (firstIdx < 0) firstIdx = (int)g_sessions.size() - 1;
