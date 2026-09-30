@@ -331,6 +331,15 @@ Check 'an explicit command gets no hold lines and no notice' ((P12-Text $exitDir
 P12-Enter;Start-Sleep -Milliseconds 600
 Check 'Enter does not close an exited explicit command' ($null-ne(P12-Node $exitDirect))
 $null=Selection-Rpc 'session.close' @{} $exitDirect
+# A configured command run in a new session is a command too, on first creation as after a restore.
+$exitRun=[string](Selection-Rpc 'command.run' @{command='exit 5';mode='new'})
+$exitRunId=if($exitRun-match'command session created (\S+);'){$Matches[1]}else{''}
+Check 'a command run in a new session exits with its code' ($exitRunId -and (P12-Wait {(P12-Node $exitRunId).exited}) -and (P12-Node $exitRunId).exitCode-eq5) "reply=$exitRun node=$((P12-Node $exitRunId)|ConvertTo-Json -Compress -Depth 4)"
+Start-Sleep -Milliseconds 500
+Check 'a command run in a new session gets no hold lines and no notice' ($exitRunId -and (P12-Text $exitRunId)-notmatch'Press Enter to close the session' -and (P12-Node $exitRunId).unread-eq0)
+P12-Enter;Start-Sleep -Milliseconds 600
+Check 'Enter does not close an exited command session' ($exitRunId -and $null-ne(P12-Node $exitRunId))
+if($exitRunId){$null=Selection-Rpc 'session.close' @{} $exitRunId}
 # The session on screen: held, then closed by a plain Enter - that session and no other.
 $null=Selection-Rpc 'session.select' @{} $exitFg
 $null=Selection-Rpc 'session.type' @{text="exit 7`r"} $exitFg

@@ -28,9 +28,12 @@ P12 implements five existing agwinterm verbs without adding canonical contract s
   could not be asked). The pane prints `The session has ended (exit N).` and `Press Enter to close
   the session.`; a plain Enter in that pane closes the session. An exit nobody was looking at (the
   session not displayed, or the window not in the foreground) raises a notice, `ok` for code 0
-  and `attention` otherwise. A session started with an explicit command (`session new --command`,
-  and a saved spec that is not one of the profiles) keeps its buffer untouched, a split side still
-  collapses to its survivor, and popups keep their own exit handling.
+  and `attention` otherwise. A session started with a command (`session new --command`, a
+  configured command run in a new session, and a saved spec that is not one of the profiles) keeps
+  its buffer untouched, with one exception: a `--command-mode direct` command whose executable and
+  arguments are exactly one of the profiles' (`cmd.exe` alone, with a bare cmd profile in the
+  catalog) counts as that profile and is held. A split side still collapses to its survivor, and
+  popups keep their own exit handling.
 
   ![an exited session held on screen with its code, and the exit notices of two background sessions](img/qa-shell-exit-hold.png)
 - `dashboard [ID ...] [--close]`: up to nine distinct tree sessions or the recent-session default.
