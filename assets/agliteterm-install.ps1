@@ -256,7 +256,7 @@ try {
     }else{
         if($Remove){throw 'Removal is supported only for install.cli'}
         $profile=Read-InstallText $ProfilePath;$next=$profile
-        $scripts=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-agent-status.ps1','agliteterm-codex-notify.ps1','agliteterm-codex-hook.ps1','agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
+        $scripts=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-agent-status.ps1','agliteterm-codex-notify.ps1','agliteterm-codex-hook.ps1','agliteterm-agent-bind.ps1','agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
         $sources=@{}
         foreach($script in $scripts){$sources[$script]=Read-InstallText (Join-Path $PSScriptRoot $script);if(-not $sources[$script]){throw "Missing bundled helper $script"}}
         $loads=if($Operation -eq 'shell'){@('agliteterm-shell.ps1')}else{@('agliteterm-claude.ps1','agliteterm-generic-agent.ps1')}
@@ -277,6 +277,9 @@ try {
             Test-InstallHookTree $root 'Claude settings' $hookEvents $hookFields $true
             $wrapper=Join-Path $DataRoot 'agliteterm-agent-status.ps1'
             Merge-InstallHooks $root @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('Stop','completed',''),@('Notification','blocked','permission_prompt')) $wrapper $false
+            # SessionStart binding (agwinterm #323): one script for both agents, the agent in argv.
+            $bindWrapper=Join-Path $DataRoot 'agliteterm-agent-bind.ps1'
+            Merge-InstallHooks $root @(,@('SessionStart','claude','')) $bindWrapper $false
             $merged=$root|ConvertTo-Json -Depth 100
             if($codexPresent){
                 try{$codex=Read-InstallText $codexPath}
@@ -288,6 +291,7 @@ try {
                 if($null -ne $codexRoot.description -and $codexRoot.description -isnot [string]){throw 'Codex hooks description is not text; unchanged'}
                 $codexWrapper=Join-Path $DataRoot 'agliteterm-codex-hook.ps1'
                 Merge-InstallHooks $codexRoot @(@('UserPromptSubmit','active',''),@('PostToolUse','active',''),@('PermissionRequest','blocked',''),@('Stop','stop','')) $codexWrapper $true
+                Merge-InstallHooks $codexRoot @(,@('SessionStart','codex','')) $bindWrapper $true
                 $codexMerged=$codexRoot|ConvertTo-Json -Depth 100
             }
         }

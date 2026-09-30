@@ -10212,6 +10212,13 @@ an explicit shell id reaches underneath). READ-ONLY appears in the status bar. T
 
 `session restore <command>|none --target PANE` pins a command typed after a fresh restart;
 `session bind <agent-command>|none --target PANE` replays that binding instead (default `claude`).
+`install hooks` also gives Claude Code and Codex a SessionStart hook that reports the live session:
+{"cmd":"session.bind","target":PANE,"args":{"agent":"claude|codex","resume":ID,"cwd":DIR,"pid":HOOKPID}}.
+lite walks the process tree up from that pid to the pane's own agent, refuses a run nested under
+another agent, keeps the permission/sandbox flags and stores the resume line for the pane's shell
+(`Set-Location -LiteralPath 'DIR'; claude --resume ID`, `cd 'DIR' && ...` in Git Bash, `cd /d` in
+cmd). The reply is `binding`; the outcome is a `bind` event, `bound: <line>` or `ignored: <why>`.
+An unknown agent, an id that is not 1-128 letters, digits, `-` or `_`, or a missing pid is refused.
 Both need an explicit shell id and save before success. Replay waits 2500 ms, then re-reads the
 current value; it never replays into an adopted live shell. A delay is not a readiness check.
 Captured commands remain separate; P10b replays them only with explicit restore-commands opt-in.
@@ -10824,6 +10831,9 @@ static std::string ctlDispatch(const std::string& line) {
         return ctlErr("session not found");
     Session* target = resolveTarget(targetWord, &targetWhy);
     if (cmd == "session.restore" || cmd == "session.bind") {
+        // A SessionStart report (agwinterm #323): `resume` beside `agent`. Without it `agent` keeps its
+        // meaning - that string IS the relaunch command, `none` clears it.
+        if (cmd == "session.bind" && req.fields.count("args.resume")) return agentBindResume(req, target);
         const bool pin = cmd == "session.restore";
         const std::string missing = pin ? "no pane or session matches '" + targetWord + "'. Nothing pinned." : "session not found";
         if (!target) return ctlErr(missing);

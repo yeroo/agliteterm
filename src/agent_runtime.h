@@ -1,4 +1,5 @@
 #include "agent_integration.h"
+#include "agent_resume.h"
 
 struct AgentHandle {
     HANDLE handle = nullptr;
@@ -172,7 +173,10 @@ static std::string agentQueueRestart(AgentEvidence evidence, bool yolo) {
     op->authorization = narrow(idText);
     const auto simple = "claude --resume " + op->evidence.identity.conversation +
         (op->evidence.identity.dangerous ? " --dangerously-skip-permissions" : "");
-    if (!op->evidence.binding.empty() && op->evidence.binding != simple && op->evidence.binding != agentResume(op->evidence, false))
+    // A binding the SessionStart hook wrote for THIS conversation (agwinterm #323: a directory
+    // prefix, `claude --resume <id>`, kept flags) is ours to replace, like the two shapes before it.
+    if (!op->evidence.binding.empty() && op->evidence.binding != simple && op->evidence.binding != agentResume(op->evidence, false) &&
+        !agent_resume::resumes(op->evidence.binding, "claude", op->evidence.identity.conversation))
         return ctlErr("custom binding differs from verified process arguments; preserved, nothing interrupted");
     if (op->evidence.bridge.empty()) return ctlErr("no prompt bridge in this shell; restart the shell or load bundled agliteterm-prompt.ps1 explicitly; nothing interrupted");
     std::lock_guard<std::mutex> guard(g_agentMutex);
@@ -407,6 +411,93 @@ static std::string agentUpdate(const JsonReq& req) {
     if (!worker) return ctlErr("update log overlay opened but supervisor failed; owned updater never resumed");
     op.release(); CloseHandle(worker); reset.armed = false;
     return ctlOkStr("Claude update opened in owned overlay " + answer.get("result") + "; completion is reported by agent.update and agent.restart events");
+}
+// `session.bind` with `resume` - a SessionStart report (agwinterm #323). The agent's hook sends the
+// live session id, its cwd and its own pid; this walks the process tree up from that pid to the
+// pane's own agent (one nested under another agent is refused), keeps the agent's permission and
+// sandbox flags, and stores the line that resumes the session in the pane's shell syntax. A
+// malformed report binds nothing.
+//
+// agwinterm answers `binding` first and resolves afterwards, because it reads command lines with a
+// CIM query that takes about a second. lite reads them straight from the processes (the PEB read
+// `claude adopt` and `restore capture` already use), so the whole walk runs HERE, before the reply,
+// while the hook - the process the walk starts from - is still waiting for it. The reply stays
+// `binding` and the outcome is a `bind` event, `bound: <line>` or `ignored: <why>`, as there.
+// Called on a control worker with no lock held; `target` is what the verb resolved.
+static std::string agentBindResume(const JsonReq& req, Session* target) {
+    const auto agentField = req.fields.find("args.agent");
+    const std::string agent = agentField == req.fields.end() ? "claude" : agentField->second;
+    const std::string id = req.get("args.resume");
+    if (!agent_resume::knownAgent(agent))
+        return ctlErr("session.bind resume: agent must be one of claude, codex, not '" + agent + "'. Nothing bound.");
+    if (!agent_resume::validSessionId(id))
+        return ctlErr("session.bind resume: the session id must be 1-128 letters, digits, '-' or '_'. Nothing bound.");
+    const std::string pidText = req.get("args.pid");
+    unsigned long long pidValue = 0;
+    bool pidOk = !pidText.empty() && pidText.size() <= 10;
+    for (char c : pidText) { if (c < '0' || c > '9') { pidOk = false; break; } pidValue = pidValue * 10 + static_cast<unsigned>(c - '0'); }
+    if (!pidOk || pidValue == 0 || pidValue > 0xFFFFFFFFull)
+        return ctlErr("session.bind resume: pid (the hook's process id) is required, it is how the pane's own agent is told from a nested one. Nothing bound.");
+    const DWORD hookPid = static_cast<DWORD>(pidValue);
+    if (!target) return ctlErr("session not found");
+    std::string pane, app; DWORD shellPid = 0;
+    {
+        LockG hold;
+        if (indexOfSession(target) < 0) return ctlErr("session not found");
+        if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("bind", target->paneId, "bound"));
+        pane = target->paneId; app = target->app; shellPid = target->childPid;
+    }
+    std::string outcome;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) outcome = "ignored: the process tree could not be read";
+    else {
+        std::map<DWORD, std::pair<DWORD, std::wstring>> all;
+        PROCESSENTRY32W entry{}; entry.dwSize = sizeof entry;
+        if (Process32FirstW(snapshot, &entry))
+            do { all[entry.th32ProcessID] = { entry.th32ParentProcessID, entry.szExeFile }; } while (Process32NextW(snapshot, &entry));
+        CloseHandle(snapshot);
+        // The ancestry of the hook, the hook first: at most 64 rows, stopping at the pane's shell, at
+        // a parent that is gone, or at a cycle. Each row's command line comes from the process itself;
+        // one that cannot be read (elevated, mid-exit) is left empty, which only matters for a node
+        // launcher - it is then no agent, and the report is ignored with the reason.
+        std::map<unsigned long, agent_resume::ProcRow> procs;
+        std::string walked;
+        DWORD cursor = hookPid;
+        for (int depth = 0; depth < 64; ++depth) {
+            const auto found = all.find(cursor);
+            if (found == all.end() || procs.count(cursor)) break;
+            agent_resume::ProcRow row;
+            row.pid = cursor; row.parent = found->second.first; row.name = narrow(found->second.second);
+            if (const auto handle = agentHandle(cursor, true)) {
+                std::wstring command;
+                if (pebParamString(handle->handle, 0x70, &command)) row.commandLine = narrow(command);
+            }
+            walked += (walked.empty() ? "" : " <- ") + row.name + ":" + std::to_string(cursor);
+            procs[cursor] = row;
+            if (cursor == shellPid) break;
+            cursor = row.parent;
+        }
+        std::string commandLine, why;
+        if (procs.empty()) outcome = "ignored: the reporting process " + std::to_string(hookPid) + " is not running";
+        else if (!agent_resume::findAgentCommandLine(procs, hookPid, shellPid, agent, commandLine, why))
+            outcome = "ignored: " + why + " (walked " + walked + ")";
+        else {
+            const std::string line = agent_resume::compose(agent_resume::classifyShell(app.empty() ? "powershell.exe" : app),
+                                                           agent, id, req.get("args.cwd"), agent_resume::resumeFlags(agent, commandLine));
+            bool gone = false;
+            {
+                LockG hold;
+                if (indexOfSession(target) < 0) gone = true;
+                else { target->agentResume = line; ++target->agentResumeGeneration; }
+            }
+            if (gone) outcome = "ignored: the pane closed during the walk";
+            else if (!saveSessionState()) outcome = "bound in memory, but the state file could not be written (see the log): " + line;
+            else outcome = "bound: " + line;
+        }
+    }
+    emitEvent("bind", pane, outcome);
+    logInfo("session.bind resume for %s (%s): %s", pane.c_str(), agent.c_str(), outcome.c_str());
+    return ctlOkStr("binding");
 }
 static std::string agentDispatch(const JsonReq& req) {
     const auto& cmd = req.get("cmd");

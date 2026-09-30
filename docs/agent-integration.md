@@ -44,8 +44,9 @@ The native host's 2048-byte argument limit is checked before launch; oversized c
 ## Installation and updates
 
 `install.hooks` copies product-scoped status/Claude/Codex/generic-agent scripts to lite app data,
-merges four Claude hook events into `~/.claude/settings.json` and, when `~/.codex` exists and is
-not behind a junction/symlink, four Codex events into `~/.codex/hooks.json`. It adds a named block to the current user's Windows PowerShell profile.
+merges four Claude status hook events and a `SessionStart` binding hook into `~/.claude/settings.json`
+and, when `~/.codex` exists and is not behind a junction/symlink, four Codex status events and the
+same `SessionStart` hook into `~/.codex/hooks.json`. It adds a named block to the current user's Windows PowerShell profile.
 It preserves unrelated settings/hooks/profile text and custom PSReadLine Enter handlers. Notification
 hooks only mark permission prompts blocked. Codex hooks report active work, approval prompts,
 and completion; a final assistant question reports blocked. Trust new hooks once in Codex `/hooks`.
@@ -69,6 +70,50 @@ written normally when their type can be read. Destinations that already hold the
 `app.update` queues the existing verified release updater only from its installed update channel.
 Developer/portable copies and concurrent update requests refuse. A queued response does not mean
 download, verification or installation succeeded. Nothing in P11 publishes a release.
+
+## SessionStart binding: resume after a restart in any shell
+
+The `SessionStart` hook (`agliteterm-agent-bind.ps1`, one script for both agents, the agent in its
+argv) runs each time Claude Code or Codex starts a session, resumes one, clears or compacts. It sends
+
+```json
+{"cmd":"session.bind","target":"<pane>","args":{"agent":"claude|codex","resume":"<session id>","cwd":"<dir>","pid":<hook pid>}}
+```
+
+and waits up to three seconds for the reply. agliteterm walks the process tree up from `pid` to the
+agent that fired the hook, reading each process's own command line. A run nested under another agent
+(a `claude -p` or `codex exec` started from an agent's tool shell inherits the pane's id) is refused.
+The agent's permission and sandbox flags are kept (`--dangerously-skip-permissions`,
+`--permission-mode`, Codex's `-s`/`--sandbox`, `-a`/`--ask-for-approval`, `-p`/`--profile`, and
+`--dangerously-bypass-approvals-and-sandbox`), a value outside `[A-Za-z0-9_.:-]` is dropped rather
+than quoted, and the line stored as the pane's binding uses the pane's own shell:
+
+| Shell | Stored line |
+|---|---|
+| PowerShell | `Set-Location -LiteralPath '<dir>'; claude --resume <id> <flags>` |
+| Git Bash / MSYS2 | `cd '<dir>' && claude --resume <id> <flags>` |
+| cmd | `cd /d "<dir>" && codex resume <id> <flags>` |
+| anything else (wsl, custom) | the resume alone |
+
+A directory with a control character, or one with a `"` for cmd, is left out and the resume is
+stored alone. On a fresh restart the binding is typed into the restored pane like any other
+(`session bind`, below `session restore` in the replay order).
+
+- The reply is `binding` once the report is well formed and the pane exists. The outcome is a `bind`
+  event in `events`: `bound: <the stored line>`, or `ignored: <why>` with the processes the walk
+  visited. agwinterm resolves after its reply; lite reads command lines from the processes
+  themselves, so it resolves before it.
+- An unknown agent, a session id that is not 1-128 letters, digits, `-` or `_`, or a missing `pid`
+  is refused and binds nothing. `session.bind` with `agent` alone keeps its meaning: that string is
+  the relaunch command, and `none` clears it.
+- The script is inert outside `TERM_PROGRAM=agliteterm`. agwinterm's own hook, when both products
+  are installed, also fires in an agliteterm pane (it checks only `AGWINTERM_SESSION_ID`) and sends
+  the same report; lite used to read that as "bind the literal command `claude`", and now resolves
+  it like its own.
+- Codex runs a new hook only after you trust it once in Codex's `/hooks`, and fires `SessionStart`
+  on a session's first turn.
+- `claude yolo` and `claude update` accept a binding of this shape for the conversation they
+  verified and replace it with their own; any other binding is still a custom one they preserve.
 
 ## Claude adoption and restarts
 

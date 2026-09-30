@@ -28,7 +28,13 @@ $r=Install hooks
 Check 'hooks installer succeeds' ($r.ok -and $installExit-eq 0)
 $json=Get-Content -Raw $settings|ConvertFrom-Json
 Check 'hooks preserve settings and unrelated command' ($json.theme-eq'dark' -and $json.permissionMode-eq'default' -and $json.hooks.Stop[0].hooks[0].command-eq'keep-me')
-Check 'all four status events installed' (@($json.hooks.PSObject.Properties).Count-eq 4 -and $json.hooks.Notification[0].matcher-eq'permission_prompt')
+Check 'all four status events and the SessionStart binding installed' (@($json.hooks.PSObject.Properties).Count-eq 5 -and $json.hooks.Notification[0].matcher-eq'permission_prompt')
+$bindCommand='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $data 'agliteterm-agent-bind.ps1')+'" '
+$claudeBind=@($json.hooks.SessionStart|Where-Object {-not $_.PSObject.Properties['matcher']}|ForEach-Object {$_.hooks}|Where-Object {$_.type-ceq'command' -and $_.command-ceq($bindCommand+'claude')})
+Check 'Claude SessionStart installs the exact matcher-less bind command and its helper' ($claudeBind.Count-eq 1 -and (Test-Path (Join-Path $data 'agliteterm-agent-bind.ps1')))
+$bindBytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($settings));$bindBackups=@(Get-ChildItem (Split-Path $settings) -Filter '*.bak').Count
+$r=Install hooks
+Check 'Claude hooks with the SessionStart binding are byte-idempotent without backup' ($r.ok -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($settings))-ceq$bindBytes -and @(Get-ChildItem (Split-Path $settings) -Filter '*.bak').Count-eq$bindBackups)
 Check 'Codex skipped without existing directory' ($r.result.Contains('Codex hooks skipped') -and -not(Test-Path (Join-Path $user '.codex/hooks.json')) -and -not $r.result.Contains('notify = ['))
 Check 'legacy Codex notify script still copied' (Test-Path (Join-Path $data 'agliteterm-codex-notify.ps1'))
 $saved=[IO.File]::ReadAllText($settings);$profileSaved=[IO.File]::ReadAllText($profile)
@@ -135,6 +141,8 @@ foreach($event in $expected.Keys){
     $matches=@($codexTree.hooks.$event|Where-Object {-not $_.PSObject.Properties['matcher']}|ForEach-Object {$_.hooks}|Where-Object {$_.type-ceq'command' -and $_.command -ceq ($codexCommand+$expected[$event])})
     Check "Codex $event installs exact matcher-less command" ($matches.Count-eq 1)
 }
+$codexBind=@($codexTree.hooks.SessionStart|Where-Object {-not $_.PSObject.Properties['matcher']}|ForEach-Object {$_.hooks}|Where-Object {$_.type-ceq'command' -and $_.command-ceq($bindCommand+'codex')})
+Check 'Codex SessionStart installs the exact matcher-less bind command' ($codexBind.Count-eq 1)
 Check 'Codex root, user handlers, other events and extensions preserved' ($codexTree.custom.keep -and $codexTree.hooks.Stop[0].hooks[0].command-eq'keep-me' -and $codexTree.hooks.Stop[0].hooks[1].input.x-eq 1 -and $codexTree.hooks.Interrupt[0].hooks[0].commandWindows-eq'keep-win' -and $codexTree.hooks.FutureEvent[0].hooks[0].extension)
 $codexBytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($codexPath));$codexBackups=@(Get-ChildItem $codexDir -Filter '*.bak').Count
 $r=Install hooks
