@@ -91,11 +91,11 @@ foreach($args_ in @(@{key='unknown';value='true'},@{key='font-size';value='16'},
 }
 Check 'unknown get refuses' (-not (Selection-Rpc 'config.get' @{key='unknown'} -AllowError).ok)
 # conpty is read when the pty-host starts, so setting it changes the saved value and nothing live.
-Check 'conpty defaults to bundled' ((Config-Get 'conpty')-ceq'bundled')
-$reply=[string](Selection-Rpc 'config.set' @{key='conpty';value='inbox'})
-Check 'conpty setter says when it applies' ($reply-match'conpty = inbox' -and $reply-match'read when the pty-host next starts' -and (Config-Get 'conpty')-ceq'inbox')
-$null=Selection-Rpc 'config.set' @{key='conpty';value='bundled'}
-Check 'conpty goes back to bundled' ((Config-Get 'conpty')-ceq'bundled')
+Check 'conpty defaults to inbox' ((Config-Get 'conpty')-ceq'inbox')
+$reply=[string](Selection-Rpc 'config.set' @{key='conpty';value='bundled'})
+Check 'conpty setter says when it applies' ($reply-match'conpty = bundled' -and $reply-match'read when the pty-host next starts' -and (Config-Get 'conpty')-ceq'bundled')
+$null=Selection-Rpc 'config.set' @{key='conpty';value='inbox'}
+Check 'conpty goes back to inbox' ((Config-Get 'conpty')-ceq'inbox')
 Check 'theme catalog names actual lite modes' ([string](Selection-Rpc 'theme.list')-ceq "auto`nlight`ndark`nclassic")
 Check 'unknown theme refuses without changing mode' (-not (Selection-Rpc 'theme.set' @{name='invented'} -AllowError).ok -and (Config-Get 'theme')-eq 'dark')
 $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))

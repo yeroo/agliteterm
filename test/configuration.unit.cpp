@@ -26,9 +26,9 @@ int main() {
         check(!parse(key, std::string("1\0x", 3), out), "embedded NUL refuses");
     }
     check(names.size() == 24 && registry.size() == 24, "all twenty-four supported keys covered");
-    {   // conpty: two words, bundled the default (agwinterm #342).
+    {   // conpty: two words, inbox the default (the bundled one garbles a resized pane).
         const Key* key = find("conpty"); uint32_t out = 7;
-        check(key && key->kind == Kind::Conpty && key->initial == 0 && format(*key, 0) == "bundled" && format(*key, 1) == "inbox", "conpty key defaults to bundled");
+        check(key && key->kind == Kind::Conpty && key->initial == 1 && format(*key, 0) == "bundled" && format(*key, 1) == "inbox", "conpty key defaults to inbox");
         check(key && parse(*key, " Inbox ", out) && out == 1 && parse(*key, "bundled", out) && out == 0, "conpty parses its two words in any case");
         out = 7;
         for (auto word : {"true", "1", "0", "conhost", "bundled inbox", "openconsole"})

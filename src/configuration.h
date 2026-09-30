@@ -37,8 +37,10 @@ static const Key keys[] = {
     {"notification-color-normal", L"NotificationColorNormal", Id::NoticeNormal, Kind::Color, 0xF2B833},
     {"notification-color-attention", L"NotificationColorAttention", Id::NoticeAttention, Kind::Color, 0xE64D3D},
     // Which ConPTY the pty-host runs shells on (agwinterm #342): 0 bundled (conpty.dll +
-    // OpenConsole.exe beside the exe), 1 inbox (the conhost built into Windows).
-    {"conpty", L"Conpty", Id::Conpty, Kind::Conpty, 0},
+    // OpenConsole.exe beside the exe), 1 inbox (the conhost built into Windows). Inbox is the
+    // default: the bundled one does not repaint after a resize and the emulator does not reflow,
+    // so a pane that changes width shows clipped lines and misplaced text (see configuration.md).
+    {"conpty", L"Conpty", Id::Conpty, Kind::Conpty, 1},
 };
 inline std::string normalized(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");

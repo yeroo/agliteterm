@@ -647,9 +647,10 @@ static HFONT g_uiFont;          // shell UI font (Segoe UI) for the toolbar butt
 static HFONT g_treeFont;        // sidebar font — the shell UI face at g_treeFontPt (0 = system size)
 static int   g_treeFontPt = 0;  // sidebar point size; 0 means "whatever the shell says", the default
 static bool g_customColors = false;   // Properties->Colors: override the terminal's default fg/bg
-// The `conpty` key: true = the pty-host this window STARTS runs shells on the inbox conhost, false
-// = on the bundled ConPTY. Read once, in connectControl; a host already running keeps its own.
-static bool g_conptyInbox = false;
+// The `conpty` key: true (the default) = the pty-host this window STARTS runs shells on the inbox
+// conhost, false = on the bundled ConPTY. Read once, in connectControl; a host already running
+// keeps its own.
+static bool g_conptyInbox = true;
 static uint32_t g_defFg = 0xC0C0C0;   // packed 0xRRGGBB, legacy cmd.exe light gray on...
 static uint32_t g_defBg = 0x000000;   // ...black
 static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices to the muted EGA/VGA DOS palette
@@ -10436,9 +10437,10 @@ Keys: `theme` (auto/dark/light/classic), `foreground`/`background` (#RRGGBB, use
 `sidebar-font-size` (0 or6..24), `scrollback-lines` (0..1000000, default5000, new surfaces only),
 and booleans `custom-colors`, `dos-palette`, `show-sidebar`, `show-toolbar`, `show-status`,
 `flag-view`, `right-click-paste`, `copy-on-ctrl-c`, `copy-on-select` (true/false/on/off/1/0).
-`conpty` (bundled/inbox) picks the ConPTY shells run on and is read when the pty-host next starts:
-bundled passes a program's terminal queries through, and lite answers OSC 10/11 with its colors,
-DA1, DA2, DSR and the cursor position.
+`conpty` (inbox/bundled, default inbox) picks the ConPTY shells run on and is read when the
+pty-host next starts. bundled passes a program's terminal queries through, and lite answers
+OSC 10/11 with its colors, DA1, DA2, DSR and the cursor position; but it does not repaint after a
+resize, so a pane that changes width shows clipped and misplaced text until the program redraws.
 `theme list/set` exposes lite's four UI modes, not the full terminal-theme catalog. `settings`
 requests Properties without raising the terminal (`settings open requested`). `keymap reload`
 re-reads registry bindings, resetting deleted entries to default/unbound and keeping explicit zero.

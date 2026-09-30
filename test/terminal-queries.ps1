@@ -1,7 +1,9 @@
 # A program's questions to the terminal reach lite and are answered (agliteterm #120, agwinterm
-# #342): the pty-host runs shells on the bundled ConPTY, which passes OSC 10/11, DA1 and CPR through
-# instead of swallowing them, and the core (ABI 19) answers from the colours lite gives it. Only
-# under the canonical owned-job supervisor; text reaches the pane through the control pipe alone.
+# #342): with `conpty = bundled` the pty-host runs shells on the bundled ConPTY, which passes
+# OSC 10/11, DA1 and CPR through instead of swallowing them, and the core (ABI 19) answers from the
+# colours lite gives it. The key defaults to inbox, so the suite sets it in the run's registry
+# namespace before its window starts the host, and takes it out again. Only under the canonical
+# owned-job supervisor; text reaches the pane through the control pipe alone.
 param([string]$Exe="$PSScriptRoot/../bin/agliteterm.exe",[switch]$Strict)
 $ErrorActionPreference='Stop'
 . "$PSScriptRoot/suite-context.ps1"
@@ -33,6 +35,9 @@ $lines=@((Ask 'osc11' ($e+']11;?'+$e+'\')),(Ask 'osc10' ($e+']10;?'+$e+'\')),(As
 [Console]::WriteLine($e+'[>4;2m'+"XTPLAIN-$Tag"+$e+'[0m')
 '@|Set-Content -LiteralPath $ask
 $pipe=Get-LiteTestPipe 'queries'
+# The host reads --conpty when it starts, and this window starts it: the value has to be there first.
+$conptyKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath -RequireIsolation))
+try{$conptyKey.SetValue('Conpty',0,[Microsoft.Win32.RegistryValueKind]::DWord)}finally{$conptyKey.Dispose()}
 $proc=$null;$checks=0;$failures=0;$colorsTouched=$false
 function Check([string]$name,[bool]$ok,[string]$detail=''){$script:checks++;if($ok){"PASS $name"}else{$script:failures++;"FAIL $name : $detail"}}
 function QueryRpc([string]$verb,$params=@{},[string]$target,[switch]$AllowError){
@@ -77,7 +82,7 @@ try{
     $a=[string]@((QueryRpc 'tree' @{} '').workspaces|ForEach-Object{$_.sessions})[0].id
     if(-not (Wait-Query {(Screen $a).Contains('>')})){throw 'the cmd pane did not reach a prompt'}
 
-    Check 'conpty defaults to bundled' ([string](QueryRpc 'config.get' @{key='conpty'} '')-ceq'bundled')
+    Check 'the window read conpty = bundled from the run''s namespace' ([string](QueryRpc 'config.get' @{key='conpty'} '')-ceq'bundled')
     # The pane's pseudoconsole is OpenConsole.exe, a child of the pty-host this run started (the host's
     # own windowless console is a conhost.exe child whichever ConPTY it uses).
     $hostRow=@(Get-CimInstance Win32_Process -Filter "Name='agwinterm-ptyhost.exe'"|Where-Object{$_.CommandLine-like"*$env:AGLITETERM_TEST_RUN*"})[0]
@@ -137,6 +142,9 @@ finally{
             if($null-ne $custom -and [int]$custom-ne 0){$failures++;"the run's CustomColors is still $custom after the restore"}
         }finally{$key.Dispose()}
     }
+    # And the ConPTY choice: absent is the default (inbox) for every suite after this one.
+    $conptyKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath -RequireIsolation))
+    try{$conptyKey.DeleteValue('Conpty',$false)}finally{$conptyKey.Dispose()}
     if($proc){
         if(-not $proc.HasExited){[void]$proc.CloseMainWindow()}
         if(-not $proc.WaitForExit(5000)){$proc.Kill();if(-not $proc.WaitForExit(10000)){throw 'Owned query window did not exit'}}

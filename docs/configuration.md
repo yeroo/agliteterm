@@ -26,7 +26,7 @@ an unknown outcome: read back before retrying.
 | scrollback-lines | 0..1000000; default 5000; new surfaces only, no live eviction; positive caps allow 512 rows of batched-trim slack |
 | omp-theme | a theme name (from `omp list`) or path for eligible new PowerShell shells, or `none` (see below) |
 | restore-commands | true/false, default false (see below) |
-| conpty | bundled (default) or inbox; read when the pty-host next starts (see below) |
+| conpty | inbox (default) or bundled; read when the pty-host next starts (see below) |
 
 `config list` is the authoritative list; it also reports the cursor and quick-terminal keys this table
 leaves out.
@@ -44,14 +44,24 @@ new or adopted surface receives bytes.
 
 ### The ConPTY shells run on
 
+`conpty = inbox`, the default, uses the conhost built into Windows. It answers some of a program's
+questions itself (device attributes, the cursor position) and drops the color queries.
+
 `conpty = bundled` runs shells on the `conpty.dll` + `x64\OpenConsole.exe` that ship beside
 `agliteterm.exe` (Microsoft's, the pair Windows Terminal uses). It hands a program's output to
 agliteterm unchanged and passes its questions through, and agliteterm answers them: the foreground
 and background colors (OSC 10 / OSC 11, from `foreground` / `background` when `custom-colors` is on,
 else light gray on black; a change reaches running panes at once), device attributes (DA1, DA2),
 device status and the cursor position. Codex draws the band behind your messages from the color
-reply. `conpty = inbox` uses the conhost built into Windows, which answers some of those itself and
-drops the color queries.
+reply.
+
+It is opt-in because of what happens when a pane changes width (the window, the sidebar, a split).
+The inbox conhost re-wraps its screen and sends it again; the bundled ConPTY re-wraps its own copy
+and sends nothing, expecting the terminal to re-wrap the same way, and agliteterm's emulator does
+not: it keeps the top-left of what it had. After a resize a shell pane shows lines cut at the old
+or new width, and what is typed next lands at the wrong place, until the screen is redrawn (`cls`,
+or a full-screen program repainting itself). A program that reads a reply without virtual-terminal
+input mode also gets the cursor-position reply as a key press on the bundled ConPTY.
 
 ![A program in a pane asks for the background, the foreground, the device attributes and the cursor position, and prints the four replies](img/qa-terminal-queries.png)
 

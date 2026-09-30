@@ -53,8 +53,11 @@ a moment while refusing every real command.
 
 ## A program does not see the terminal's colors
 
-Codex shades your messages only when the terminal answers its color query. Look in `agliteterm.log`
-for the `pty-host:` line of the launch that started the host:
+Codex shades your messages only when the terminal answers its color query, which needs
+`agwintermctl config set conpty bundled` and a restart of the pty-host (close every window). That
+ConPTY does not repaint a pane after a resize, which is why it is not the default: see
+[the ConPTY shells run on](configuration.md#the-conpty-shells-run-on). With it set, look in
+`agliteterm.log` for the `pty-host:` line of the launch that started the host:
 
 - `started with --conpty bundled (conpty.dll and OpenConsole.exe are beside the exe)` is the expected
   case. It says what agliteterm asked for and found, not what the host loaded: if colors are still
@@ -62,11 +65,8 @@ for the `pty-host:` line of the launch that started the host:
   Manager, Details). With none, the dll did not load (blocked or damaged): reinstall.
 - `conpty.dll or OpenConsole.exe is missing` means the files beside `agliteterm.exe` are incomplete:
   reinstall.
-- `started with --conpty inbox` means `conpty` is set to `inbox`:
-  `agwintermctl config set conpty bundled`.
+- `started with --conpty inbox` means `conpty` was `inbox` (the default) when that host started.
 - No such line means this window connected to a host that was already running, which keeps the
   ConPTY it started with until its last window and shell are gone.
-
-See [the ConPTY shells run on](configuration.md#the-conpty-shells-run-on).
 
 Report bugs in [Issues](https://github.com/yeroo/agliteterm/issues).
