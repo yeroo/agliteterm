@@ -130,9 +130,8 @@ inline std::vector<std::string> splitCommandLine(const std::string& line) {
     return args;
 }
 
-// The flags of the running agent that a resume must repeat: the permission and sandbox mode, so a
-// YOLO session comes back YOLO. A value outside the conservative set is dropped rather than quoted,
-// which keeps the relaunch line free of anything a shell could interpret.
+// The flag vocabulary resumeFlags keeps and composedFlags accepts: the agent's flags that stand
+// alone, and those followed by a value.
 inline std::vector<std::string> bareFlags(const std::string& agent) {
     return agent == "codex" ? std::vector<std::string>{ "--dangerously-bypass-approvals-and-sandbox" }
                             : std::vector<std::string>{ "--dangerously-skip-permissions" };
@@ -145,19 +144,21 @@ inline bool listed(const std::vector<std::string>& set, const std::string& s) {
     for (const auto& each : set) if (each == s) return true;
     return false;
 }
+// The flags of the running agent that a resume must repeat: the permission and sandbox mode, so a
+// YOLO session comes back YOLO. A value outside the conservative set is dropped rather than quoted,
+// which keeps the relaunch line free of anything a shell could interpret.
 inline std::vector<std::string> resumeFlags(const std::string& agent, const std::string& commandLine) {
     const auto bare = bareFlags(agent), valued = valuedFlags(agent);
-    const auto in = listed;
     const auto args = splitCommandLine(commandLine);
     std::vector<std::string> flags;
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
-        if (in(bare, a)) { if (!in(flags, a)) flags.push_back(a); continue; }
+        if (listed(bare, a)) { if (!listed(flags, a)) flags.push_back(a); continue; }
         // `--sandbox value` and `--sandbox=value`; short flags only in the spaced form.
         const size_t eq = a.compare(0, 2, "--") == 0 ? a.find('=') : std::string::npos;
         const bool joined = eq != std::string::npos && eq > 0;
         const std::string key = joined ? a.substr(0, eq) : a;
-        if (!in(valued, key)) continue;
+        if (!listed(valued, key)) continue;
         std::string value; bool haveValue = false;
         if (joined) { value = a.substr(eq + 1); haveValue = true; }
         else if (i + 1 < args.size()) { value = args[++i]; haveValue = true; }

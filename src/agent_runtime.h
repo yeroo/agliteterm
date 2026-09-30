@@ -463,6 +463,9 @@ static std::string agentBindResume(const JsonReq& req, Session* target) {
         // what the walk tolerates (Git Bash's exec break), so without the birth check it would climb
         // into whatever process got that number since - another pane's agent, read as a nested run
         // or taken for this pane's own (agentEvidence refuses the same way).
+        // The birth time is read through a handle of its own: it needs only QUERY_LIMITED, which an
+        // elevated or protected process still grants, where the command line needs VM_READ, which
+        // such a process refuses - and a reused pid held by one of those must not skip the check.
         // Each row's command line comes from the process itself. One that cannot be read (elevated,
         // mid-exit) is left empty: a node launcher is then no agent and the walk passes over it; a
         // native claude.exe / codex.exe is an agent by its name and is bound WITHOUT its kept flags,
@@ -476,12 +479,14 @@ static std::string agentBindResume(const JsonReq& req, Session* target) {
             if (found == all.end() || procs.count(cursor)) break;
             agent_resume::ProcRow row;
             row.pid = cursor; row.parent = found->second.first; row.name = narrow(found->second.second);
-            if (const auto handle = agentHandle(cursor, true)) {
-                if (haveChildBorn && handle->born > childBorn) {
+            if (const auto times = agentHandle(cursor)) {
+                if (haveChildBorn && times->born > childBorn) {
                     walked += " <- (pid " + std::to_string(cursor) + " reused: born after its child)";
                     break;
                 }
-                childBorn = handle->born; haveChildBorn = true;
+                childBorn = times->born; haveChildBorn = true;
+            }
+            if (const auto handle = agentHandle(cursor, true)) {
                 std::wstring command;
                 if (pebParamString(handle->handle, 0x70, &command)) row.commandLine = narrow(command);
             }
