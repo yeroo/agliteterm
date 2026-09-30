@@ -92,6 +92,15 @@ int main() {
     check(compose(Shell::PowerShell, "claude", "abc", R"(C:\src\it's)", {}) == "Set-Location -LiteralPath 'C:\\src\\it''s'; claude --resume abc", "compose: powershell");
     check(compose(Shell::Cmd, "codex", "01a0", R"(C:\src)", { "-s", "workspace-write" }) == "cd /d \"C:\\src\" && codex resume 01a0 -s workspace-write", "compose: cmd");
     check(compose(Shell::Cmd, "claude", "abc", "C:\\a\"b", {}) == "claude --resume abc", "compose: cmd drops a directory with a quote");
+    check(compose(Shell::Cmd, "claude", "abc", "C:\\work\\%OS%", {}) == "claude --resume abc", "compose: cmd drops a directory with a percent sign");
+    // PowerShell closes a single-quoted string at U+2018..U+201B as well as at the apostrophe.
+    check(compose(Shell::PowerShell, "claude", "abc", "C:\\x\xE2\x80\x99; Start-Process calc; \xE2\x80\x99", {})
+              == "Set-Location -LiteralPath 'C:\\x\xE2\x80\x99\xE2\x80\x99; Start-Process calc; \xE2\x80\x99\xE2\x80\x99'; claude --resume abc",
+          "compose: powershell doubles a typographic quote");
+    check(powershell_quote::body("\xE2\x80\x98" "a" "\xE2\x80\x9A" "b" "\xE2\x80\x9B" "'") == "\xE2\x80\x98\xE2\x80\x98" "a" "\xE2\x80\x9A\xE2\x80\x9A" "b" "\xE2\x80\x9B\xE2\x80\x9B" "''",
+          "powershell quote: all five quote characters are doubled");
+    check(powershell_quote::body("\xE2\x80\x97 \xE2\x80\x9C \xE2\x80") == "\xE2\x80\x97 \xE2\x80\x9C \xE2\x80", "powershell quote: neighbours and a cut sequence pass unchanged");
+    check(compose(Shell::Bash, "claude", "abc", "C:\\x\xE2\x80\x99s", {}) == "cd 'C:\\x\xE2\x80\x99s' && claude --resume abc", "compose: bash ends a quote only at the apostrophe");
     check(compose(Shell::Other, "codex", "01a0", R"(C:\src)", {}) == "codex resume 01a0", "compose: unknown shell gets the resume alone");
     check(compose(Shell::Bash, "claude", "abc", "", {}) == "claude --resume abc" && compose(Shell::Bash, "claude", "abc", "   ", {}) == "claude --resume abc", "compose: empty or blank cwd");
     check(compose(Shell::PowerShell, "claude", "abc", "C:\\src\nStart-Process calc", {}) == "claude --resume abc", "compose: a cwd with a control character is dropped, never typed");
@@ -120,6 +129,15 @@ int main() {
         check(!resumes(compose(Shell::PowerShell, "codex", id, "C:\\src", {}), "claude", id) && resumes(compose(Shell::PowerShell, "codex", id, "C:\\src", {}), "codex", id), "resumes: the agent must match");
         check(!resumes("& 'C:\\bin\\claude.exe' --resume " + id, "claude", id) && !resumes("echo hi; claude --resume " + id, "claude", id), "resumes: another shape is a custom binding");
         check(!resumes("claude --resume " + id, "claude", "") && !resumes("", "claude", id), "resumes: empty inputs");
+        // Only what compose could have written after the id; anything else is the user's own line.
+        check(resumes("claude --resume " + id + " --permission-mode plan --dangerously-skip-permissions", "claude", id), "resumes: kept claude flags");
+        check(resumes("codex resume " + id + " -s workspace-write -a on-request --profile work", "codex", id), "resumes: kept codex flags");
+        for (const char* tail : { " --model opus", " && npm test", "; Write-Host done", " | Tee-Object log", " ", "  --dangerously-skip-permissions",
+                                  " --permission-mode", " --permission-mode a;b", " --dangerously-skip-permissions ", " -s workspace-write" })
+            check(!resumes("claude --resume " + id + tail, "claude", id), "resumes: text compose never writes after the id is a custom binding");
+        check(!resumes("Set-Location -LiteralPath 'C:\\x'; claude --resume " + id + "; Start-Something", "claude", id), "resumes: a command behind the resume is a custom binding");
+        check(!resumes("codex resume " + id + " --dangerously-skip-permissions", "codex", id), "resumes: another agent's flag is not kept");
+        check(resumes(compose(Shell::PowerShell, "claude", id, "C:\\x\xE2\x80\x99; y", { "--permission-mode", "plan" }), "claude", id), "resumes: a directory with a typographic quote");
         check(runPart("Set-Location -LiteralPath 'C:\\a''b'; claude --resume x") == "claude --resume x" && runPart("cd 'C:\\a'\\''b' && claude --resume x") == "claude --resume x" && runPart("cd /d \"C:\\a\" && codex resume y") == "codex resume y", "runPart strips each prefix compose writes");
         check(runPart("Set-Location -LiteralPath 'C:\\a' ; claude") == "Set-Location -LiteralPath 'C:\\a' ; claude" && runPart("claude") == "claude", "runPart leaves anything else whole");
     }

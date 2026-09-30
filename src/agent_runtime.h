@@ -422,7 +422,8 @@ static std::string agentUpdate(const JsonReq& req) {
 // CIM query that takes about a second. lite reads them straight from the processes (the PEB read
 // `claude adopt` and `restore capture` already use), so the whole walk runs HERE, before the reply,
 // while the hook - the process the walk starts from - is still waiting for it. The reply stays
-// `binding` and the outcome is a `bind` event, `bound: <line>` or `ignored: <why>`, as there.
+// `binding` and the outcome is a `bind` event, `bound: <line>` or `ignored: <why>`, as there -
+// plus lite's `unsaved: <line>` when the binding is in memory and the state file refused the write.
 // Called on a control worker with no lock held; `target` is what the verb resolved.
 static std::string agentBindResume(const JsonReq& req, Session* target) {
     const auto agentField = req.fields.find("args.agent");
@@ -457,18 +458,30 @@ static std::string agentBindResume(const JsonReq& req, Session* target) {
             do { all[entry.th32ProcessID] = { entry.th32ParentProcessID, entry.szExeFile }; } while (Process32NextW(snapshot, &entry));
         CloseHandle(snapshot);
         // The ancestry of the hook, the hook first: at most 64 rows, stopping at the pane's shell, at
-        // a parent that is gone, or at a cycle. Each row's command line comes from the process itself;
-        // one that cannot be read (elevated, mid-exit) is left empty, which only matters for a node
-        // launcher - it is then no agent, and the report is ignored with the reason.
+        // a parent that is gone, at a cycle, or at a "parent" born after its child. The last is a
+        // reused pid: Toolhelp keeps a dead parent's number, and a parent that has exited is exactly
+        // what the walk tolerates (Git Bash's exec break), so without the birth check it would climb
+        // into whatever process got that number since - another pane's agent, read as a nested run
+        // or taken for this pane's own (agentEvidence refuses the same way).
+        // Each row's command line comes from the process itself. One that cannot be read (elevated,
+        // mid-exit) is left empty: a node launcher is then no agent and the walk passes over it; a
+        // native claude.exe / codex.exe is an agent by its name and is bound WITHOUT its kept flags,
+        // which the log line below says.
         std::map<unsigned long, agent_resume::ProcRow> procs;
         std::string walked;
         DWORD cursor = hookPid;
+        ULONGLONG childBorn = 0; bool haveChildBorn = false;
         for (int depth = 0; depth < 64; ++depth) {
             const auto found = all.find(cursor);
             if (found == all.end() || procs.count(cursor)) break;
             agent_resume::ProcRow row;
             row.pid = cursor; row.parent = found->second.first; row.name = narrow(found->second.second);
             if (const auto handle = agentHandle(cursor, true)) {
+                if (haveChildBorn && handle->born > childBorn) {
+                    walked += " <- (pid " + std::to_string(cursor) + " reused: born after its child)";
+                    break;
+                }
+                childBorn = handle->born; haveChildBorn = true;
                 std::wstring command;
                 if (pebParamString(handle->handle, 0x70, &command)) row.commandLine = narrow(command);
             }
@@ -491,8 +504,10 @@ static std::string agentBindResume(const JsonReq& req, Session* target) {
                 else { target->agentResume = line; ++target->agentResumeGeneration; }
             }
             if (gone) outcome = "ignored: the pane closed during the walk";
-            else if (!saveSessionState()) outcome = "bound in memory, but the state file could not be written (see the log): " + line;
+            else if (!saveSessionState()) outcome = "unsaved: " + line;   // bound in memory only; the log says why
             else outcome = "bound: " + line;
+            if (!gone && commandLine.empty())
+                logWarn("session.bind resume for %s: the %s process's command line could not be read, so its permission/sandbox flags are not on the resume line", pane.c_str(), agent.c_str());
         }
     }
     emitEvent("bind", pane, outcome);

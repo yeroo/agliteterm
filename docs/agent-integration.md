@@ -95,13 +95,17 @@ than quoted, and the line stored as the pane's binding uses the pane's own shell
 | cmd | `cd /d "<dir>" && codex resume <id> <flags>` |
 | anything else (wsl, custom) | the resume alone |
 
-A directory with a control character, or one with a `"` for cmd, is left out and the resume is
-stored alone. On a fresh restart the binding is typed into the restored pane like any other
+A directory with a control character, or one with a `"` or a `%` for cmd (cmd has no escape for
+either inside its quotes), is left out and the resume is stored alone. PowerShell's typographic
+quotes (U+2018 to U+201B) end a single-quoted string like the plain apostrophe, so all five are
+doubled. On a fresh restart the binding is typed into the restored pane like any other
 (`session bind`, below `session restore` in the replay order).
 
 - The reply is `binding` once the report is well formed and the pane exists. The outcome is a `bind`
-  event in `events`: `bound: <the stored line>`, or `ignored: <why>` with the processes the walk
-  visited. agwinterm resolves after its reply; lite reads command lines from the processes
+  event in `events`: `bound: <the stored line>`; `unsaved: <the line>` when it is bound in memory
+  and the state file could not be written (the log says why); or `ignored: <why>` with the
+  processes the walk visited. A process whose recorded parent was born after it has a reused
+  parent pid, and the walk ends there. agwinterm resolves after its reply; lite reads command lines from the processes
   themselves, so it resolves before it.
 - An unknown agent, a session id that is not 1-128 letters, digits, `-` or `_`, or a missing `pid`
   is refused and binds nothing. `session.bind` with `agent` alone keeps its meaning: that string is
@@ -112,8 +116,10 @@ stored alone. On a fresh restart the binding is typed into the restored pane lik
   it like its own.
 - Codex runs a new hook only after you trust it once in Codex's `/hooks`, and fires `SessionStart`
   on a session's first turn.
-- `claude yolo` and `claude update` accept a binding of this shape for the conversation they
-  verified and replace it with their own; any other binding is still a custom one they preserve.
+- `claude yolo` and `claude update` accept a binding of exactly this shape for the conversation
+  they verified - the directory prefix, the resume, the id and only the flags the hook keeps - and
+  replace it with their own. Anything else, including the same resume followed by another flag or
+  another command, is still a custom binding they preserve.
 
 ## Claude adoption and restarts
 

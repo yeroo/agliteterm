@@ -10217,9 +10217,12 @@ an explicit shell id reaches underneath). READ-ONLY appears in the status bar. T
 lite walks the process tree up from that pid to the pane's own agent, refuses a run nested under
 another agent, keeps the permission/sandbox flags and stores the resume line for the pane's shell
 (`Set-Location -LiteralPath 'DIR'; claude --resume ID`, `cd 'DIR' && ...` in Git Bash, `cd /d` in
-cmd). The reply is `binding`; the outcome is a `bind` event, `bound: <line>` or `ignored: <why>`.
-An unknown agent, an id that is not 1-128 letters, digits, `-` or `_`, or a missing pid is refused.
-Both need an explicit shell id and save before success. Replay waits 2500 ms, then re-reads the
+cmd). The reply is `binding` as soon as the report is well formed; the outcome is a `bind` event:
+`bound: <line>`, `unsaved: <line>` (bound in memory, the state file could not be written) or
+`ignored: <why>`. An unknown agent, an id that is not 1-128 letters, digits, `-` or `_`, or a
+missing pid is refused.
+`session restore` and `session bind <agent-command>` need an explicit shell id and save before
+success. Replay waits 2500 ms, then re-reads the
 current value; it never replays into an adopted live shell. A delay is not a readiness check.
 Captured commands remain separate; P10b replays them only with explicit restore-commands opt-in.
 

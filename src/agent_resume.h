@@ -11,6 +11,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "powershell_quote.h"
 
 namespace agent_resume {
 
@@ -132,18 +133,21 @@ inline std::vector<std::string> splitCommandLine(const std::string& line) {
 // The flags of the running agent that a resume must repeat: the permission and sandbox mode, so a
 // YOLO session comes back YOLO. A value outside the conservative set is dropped rather than quoted,
 // which keeps the relaunch line free of anything a shell could interpret.
+inline std::vector<std::string> bareFlags(const std::string& agent) {
+    return agent == "codex" ? std::vector<std::string>{ "--dangerously-bypass-approvals-and-sandbox" }
+                            : std::vector<std::string>{ "--dangerously-skip-permissions" };
+}
+inline std::vector<std::string> valuedFlags(const std::string& agent) {
+    return agent == "codex" ? std::vector<std::string>{ "-s", "--sandbox", "-a", "--ask-for-approval", "-p", "--profile" }
+                            : std::vector<std::string>{ "--permission-mode" };
+}
+inline bool listed(const std::vector<std::string>& set, const std::string& s) {
+    for (const auto& each : set) if (each == s) return true;
+    return false;
+}
 inline std::vector<std::string> resumeFlags(const std::string& agent, const std::string& commandLine) {
-    const bool codex = agent == "codex";
-    const std::vector<std::string> bare = codex
-        ? std::vector<std::string>{ "--dangerously-bypass-approvals-and-sandbox" }
-        : std::vector<std::string>{ "--dangerously-skip-permissions" };
-    const std::vector<std::string> valued = codex
-        ? std::vector<std::string>{ "-s", "--sandbox", "-a", "--ask-for-approval", "-p", "--profile" }
-        : std::vector<std::string>{ "--permission-mode" };
-    auto in = [](const std::vector<std::string>& set, const std::string& s) {
-        for (const auto& each : set) if (each == s) return true;
-        return false;
-    };
+    const auto bare = bareFlags(agent), valued = valuedFlags(agent);
+    const auto in = listed;
     const auto args = splitCommandLine(commandLine);
     std::vector<std::string> flags;
     for (size_t i = 1; i < args.size(); ++i) {
@@ -168,6 +172,8 @@ inline std::string replaceAll(std::string s, const std::string& from, const std:
 }
 // A directory that may be typed into a shell inside quotes: no control character (a newline would
 // end the line and start another). lite's own rule; an unusable cwd drops the prefix, not the bind.
+// What each shell's quotes cannot hold is compose's business: PowerShell's five quote characters
+// are doubled, cmd has no escape for `"` or `%` inside its quotes and drops the prefix.
 inline bool typableCwd(const std::string& cwd) {
     for (unsigned char c : cwd) if (c < 0x20 || c == 0x7F) return false;
     for (char c : cwd) if (c != ' ' && c != '\t') return true;
@@ -176,16 +182,19 @@ inline bool typableCwd(const std::string& cwd) {
 
 // The line typed into a restored pane to resume the session: change to its directory in the pane's
 // own shell syntax, then resume by id with `flags`. PowerShell 5.1 has no `&&`, so it gets `;`. An
-// empty cwd, or a shell whose syntax is unknown, gets the resume alone.
+// empty cwd, or a shell whose syntax is unknown, gets the resume alone. So does a cmd pane whose
+// directory holds `"` (no escape inside cmd's quotes) or `%`: an interactive cmd expands %NAME%
+// inside double quotes too, so `C:\work\%OS%` would be typed as another directory, and a variable
+// whose value holds a quote would end the string.
 inline std::string compose(Shell shell, const std::string& agent, const std::string& sessionId,
                            const std::string& cwd, const std::vector<std::string>& flags) {
     std::string run = (agent == "codex" ? "codex resume " : "claude --resume ") + sessionId;
     for (const auto& f : flags) run += " " + f;
     if (!typableCwd(cwd)) return run;
     switch (shell) {
-    case Shell::PowerShell: return "Set-Location -LiteralPath '" + replaceAll(cwd, "'", "''") + "'; " + run;
+    case Shell::PowerShell: return "Set-Location -LiteralPath " + powershell_quote::literal(cwd) + "; " + run;
     case Shell::Bash: return "cd '" + replaceAll(cwd, "'", "'\\''") + "' && " + run;
-    case Shell::Cmd: if (cwd.find('"') == std::string::npos) return "cd /d \"" + cwd + "\" && " + run; return run;
+    case Shell::Cmd: if (cwd.find_first_of("\"%") == std::string::npos) return "cd /d \"" + cwd + "\" && " + run; return run;
     default: return run;
     }
 }
@@ -210,17 +219,42 @@ inline std::string runPart(const std::string& line) {
     if (rest.empty()) rest = after("cd /d \"", "\"", "", "\" && ");
     return rest.empty() ? line : rest;
 }
-// Whether `binding` is a SessionStart line resuming `sessionId` with `agent` (any directory, any
-// kept flags). claude yolo / claude update use it to tell "the binding the hook wrote for the
-// conversation I verified" from a custom binding they must not overwrite.
+// Whether `tail`, the text after the session id, is exactly what compose appends: nothing, or for
+// each kept flag one space and a bare flag of `agent`, or one space, a valued flag, one space and a
+// value validFlagValue accepts. Anything else - another flag, a second command behind `;`, `&&` or
+// `|` - is somebody's own text.
+inline bool composedFlags(const std::string& agent, const std::string& tail) {
+    const auto bare = bareFlags(agent), valued = valuedFlags(agent);
+    size_t at = 0;
+    auto next = [&](std::string& token) {   // one space, then a run without spaces
+        if (at >= tail.size() || tail[at] != ' ') return false;
+        const size_t end = tail.find(' ', at + 1);
+        const size_t stop = end == std::string::npos ? tail.size() : end;
+        token = tail.substr(at + 1, stop - at - 1);
+        at = stop;
+        return !token.empty();
+    };
+    while (at < tail.size()) {
+        std::string token, value;
+        if (!next(token)) return false;
+        if (listed(bare, token)) continue;
+        if (!listed(valued, token) || !next(value) || !validFlagValue(value)) return false;
+    }
+    return true;
+}
+// Whether `binding` is a SessionStart line resuming `sessionId` with `agent`: one of compose's
+// directory prefixes or none, the resume, the id, and only flags compose could have kept. claude
+// yolo / claude update use it to tell "the binding the hook wrote for the conversation I verified"
+// from a custom binding they must not overwrite - `claude --resume <id> --model opus` and
+// `claude --resume <id>; npm test` are custom ones (revmux r1: any text after the id passed).
 inline bool resumes(const std::string& binding, const std::string& agent, const std::string& sessionId) {
     if (sessionId.empty()) return false;
     const std::string run = runPart(binding);
     const std::string head = agent == "codex" ? "codex resume " : "claude --resume ";
     if (run.compare(0, head.size(), head) != 0) return false;
     const std::string rest = run.substr(head.size());
-    if (lower(rest.substr(0, sessionId.size())) != lower(sessionId)) return false;
-    return rest.size() == sessionId.size() || rest[sessionId.size()] == ' ';
+    if (rest.size() < sessionId.size() || lower(rest.substr(0, sessionId.size())) != lower(sessionId)) return false;
+    return composedFlags(agent, rest.substr(sessionId.size()));
 }
 
 }  // namespace agent_resume
