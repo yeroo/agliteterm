@@ -215,6 +215,7 @@ foreach($color in @(@('notification-color-ok','NotificationColorOk',0x3DC759,'#3
     }finally{ P12-ColorSet $key $color[3] $color[1] $color[2] }
     Check "$key restores" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq$color[3])
 }
+$null=Selection-Rpc 'notify' @{body='before seen'} $b     # the block above leaves $b at zero; give the next check something to clear
 $null=Selection-Rpc 'session.seen' @{} $b
 Check 'seen clears notification badge' ((P12-Node $b).unread-eq0)
 $null=Selection-Rpc 'notify' @{body='Click to B'} $b
