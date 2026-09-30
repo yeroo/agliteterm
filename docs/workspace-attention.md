@@ -9,8 +9,15 @@ P12 implements five existing agwinterm verbs without adding canonical contract s
   A red content-area warning remains visible with the status bar hidden. Input uses duplicated
   pipe handles and bounded writes; unresolved cancellation retains its lease until completion,
   never schedules the bytes for later. Partial fanout is possible when a recipient refuses/fails.
-- `notify BODY --title TITLE --target ID`: a separate notice badge, notification event and
-  clickable eight-second banner. It requests a desktop balloon without raising the app; Windows
+- `notify BODY --title TITLE --category ok|normal|attention --target ID`: a separate notice badge,
+  notification event and clickable eight-second banner. The badge takes the colour of the highest
+  unread category (attention red, normal yellow, ok green; omitted = attention; any other value
+  is refused and nothing is delivered). Finished commands count in the same badge and keep the
+  red while no notice is unread. `notification-color-ok` / `-normal` / `-attention` (`#RRGGBB`)
+  change the colours.
+
+  ![ok, normal and attention notices as green, yellow and red pills](img/qa-notify-categories.png)
+ It requests a desktop balloon without raising the app; Windows
   may suppress it. Body/title are capped at 4096/256 UTF-8 bytes; balloon text is truncated to the
   Windows limits. Selecting the session or `session seen` clears the badge. A split pane maps
   to its owning session, while a popup/cover refuses. Notices are transient, not persisted;

@@ -150,6 +150,23 @@ $r=Selection-Rpc 'notify' @{body='bad'} 'missing' -AllowError
 Check 'notify missing target refuses' (-not$r.ok)
 $r=Selection-Rpc 'notify' @{body=('x'*4097)} $b -AllowError
 Check 'oversized notify refuses' (-not$r.ok)
+# Categories (agwinterm #335): the three words deliver; anything else refuses and delivers nothing.
+$categoryBase=(P12-Node $b).unread
+foreach($word in 'ok','normal','attention'){ $r=Selection-Rpc 'notify' @{body="category $word";category=$word} $b
+    Check "notify accepts category $word" ($r-like'notified*') }
+Check 'three categorised notices count three' ((P12-Node $b).unread-eq($categoryBase+3))
+foreach($bad in 'warning','OK','',5,$null,@{x=1}){ $r=Selection-Rpc 'notify' @{body='never delivered';category=$bad} $b -AllowError
+    Check "notify refuses category $(ConvertTo-Json $bad -Compress)" (-not$r.ok -and $r.error-ceq'notify: category must be ok, normal or attention') }
+Check 'a refused category delivers nothing' ((P12-Node $b).unread-eq($categoryBase+3))
+foreach($key in 'notification-color-ok','notification-color-normal','notification-color-attention'){
+    $before=[string](Selection-Rpc 'config.get' @{key=$key})
+    $r=Selection-Rpc 'config.set' @{key=$key;value='#102030'}
+    Check "$key sets and reads back" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq'#102030')
+    $r=Selection-Rpc 'config.set' @{key=$key;value='green'} -AllowError
+    Check "$key refuses a non-hex colour and keeps the value" (-not$r.ok -and [string](Selection-Rpc 'config.get' @{key=$key})-ceq'#102030')
+    $null=Selection-Rpc 'config.set' @{key=$key;value=$before}
+    Check "$key restores" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq$before)
+}
 $null=Selection-Rpc 'session.seen' @{} $b
 Check 'seen clears notification badge' ((P12-Node $b).unread-eq0)
 $null=Selection-Rpc 'notify' @{body='Click to B'} $b

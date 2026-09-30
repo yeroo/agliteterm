@@ -37,6 +37,25 @@ int main() {
                          {4,9,38,1}, {1,9,38,1}, {1,9,40,4}, {7,9,40,7},
                          {3,5,39,4}, {4,5,39,4}, {2,5,40,2}, {4,5,38,1}})
         check(lite_remainder::navigate(c[0],c[1],c[2])==c[3]);
+    // Notice categories (agwinterm #335): exact lowercase words, priority attention > normal > ok.
+    {
+        using lite_remainder::Category;
+        Category c = Category::Normal;
+        check(lite_remainder::category("ok", c) && c == Category::Ok);
+        check(lite_remainder::category("normal", c) && c == Category::Normal);
+        check(lite_remainder::category("attention", c) && c == Category::Attention);
+        for (const auto& bad : {"", "OK", "Attention", " ok", "ok ", "warning", "null", "5", "true"}) {
+            Category kept = Category::Normal;
+            check(!lite_remainder::category(bad, kept) && kept == Category::Normal);   // a refusal leaves out untouched
+        }
+        check(lite_remainder::highest(Category::Ok, Category::Normal) == Category::Normal);
+        check(lite_remainder::highest(Category::Attention, Category::Ok) == Category::Attention);
+        check(lite_remainder::highest(Category::Normal, Category::Normal) == Category::Normal);
+        check(lite_remainder::highest(Category::Ok, Category::Ok) == Category::Ok);
+        // Pill text: dark on the default green and yellow, white on the default red, black and white ends.
+        check(lite_remainder::darkTextOn(0x3DC759) && lite_remainder::darkTextOn(0xF2B833));
+        check(!lite_remainder::darkTextOn(0xE64D3D) && !lite_remainder::darkTextOn(0x000000) && lite_remainder::darkTextOn(0xFFFFFF));
+    }
     std::cout << "remainder: " << checks << " checks, " << failed << " failed\n";
     return failed ? 1 : 0;
 }

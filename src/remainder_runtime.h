@@ -16,7 +16,7 @@ static void selectRemainderSession(const std::string& id) {
     { LockG hold; const int at = indexOfSessionId(id);
       if (at < 0 || g_sessions[at]->hidden) return;
       g_activeWs = g_sessions[at]->ws; g_pane[0] = at; setFocusedPane(0);
-      g_sessions[at]->notifications = 0; touchMruLocked(g_sessions[at]); }
+      g_sessions[at]->clearNotices(); touchMruLocked(g_sessions[at]); }
     syncSplitToPrimary(); refreshTree(); InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 static void openDashboardSession(int cell) {
@@ -190,11 +190,24 @@ static std::string remainderOnUi(const JsonReq& req) {
     if (cmd == "notify") {
         const auto& body = req.get("args.body"); const auto& title = req.get("args.title"); std::string id;
         if (body.size() > 4096 || title.size() > 256) return ctlErr("notify: maximum 4096 body / 256 title UTF-8 bytes");
+        // Category (agwinterm #335): optional; omitted = attention, the red every notice had. Any
+        // other value - a wrong word, a number, null, an object - is refused before anything is
+        // delivered. (An array is invisible to the flat request parser and reads as omitted.)
+        auto category = lite_remainder::Category::Attention;
+        {
+            const auto found = req.fields.find("args.category");
+            bool nested = false;
+            for (const auto& field : req.fields) if (field.first.rfind("args.category.", 0) == 0) { nested = true; break; }
+            if (nested || (found != req.fields.end() && !lite_remainder::category(found->second, category)))
+                return ctlErr("notify: category must be ok, normal or attention");
+        }
         { LockG hold; std::string why; auto* s = resolveTarget(req.get("target"), &why);
           if (!s) return ctlErr(why.empty() ? "session not found" : why);
           if (s->hidden) s = splitOwnerOf(s);
           if (!s) return ctlErr("notify: popup/cover is not a tree session");
-          id = s->id; s->notifications = min(999, s->notifications + 1);
+          id = s->id;
+          s->noticeCategory = s->notifications > 0 ? lite_remainder::highest(s->noticeCategory, category) : category;
+          s->notifications = min(999, s->notifications + 1);
         }
         g_noticeId = id; g_noticeText = (title.empty() ? L"agliteterm" : widen(title)) + L": " + widen(body);
         g_noticeUntil = GetTickCount64() + 8000;
