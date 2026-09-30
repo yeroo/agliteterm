@@ -499,7 +499,7 @@ if (-not $Only -or $Only -eq 'killed-command') {
         if ($err) { "        error:  $err" }
         "        marker on screen before the kill: $seenBefore"
         "        session was adopted:              $adopted"
-        "        exited after `exit 7`:            $exitedAfter"
+        "        exited after 'exit 7':            $exitedAfter"
         "        node:   $($nodeAfter | ConvertTo-Json -Compress -Depth 4)"
         "        buffer left without hold lines:   $silent"
         "        after: [$(($textAfter -replace '\s+', ' ').Trim())]"
