@@ -107,6 +107,7 @@ int main() {
     for (const auto& app : {"powershell.exe", "C:\\Windows\\PowerShell.EXE", "pwsh", "C:/bin/pwsh.exe"}) check(shell_configuration::powershell(app), "exact PowerShell executable accepted");
     for (const auto& app : {"notpowershell.exe", "pwsh-helper.exe", "C:/pwsh/cmd.exe", "cmd.exe", ""}) check(!shell_configuration::powershell(app), "substring/non-PowerShell executable refused");
     check(shell_configuration::literal("C:\\theme's $x;name.omp.json") == "'C:\\theme''s $x;name.omp.json'", "PowerShell literal quotes metacharacters");
+    check(shell_configuration::literal("C:\\Bob\xE2\x80\x99s; calc") == "'C:\\Bob\xE2\x80\x99\xE2\x80\x99s; calc'", "PowerShell literal doubles a typographic quote");
     for (int flags = 0; flags < 16; ++flags) {
         std::string b = flags & 1 ? "B" : "", r = flags & 2 ? "R" : "", k = flags & 4 ? "K" : "";
         const auto expected = !b.empty() ? b : !r.empty() ? r : (flags & 8) ? k : "";

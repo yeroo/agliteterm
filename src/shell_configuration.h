@@ -1,4 +1,5 @@
 #pragma once
+#include "powershell_quote.h"
 #include <string>
 #include <mutex>
 #include <atomic>
@@ -65,11 +66,7 @@ inline bool powershell(const std::string& path) {
     const auto name = profiles::folded(path.substr(separator == std::string::npos ? 0 : separator + 1));
     return name == "pwsh.exe" || name == "powershell.exe" || name == "pwsh" || name == "powershell";
 }
-inline std::string literal(const std::string& value) {
-    std::string out = "'";
-    for (char c : value) { out += c; if (c == '\'') out += '\''; }
-    return out + "'";
-}
+inline std::string literal(const std::string& value) { return powershell_quote::literal(value); }
 inline const std::string& replay(const std::string& binding, const std::string& pin,
                                  const std::string& captured, bool enabled) {
     static const std::string empty;

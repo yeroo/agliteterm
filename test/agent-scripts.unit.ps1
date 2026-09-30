@@ -127,6 +127,32 @@ $null=Invoke-AgentFixture "& '$codexHook' active" 0 '{broken'
 Check 'malformed Codex stdin is silent and inert' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
 $null=Invoke-AgentFixture "`$env:TERM_PROGRAM='other'; & '$codexHook' active" 0 '{}'
 Check 'Codex hook is inert outside lite' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+# SessionStart binding (agwinterm #323): the report carries the agent, the live id, the cwd and the
+# hook's own pid; nothing is printed (both CLIs read a hook's stdout); nested runs and anything
+# malformed send nothing.
+$bind=(Join-Path $assets 'agliteterm-agent-bind.ps1').Replace("'","''")
+$bindId='36145f11-e132-4691-ab98-ae5c4445c46b';$bindCwd='C:\src\it''s '+[char]0x00e9
+$bindJson=@{session_id=$bindId;cwd=$bindCwd}|ConvertTo-Json -Compress
+$request=@(Invoke-AgentFixture "& '$bind' claude" 1 $bindJson)
+Check 'SessionStart bind reports agent, id, cwd and its own pid with empty stdout' ($request.Count-eq 1 -and $request[0].cmd-eq'session.bind' -and $request[0].target-eq'private-test-pane' -and $request[0].args.agent-ceq'claude' -and $request[0].args.resume-ceq$bindId -and $request[0].args.cwd-ceq$bindCwd -and [int64]$request[0].args.pid-gt 0 -and $script:fixtureStdout-eq'')
+$held=[IO.FileStream]::new($cliTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$request=@(Invoke-AgentFixture "& '$bind' codex" 1 (@{session_id='01a0ce4b-7125-7dd1-b5a1-a99d8f14402c';cwd='C:\src';transcript_path=$cliTranscript}|ConvertTo-Json -Compress))}finally{$held.Dispose()}
+Check 'interactive Codex SessionStart reads a live rollout and binds' ($request.Count-eq 1 -and $request[0].args.agent-ceq'codex' -and $request[0].args.resume-ceq'01a0ce4b-7125-7dd1-b5a1-a99d8f14402c' -and $script:fixtureStdout-eq'')
+$held=[IO.FileStream]::new($execTranscript,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]'ReadWrite, Delete')
+try{$null=Invoke-AgentFixture "& '$bind' codex" 0 (@{session_id='01a0';transcript_path=$execTranscript}|ConvertTo-Json -Compress)}finally{$held.Dispose()}
+Check 'a nested codex exec SessionStart binds nothing' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$null=Invoke-AgentFixture "`$env:CLAUDE_CODE_ENTRYPOINT='sdk-cli'; & '$bind' claude" 0 $bindJson
+Check 'a headless claude -p SessionStart binds nothing (entrypoint)' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$null=Invoke-AgentFixture "`$env:CLAUDE_CODE_SESSION_ATTENDED='0'; & '$bind' claude" 0 $bindJson
+Check 'an unattended claude SessionStart binds nothing' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+$request=@(Invoke-AgentFixture "`$env:CLAUDE_CODE_ENTRYPOINT='cli'; & '$bind' claude" 1 $bindJson)
+Check 'the interactive claude entrypoint binds' ($request.Count-eq 1 -and $request[0].args.resume-ceq$bindId)
+foreach($case in @(@("& '$bind' gemini",$bindJson,'an unknown agent'),@("& '$bind'",$bindJson,'a missing agent'),@("& '$bind' claude",'{"cwd":"C:\\src"}','a report without a session id'),@("& '$bind' claude",'{"session_id":7}','a non-text session id'),@("& '$bind' claude",'{broken','malformed stdin'))){
+    $null=Invoke-AgentFixture $case[0] 0 $case[1]
+    Check "SessionStart bind is silent and inert for $($case[2])" (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
+}
+$null=Invoke-AgentFixture "`$env:TERM_PROGRAM='other'; & '$bind' claude" 0 $bindJson
+Check 'SessionStart bind is inert outside lite' (-not$script:unexpectedConnection -and $script:fixtureStdout-eq'')
 $prompt=(Join-Path $assets 'agliteterm-prompt.ps1').Replace("'","''")
 $protocol=@'
 $global:p11Claims=0;$global:p11Acks=0;$global:p11Receipts=0
