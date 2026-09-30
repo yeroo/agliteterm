@@ -191,14 +191,13 @@ static std::string remainderOnUi(const JsonReq& req) {
         const auto& body = req.get("args.body"); const auto& title = req.get("args.title"); std::string id;
         if (body.size() > 4096 || title.size() > 256) return ctlErr("notify: maximum 4096 body / 256 title UTF-8 bytes");
         // Category (agwinterm #335): optional; omitted = attention, the red every notice had. Any
-        // other value - a wrong word, a number, null, an object - is refused before anything is
-        // delivered. (An array is invisible to the flat request parser and reads as omitted.)
+        // other value - a wrong word, a number, null, an object or an array (JsonReq::structured
+        // records those two; the flat fields cannot) - is refused before anything is delivered.
         auto category = lite_remainder::Category::Attention;
         {
             const auto found = req.fields.find("args.category");
-            bool nested = false;
-            for (const auto& field : req.fields) if (field.first.rfind("args.category.", 0) == 0) { nested = true; break; }
-            if (nested || (found != req.fields.end() && !lite_remainder::category(found->second, category)))
+            if (req.structured.count("args.category") ||
+                (found != req.fields.end() && !lite_remainder::category(found->second, category)))
                 return ctlErr("notify: category must be ok, normal or attention");
         }
         { LockG hold; std::string why; auto* s = resolveTarget(req.get("target"), &why);

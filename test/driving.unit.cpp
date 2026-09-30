@@ -75,6 +75,16 @@ int main() {
     std::string decoded;
     check(driving::decodeCommandField("\\uD83D\\uDE00", decoded) && decoded == "\xF0\x9F\x98\x80", "escaped surrogate pair produces UTF-8 scalar");
     check(driving::decodeCommandField("игла", decoded) && decoded == "игла", "literal valid UTF-8 is preserved");
+    {   // JsonReq::structured: object- and array-valued keys are recorded; the flat fields cannot show them.
+        JsonReq req; size_t at = 0;
+        const std::string text = R"({"cmd":"notify","args":{"body":"b","category":{},"list":[1,"x"],"n":5,"nested":{"k":"v"},"s":"t"}})";
+        check(jsonParseObject(text, at, "", req), "a request with object and array values parses");
+        check(req.structured.count("args") && req.structured.count("args.category") && req.structured.count("args.list") && req.structured.count("args.nested"),
+              "object and array keys are recorded as structured, an empty object included");
+        check(!req.structured.count("args.n") && !req.structured.count("args.s") && !req.structured.count("cmd"), "scalar keys are not structured");
+        check(req.get("args.nested.k") == "v" && req.get("args.n") == "5" && req.get("args.s") == "t" && !req.fields.count("args.category") && !req.fields.count("args.list"),
+              "the flattening itself is unchanged");
+    }
     std::printf("%d driving unit checks passed\n", checks);
     return 0;
 }

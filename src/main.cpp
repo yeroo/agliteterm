@@ -427,8 +427,10 @@ struct Session {
     int unread = 0;                // commands finished while NOT visible — red count pill in the tree
     int notifications = 0;         // explicit notices, independent of command-completion bookkeeping
     // The highest category among those unread notices (agwinterm #335); it picks the pill colour
-    // and means something only while notifications > 0. Written under g_lock with the count, and
-    // cleared with it: every place that zeroes the count goes through clearNotices.
+    // and means something only while notifications > 0. Written under g_lock with the count and
+    // never apart from it: every place that zeroes the count goes through clearNotices, and the
+    // one place that MOVES the count - a split promotion (closeSplitSide) - moves this with it.
+    // Read back as `unreadCategory` on the tree node while a notice is unread.
     lite_remainder::Category noticeCategory = lite_remainder::Category::Ok;
     void clearNotices() { notifications = 0; noticeCategory = lite_remainder::Category::Ok; }
     bool hidden = false;          // split-pane shell: a real shell, but NOT a sidebar/tree session
@@ -3182,6 +3184,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
             survivor->notifications = owner->notifications;
+            survivor->noticeCategory = owner->noticeCategory;   // the category travels with its count (revmux r1)
             survivor->horizontal = owner->horizontal;  // kept for the next `split on`
             survivor->splitRatio = owner->splitRatio;
             survivor->hidden = false;
@@ -10339,8 +10342,9 @@ clickable eight-second banner, and requests a bounded desktop balloon without ra
 Windows may suppress the balloon. The badge takes the colour of the highest unread category:
 attention red, normal yellow, ok green; an omitted category is attention, any other value is
 refused and nothing is delivered. Finished commands count in the same badge and keep the red when
-no notice is unread. Config keys notification-color-ok, notification-color-normal and
-notification-color-attention (#RRGGBB) change the three colours.
+no notice is unread. `tree --json` carries the highest unread category as `unreadCategory`.
+Config keys notification-color-ok, notification-color-normal and notification-color-attention
+(#RRGGBB) change the three colours.
 `session seen` or selecting the session clears its notice badge. Popup/cover targets refuse.
 `dashboard [ID ...] [--close]` shows up to nine live fixed-strike previews, defaulting to recent
 sessions. Arrows/Home/End navigate; Enter/Space/click select, Escape closes. No shell input leaks
@@ -10545,6 +10549,9 @@ static std::string ctlDispatch(const std::string& line) {
                         // a spec that could not be relaunched on this machine: kept, not dropped
                         ",\"failed\":" + (s->failed ? "true" : "false") +
                         ",\"unread\":" + std::to_string(s->unread + s->notifications) +
+                        // Beyond the contract: the highest category among the unread notices, the
+                        // read-back for notify's --category; absent while no notice is unread.
+                        (s->notifications > 0 ? std::string(",\"unreadCategory\":\"") + lite_remainder::name(s->noticeCategory) + "\"" : std::string()) +
                         // Beyond the contract (extra fields are allowed): the grid the session was
                         // last resized to. It is how a caller sees that `sidebar width` moved the
                         // content region, and the oracle #23 needs (a pane that collapsed to 2).

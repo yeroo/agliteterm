@@ -37,6 +37,7 @@ inline bool category(const std::string& text, Category& out) {
     return true;
 }
 inline Category highest(Category a, Category b) { return static_cast<int>(a) >= static_cast<int>(b) ? a : b; }
+inline const char* name(Category c) { return c == Category::Ok ? "ok" : c == Category::Normal ? "normal" : "attention"; }
 // Pill text: dark on a light pill, white on a dark one - agwinterm's rule (Lum >= 0.55 on the
 // 0.299 / 0.587 / 0.114 weights), so a user-chosen yellow stays readable. rgb = packed 0xRRGGBB.
 inline bool darkTextOn(unsigned rgb) {

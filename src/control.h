@@ -11,11 +11,16 @@
 #include <windows.h>
 #include <string>
 #include <map>
+#include <set>
 
 // ---- tiny JSON: parse one request object into the fields the API subset uses.
 // Full escapes on strings; nested "args" is flattened as "args.<key>". ----
 struct JsonReq {
     std::map<std::string, std::string> fields;
+    // Keys whose value was an object or an array. The flat `fields` cannot show them - an object
+    // becomes its members under a prefix, an empty one and every array leave nothing at all - so a
+    // verb that must refuse a non-scalar where it wants a word (notify's category) asks here.
+    std::set<std::string> structured;
     const std::string& get(const std::string& k) const {
         static const std::string empty;
         auto it = fields.find(k);
@@ -94,8 +99,10 @@ inline bool jsonParseObject(const std::string& s, size_t& i, const std::string& 
             if (!jsonParseString(s, i, val)) return false;
             out.fields[prefix + key] = val;
         } else if (s[i] == '{') {
+            out.structured.insert(prefix + key);
             if (!jsonParseObject(s, i, prefix + key + ".", out)) return false;
-        } else if (s[i] == '[') {   // arrays: skip balanced (unused by the subset)
+        } else if (s[i] == '[') {   // arrays: skip balanced (unused by the subset), but say one was here
+            out.structured.insert(prefix + key);
             int depth = 0;
             do {
                 if (s[i] == '[') depth++;

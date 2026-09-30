@@ -52,6 +52,9 @@ int main() {
         check(lite_remainder::highest(Category::Attention, Category::Ok) == Category::Attention);
         check(lite_remainder::highest(Category::Normal, Category::Normal) == Category::Normal);
         check(lite_remainder::highest(Category::Ok, Category::Ok) == Category::Ok);
+        for (Category each : {Category::Ok, Category::Normal, Category::Attention}) {   // the tree's word parses back to the same category
+            Category back = Category::Ok; check(lite_remainder::category(lite_remainder::name(each), back) && back == each);
+        }
         // Pill text: dark on the default green and yellow, white on the default red, black and white ends.
         check(lite_remainder::darkTextOn(0x3DC759) && lite_remainder::darkTextOn(0xF2B833));
         check(!lite_remainder::darkTextOn(0xE64D3D) && !lite_remainder::darkTextOn(0x000000) && lite_remainder::darkTextOn(0xFFFFFF));

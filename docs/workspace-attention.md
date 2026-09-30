@@ -14,14 +14,14 @@ P12 implements five existing agwinterm verbs without adding canonical contract s
   unread category (attention red, normal yellow, ok green; omitted = attention; any other value
   is refused and nothing is delivered). Finished commands count in the same badge and keep the
   red while no notice is unread. `notification-color-ok` / `-normal` / `-attention` (`#RRGGBB`)
-  change the colours.
-
-  ![ok, normal and attention notices as green, yellow and red pills](img/qa-notify-categories.png)
- It requests a desktop balloon without raising the app; Windows
+  change the colours, and `tree --json` carries the highest unread category as `unreadCategory`.
+  It requests a desktop balloon without raising the app; Windows
   may suppress it. Body/title are capped at 4096/256 UTF-8 bytes; balloon text is truncated to the
   Windows limits. Selecting the session or `session seen` clears the badge. A split pane maps
   to its owning session, while a popup/cover refuses. Notices are transient, not persisted;
   a newer banner replaces the previous one, but each target's badge and event remain.
+
+  ![ok, normal and attention notices as green, yellow and red pills](img/qa-notify-categories.png)
 - `dashboard [ID ...] [--close]`: up to nine distinct tree sessions or the recent-session default.
   Arrows/Home/End choose a tile, Enter/Space/click activate it, Escape closes without switching.
   Keys/paste/mouse input cannot pass through. Previews use the existing fixed strike, clipped to
