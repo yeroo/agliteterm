@@ -1,7 +1,13 @@
 {
   "repo": "yeroo/agwinterm",
-  "tag": "v0.19.0",
+  "tag": "v0.20.12",
   "note": "The agwinterm release whose agwinterm_core.dll + agwinterm-ptyhost.exe this client is built against. tools/fetch-native.ps1 refuses a release whose published abiVersion is not the one src/main.cpp requires. Pin an explicit tag (e.g. v0.17.4) to make a build reproducible; 'latest' tracks the newest release.",
   "cliTag": "v0.20.11",
-  "cliNote": "The agwinterm release whose agwintermctl.exe the checks drive agliteterm with, locally and in CI. Pinned independently of the core/ABI tag above, because the checks need a client new enough for every contract feature lite answers while the core must match kRequiredAbi exactly. The CLI is never shipped with agliteterm. tools/fetch-native.ps1 refuses a staged CLI whose version is not this tag; 'latest' skips that comparison and is downloaded afresh on every fetch, since nothing else would notice a stale copy; when that download fails, the cached copy is used with a warning."
+  "cliNote": "The agwinterm release whose agwintermctl.exe the checks drive agliteterm with, locally and in CI. Pinned independently of the core/ABI tag above, because the checks need a client new enough for every contract feature lite answers while the core must match kRequiredAbi exactly. The CLI is never shipped with agliteterm. tools/fetch-native.ps1 refuses a staged CLI whose version is not this tag; 'latest' skips that comparison and is downloaded afresh on every fetch, since nothing else would notice a stale copy; when that download fails, the cached copy is used with a warning.",
+  "conpty": {
+    "package": "Microsoft.Windows.Console.ConPTY",
+    "version": "1.24.260710001",
+    "sha256": "175640566a3b59c4b132070ee96c2c77e5ab7edd2e92732a5eb3610bbf63d90e"
+  },
+  "conptyNote": "Microsoft's ConPTY (MIT), which agwinterm-ptyhost.exe --conpty bundled loads from its own directory: conpty.dll and x64\\OpenConsole.exe out of this NuGet package. sha256 is the .nupkg's; tools/fetch-native.ps1 stages nothing from a package with another hash. Keep the version the one the pinned agwinterm release references (src/Agwinterm.Win32/Agwinterm.Win32.csproj)."
 }

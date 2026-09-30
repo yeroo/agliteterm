@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 # User settings under %LOCALAPPDATA%\agliteterm and HKCU\Software\agliteterm are deliberately kept:
 # reinstalling should find your sessions where you left them.
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-foreach ($f in 'agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll') {
+foreach ($f in 'agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll', 'conpty.dll', 'x64\OpenConsole.exe') {
     $p = Join-Path $toolsDir $f
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
 }

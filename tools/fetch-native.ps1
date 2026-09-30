@@ -21,6 +21,11 @@
 # -NativeDir (or AGLITETERM_NATIVE_DIR) takes a local agwinterm checkout's target\release instead,
 # which is how you work on the core and the client together — and the only way to build against a
 # core that has not been released yet.
+#
+# And it stages Microsoft's ConPTY (conpty.dll + x64\OpenConsole.exe), which the pty-host loads
+# from its own directory. That pair is not an agwinterm asset: it comes from the NuGet package
+# native/pinned.json's conpty entry names, by version and SHA-256 (tools\conpty-pin.ps1), cached
+# under .native\conpty-<version>\, with -NativeDir as without it.
 [CmdletBinding()]
 param(
     [string]$NativeDir = $env:AGLITETERM_NATIVE_DIR,
@@ -41,6 +46,36 @@ $m = Select-String -Path $mainCpp -Pattern 'kRequiredAbi\s*=\s*(\d+)' | Select-O
 if (-not $m) { throw "kRequiredAbi not found in src\main.cpp - cannot verify the core pairing" }
 $requiredAbi = [int]$m.Matches[0].Groups[1].Value
 
+# --- the pin file: the release to take the core from, the CLI, the ConPTY package ----------------
+$pinFile = Join-Path $root 'native\pinned.json'
+if (-not (Test-Path $pinFile)) { throw "native\pinned.json not found - it names the agwinterm release to build against" }
+$pin = Get-Content $pinFile -Raw | ConvertFrom-Json
+
+# --- Microsoft's ConPTY, beside the pty-host that loads it ----------------------------------------
+. (Join-Path $PSScriptRoot 'conpty-pin.ps1')
+$conpty = Get-ConptyPin $pin
+$conptyCache = Join-Path $root ".native\conpty-$($conpty.Version)"
+if ($Force -and (Test-Path $conptyCache)) { Remove-Item -Recurse -Force $conptyCache }
+New-Item -ItemType Directory -Force $conptyCache | Out-Null
+$conptyPackage = Join-Path $conptyCache "$($conpty.Package).$($conpty.Version).nupkg"
+if (-not (Test-Path $conptyPackage)) {
+    $conptyUrl = Get-ConptyPackageUrl $conpty
+    try { Invoke-WebRequest -Uri $conptyUrl -OutFile $conptyPackage -UseBasicParsing }
+    catch {
+        Remove-Item $conptyPackage -Force -ErrorAction SilentlyContinue   # no partial file for the next run to trust
+        throw "could not download $($conpty.Package) $($conpty.Version) from ${conptyUrl}: $($_.Exception.Message)"
+    }
+}
+try { Assert-ConptyPackage $conptyPackage $conpty }
+catch {
+    # A cached file with another hash is a bad download: drop it, so the next run fetches it again.
+    Remove-Item $conptyPackage -Force -ErrorAction SilentlyContinue
+    throw
+}
+# Checks the hash again itself (nothing is staged without it). A destination it cannot replace - a
+# pty-host running from bin - is reported as that, and the verified package stays cached.
+Install-ConptyPackage -Package $conptyPackage -Conpty $conpty -Bin $bin
+
 # --- a local core beats a downloaded one --------------------------------------------------------
 if ($NativeDir) {
     if (-not (Test-Path $NativeDir)) { throw "NativeDir does not exist: $NativeDir" }
@@ -51,14 +86,11 @@ if ($NativeDir) {
     }
     # No manifest to check against a local build: the ABI is whatever that tree compiled. The
     # handshake in main.cpp still refuses a mismatch at load, which is the pre-split behaviour.
-    "native: local $NativeDir (abi unchecked - local build)"
+    "native: local $NativeDir (abi unchecked - local build); conpty $($conpty.Version)"
     return
 }
 
 # --- the pinned release -------------------------------------------------------------------------
-$pinFile = Join-Path $root 'native\pinned.json'
-if (-not (Test-Path $pinFile)) { throw "native\pinned.json not found - it names the agwinterm release to build against" }
-$pin = Get-Content $pinFile -Raw | ConvertFrom-Json
 $repo = $pin.repo
 if ($Tag) { $pin.tag = $Tag }
 
@@ -137,4 +169,4 @@ if ($cliTag -eq 'latest') {
 else { Get-Asset $cliBase $cliTag 'agwintermctl.exe' $ctlCached $cliHint }
 Install-CheckedCli -Cached $ctlCached -Staged $ctlStaged -CliTag $cliTag
 
-"native: $repo@$($pin.tag) abi $requiredAbi (cached in .native\$($pin.tag)); cli $cliTag (cached in .native\cli-$cliTag)"
+"native: $repo@$($pin.tag) abi $requiredAbi (cached in .native\$($pin.tag)); cli $cliTag (cached in .native\cli-$cliTag); conpty $($conpty.Version)"

@@ -30,7 +30,7 @@ if (-not (Test-Path (Join-Path $stage 'agliteterm.exe'))) {
     & (Join-Path $here 'build.ps1') -NativeDir $NativeDir
     if ($LASTEXITCODE -ne 0) { throw 'installer build failed' }
 }
-foreach ($f in @('agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll', 'agliteterm.ico')) {
+foreach ($f in @('agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll', 'conpty.dll', 'x64\OpenConsole.exe', 'ConPTY-LICENSE.txt', 'agliteterm.ico')) {
     if (-not (Test-Path (Join-Path $stage $f))) { throw "stage is missing $f" }
 }
 
@@ -47,7 +47,10 @@ Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Compression
 # release nobody notices until someone downloads it.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $names = [IO.Compression.ZipFile]::OpenRead($zip).Entries.FullName
-foreach ($f in @('agliteterm.exe', 'agwinterm_core.dll', 'agwinterm-ptyhost.exe')) {
+# Compress-Archive writes a subdirectory entry with `\` under Windows PowerShell 5.1 and `/` under
+# pwsh 7, so the separator is folded before the comparison.
+$names = @($names | ForEach-Object { $_ -replace '\\', '/' })
+foreach ($f in @('agliteterm.exe', 'agwinterm_core.dll', 'agwinterm-ptyhost.exe', 'conpty.dll', 'x64/OpenConsole.exe')) {
     if ($names -notcontains $f) { throw "the portable zip is missing $f" }
 }
 Write-Host ("== done: {0} ({1:N1} MB, {2} files) ==" -f $zip, ((Get-Item $zip).Length / 1MB), $names.Count) -ForegroundColor Green

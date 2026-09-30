@@ -78,6 +78,7 @@ CAppModule _Module;
 #include "styled_text.h"
 #include "driving.h"
 #include "configuration.h"
+#include "native_host.h"
 #include "profiles.h"
 #include "shell_configuration.h"
 #include "commands.h"
@@ -106,6 +107,7 @@ struct FfiMark {   // FTCS / OSC 133 boundary; lines are buffer-absolute, -1 = u
 static uint32_t (*core_abi)();
 static void* (*emu_new)(uint32_t, uint32_t);
 static bool (*emu_set_scrollback)(void*, uint32_t);
+static bool (*emu_set_default_colors)(void*, uint32_t, uint32_t);   // 0xRRGGBB foreground, background
 static std::atomic<uint32_t> g_scrollbackLines{5000}; // core default; new replicas only
 static void (*emu_free)(void*);
 static bool (*emu_feed)(void*, const uint8_t*, uint32_t);
@@ -127,7 +129,11 @@ static void (*core_free_buf)(uint8_t*, uint32_t);
 // the core it is built against. Re-check every struct above (FfiEmuInfo, FfiMark) AND FfiCell in
 // styled_text.h against lib.rs on each bump: emu_info, emu_marks and emu_copy_grid /
 // emu_copy_history_row respectively write those layouts into caller memory.
-static constexpr uint32_t kRequiredAbi = 18;
+// v19 (agwinterm 0.20.12, #342) added agwcore_emu_set_default_colors and changed no struct: the
+// core now ANSWERS a program's questions (OSC 10/11 colours from the pair that export is given,
+// DA1, DA2, DSR 5n, CPR 6n, DECXCPR ?6n) and ignores a CSI with a `>`, `=` or `<` prefix, which
+// v18 ran as the unprefixed sequence (XTMODKEYS `CSI > 4 ; 2 m` left underline + faint on).
+static constexpr uint32_t kRequiredAbi = 19;
 static constexpr uint32_t kProtocolVersion = 2;
 static constexpr int kSidebarW = 180;
 static constexpr int kSplitterW = 5;   // draggable divider between the sidebar and the terminal
@@ -641,6 +647,10 @@ static HFONT g_uiFont;          // shell UI font (Segoe UI) for the toolbar butt
 static HFONT g_treeFont;        // sidebar font — the shell UI face at g_treeFontPt (0 = system size)
 static int   g_treeFontPt = 0;  // sidebar point size; 0 means "whatever the shell says", the default
 static bool g_customColors = false;   // Properties->Colors: override the terminal's default fg/bg
+// The `conpty` key: true (the default) = the pty-host this window STARTS runs shells on the inbox
+// conhost, false = on the bundled ConPTY. Read once, in connectControl; a host already running
+// keeps its own.
+static bool g_conptyInbox = true;
 static uint32_t g_defFg = 0xC0C0C0;   // packed 0xRRGGBB, legacy cmd.exe light gray on...
 static uint32_t g_defBg = 0x000000;   // ...black
 static bool g_dosPalette = true;      // Properties->Colors: remap ANSI indices to the muted EGA/VGA DOS palette
@@ -739,6 +749,15 @@ static void resolveTheme() {
 // Terminal defaults: an explicit Properties override always wins over the theme.
 static uint32_t themeFg() { return g_customColors ? g_defFg : g_th.termFg; }
 static uint32_t themeBg() { return g_customColors ? g_defBg : g_th.termBg; }
+// Tell an emulator the colours above, which is what it answers OSC 10 / OSC 11 with ("what are
+// your foreground and background?" - Codex shades the user's messages from the reply). An emulator
+// never told answers no colour rather than a made-up one. The caller holds g_lock.
+// applyEmulatorColors re-tells every listed one when Properties or `config set` changes the pair,
+// so a new session is told inside the g_lock hold that lists it: told earlier, a change landing
+// between the two would miss it (not listed yet) and leave it answering the old pair. The four
+// themes share one terminal pair, so a theme switch alone changes nothing here.
+static void emuThemeColors(void* emu) { if (emu) emu_set_default_colors(emu, themeFg(), themeBg()); }
+static void applyEmulatorColors();   // fwd: needs the session list
 
 // Undocumented uxtheme entry points (Win10 1903+), exported by ordinal only. These are what File
 // Explorer itself uses; opting the process into dark mode is what makes USER32 draw the MENU BAR and
@@ -1215,6 +1234,10 @@ static HANDLE g_control = INVALID_HANDLE_VALUE;
 static uint32_t g_creationRevision = 0; // negotiated before worker threads start
 static uint32_t g_creationHostPid = 0;
 static std::vector<Session*> g_sessions;
+static void applyEmulatorColors() {
+    LockG hold;
+    for (Session* s : g_sessions) emuThemeColors(s->emu);
+}
 static WorkspaceNames g_workspaces = { L"workspace 1" };  // persisted names plus process-local stable identity
 static std::set<int> g_collapsedWorkspaces; // transient, under g_lock; remapped with workspace indices
 static bool g_broadcast = false; // UI-thread state, never persisted
@@ -1651,6 +1674,7 @@ static void loadCore() {
     core_abi = (decltype(core_abi))GetProcAddress(m, "agwcore_abi_version");
     emu_new = (decltype(emu_new))GetProcAddress(m, "agwcore_emu_new");
     emu_set_scrollback = (decltype(emu_set_scrollback))GetProcAddress(m, "agwcore_emu_set_scrollback");
+    emu_set_default_colors = (decltype(emu_set_default_colors))GetProcAddress(m, "agwcore_emu_set_default_colors");
     emu_free = (decltype(emu_free))GetProcAddress(m, "agwcore_emu_free");
     emu_feed = (decltype(emu_feed))GetProcAddress(m, "agwcore_emu_feed");
     emu_resize = (decltype(emu_resize))GetProcAddress(m, "agwcore_emu_resize");
@@ -1661,7 +1685,7 @@ static void loadCore() {
     emu_get_text = (decltype(emu_get_text))GetProcAddress(m, "agwcore_emu_get_text");
     emu_take_host_actions = (decltype(emu_take_host_actions))GetProcAddress(m, "agwcore_emu_take_host_actions");
     core_free_buf = (decltype(core_free_buf))GetProcAddress(m, "agwcore_free_buf");
-    if (!core_abi || !emu_new || !emu_set_scrollback || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !emu_take_host_actions || !core_free_buf)
+    if (!core_abi || !emu_new || !emu_set_scrollback || !emu_set_default_colors || !emu_feed || !emu_info || !emu_copy_grid || !emu_resize || !emu_free || !emu_copy_history_row || !emu_marks || !emu_get_text || !emu_take_host_actions || !core_free_buf)
         fatal(L"agwinterm_core.dll: exports missing");
     // Name BOTH numbers. The old message hardcoded "need v15", so it went stale on every bump and
     // never said what the dll actually reported — the one fact you need when the exe and the core
@@ -1711,7 +1735,9 @@ static HostHealth controlHandshake() {
 static void connectControl() {
     const std::wstring hostId = g_testHostAppId.empty() ? std::wstring(kAppId) : g_testHostAppId;
     std::wstring control = hostId + L"-ptyhost";
-    std::wstring cmd = L"\"" + exeDir() + L"\\agwinterm-ptyhost.exe\" --pipe " + hostId;
+    // --conpty is read once, when the host starts: a host already running keeps the ConPTY it
+    // chose then, for every window that connects to it (the `conpty` key says so when set).
+    std::wstring cmd = L"\"" + exeDir() + L"\\agwinterm-ptyhost.exe\" --pipe " + hostId + native_host::conptyArgument(g_conptyInbox);
     // At most ONE host is started per launch. The host serves its pipe with PIPE_UNLIMITED_INSTANCES,
     // so a second one can bind the same name and clients get split between them — sessions created
     // against host A are invisible to a client that lands on host B. Retrying is for waiting out a
@@ -1730,6 +1756,15 @@ static void connectControl() {
                 fatal(L"could not start agwinterm-ptyhost.exe");
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
+            // The host falls back to the inbox conhost when either file is missing, or when the dll
+            // does not load, and says so only on a stderr nobody reads. lite cannot see which it
+            // chose: the log records the argument and whether the two files are there, no more.
+            const bool haveBundled = GetFileAttributesW((exeDir() + L"\\conpty.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                (GetFileAttributesW((exeDir() + L"\\x64\\OpenConsole.exe").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                 GetFileAttributesW((exeDir() + L"\\OpenConsole.exe").c_str()) != INVALID_FILE_ATTRIBUTES);
+            if (g_conptyInbox) logInfo("pty-host: started with --conpty inbox (conpty = inbox)");
+            else if (haveBundled) logInfo("pty-host: started with --conpty bundled (conpty.dll and OpenConsole.exe are beside the exe)");
+            else logWarn("pty-host: started with --conpty bundled, but conpty.dll or OpenConsole.exe is missing beside the exe - shells run on the inbox conhost, which drops the color queries (OSC 10/11)");
             g_control = openPipe(control, 5000, true);
         }
         HostHealth health = g_control != INVALID_HANDLE_VALUE ? controlHandshake() : HostHealth::Dead;
@@ -2623,6 +2658,7 @@ static Session* failedCommandSession(int cols, int rows, const char* app,
         s->id = g_idPrefix + "-failed-" + std::to_string(g_seq++);
         s->paneId = s->id;
         s->ws = g_workspaces.destination(workspace);
+        emuThemeColors(s->emu);
         emu_feed(s->emu, (const uint8_t*)message.data(), (uint32_t)message.size());
         g_sessions.push_back(s); g_userEmptied = false;
         emitEvent("session", s->id, "created"); emitEvent("tree");
@@ -2737,7 +2773,10 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
         strcpy_s(req.cmd.create.env[i].key, k);
         strcpy_s(req.cmd.create.env[i].value, v);
     };
-    req.cmd.create.env_count = 7;
+    // The header is generated in agwinterm from proto/ptyhost.options (Create.env max_count). A
+    // regeneration from a smaller limit would make the setEnv calls below write past the array.
+    static_assert(sizeof req.cmd.create.env / sizeof req.cmd.create.env[0] >= 9, "Create.env holds fewer entries than newSession sets - raise max_count in agwinterm's proto/ptyhost.options and regenerate");
+    req.cmd.create.env_count = 9;
     setEnv(0, "AGWINTERM", "1");
     setEnv(1, "AGWINTERM_ENABLED", "1");
     std::string pipeNarrow = narrow(lite_test_registry::endpoint(g_testRun, g_argPipe.empty() ? std::wstring(kAppId) : g_argPipe));
@@ -2749,6 +2788,12 @@ static Session* newSession(int cols, int rows, const char* app = nullptr,
     setEnv(5, "TERM_PROGRAM", "agliteterm");
     const auto windowIdentity=quick?std::string("quick"):narrow(g_instance);
     setEnv(6, "AGWINTERM_WINDOW_ID", windowIdentity.c_str());
+    // The pair the pty-host answers OSC 10 / OSC 11 with while no window is attached (agwinterm
+    // #342); attached, this window's emulator answers (emuThemeColors).
+    setEnv(7, "AGWINTERM_THEME_COLORS", native_host::themeColors(themeFg(), themeBg()).c_str());
+    // 24-bit colour. Windows shells leave TERM unset, and a program that sizes its palette from
+    // the environment (Codex among them) falls back to 16 colours without this.
+    setEnv(8, "COLORTERM", "truecolor");
     // An id the host already holds is REFUSED, and that single rejection is what used to sink every
     // spec of a restore at once. scanHostSessions() reserves the ids it can see, but it only sees
     // what `list` returns: a reply this build cannot decode (more sessions than its field storage
@@ -2876,6 +2921,7 @@ static Session* attachSession(const char* id, int cols, int rows, const char* ap
     // seeding the scrollback is a separate improvement.
     EnterCriticalSection(&g_lock);
     s->ws = g_workspaces.destination(workspace);
+    emuThemeColors(s->emu);   // before the reader thread exists: the first bytes may already ask
     // Nothing joins the reader — it ends with the data pipe — so its handle is closed at once rather
     // than kept as one more zombie thread object per session.
     if (HANDLE reader = CreateThread(nullptr, 0, readerThread, s, 0, nullptr)) CloseHandle(reader);
@@ -3527,6 +3573,7 @@ static uint32_t configValue(const configuration::Key& key) {
     case Id::NoticeOk: return g_noticeColor[0];
     case Id::NoticeNormal: return g_noticeColor[1];
     case Id::NoticeAttention: return g_noticeColor[2];
+    case Id::Conpty: return g_conptyInbox;
     }
     return 0;
 }
@@ -3557,6 +3604,7 @@ static void assignConfig(const configuration::Key& key, uint32_t value) {
     case Id::NoticeOk: g_noticeColor[0] = value; break;
     case Id::NoticeNormal: g_noticeColor[1] = value; break;
     case Id::NoticeAttention: g_noticeColor[2] = value; break;
+    case Id::Conpty: g_conptyInbox = value != 0; break;
     }
 }
 static void loadColors() {   // config API and startup share key names, types, validation and defaults
@@ -6960,6 +7008,7 @@ static void propCommit() {
             if (key.id == value.first && configValue(key) != value.second) changed.push_back(key.id);
     if (g_pFace != g_faceIdx || g_pSize != g_sizeIdx) pickFont(g_pFace, g_pSize);
     g_customColors = g_pUse; g_defFg = g_pFg; g_defBg = g_pBg; g_dosPalette = g_pDos;
+    applyEmulatorColors();
     if (g_pSidePt != g_treeFontPt) { g_treeFontPt = g_pSidePt; applyTreeFont(); relayout(); }
     if (g_pTheme != g_themeMode) {   // theme switch: re-skin everything live, incl. this open dialog
         g_themeMode = g_pTheme;
@@ -8204,6 +8253,7 @@ static std::string configOnUi(const JsonReq& req) {
     case Id::CursorStyle: case Id::CursorBlink: case Id::CursorBlinkMs:
         g_caretOn=true;SetTimer(g_hwnd,kCaretTimer,g_cursorBlinkMs,nullptr);break;
     case Id::QuickSize: repositionQuick(); break;
+    case Id::CustomColors: case Id::Foreground: case Id::Background: applyEmulatorColors(); break;
     case Id::Theme: applyTheme(); break;
     case Id::SidebarFont: applyTreeFont(); relayout(); break;
     case Id::ShowSidebar: case Id::ShowToolbar: case Id::ShowStatus: {
@@ -8225,7 +8275,8 @@ static std::string configOnUi(const JsonReq& req) {
         if (h) InvalidateRect(h, nullptr, FALSE);
     if (theme) return ctlOkStr("theme set");
     return ctlOkStr(name + " = " + configuration::format(*key, value) +
-        (key->id == Id::Scrollback ? "  (applies to new surfaces)" : ""));
+        (key->id == Id::Scrollback ? "  (applies to new surfaces)" :
+         key->id == Id::Conpty ? "  (read when the pty-host next starts)" : ""));
 }
 static void drainConfigRequests() {
     std::deque<std::shared_ptr<ConfigRequest>> requests;
@@ -10386,6 +10437,10 @@ Keys: `theme` (auto/dark/light/classic), `foreground`/`background` (#RRGGBB, use
 `sidebar-font-size` (0 or6..24), `scrollback-lines` (0..1000000, default5000, new surfaces only),
 and booleans `custom-colors`, `dos-palette`, `show-sidebar`, `show-toolbar`, `show-status`,
 `flag-view`, `right-click-paste`, `copy-on-ctrl-c`, `copy-on-select` (true/false/on/off/1/0).
+`conpty` (inbox/bundled, default inbox) picks the ConPTY shells run on and is read when the
+pty-host next starts. bundled passes a program's terminal queries through, and lite answers
+OSC 10/11 with its colors, DA1, DA2, DSR and the cursor position; but it does not repaint after a
+resize, so a pane that changes width shows clipped and misplaced text until the program redraws.
 `theme list/set` exposes lite's four UI modes, not the full terminal-theme catalog. `settings`
 requests Properties without raising the terminal (`settings open requested`). `keymap reload`
 re-reads registry bindings, resetting deleted entries to default/unbound and keeping explicit zero.
@@ -12793,6 +12848,7 @@ static Session* failedSpecSession(const RestoreSpec& sp, int cols, int rows) {
     if (!sp.cwd.empty()) msg += "  cwd: " + sp.cwd + "\r\n";
     msg += "  The entry is kept so its name and settings are not lost.\r\n";
     EnterCriticalSection(&g_lock);
+    emuThemeColors(s->emu);
     if (s->emu) emu_feed(s->emu, (const uint8_t*)msg.data(), (uint32_t)msg.size());
     g_sessions.push_back(s);
     g_userEmptied = false;   // see attachSession: the deliberate-empty flag is per-empty, not per-process

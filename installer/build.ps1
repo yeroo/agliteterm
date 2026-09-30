@@ -33,12 +33,16 @@ Write-Host '== stage ==' -ForegroundColor Cyan
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 $bin = Join-Path $root 'bin'
-foreach ($f in @('agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll')) {
+foreach ($f in @('agliteterm.exe', 'agwinterm-ptyhost.exe', 'agwinterm_core.dll', 'conpty.dll', 'x64\OpenConsole.exe')) {
   if (-not (Test-Path (Join-Path $bin $f))) { throw "bin is missing $f" }
-  Copy-Item (Join-Path $bin $f) $stage -Force
+  # Microsoft's ConPTY keeps its layout: the pty-host loads conpty.dll from its own directory and
+  # that dll starts x64\OpenConsole.exe. Without the pair the host falls back to the inbox conhost.
+  $dest = Join-Path $stage $f
+  New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
+  Copy-Item (Join-Path $bin $f) $dest -Force
 }
 Copy-Item (Join-Path $root 'assets\*') $stage -Force   # fonts + licenses + app icon
-foreach ($f in @('agliteterm.ico', 'CozetteVector.ttf', 'MesloLGLDZNerdFont-Regular.ttf')) {
+foreach ($f in @('agliteterm.ico', 'CozetteVector.ttf', 'MesloLGLDZNerdFont-Regular.ttf', 'ConPTY-LICENSE.txt')) {
   if (-not (Test-Path (Join-Path $stage $f))) { throw "stage is missing $f" }
 }
 

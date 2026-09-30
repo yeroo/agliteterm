@@ -80,16 +80,22 @@ foreach($row in $rows){
 }
 Check 'scrollback setter names new-surface scope' ($reply -match 'applies to new surfaces')
 $list=[string](Selection-Rpc 'config.list')
-Check 'config list contains twenty-four supported keys once each' (($list-split "`n").Count-eq 24 -and @($list-split "`n"|Select-Object -Unique).Count-eq 24)
+Check 'config list contains twenty-five supported keys once each' (($list-split "`n").Count-eq 25 -and @($list-split "`n"|Select-Object -Unique).Count-eq 25)
 Check 'config key normalization' ((Config-Get ' COPY-ON-SELECT ')-eq 'false')
 foreach($args_ in @(@{key='unknown';value='true'},@{key='font-size';value='16'},@{value='true'},@{key='theme'},
     @{key='copy-on-select';value='toggle'},@{key='scrollback-lines';value='1000001'},@{key='scrollback-lines';value='4294967296'},
-    @{key='sidebar-font-size';value='5'},@{key='foreground';value='#gg1234'},@{key='theme';value='1'})) {
+    @{key='sidebar-font-size';value='5'},@{key='foreground';value='#gg1234'},@{key='theme';value='1'},@{key='conpty';value='true'})) {
     $before=[string](Selection-Rpc 'config.list')
     $r=Selection-Rpc 'config.set' $args_ -AllowError
     Check "invalid config refuses without mutation: $($args_.key)/$($args_.value)" (-not $r.ok -and [string](Selection-Rpc 'config.list')-ceq $before)
 }
 Check 'unknown get refuses' (-not (Selection-Rpc 'config.get' @{key='unknown'} -AllowError).ok)
+# conpty is read when the pty-host starts, so setting it changes the saved value and nothing live.
+Check 'conpty defaults to inbox' ((Config-Get 'conpty')-ceq'inbox')
+$reply=[string](Selection-Rpc 'config.set' @{key='conpty';value='bundled'})
+Check 'conpty setter says when it applies' ($reply-match'conpty = bundled' -and $reply-match'read when the pty-host next starts' -and (Config-Get 'conpty')-ceq'bundled')
+$null=Selection-Rpc 'config.set' @{key='conpty';value='inbox'}
+Check 'conpty goes back to inbox' ((Config-Get 'conpty')-ceq'inbox')
 Check 'theme catalog names actual lite modes' ([string](Selection-Rpc 'theme.list')-ceq "auto`nlight`ndark`nclassic")
 Check 'unknown theme refuses without changing mode' (-not (Selection-Rpc 'theme.set' @{name='invented'} -AllowError).ok -and (Config-Get 'theme')-eq 'dark')
 $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-LiteTestRegistryPath))

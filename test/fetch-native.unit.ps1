@@ -72,6 +72,64 @@ try{
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+# The ConPTY pin (tools\conpty-pin.ps1): which package, and staging the pair only from that one.
+. (Join-Path $root 'tools/conpty-pin.ps1')
+$conpty=try{Get-ConptyPin $pin}catch{$null}
+Check 'native/pinned.json pins the ConPTY package by version and SHA-256' ($conpty -and $conpty.Package-ceq'Microsoft.Windows.Console.ConPTY' -and $conpty.Version-cmatch'\A\d+(\.\d+){1,3}\z' -and $conpty.Sha256-cmatch'\A[0-9a-f]{64}\z')
+Check 'the package URL is nuget.org''s flat container, lower case' ($conpty -and (Get-ConptyPackageUrl $conpty)-ceq"https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$($conpty.Version)/microsoft.windows.console.conpty.$($conpty.Version).nupkg")
+foreach($bad in @(
+    @{Pin=[pscustomobject]@{repo='r'};Word='conpty entry'},
+    @{Pin=[pscustomobject]@{conpty=[pscustomobject]@{package='Some Package';version='1.0.0';sha256=('a'*64)}};Word='conpty.package'},
+    @{Pin=[pscustomobject]@{conpty=[pscustomobject]@{package='A.B';version='latest';sha256=('a'*64)}};Word='conpty.version'},
+    @{Pin=[pscustomobject]@{conpty=[pscustomobject]@{package='A.B';version='1.0.0';sha256=('A'*64)}};Word='conpty.sha256'},
+    @{Pin=[pscustomobject]@{conpty=[pscustomobject]@{package='A.B';version='1.0.0';sha256='abc'}};Word='conpty.sha256'})){
+    $m=Refusal {Get-ConptyPin $bad.Pin}
+    Check "Get-ConptyPin refuses a pin with a bad $($bad.Word)" ($m -and $m.Contains($bad.Word))
+}
+$tmp=Join-Path ([IO.Path]::GetTempPath()) ('agliteterm-conpty-pin-test-'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory $tmp|Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+function FakePackage([string]$Name,[hashtable]$Entries){
+    $src=Join-Path $tmp "$Name-src"
+    foreach($entry in $Entries.Keys){$file=Join-Path $src $entry;New-Item -ItemType Directory -Force (Split-Path $file -Parent)|Out-Null;[IO.File]::WriteAllText($file,$Entries[$entry])}
+    $zip=Join-Path $tmp "$Name.nupkg";[IO.Compression.ZipFile]::CreateFromDirectory($src,$zip);$zip
+}
+function PinFor([string]$Zip){[pscustomobject]@{Package='Fake.ConPTY';Version='1.2.3';Sha256=(Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash.ToLowerInvariant()}}
+try{
+    $good=FakePackage 'good' @{'runtimes/win-x64/native/conpty.dll'='DLL';'build/native/runtimes/x64/OpenConsole.exe'='EXE';'runtimes/win-arm64/native/conpty.dll'='ARM'}
+    $bin=Join-Path $tmp 'bin-good';New-Item -ItemType Directory $bin|Out-Null
+    $m=Refusal {Install-ConptyPackage -Package $good -Conpty (PinFor $good) -Bin $bin}
+    Check 'a package with the pinned hash stages conpty.dll and x64\OpenConsole.exe, the x64 ones' ($null-eq $m -and (Get-Content -Raw (Join-Path $bin 'conpty.dll'))-ceq'DLL' -and (Get-Content -Raw (Join-Path $bin 'x64/OpenConsole.exe'))-ceq'EXE')
+    $wrong=PinFor $good;$wrong.Sha256='0'*64
+    $m=Refusal {Install-ConptyPackage -Package $good -Conpty $wrong -Bin $bin}
+    Check 'a package with another hash is refused, naming both hashes and the fix' ($m -and $m.Contains('0'*64) -and $m.Contains((PinFor $good).Sha256) -and $m.Contains('-Force'))
+    Check 'and what an earlier run staged is removed with it' (-not (Test-Path (Join-Path $bin 'conpty.dll')) -and -not (Test-Path (Join-Path $bin 'x64/OpenConsole.exe')))
+    $half=FakePackage 'half' @{'runtimes/win-x64/native/conpty.dll'='DLL';'build/native/runtimes/arm64/OpenConsole.exe'='ARM'}
+    $bin=Join-Path $tmp 'bin-half';New-Item -ItemType Directory $bin|Out-Null
+    $m=Refusal {Install-ConptyPackage -Package $half -Conpty (PinFor $half) -Bin $bin}
+    Check 'a package without the x64 OpenConsole.exe stages neither file' ($m -and $m.Contains('build/native/runtimes/x64/OpenConsole.exe') -and -not (Test-Path (Join-Path $bin 'conpty.dll')))
+    $m=Refusal {Install-ConptyPackage -Package (Join-Path $tmp 'absent.nupkg') -Conpty (PinFor $good) -Bin $bin}
+    Check 'a missing package is refused' ($m -and $m.Contains('was not staged'))
+    $m=Refusal {Assert-ConptyPackage $good $wrong}
+    Check 'Assert-ConptyPackage alone refuses another hash (what fetch-native drops a cached download on)' ($m -and $m.Contains('0'*64))
+    # A pty-host running from bin keeps conpty.dll open. Same bytes: nothing to replace, the build goes on.
+    $bin=Join-Path $tmp 'bin-held';New-Item -ItemType Directory $bin|Out-Null
+    Install-ConptyPackage -Package $good -Conpty (PinFor $good) -Bin $bin
+    $held=[IO.File]::Open((Join-Path $bin 'conpty.dll'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try{
+        $m=Refusal {Install-ConptyPackage -Package $good -Conpty (PinFor $good) -Bin $bin}
+        Check 'a held conpty.dll with the same bytes is left alone and staging succeeds' ($null-eq $m)
+        # Other bytes (the pin moved): it cannot be replaced, and the message names the cause, not the pin.
+        $next=FakePackage 'next' @{'runtimes/win-x64/native/conpty.dll'='DLL2';'build/native/runtimes/x64/OpenConsole.exe'='EXE2'}
+        $m=Refusal {Install-ConptyPackage -Package $next -Conpty (PinFor $next) -Bin $bin}
+        Check 'a held conpty.dll that must change is reported as in use, not as a bad pin' ($m -and $m.Contains('could not be replaced') -and $m.Contains('agwinterm-ptyhost.exe') -and -not $m.Contains('-Force'))
+        Check 'and the pair already in bin is still there' ((Test-Path (Join-Path $bin 'conpty.dll')) -and (Get-Content -Raw (Join-Path $bin 'x64/OpenConsole.exe'))-ceq'EXE')
+        Check 'and no staging file is left behind' (@(Get-ChildItem $bin -Recurse -Filter '*.staging').Count-eq 0)
+    }finally{$held.Dispose()}
+}finally{Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue}
+$fetch=Get-Content -Raw (Join-Path $root 'tools/fetch-native.ps1')
+Check 'fetch-native stages the ConPTY before it branches on -NativeDir' ($fetch.IndexOf('Install-ConptyPackage')-gt 0 -and $fetch.IndexOf('Install-ConptyPackage')-lt $fetch.IndexOf('if ($NativeDir) {'))
+
 # CI drives lite with the CLI fetch-native staged from cliTag, not a second, CI-only build of it.
 $ci=Get-Content -Raw (Join-Path $root '.github/workflows/ci.yml')
 foreach($word in 'ci-full-cli','setup-dotnet','Agwinterm.Ctl.csproj'){

@@ -28,6 +28,12 @@ To build against a core you are changing:
 ./build.ps1 -NativeDir C:\src\agwinterm\native\target\release
 ```
 
+The pty-host loads Microsoft's ConPTY (`conpty.dll`, `x64\OpenConsole.exe`) from its own directory.
+That pair is not an agwinterm asset: `tools/fetch-native.ps1` takes it from the
+`Microsoft.Windows.Console.ConPTY` NuGet package that `native/pinned.json`'s `conpty` entry pins by
+version and SHA-256, with `-NativeDir` as without it, and stages nothing from a package with another
+hash. Keep the version the one the pinned agwinterm release references.
+
 ### The control-API contract
 
 `test/control-api.json` mirrors the canonical contract in agwinterm, `tools/check-contract.ps1`
