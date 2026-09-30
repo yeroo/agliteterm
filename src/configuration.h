@@ -8,8 +8,8 @@ namespace configuration {
 enum class Id { Theme, CustomColors, Foreground, Background, DosPalette, SidebarFont,
     ShowSidebar, ShowToolbar, ShowStatus, FlagView, RightClickPaste, CopyOnCtrlC,
     CopyOnSelect, Scrollback, RestoreCommands, CursorStyle, CursorBlink, CursorBlinkMs, QuickSize, QuickHotkey,
-    NoticeOk, NoticeNormal, NoticeAttention };
-enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback, CursorStyle, CursorBlink, PositiveInt, QuickSize, Hotkey };
+    NoticeOk, NoticeNormal, NoticeAttention, Conpty };
+enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback, CursorStyle, CursorBlink, PositiveInt, QuickSize, Hotkey, Conpty };
 struct Key { const char* name; const wchar_t* registry; Id id; Kind kind; uint32_t initial; };
 static const Key keys[] = {
     {"theme", L"Theme", Id::Theme, Kind::Theme, 0},
@@ -36,6 +36,9 @@ static const Key keys[] = {
     {"notification-color-ok", L"NotificationColorOk", Id::NoticeOk, Kind::Color, 0x3DC759},
     {"notification-color-normal", L"NotificationColorNormal", Id::NoticeNormal, Kind::Color, 0xF2B833},
     {"notification-color-attention", L"NotificationColorAttention", Id::NoticeAttention, Kind::Color, 0xE64D3D},
+    // Which ConPTY the pty-host runs shells on (agwinterm #342): 0 bundled (conpty.dll +
+    // OpenConsole.exe beside the exe), 1 inbox (the conhost built into Windows).
+    {"conpty", L"Conpty", Id::Conpty, Kind::Conpty, 0},
 };
 inline std::string normalized(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -50,7 +53,7 @@ inline const Key* find(const std::string& name) {
 }
 inline bool valid(const Key& key, uint32_t value) {
     switch (key.kind) {
-    case Kind::Boolean: case Kind::CursorBlink: return value <= 1;
+    case Kind::Boolean: case Kind::CursorBlink: case Kind::Conpty: return value <= 1;
     case Kind::CursorStyle: return value <= 2;
     case Kind::PositiveInt: return value > 0 && value <= INT32_MAX;
     case Kind::QuickSize: return value >= 40 && value <= 90;
@@ -66,6 +69,7 @@ inline std::string format(const Key& key, uint32_t value) {
     switch (key.kind) {
     case Kind::Boolean: case Kind::CursorBlink: return value ? "true" : "false";
     case Kind::CursorStyle: return value == 0 ? "bar" : value == 1 ? "block" : "underline";
+    case Kind::Conpty: return value ? "inbox" : "bundled";
     case Kind::Hotkey: return quick_settings::format(value);
     case Kind::Theme: {
         static const char* modes[] = {"auto", "dark", "light", "classic"};
@@ -89,6 +93,9 @@ inline bool parse(const Key& key, const std::string& raw, uint32_t& out) {
         else if (s == "block" || s == "box") value = 1;
         else if (s == "underline" || s == "underscore") value = 2;
         else return false;
+    } else if (key.kind == Kind::Conpty) {
+        if (s == "inbox") value = 1;
+        else if (s != "bundled") return false;
     } else if (key.kind == Kind::CursorBlink && (s == "yes" || s == "no")) value = s == "yes";
     else if (key.kind == Kind::Boolean || key.kind == Kind::CursorBlink) {
         if (s == "true" || s == "on" || s == "1") value = 1;

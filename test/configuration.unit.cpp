@@ -1,6 +1,7 @@
 #include "../src/configuration.h"
 #include "../src/profiles.h"
 #include "../src/shell_configuration.h"
+#include "../src/native_host.h"
 #include <cstdio>
 #include <set>
 #include <future>
@@ -24,7 +25,19 @@ int main() {
         check(!parse(key, "no-such-value", out), "unknown value refuses");
         check(!parse(key, std::string("1\0x", 3), out), "embedded NUL refuses");
     }
-    check(names.size() == 23 && registry.size() == 23, "all twenty-three supported keys covered");
+    check(names.size() == 24 && registry.size() == 24, "all twenty-four supported keys covered");
+    {   // conpty: two words, bundled the default (agwinterm #342).
+        const Key* key = find("conpty"); uint32_t out = 7;
+        check(key && key->kind == Kind::Conpty && key->initial == 0 && format(*key, 0) == "bundled" && format(*key, 1) == "inbox", "conpty key defaults to bundled");
+        check(key && parse(*key, " Inbox ", out) && out == 1 && parse(*key, "bundled", out) && out == 0, "conpty parses its two words in any case");
+        out = 7;
+        for (auto word : {"true", "1", "0", "conhost", "bundled inbox", "openconsole"})
+            check(key && !parse(*key, word, out) && out == 7, "conpty refuses anything else");
+        check(key && valid(*key, 1) && !valid(*key, 2), "conpty has two values");
+    }
+    check(native_host::themeColors(0xC0C0C0, 0x000000) == "c0c0c0;000000" && native_host::themeColors(0x0A0B0C, 0xFFEEDD) == "0a0b0c;ffeedd", "theme pair is rrggbb;rrggbb, lower case, zero padded");
+    check(native_host::themeColors(0xFF112233, 0x1445566) == "112233;445566", "theme pair keeps six digits a side");
+    check(std::wstring(native_host::conptyArgument(false)) == L" --conpty bundled" && std::wstring(native_host::conptyArgument(true)) == L" --conpty inbox", "the pty-host is always told which ConPTY");
     for (const auto& pair : {std::pair<const char*, uint32_t>{"notification-color-ok", 0x3DC759},
                              {"notification-color-normal", 0xF2B833}, {"notification-color-attention", 0xE64D3D}}) {
         const Key* key = find(pair.first); uint32_t out = 1;

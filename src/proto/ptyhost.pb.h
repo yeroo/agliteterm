@@ -40,7 +40,7 @@ typedef struct _agwinterm_ptyhost_Create {
     bool de_elevate;
     bool fresh_env_off; /* proto3 default false = freshEnv ON (matches v1 semantics) */
     pb_size_t env_count;
-    agwinterm_ptyhost_Create_EnvEntry env[8];
+    agwinterm_ptyhost_Create_EnvEntry env[10];
     char creation_ticket[33]; /* creation_revision >= 1: host-issued, single-use spawn authority */
 } agwinterm_ptyhost_Create;
 
@@ -517,14 +517,14 @@ extern const pb_msgdesc_t agwinterm_ptyhost_ListReply_msg;
 #define agwinterm_ptyhost_Attach_size            166
 #define agwinterm_ptyhost_CreateReply_size       164
 #define agwinterm_ptyhost_Create_EnvEntry_size   259
-#define agwinterm_ptyhost_Create_size            35602
+#define agwinterm_ptyhost_Create_size            36126
 #define agwinterm_ptyhost_CreationRef_size       164
 #define agwinterm_ptyhost_CreationReply_size     166
 #define agwinterm_ptyhost_HelloReply_size        18
 #define agwinterm_ptyhost_Hello_size             6
 #define agwinterm_ptyhost_List_size              0
 #define agwinterm_ptyhost_PrepareCreate_size     130
-#define agwinterm_ptyhost_Request_size           35606
+#define agwinterm_ptyhost_Request_size           36130
 #define agwinterm_ptyhost_Resize_size            176
 #define agwinterm_ptyhost_SessionRef_size        164
 #define agwinterm_ptyhost_Shutdown_size          0

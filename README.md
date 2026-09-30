@@ -25,7 +25,7 @@ What it does:
 - **Native and small.** Dark, Light, Classic and Follow-Windows themes; bundled bitmap fonts (Cozette, Tamzen, Terminus, Spleen, UNSCII, GNU Unifont); copy on select, right-click paste that works under a TUI, OSC 52.
 - **Explains itself.** An always-on decision log that never records terminal output, and `agliteterm --diagnose` for bug reports.
 
-For the terminal work, VT parsing and shell I/O, agliteterm uses agwinterm's Rust emulator core and pty-host, consumed as ABI-pinned release artifacts; the window, sidebar, persistence and control server are agliteterm's own.
+For the terminal work, VT parsing and shell I/O, agliteterm uses agwinterm's Rust emulator core and pty-host, consumed as ABI-pinned release artifacts; the window, sidebar, persistence and control server are agliteterm's own. Shells run on Microsoft's ConPTY (`conpty.dll` + `OpenConsole.exe`, shipped beside the exe) rather than the conhost built into Windows: it hands a program's output over unchanged and passes its questions through, so agliteterm answers them itself - its colors (OSC 10/11, which Codex uses to shade your messages), device attributes and the cursor position. `config set conpty inbox` goes back to the built-in conhost.
 
 ![agliteterm running Claude Code, with the working session marked in the sidebar](docs/img/screenshot.png)
 
@@ -130,7 +130,7 @@ Neither agwinterm nor agliteterm is a cut-down build of the other. They are sepa
 
 agliteterm's design comes from **[umputun's agterm](https://github.com/umputun/agterm)**, the macOS terminal that treated AI coding agents as first-class citizens first. 💜
 
-The emulator core (`agwinterm_core.dll`) and the shell host (`agwinterm-ptyhost.exe`) come from [agwinterm](https://github.com/yeroo/agwinterm). The UI is built on [WTL](https://sourceforge.net/projects/wtl/) (MS-PL, `third_party/wtl`). The bundled fonts keep their upstream licenses, shipped beside them in `assets/` and listed with versions in [THIRD_PARTY_FONTS.md](https://github.com/yeroo/agwinterm/blob/main/THIRD_PARTY_FONTS.md).
+The emulator core (`agwinterm_core.dll`) and the shell host (`agwinterm-ptyhost.exe`) come from [agwinterm](https://github.com/yeroo/agwinterm). `conpty.dll` and `OpenConsole.exe` are Microsoft's ConPTY from [microsoft/terminal](https://github.com/microsoft/terminal), taken unmodified from the [Microsoft.Windows.Console.ConPTY](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY) package (MIT, `assets/ConPTY-LICENSE.txt`). The UI is built on [WTL](https://sourceforge.net/projects/wtl/) (MS-PL, `third_party/wtl`). The bundled fonts keep their upstream licenses, shipped beside them in `assets/` and listed with versions in [THIRD_PARTY_FONTS.md](https://github.com/yeroo/agwinterm/blob/main/THIRD_PARTY_FONTS.md).
 
 ## License
 

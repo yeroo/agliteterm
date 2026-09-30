@@ -51,4 +51,14 @@ it in Task Manager and relaunch. `agliteterm.log` records the connection attempt
 the case it is really there for — a host left dying by a killed window, which answers a handshake for
 a moment while refusing every real command.
 
+## A program does not see the terminal's colors
+
+Codex shades your messages only when the terminal answers its color query. Look in `agliteterm.log`
+for the `pty-host:` line of the launch that started the host: `started with the bundled ConPTY` is
+the working case; `conpty.dll or OpenConsole.exe is missing` means the files beside `agliteterm.exe`
+are incomplete (reinstall); `started with the inbox conhost` means `conpty` is set to `inbox`
+(`agwintermctl config set conpty bundled`). No such line means this window connected to a host that
+was already running, which keeps the ConPTY it started with until its last window and shell are
+gone. See [the ConPTY shells run on](configuration.md#the-conpty-shells-run-on).
+
 Report bugs in [Issues](https://github.com/yeroo/agliteterm/issues).

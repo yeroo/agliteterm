@@ -26,6 +26,7 @@ an unknown outcome: read back before retrying.
 | scrollback-lines | 0..1000000; default 5000; new surfaces only, no live eviction; positive caps allow 512 rows of batched-trim slack |
 | omp-theme | a theme name (from `omp list`) or path for eligible new PowerShell shells, or `none` (see below) |
 | restore-commands | true/false, default false (see below) |
+| conpty | bundled (default) or inbox; read when the pty-host next starts (see below) |
 
 `config list` is the authoritative list; it also reports the cursor and quick-terminal keys this table
 leaves out.
@@ -40,6 +41,25 @@ bindings are `RightClickPaste` and `CopyOnCtrlC` (DWORD `0`).
 
 Scrollback config affects the local replica, not the host's retained history, and is applied before a
 new or adopted surface receives bytes.
+
+### The ConPTY shells run on
+
+`conpty = bundled` runs shells on the `conpty.dll` + `x64\OpenConsole.exe` that ship beside
+`agliteterm.exe` (Microsoft's, the pair Windows Terminal uses). It hands a program's output to
+agliteterm unchanged and passes its questions through, and agliteterm answers them: the foreground
+and background colors (OSC 10 / OSC 11, from `foreground` / `background` when `custom-colors` is on,
+else light gray on black; a change reaches running panes at once), device attributes (DA1, DA2),
+device status and the cursor position. Codex draws the band behind your messages from the color
+reply. `conpty = inbox` uses the conhost built into Windows, which answers some of those itself and
+drops the color queries.
+
+The pty-host reads the key once, when it starts, and it outlives the window: every window that
+connects to a running host gets the ConPTY that host started with. The new value applies after the
+last window and shell of that host are gone. If either file is missing the host falls back to the
+inbox conhost; `agliteterm.log` names the ConPTY each host was started with.
+
+Panes start with `COLORTERM=truecolor`, and with `AGWINTERM_THEME_COLORS=rrggbb;rrggbb`
+(foreground;background), which the pty-host answers color queries with while no window is attached.
 
 Font face and size are chosen in Properties. There is deliberately no zoom: a raster face only exists
 at the strike sizes its pack ships.

@@ -1,5 +1,6 @@
 # Build agliteterm: MSVC cl.exe (located via vswhere) against a PINNED agwinterm core.
-# Output: bin\ with agliteterm.exe + agwinterm_core.dll + agwinterm-ptyhost.exe + the bundled fonts.
+# Output: bin\ with agliteterm.exe + agwinterm_core.dll + agwinterm-ptyhost.exe + Microsoft's ConPTY
+# (conpty.dll, x64\OpenConsole.exe) + the bundled fonts.
 #
 # The core and pty-host are not built here — they live in the agwinterm repository and arrive as
 # ABI-stamped release assets (tools\fetch-native.ps1, pinned by native\pinned.json). To build
@@ -12,7 +13,8 @@ param([string]$NativeDir = $env:AGLITETERM_NATIVE_DIR, [switch]$ForceFetch)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
-# 1) The core + pty-host this client rides on (downloaded and ABI-checked, or taken locally).
+# 1) The core + pty-host this client rides on (downloaded and ABI-checked, or taken locally), and
+#    the ConPTY the pty-host loads (from NuGet, hash-checked).
 & (Join-Path $root 'tools\fetch-native.ps1') -NativeDir $NativeDir -Force:$ForceFetch
 
 # 2) Locate MSVC.

@@ -31,6 +31,8 @@ jobs:
       # It also stages bin/agwintermctl.exe from the release pinned by native/pinned.json's cliTag,
       # and refuses one that does not report that version: the checks below drive lite with the
       # same released client a local run gets, not a CI-only build of it.
+      # And it stages Microsoft's ConPTY (conpty.dll + x64\OpenConsole.exe) beside the pty-host, from
+      # the NuGet package native/pinned.json pins by version and SHA-256.
       - name: Fetch the pinned agwinterm core and CLI
         shell: pwsh
         run: ./tools/fetch-native.ps1
