@@ -53,6 +53,8 @@ device status and the cursor position. Codex draws the band behind your messages
 reply. `conpty = inbox` uses the conhost built into Windows, which answers some of those itself and
 drops the color queries.
 
+![A program in a pane asks for the background, the foreground, the device attributes and the cursor position, and prints the four replies](img/qa-terminal-queries.png)
+
 The pty-host reads the key once, when it starts, and it outlives the window: every window that
 connects to a running host gets the ConPTY that host started with. The new value applies after the
 last window and shell of that host are gone. If either file is missing the host falls back to the
