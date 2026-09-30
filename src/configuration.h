@@ -7,7 +7,8 @@
 namespace configuration {
 enum class Id { Theme, CustomColors, Foreground, Background, DosPalette, SidebarFont,
     ShowSidebar, ShowToolbar, ShowStatus, FlagView, RightClickPaste, CopyOnCtrlC,
-    CopyOnSelect, Scrollback, RestoreCommands, CursorStyle, CursorBlink, CursorBlinkMs, QuickSize, QuickHotkey };
+    CopyOnSelect, Scrollback, RestoreCommands, CursorStyle, CursorBlink, CursorBlinkMs, QuickSize, QuickHotkey,
+    NoticeOk, NoticeNormal, NoticeAttention };
 enum class Kind { Boolean, Color, Theme, SidebarFont, Scrollback, CursorStyle, CursorBlink, PositiveInt, QuickSize, Hotkey };
 struct Key { const char* name; const wchar_t* registry; Id id; Kind kind; uint32_t initial; };
 static const Key keys[] = {
@@ -31,6 +32,10 @@ static const Key keys[] = {
     {"cursor-blink-ms", L"CursorBlinkMs", Id::CursorBlinkMs, Kind::PositiveInt, 530},
     {"quick-terminal-size", L"QuickTerminalSize", Id::QuickSize, Kind::QuickSize, 70},
     {"quick-terminal-hotkey", L"QuickTerminalHotkey", Id::QuickHotkey, Kind::Hotkey, 0},
+    // Unread-pill colours by notice category (agwinterm #335), agwinterm's defaults.
+    {"notification-color-ok", L"NotificationColorOk", Id::NoticeOk, Kind::Color, 0x3DC759},
+    {"notification-color-normal", L"NotificationColorNormal", Id::NoticeNormal, Kind::Color, 0xF2B833},
+    {"notification-color-attention", L"NotificationColorAttention", Id::NoticeAttention, Kind::Color, 0xE64D3D},
 };
 inline std::string normalized(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");

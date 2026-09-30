@@ -25,6 +25,25 @@ inline int remap(int index, int from, int to) {
     if (from > to && index >= to && index < from) return index + 1;
     return index;
 }
+// Notification categories (agwinterm #335): the priority of an unread notice. The highest among a
+// session's unread notices picks the pill colour; an untyped notice is `attention`, the red every
+// notice had. The word is exact and lowercase, as agwintermctl sends it.
+enum class Category { Ok = 0, Normal = 1, Attention = 2 };
+inline bool category(const std::string& text, Category& out) {
+    if (text == "ok") out = Category::Ok;
+    else if (text == "normal") out = Category::Normal;
+    else if (text == "attention") out = Category::Attention;
+    else return false;
+    return true;
+}
+inline Category highest(Category a, Category b) { return static_cast<int>(a) >= static_cast<int>(b) ? a : b; }
+inline const char* name(Category c) { return c == Category::Ok ? "ok" : c == Category::Normal ? "normal" : "attention"; }
+// Pill text: dark on a light pill, white on a dark one - agwinterm's rule (Lum >= 0.55 on the
+// 0.299 / 0.587 / 0.114 weights), so a user-chosen yellow stays readable. rgb = packed 0xRRGGBB.
+inline bool darkTextOn(unsigned rgb) {
+    const unsigned r = (rgb >> 16) & 255, g = (rgb >> 8) & 255, b = rgb & 255;
+    return 299 * r + 587 * g + 114 * b >= 550 * 255;
+}
 inline int columns(int count) { return count > 4 ? 3 : count > 1 ? 2 : 1; }
 inline int navigate(int at, int count, int key) {
     if (!count) return 0;

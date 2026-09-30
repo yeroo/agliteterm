@@ -46,7 +46,8 @@ try {
     $names=@('Key_MarkMode','Key_SelectAll','Key_ZoomIn','Key_ZoomOut','Key_ZoomReset','Key_Broadcast','Key_Dashboard','Key_Quick','Key_NextWorkspace','Key_PreviousWorkspace','Key_WorkspaceCollapse')+@('WinX','WinY','WinW','WinH','WinMax'|ForEach-Object{"$_-$script:selectionPipe"})
     $configDefaults=@{Theme=0;CustomColors=0;DefFg=0xC0C0C0;DefBg=0;DosPalette=1;SidebarFontPt=0;
         ShowSidebar=1;ShowToolbar=1;ShowStatus=1;FlagView=0;RightClickPaste=1;CopyOnCtrlC=1;
-        CopyOnSelect=1;ScrollbackLines=5000;RestoreCommands=0;CursorStyle=0;CursorBlink=1;CursorBlinkMs=530;QuickTerminalSize=70;QuickTerminalHotkey=0}
+        CopyOnSelect=1;ScrollbackLines=5000;RestoreCommands=0;CursorStyle=0;CursorBlink=1;CursorBlinkMs=530;QuickTerminalSize=70;QuickTerminalHotkey=0;
+        NotificationColorOk=0x3DC759;NotificationColorNormal=0xF2B833;NotificationColorAttention=0xE64D3D}
     $names+=@($configDefaults.Keys)+@('Key_Copy','Key_FocusL','Key_FocusR','P10UntouchedSentinel','OmpTheme')
     $script:selectionRegistry=New-RegistryGuard $names {param($n) Read-RegistryGuardValue $reg $n}
     if($reg){$reg.Dispose()};$geoSaved=$true

@@ -24,7 +24,14 @@ int main() {
         check(!parse(key, "no-such-value", out), "unknown value refuses");
         check(!parse(key, std::string("1\0x", 3), out), "embedded NUL refuses");
     }
-    check(names.size() == 20 && registry.size() == 20, "all twenty supported keys covered");
+    check(names.size() == 23 && registry.size() == 23, "all twenty-three supported keys covered");
+    for (const auto& pair : {std::pair<const char*, uint32_t>{"notification-color-ok", 0x3DC759},
+                             {"notification-color-normal", 0xF2B833}, {"notification-color-attention", 0xE64D3D}}) {
+        const Key* key = find(pair.first); uint32_t out = 1;
+        check(key && key->kind == Kind::Color && key->initial == pair.second, "notice colour key and agwinterm default");
+        check(key && parse(*key, "#0a0B0c", out) && out == 0x0A0B0C && format(*key, out) == "#0A0B0C", "notice colour parses #RRGGBB either case");
+        check(key && !parse(*key, "red", out) && !parse(*key, "#12345", out) && out == 0x0A0B0C, "notice colour refuses a non-hex value");
+    }
     check(find("font-size") == nullptr && find("") == nullptr, "unsupported keys stay unsupported");
     check(normalized(" \tCoPy-On-SeLeCt\r\n") == "copy-on-select", "key normalization");
     auto probe = [](const char* key, const char* text, bool good, uint32_t expected) {

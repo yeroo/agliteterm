@@ -426,6 +426,13 @@ struct Session {
     int seenDone = 0;              // completed-command (FTCS) count when the session was last visible
     int unread = 0;                // commands finished while NOT visible — red count pill in the tree
     int notifications = 0;         // explicit notices, independent of command-completion bookkeeping
+    // The highest category among those unread notices (agwinterm #335); it picks the pill colour
+    // and means something only while notifications > 0. Written under g_lock with the count and
+    // never apart from it: every place that zeroes the count goes through clearNotices, and the
+    // one place that MOVES the count - a split promotion (closeSplitSide) - moves this with it.
+    // Read back as `unreadCategory` on the tree node while a notice is unread.
+    lite_remainder::Category noticeCategory = lite_remainder::Category::Ok;
+    void clearNotices() { notifications = 0; noticeCategory = lite_remainder::Category::Ok; }
     bool hidden = false;          // split-pane shell: a real shell, but NOT a sidebar/tree session
     // P5: THIS SHELL's pane overlay — one more hidden Session (minted by newSession, name `overlay`,
     // never in g_pane, never a tree node, never persisted), drawn in this shell's box instead of the
@@ -2570,7 +2577,7 @@ static void selectPrimary(int idx, bool activateWorkspace = true, Session* expec
         g_pane[0] = idx;
         if (activateWorkspace) g_activeWs = g_sessions[idx]->ws;
         setFocusedPane(0);
-        g_sessions[idx]->notifications = 0;
+        g_sessions[idx]->clearNotices();
         touchMruLocked(g_sessions[idx]);
     }
     syncSplitToPrimary();
@@ -3044,7 +3051,7 @@ static void closeSessionAt(int idx) {
     emitEvent("tree");
     remapPanesAfterClose(idx);
     auto* primary = displayedOwner();
-    if (primary && primary != previousPrimary) primary->notifications = 0;
+    if (primary && primary != previousPrimary) primary->clearNotices();
     // "Emptied" means NOTHING IS LEFT ON SCREEN IN THIS WINDOW, which is neither the raw session
     // count nor the save's count. The save writes only non-hidden sessions, so a quick/scratch popup
     // (its own window) keeps g_sessions non-empty while the save sees zero — judged by the raw vector
@@ -3177,6 +3184,7 @@ static Session* closeSplitSide(Session* owner, bool closeOwner) {
             survivor->ws = owner->ws;
             survivor->flagged = owner->flagged;
             survivor->notifications = owner->notifications;
+            survivor->noticeCategory = owner->noticeCategory;   // the category travels with its count (revmux r1)
             survivor->horizontal = owner->horizontal;  // kept for the next `split on`
             survivor->splitRatio = owner->splitRatio;
             survivor->hidden = false;
@@ -3389,6 +3397,10 @@ static void loadFontSel() {
     }
     setDefaultFont();
 }
+// Unread-pill colours by notice category (agwinterm #335), packed 0xRRGGBB and indexed by
+// lite_remainder::Category. Config keys notification-color-ok / -normal / -attention; read by the
+// tree's paint and written by assignConfig, both under g_lock.
+static uint32_t g_noticeColor[3] = { 0x3DC759, 0xF2B833, 0xE64D3D };
 static uint32_t configValue(const configuration::Key& key) {
     using configuration::Id;
     switch (key.id) {
@@ -3412,6 +3424,9 @@ static uint32_t configValue(const configuration::Key& key) {
     case Id::CursorBlinkMs: return g_cursorBlinkMs;
     case Id::QuickSize: return g_quickSize;
     case Id::QuickHotkey: return g_quickHotkey;
+    case Id::NoticeOk: return g_noticeColor[0];
+    case Id::NoticeNormal: return g_noticeColor[1];
+    case Id::NoticeAttention: return g_noticeColor[2];
     }
     return 0;
 }
@@ -3439,6 +3454,9 @@ static void assignConfig(const configuration::Key& key, uint32_t value) {
     case Id::CursorBlinkMs: g_cursorBlinkMs = value; break;
     case Id::QuickSize: g_quickSize = value; break;
     case Id::QuickHotkey: g_quickHotkey = value; break;
+    case Id::NoticeOk: g_noticeColor[0] = value; break;
+    case Id::NoticeNormal: g_noticeColor[1] = value; break;
+    case Id::NoticeAttention: g_noticeColor[2] = value; break;
     }
 }
 static void loadColors() {   // config API and startup share key names, types, validation and defaults
@@ -8092,6 +8110,9 @@ static std::string configOnUi(const JsonReq& req) {
         CheckMenuItem(GetMenu(g_hwnd), IDM_FLAGVIEW, MF_BYCOMMAND | (value ? MF_CHECKED : MF_UNCHECKED));
         if (g_toolbar) SendMessageW(g_toolbar, TB_CHECKBUTTON, IDM_FLAGVIEW, MAKELPARAM(value, 0));
         refreshTree(); break;
+    case Id::NoticeOk: case Id::NoticeNormal: case Id::NoticeAttention:
+        if (g_tree) InvalidateRect(g_tree, nullptr, FALSE);   // the pills live in the tree child, which the sweep below does not repaint
+        break;
     default: break;
     }
     for (HWND h : {g_hwnd, g_quickHwnd, g_scratchHwnd, g_overlayHwnd})
@@ -8707,6 +8728,7 @@ public:
                 LPARAM p = treeSessionIndex(cd->nmcd.lItemlParam);
                 if (p >= 0 && p < (LPARAM)g_sessions.size()) {
                     bool flagged = false; int unread = 0; std::wstring ctx;
+                    uint32_t pillRgb = 0;   // packed 0xRRGGBB, picked under the hold below
                     {   // session.context writes `context` on a pipe thread under g_lock; copy it
                         // under the same hold and draw with nothing held. The section is recursive,
                         // so a paint reached from inside a hold (refreshTree's rebuild) is fine.
@@ -8714,6 +8736,12 @@ public:
                         if (p < (LPARAM)g_sessions.size()) {
                             flagged = g_sessions[p]->flagged;
                             unread = g_sessions[p]->unread + g_sessions[p]->notifications;
+                            // The pill's colour (agwinterm #335): the highest category among the
+                            // unread NOTICES when there are any; finished commands - lite's own
+                            // count, which has no category - keep the attention colour alone.
+                            pillRgb = g_noticeColor[g_sessions[p]->notifications > 0
+                                ? static_cast<int>(g_sessions[p]->noticeCategory)
+                                : static_cast<int>(lite_remainder::Category::Attention)];
                             ctx = g_sessions[p]->context;
                         }
                     }
@@ -8745,18 +8773,19 @@ public:
                             SelectObject(dc, op); SelectObject(dc, ob);
                             DeleteObject(pen); DeleteObject(br);
                         }
-                        if (unread > 0) {   // red count pill (full app's notification badge)
+                        if (unread > 0) {   // count pill (full app's notification badge), coloured by category
                             HGDIOBJ of = SelectObject(dc, bf);
                             int x1 = rr.right - kTreePillInset, x0 = x1 - pillW;
                             RECT pill{ x0, cy - 8, x1, cy + 8 };
-                            HBRUSH rb = CreateSolidBrush(RGB(205, 72, 58));
-                            HPEN rp = CreatePen(PS_SOLID, 1, RGB(205, 72, 58));
+                            const COLORREF pillColor = toColorRef(pillRgb, false);
+                            HBRUSH rb = CreateSolidBrush(pillColor);
+                            HPEN rp = CreatePen(PS_SOLID, 1, pillColor);
                             HGDIOBJ ob2 = SelectObject(dc, rb), op2 = SelectObject(dc, rp);
                             RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, 12, 12);
                             SelectObject(dc, ob2); SelectObject(dc, op2);
                             DeleteObject(rb); DeleteObject(rp);
                             SetBkMode(dc, TRANSPARENT);
-                            SetTextColor(dc, RGB(255, 255, 255));
+                            SetTextColor(dc, lite_remainder::darkTextOn(pillRgb) ? RGB(31, 26, 18) : RGB(255, 255, 255));
                             DrawTextW(dc, bn, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                             SelectObject(dc, of);
                         }
@@ -10308,8 +10337,14 @@ compatibility limits: docs/agent-integration.md. Do not invoke these on a peer's
 displayed session's workspace, including splits. It starts off and shows a red warning while on.
 Readonly/reserved sources block fanout; popup input, paste, API typing and mouse reports stay targeted.
 Use the palette or keymap `toggle_broadcast` action; this is explicit opt-in, never a test on real peers.
-`notify BODY --title TITLE --target ID` adds a badge, event and clickable eight-second banner,
-and requests a bounded desktop balloon without raising the window. Windows may suppress the balloon.
+`notify BODY --title TITLE --category ok|normal|attention --target ID` adds a badge, event and
+clickable eight-second banner, and requests a bounded desktop balloon without raising the window.
+Windows may suppress the balloon. The badge takes the colour of the highest unread category:
+attention red, normal yellow, ok green; an omitted category is attention, any other value is
+refused and nothing is delivered. Finished commands count in the same badge and keep the red when
+no notice is unread. `tree --json` carries the highest unread category as `unreadCategory`.
+Config keys notification-color-ok, notification-color-normal and notification-color-attention
+(#RRGGBB) change the three colours.
 `session seen` or selecting the session clears its notice badge. Popup/cover targets refuse.
 `dashboard [ID ...] [--close]` shows up to nine live fixed-strike previews, defaulting to recent
 sessions. Arrows/Home/End navigate; Enter/Space/click select, Escape closes. No shell input leaks
@@ -10514,6 +10549,9 @@ static std::string ctlDispatch(const std::string& line) {
                         // a spec that could not be relaunched on this machine: kept, not dropped
                         ",\"failed\":" + (s->failed ? "true" : "false") +
                         ",\"unread\":" + std::to_string(s->unread + s->notifications) +
+                        // Beyond the contract: the highest category among the unread notices, the
+                        // read-back for notify's --category; absent while no notice is unread.
+                        (s->notifications > 0 ? std::string(",\"unreadCategory\":\"") + lite_remainder::name(s->noticeCategory) + "\"" : std::string()) +
                         // Beyond the contract (extra fields are allowed): the grid the session was
                         // last resized to. It is how a caller sees that `sidebar width` moved the
                         // content region, and the oracle #23 needs (a pane that collapsed to 2).
@@ -10753,7 +10791,7 @@ static std::string ctlDispatch(const std::string& line) {
                 g_walk = {};
             } else {
                 g_walk = {}; touchMruLocked(displayedOwner());
-                if (auto* primary = displayedOwner()) primary->notifications = 0;
+                if (auto* primary = displayedOwner()) primary->clearNotices();
             }
             int idx = op == "cancel" ? visibleIndex(pick) : liveIndex(pick);
             if (idx >= 0) {
@@ -11480,7 +11518,7 @@ static std::string ctlDispatch(const std::string& line) {
             if (isCoverLocked(target)) return ctlErr(sessionIdentityCover("seen", target->id, "marked"));
             target->seenDone = completedMarks(target);   // under the same hold as the re-check (revmux r4)
             target->unread = 0;
-            target->notifications = 0;
+            target->clearNotices();
         }
         PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
         return ctlOkStr("seen");

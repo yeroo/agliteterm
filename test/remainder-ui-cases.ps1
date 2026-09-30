@@ -150,6 +150,72 @@ $r=Selection-Rpc 'notify' @{body='bad'} 'missing' -AllowError
 Check 'notify missing target refuses' (-not$r.ok)
 $r=Selection-Rpc 'notify' @{body=('x'*4097)} $b -AllowError
 Check 'oversized notify refuses' (-not$r.ok)
+# Categories (agwinterm #335). The tree's `unreadCategory` is the read-back: the highest category
+# among the unread notices, absent while none is unread. Anything but the three words refuses and
+# delivers nothing - a wrong word, wrong case, empty, a number, null, an object (empty too), an array.
+$null=Selection-Rpc 'session.seen' @{} $b
+Check 'no unread notice, no category on the node' ((P12-Node $b).unread-eq0 -and $null-eq(P12-Node $b).unreadCategory)
+$treeRect=[SelectionUi]::ChildRect($h,'SysTreeView32')
+$pillX=[Math]::Max(0,$treeRect.Right-70);$pillH=[Math]::Min(240,$treeRect.Bottom-$treeRect.Top)
+function P12-Pills([string]$name){ Start-Sleep -Milliseconds 300; ,(Selection-Capture $h $name $pillX $treeRect.Top 70 $pillH) }   # the pill column of the sidebar
+$r=Selection-Rpc 'notify' @{body='category ok';category='ok'} $b
+Check 'notify accepts category ok and the node says ok' ($r-like'notified*' -and (P12-Node $b).unreadCategory-ceq'ok' -and (P12-Node $b).unread-eq1)
+$pillOk=P12-Pills 'p12-pill-ok'
+$r=Selection-Rpc 'notify' @{body='category normal';category='normal'} $b
+Check 'a normal notice outranks ok' ($r-like'notified*' -and (P12-Node $b).unreadCategory-ceq'normal' -and (P12-Node $b).unread-eq2)
+$r=Selection-Rpc 'notify' @{body='category attention';category='attention'} $b
+Check 'an attention notice outranks normal' ($r-like'notified*' -and (P12-Node $b).unreadCategory-ceq'attention' -and (P12-Node $b).unread-eq3)
+$r=Selection-Rpc 'notify' @{body='late ok';category='ok'} $b
+Check 'a later ok notice does not lower the category' ((P12-Node $b).unreadCategory-ceq'attention' -and (P12-Node $b).unread-eq4)
+foreach($bad in 'warning','OK','',5,$null,@{x=1},@{},@(),@('ok')){ $r=Selection-Rpc 'notify' @{body='never delivered';category=$bad} $b -AllowError
+    Check "notify refuses category $(ConvertTo-Json $bad -Compress)" (-not$r.ok -and $r.error-ceq'notify: category must be ok, normal or attention') }
+Check 'a refused category delivers nothing' ((P12-Node $b).unread-eq4 -and (P12-Node $b).unreadCategory-ceq'attention')
+$r=Selection-Rpc 'notify' @{body='untyped'} $b
+Check 'an untyped notice is attention' ((P12-Node $b).unread-eq5 -and (P12-Node $b).unreadCategory-ceq'attention')
+# The paint follows the category: one unread notice either way, so only the pill's colour differs.
+$null=Selection-Rpc 'session.seen' @{} $b
+Check 'seen clears the count and the category' ((P12-Node $b).unread-eq0 -and $null-eq(P12-Node $b).unreadCategory)
+$null=Selection-Rpc 'notify' @{body='one attention';category='attention'} $b
+$pillAttention=P12-Pills 'p12-pill-attention'
+Check 'an attention pill is painted differently from an ok pill' ((Selection-PixelDiff $pillOk $pillAttention)-gt 40) "diff=$(Selection-PixelDiff $pillOk $pillAttention)"
+$null=Selection-Rpc 'session.seen' @{} $b
+$null=Selection-Rpc 'notify' @{body='one ok again';category='ok'} $b
+$pillOkAgain=P12-Pills 'p12-pill-ok-again'
+Check 'after seen an ok notice paints the ok pill again' ((Selection-PixelDiff $pillOk $pillOkAgain)-eq 0) "diff=$(Selection-PixelDiff $pillOk $pillOkAgain)"
+# A split promotion moves the count to the surviving shell; the category must travel with it. A
+# session of its own, so $a and $b keep their shells for the cases below, and the selection goes
+# back to where it was.
+$null=Selection-Rpc 'session.seen' @{} $b
+$activeBefore=[string](P12-Nodes|Where-Object active|Select-Object -First 1).id
+$promo=[string](Selection-Rpc 'session.new' @{name='P12-promotion'})
+$null=Selection-Rpc 'session.split' @{op='on'} $promo
+$null=Selection-Rpc 'notify' @{body='before promotion';category='normal'} $promo
+$null=Selection-Rpc 'session.split.close' @{} $promo     # the session's own shell closes: the split shell becomes the session
+Check 'a split promotion keeps the count and its category' ((P12-Wait {(P12-Node $promo) -and (P12-Node $promo).unread-eq1}) -and (P12-Node $promo).unreadCategory-ceq'normal') "node=$((P12-Node $promo)|ConvertTo-Json -Compress -Depth 4)"
+$null=Selection-Rpc 'session.close' @{} $promo
+if($activeBefore){$null=Selection-Rpc 'session.select' @{} $activeBefore}
+# The colour keys, written through the registry guard like every other saved setting in this fixture.
+function P12-ColorSet([string]$Key,[string]$Text,[string]$Registry,[int]$Stored){
+    $regKey=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-LiteTestRegistryPath))
+    $prior=$script:selectionRegistry[$Registry].Expected
+    try{Set-RegistryGuardValue $script:selectionRegistry $Registry @{Exists=$true;Kind=4;Value=$Stored} `
+        {param($n) Read-RegistryGuardValue $regKey $n} `
+        {param($n,$state) $null=Selection-Rpc 'config.set' @{key=$Key;value=$Text}}
+    }catch{if(Test-RegistryGuardValue (Read-RegistryGuardValue $regKey $Registry) $prior){$script:selectionRegistry[$Registry].Expected=$prior};throw
+    }finally{$regKey.Dispose()}
+}
+foreach($color in @(@('notification-color-ok','NotificationColorOk',0x3DC759,'#3DC759'),@('notification-color-normal','NotificationColorNormal',0xF2B833,'#F2B833'),@('notification-color-attention','NotificationColorAttention',0xE64D3D,'#E64D3D'))){
+    $key=[string]$color[0]
+    Check "$key reads agwinterm's default" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq$color[3])
+    try{
+        P12-ColorSet $key '#102030' $color[1] 0x102030
+        Check "$key sets and reads back" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq'#102030')
+        $r=Selection-Rpc 'config.set' @{key=$key;value='green'} -AllowError
+        Check "$key refuses a non-hex colour and keeps the value" (-not$r.ok -and [string](Selection-Rpc 'config.get' @{key=$key})-ceq'#102030')
+    }finally{ P12-ColorSet $key $color[3] $color[1] $color[2] }
+    Check "$key restores" ([string](Selection-Rpc 'config.get' @{key=$key})-ceq$color[3])
+}
+$null=Selection-Rpc 'notify' @{body='before seen'} $b     # the block above leaves $b at zero; give the next check something to clear
 $null=Selection-Rpc 'session.seen' @{} $b
 Check 'seen clears notification badge' ((P12-Node $b).unread-eq0)
 $null=Selection-Rpc 'notify' @{body='Click to B'} $b
