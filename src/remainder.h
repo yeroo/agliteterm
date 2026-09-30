@@ -44,6 +44,17 @@ inline bool darkTextOn(unsigned rgb) {
     const unsigned r = (rgb >> 16) & 255, g = (rgb >> 8) & 255, b = rgb & 255;
     return 299 * r + 587 * g + 114 * b >= 550 * 255;
 }
+// Shell exit (agwinterm #336, #337): the words a one-pane profile shell's exit leaves behind. The
+// code is the host's; `known` is false when the host could not be asked, and the text then says
+// nothing about a code rather than inventing a zero.
+inline std::string exitHoldText(bool known, int code) {
+    return std::string("\r\n\r\nThe session has ended") + (known ? " (exit " + std::to_string(code) + ")" : std::string()) +
+           ".\r\nPress Enter to close the session.\r\n";
+}
+inline std::string exitNoticeBody(const std::string& name, bool known, int code) {
+    return name + (known ? " exited with code " + std::to_string(code) + "." : " exited.");
+}
+inline Category exitCategory(bool known, int code) { return known && code == 0 ? Category::Ok : Category::Attention; }
 inline int columns(int count) { return count > 4 ? 3 : count > 1 ? 2 : 1; }
 inline int navigate(int at, int count, int key) {
     if (!count) return 0;

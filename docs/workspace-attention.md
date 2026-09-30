@@ -22,6 +22,17 @@ P12 implements five existing agwinterm verbs without adding canonical contract s
   a newer banner replaces the previous one, but each target's badge and event remain.
 
   ![ok, normal and attention notices as green, yellow and red pills](img/qa-notify-categories.png)
+
+- Shell exit: a one-pane session whose profile shell exits stays on screen. Its row says `(exit N)`
+  and `tree --json` carries `exitCode` beside `exited` (the pty-host's code; absent when the host
+  could not be asked). The pane prints `The session has ended (exit N).` and `Press Enter to close
+  the session.`; a plain Enter in that pane closes the session. An exit nobody was looking at (the
+  session not displayed, or the window not in the foreground) raises a notice, `ok` for code 0
+  and `attention` otherwise. A session started with an explicit command (`session new --command`,
+  and a saved spec that is not one of the profiles) keeps its buffer untouched, a split side still
+  collapses to its survivor, and popups keep their own exit handling.
+
+  ![an exited session held on screen with its code, and the exit notices of two background sessions](img/qa-shell-exit-hold.png)
 - `dashboard [ID ...] [--close]`: up to nine distinct tree sessions or the recent-session default.
   Arrows/Home/End choose a tile, Enter/Space/click activate it, Escape closes without switching.
   Keys/paste/mouse input cannot pass through. Previews use the existing fixed strike, clipped to

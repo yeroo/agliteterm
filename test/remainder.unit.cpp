@@ -59,6 +59,19 @@ int main() {
         check(lite_remainder::darkTextOn(0x3DC759) && lite_remainder::darkTextOn(0xF2B833));
         check(!lite_remainder::darkTextOn(0xE64D3D) && !lite_remainder::darkTextOn(0x000000) && lite_remainder::darkTextOn(0xFFFFFF));
     }
+    // Shell exit (agwinterm #336, #337): the hold lines, the notice body and its category.
+    {
+        using lite_remainder::Category;
+        check(lite_remainder::exitHoldText(true, 42) == "\r\n\r\nThe session has ended (exit 42).\r\nPress Enter to close the session.\r\n");
+        check(lite_remainder::exitHoldText(true, 0).find("(exit 0).") != std::string::npos);
+        check(lite_remainder::exitHoldText(true, -1073741510).find("(exit -1073741510).") != std::string::npos);   // Ctrl+C's code, signed as the host reports it
+        check(lite_remainder::exitHoldText(false, 7) == "\r\n\r\nThe session has ended.\r\nPress Enter to close the session.\r\n");   // unknown: no invented code
+        check(lite_remainder::exitNoticeBody("build", true, 3) == "build exited with code 3.");
+        check(lite_remainder::exitNoticeBody("build", false, 3) == "build exited.");
+        check(lite_remainder::exitCategory(true, 0) == Category::Ok);
+        check(lite_remainder::exitCategory(true, 1) == Category::Attention && lite_remainder::exitCategory(true, -1) == Category::Attention);
+        check(lite_remainder::exitCategory(false, 0) == Category::Attention);   // an unknown code is not a success
+    }
     std::cout << "remainder: " << checks << " checks, " << failed << " failed\n";
     return failed ? 1 : 0;
 }
